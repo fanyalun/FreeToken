@@ -52,5 +52,11 @@
     }
   ],
   "scope": "selected manifests, output hashes and 48-sample quality summaries",
-  "existing_figure_revision_or_missing_link_failures": true
+  "existing_figure_revision_or_missing_link_failures": true,
+  "post_cleanup": {
+    "preserved_files_checked": 3994,
+    "preserved_hash_failures": [],
+    "new_broken_symlinks": [],
+    "original_checks_scope": "historical selected artifact checks before cleanup; figure revision warnings remain"
+  }
 }

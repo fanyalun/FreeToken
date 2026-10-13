@@ -1,28 +1,12 @@
 {
-  "snapshot_file_count": 102740,
-  "snapshot_group_count": 124,
-  "unique_allocated_bytes": 82962927616,
-  "path_allocated_bytes": 101691904000,
-  "symlinks": 674,
+  "snapshot_file_count": 74270,
+  "unique_allocated_bytes": 41602326528,
+  "deleted_paths": 45,
+  "deleted_regular_files": 28618,
+  "removed_allocated_bytes": 41438965760,
+  "filesystem_available_delta_bytes": 41422516224,
+  "symlinks": 476,
   "broken_symlinks": 38,
-  "protected_groups": 65,
-  "candidate_groups_or_subdirectories": 24,
-  "candidate_unique_reclaim_bytes": 11115188224,
-  "tiers": {
-    "a_test": {
-      "paths": 16,
-      "files": 321,
-      "estimated_reclaim_bytes": 264912896
-    },
-    "b_failed": {
-      "paths": 5,
-      "files": 147,
-      "estimated_reclaim_bytes": 2277863424
-    },
-    "c_trace": {
-      "paths": 3,
-      "files": 1149,
-      "estimated_reclaim_bytes": 8572411904
-    }
-  }
+  "new_broken_symlinks": 0,
+  "scope": "post-deletion scan; newly generated metadata and directory blocks excluded"
 }

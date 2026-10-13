@@ -1,11 +1,9 @@
-# 交叉检索与建表
+# 交叉检索与建表记录
 
-这里只发布轻量结果快照；原始生成、评分、审计、模型和表资产仍在本机原路径。
+AI2D离线表的cluster、PCA、cache及对应资产目录已经按用户授权删除。现存建表时间、采样/划分、source snapshot、collection record和交叉检索结果保持原样。
 
-## AI2D建表与三数据集交叉检索
-
-3表乘3数据集乘20条，共180条formal检索请求；不等于任务精度实验。
-
-- [结果快照](report.md)，内容与原始 `ai2d_offline_build_cross_20261003/report.md` 的SHA-256一致。
-- 本机原始目录：`/home/fanya/FreeToken/artifacts/ai2d_offline_build_cross_20261003`。
-- 保留 summary、manifest、complete、effective_config、predictions、score、judge_raw、audit 及必要源码/资产；不只保留图。
+- [历史测量报告快照](report.md)：3张表乘3个数据集乘20条，共180条正式检索请求；不是任务精度结果。
+- 原始目录：`/home/fanya/FreeToken/artifacts/ai2d_offline_build_cross_20261003`。
+- 历史报告中的complete和asset verification表示当时的验证状态，不表示AI2D表资产目前仍存在。再次执行AI2D表检索需要重新构建表；本轮没有重跑。
+- 原asset manifest的来源信息及删除文件hash记录在本机清理归档。
+- [当前删除凭据](../cleanup_receipt.json)。

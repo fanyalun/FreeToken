@@ -3,28 +3,12 @@
   "sources_unmodified": true,
   "snapshots": [
     {
-      "study": "联合检索阈值敏感度",
-      "source": "artifacts/tablemoe_joint_threshold_20261007/accuracy_hit.csv",
-      "snapshot": "docs/experiment_results_20261013/thresholds/accuracy_hit.csv",
-      "bytes": 1220,
-      "sha256": "19cf916f2f7657b6156dadda4a7da22c3ae70e5819b4ea0f960238953c038e15",
-      "snapshot_sha256": "19cf916f2f7657b6156dadda4a7da22c3ae70e5819b4ea0f960238953c038e15"
-    },
-    {
       "study": "MMLongBench检索阈值敏感度k5",
       "source": "artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/summary.csv",
       "snapshot": "docs/experiment_results_20261013/thresholds/summary.csv",
       "bytes": 3497,
       "sha256": "e0e975896d680e172b2210244349b0e1b0d363f6e6faa52f0faf1ee061294eb9",
       "snapshot_sha256": "e0e975896d680e172b2210244349b0e1b0d363f6e6faa52f0faf1ee061294eb9"
-    },
-    {
-      "study": "MMLongBench检索阈值敏感度k6图",
-      "source": "artifacts/mmlongbench_write_threshold_modality_hit_figures_20261009/plot_data.csv",
-      "snapshot": "docs/experiment_results_20261013/thresholds/plot_data.csv",
-      "bytes": 1195,
-      "sha256": "2ae36b814a17a4824430d434ce8de631189145f9f5d49ab11fc2e6226412f22e",
-      "snapshot_sha256": "2ae36b814a17a4824430d434ce8de631189145f9f5d49ab11fc2e6226412f22e"
     },
     {
       "study": "重计算比例敏感度",
@@ -74,5 +58,6 @@
       "sha256": "2eb76e050890e21476797c4e6d837466b2053b836160476ec1b65e5404b77763",
       "snapshot_sha256": "2eb76e050890e21476797c4e6d837466b2053b836160476ec1b65e5404b77763"
     }
-  ]
+  ],
+  "retention_update": "2026-10-13: removed non-k5 threshold snapshots; authoritative retained snapshots unchanged"
 }
