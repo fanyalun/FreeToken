@@ -1,0 +1,78 @@
+{
+  "action": "copy_lightweight_summaries",
+  "sources_unmodified": true,
+  "snapshots": [
+    {
+      "study": "联合检索阈值敏感度",
+      "source": "artifacts/tablemoe_joint_threshold_20261007/accuracy_hit.csv",
+      "snapshot": "docs/experiment_results_20261013/thresholds/accuracy_hit.csv",
+      "bytes": 1220,
+      "sha256": "19cf916f2f7657b6156dadda4a7da22c3ae70e5819b4ea0f960238953c038e15",
+      "snapshot_sha256": "19cf916f2f7657b6156dadda4a7da22c3ae70e5819b4ea0f960238953c038e15"
+    },
+    {
+      "study": "MMLongBench检索阈值敏感度k5",
+      "source": "artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/summary.csv",
+      "snapshot": "docs/experiment_results_20261013/thresholds/summary.csv",
+      "bytes": 3497,
+      "sha256": "e0e975896d680e172b2210244349b0e1b0d363f6e6faa52f0faf1ee061294eb9",
+      "snapshot_sha256": "e0e975896d680e172b2210244349b0e1b0d363f6e6faa52f0faf1ee061294eb9"
+    },
+    {
+      "study": "MMLongBench检索阈值敏感度k6图",
+      "source": "artifacts/mmlongbench_write_threshold_modality_hit_figures_20261009/plot_data.csv",
+      "snapshot": "docs/experiment_results_20261013/thresholds/plot_data.csv",
+      "bytes": 1195,
+      "sha256": "2ae36b814a17a4824430d434ce8de631189145f9f5d49ab11fc2e6226412f22e",
+      "snapshot_sha256": "2ae36b814a17a4824430d434ce8de631189145f9f5d49ab11fc2e6226412f22e"
+    },
+    {
+      "study": "重计算比例敏感度",
+      "source": "artifacts/mmlongbench_write_recompute_sensitivity_20261011/summary.csv",
+      "snapshot": "docs/experiment_results_20261013/recompute/summary.csv",
+      "bytes": 2021,
+      "sha256": "8ae27354411ec4c577e304ba8dc7ca31a70ae6727f64439e6ec4691bdb4080f7",
+      "snapshot_sha256": "8ae27354411ec4c577e304ba8dc7ca31a70ae6727f64439e6ec4691bdb4080f7"
+    },
+    {
+      "study": "MMLongBench五方法质量对比",
+      "source": "artifacts/mmlongbench_write_multimethod_skip40_balanced30_20261009/summary.csv",
+      "snapshot": "docs/experiment_results_20261013/accuracy/summary.csv",
+      "bytes": 1858,
+      "sha256": "87e4bb6ad48f0052aa331b3ab62a9f3308c4ff120fd2943ce4520f17559bc44f",
+      "snapshot_sha256": "87e4bb6ad48f0052aa331b3ab62a9f3308c4ff120fd2943ce4520f17559bc44f"
+    },
+    {
+      "study": "当前性能图及五方法原始表",
+      "source": "artifacts/mmlongbench_offload_five_methods_20261009/plot_data.csv",
+      "snapshot": "docs/experiment_results_20261013/performance/plot_data.csv",
+      "bytes": 1035,
+      "sha256": "287921b24a69adc557adf6a683d5b2dc54b0d64434ecdd7c702b884ef98cdfeb",
+      "snapshot_sha256": "287921b24a69adc557adf6a683d5b2dc54b0d64434ecdd7c702b884ef98cdfeb"
+    },
+    {
+      "study": "历史六方法性能对比",
+      "source": "artifacts/mmlongbench_offload_six_methods_20261009/plot_data.csv",
+      "snapshot": "docs/experiment_results_20261013/performance/mmlongbench_offload_six_methods_20261009_plot_data.csv",
+      "bytes": 1247,
+      "sha256": "6572cbe6b4c5fa4e9ca30b4e32c828bd4a3647611901cdf876c616110a6dfbc4",
+      "snapshot_sha256": "6572cbe6b4c5fa4e9ca30b4e32c828bd4a3647611901cdf876c616110a6dfbc4"
+    },
+    {
+      "study": "Prefill batch与专家IO",
+      "source": "artifacts/tablemoe_prefill_bs_mmbench16_20261004/summary.csv",
+      "snapshot": "docs/experiment_results_20261013/prefill_io/summary.csv",
+      "bytes": 1967,
+      "sha256": "74d87f4b78b8025980a8893dc18d7078abd1c3ed7a9b0759a8f15b2089c42bba",
+      "snapshot_sha256": "74d87f4b78b8025980a8893dc18d7078abd1c3ed7a9b0759a8f15b2089c42bba"
+    },
+    {
+      "study": "AI2D建表与三数据集交叉检索",
+      "source": "artifacts/ai2d_offline_build_cross_20261003/report.md",
+      "snapshot": "docs/experiment_results_20261013/cross_retrieval/report.md",
+      "bytes": 4332,
+      "sha256": "2eb76e050890e21476797c4e6d837466b2053b836160476ec1b65e5404b77763",
+      "snapshot_sha256": "2eb76e050890e21476797c4e6d837466b2053b836160476ec1b65e5404b77763"
+    }
+  ]
+}

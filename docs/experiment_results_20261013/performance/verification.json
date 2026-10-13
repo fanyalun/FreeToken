@@ -1,0 +1,231 @@
+{
+  "checks": [
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_0/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_0/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_0/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_0/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_1/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_1/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_1/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/1_native_hybrid/timing_1/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "method": "FreeToken",
+      "kind": "two_round_plot_average",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_0/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_0/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_0/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_0/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_1/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_1/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_1/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_modes_skip40_offload_20261009_gpu1/formal/3_modes_offload_skip40/timing_1/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "method": "MoDES-U",
+      "kind": "two_round_plot_average",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_0/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_0/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_0/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_0/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_1/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_1/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_1/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_offload_extended_20261009_gpu1/formal/3_modes_offload_skip25/timing_1/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "method": "MoDES-G",
+      "kind": "two_round_plot_average",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_0/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_0/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_0/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_0/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_1/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_1/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_1/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_cap1_three_strategy_20261005/formal/0_table_offload/timing_1/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "method": "TableMoE-U",
+      "kind": "two_round_plot_average",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_0/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_0/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_0/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_0/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_1/summary.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_1/results.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_1/command.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_tablemoe_p07_k5_offload_20261009_gpu1/formal/2_table_offload/timing_1/complete.json",
+      "kind": "timing_source_hash",
+      "passed": true
+    },
+    {
+      "method": "TableMoE-G",
+      "kind": "two_round_plot_average",
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "scope": "existing two-round timing files and CSV means; no GPU rerun"
+}

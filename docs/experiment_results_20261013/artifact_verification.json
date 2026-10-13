@@ -1,0 +1,56 @@
+{
+  "checks": 230,
+  "passed": 222,
+  "failed": [
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/plot_manifest.json",
+      "kind": "manifest_output",
+      "exists": true,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/plot_verification.json",
+      "kind": "manifest_output",
+      "exists": true,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/figure_outputs/mmlongbench_write_threshold_sensitivity_keep07_k5_pair.pdf",
+      "kind": "manifest_output",
+      "exists": true,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/figure_outputs/mmlongbench_write_threshold_sensitivity_keep07_k5_pair.png",
+      "kind": "manifest_output",
+      "exists": true,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_offline_threshold_sensitivity_keep07_k5_20261009/figure_outputs/mmlongbench_write_threshold_sensitivity_keep07_k5_pair.md",
+      "kind": "manifest_output",
+      "exists": true,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_multimethod_skip40_balanced30_20261009/figure_outputs/mmlongbench_write_baseline_tablemoe_modes_skip40_pair.md",
+      "kind": "manifest_output",
+      "exists": false,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_multimethod_skip40_balanced30_20261009/figure_outputs/mmlongbench_write_baseline_tablemoe_modes_skip40_pair.png",
+      "kind": "manifest_output",
+      "exists": false,
+      "passed": false
+    },
+    {
+      "path": "/home/fanya/FreeToken/artifacts/mmlongbench_write_multimethod_skip40_balanced30_20261009/figure_outputs/mmlongbench_write_baseline_tablemoe_modes_skip40_pair.pdf",
+      "kind": "manifest_output",
+      "exists": false,
+      "passed": false
+    }
+  ],
+  "scope": "selected manifests, output hashes and 48-sample quality summaries",
+  "existing_figure_revision_or_missing_link_failures": true
+}
