@@ -30,6 +30,7 @@ class GraphCaptureBuffer:
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
+    tablemoe_slots: torch.Tensor
 
     @classmethod
     def init(
@@ -45,6 +46,7 @@ class GraphCaptureBuffer:
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            tablemoe_slots=torch.zeros(bs, dtype=torch.int32, device=device),
         )
 
     def set_batch(self, batch: Batch) -> None:
@@ -58,6 +60,7 @@ class GraphCaptureBuffer:
         if self.mrope_positions is not None:
             batch.mrope_positions = self.mrope_positions[:, _slice]
         batch.linear_table_idx = self.table_idx[_slice]
+        batch.tablemoe_slots = self.tablemoe_slots[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
@@ -74,6 +77,8 @@ class GraphCaptureBuffer:
             self.mrope_positions[:, _slice] = batch.mrope_positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        if batch.tablemoe_slots is not None:
+            self.tablemoe_slots[_slice] = batch.tablemoe_slots
 
 
 def _determine_cuda_graph_bs(
@@ -117,7 +122,18 @@ class GraphRunner:
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
         mrope: bool = False,
+        tablemoe_runtime=None,
     ) -> None:
+        if tablemoe_runtime is not None and not getattr(tablemoe_runtime, "graph_enabled", False):
+            if (getattr(getattr(tablemoe_runtime, "config", None), "moe_policy", "native") != "native"
+                    and (cuda_graph_bs or cuda_graph_max_bs)):
+                raise RuntimeError("MoDES backend cannot capture CUDA Graph; use --cuda-graph-max-bs 0")
+            requested = bool(cuda_graph_bs) if cuda_graph_bs is not None else cuda_graph_max_bs != 0
+            if (requested and hasattr(tablemoe_runtime, "graph_enabled")
+                    and tablemoe_runtime.expert_mode == "hybrid"):
+                raise RuntimeError("optimized TableMoE hybrid CUDA Graph requires the CPU flag handshake; "
+                                   "use --cuda-graph-max-bs 0 for eager execution")
+            cuda_graph_bs, cuda_graph_max_bs = [], 0
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
@@ -131,6 +147,7 @@ class GraphRunner:
         self.mrope = mrope
         self.stream = stream
         self.device = device
+        self.tablemoe_runtime = tablemoe_runtime
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -161,6 +178,8 @@ class GraphRunner:
         self.buffer = GraphCaptureBuffer.init(
             self.max_graph_bs, vocab_size, self.device, mrope=self.mrope
         )
+        if self.tablemoe_runtime is not None:
+            self.tablemoe_runtime.graph_slots = self.buffer.tablemoe_slots
         self._reset_moe_offload_cache()
 
         pbar = tqdm(
@@ -186,6 +205,9 @@ class GraphRunner:
                           if self.dummy_req.linear_slot_idx is not None
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
+            if self.tablemoe_runtime is not None:
+                self.tablemoe_runtime.prepare_graph_workspace(bs)
+                self.buffer.tablemoe_slots[:bs].fill_(self.tablemoe_runtime.dummy_slot)
             with get_global_ctx().forward_batch(batch):
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
@@ -198,6 +220,8 @@ class GraphRunner:
             self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
+        if self.tablemoe_runtime is not None:
+            self.tablemoe_runtime.reset_capture_state()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
@@ -228,5 +252,7 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        if self.tablemoe_runtime is not None:
+            self.tablemoe_runtime.graph_slots = None
         self.buffer = None
         gc.collect()

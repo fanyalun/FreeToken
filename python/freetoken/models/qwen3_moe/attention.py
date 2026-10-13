@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
 from freetoken.layers import BaseOP, LinearOProj, LinearQKVMerged, RMSNorm
@@ -84,6 +86,13 @@ class Qwen3MoeAttention(BaseOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.get_attn_positions(), q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
+        if (getattr(ctx, "tablemoe_runtime", None) is not None and ctx.batch.is_prefill
+                and getattr(ctx.tablemoe_runtime, "prefill_uses_tablemoe", True)):
+            from freetoken.moe.tablemoe import last_token_attention_scores
+
+            ctx.batch.tablemoe_attn_scores[self.layer_id] = last_token_attention_scores(
+                q, k.view(-1, self.num_kv_heads, self.head_dim), ctx.batch.padded_reqs
+            )
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self.o_proj.forward(o.view(-1, self.qo_attn_dim))
 

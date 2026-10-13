@@ -275,6 +275,10 @@ class OffloadMoELayer(MoELayer):
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
+        if getattr(self, "tablemoe_runtime", None) is not None:
+            return self.tablemoe_runtime.forward(
+                self.layer_id, hidden_states, topk_weights, topk_ids, get_global_ctx().batch
+            )
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
@@ -355,6 +359,10 @@ class OffloadMoELayer(MoELayer):
         ``materialize_layer``. In both, position == expert id, so the routing ids
         pass through unmapped."""
         cache = self.offload_cache
+        if getattr(self, "tablemoe_runtime", None) is not None:
+            return self.tablemoe_runtime.forward(
+                self.layer_id, hidden_states, topk_weights, topk_ids, get_global_ctx().batch
+            )
         assert cache is not None
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)

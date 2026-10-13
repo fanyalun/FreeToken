@@ -724,6 +724,44 @@ def parse_args(
         ),
     )
 
+    parser.add_argument("--moe-policy", choices=["native", "modes", "modes_tablemoe"],
+                        default=ServerArgs.moe_policy)
+    parser.add_argument("--modes-config", default=None)
+    parser.add_argument("--modes-prefill-policy", choices=["modes", "tablemoe"],
+                        default=ServerArgs.modes_prefill_policy,
+                        help="Prefill routing for MoDES policies; decode keeps the selected --moe-policy.")
+    parser.add_argument("--tablemoe-pca-dir", default=None)
+    parser.add_argument("--tablemoe-implementation", choices=["reference", "optimized"],
+                        default=ServerArgs.tablemoe_implementation)
+    parser.add_argument("--tablemoe-stats", action="store_true", default=ServerArgs.tablemoe_stats)
+    parser.add_argument("--tablemoe-no-renormalize-weights", action="store_false",
+                        dest="tablemoe_renormalize_weights", default=ServerArgs.tablemoe_renormalize_weights,
+                        help="Preserve original router weights for surviving TableMoE routes in both phases.")
+    parser.add_argument("--tablemoe-report-path", default=None)
+    parser.add_argument("--tablemoe-collect-config", default=None)
+    parser.add_argument("--tablemoe-skip-lookup", action="store_true", default=ServerArgs.tablemoe_skip_lookup,
+                        help="Execute important routes and drop other routes without online/offline lookup.")
+    parser.add_argument("--tablemoe-expert-mode", choices=["cpu", "offload", "hybrid"],
+                        default=ServerArgs.tablemoe_expert_mode,
+                        help="Execution of important TableMoE routes; hybrid uses GPU prefill and CPU overflow on decode.")
+    parser.add_argument("--tablemoe-cache-dir", default=None)
+    parser.add_argument("--tablemoe-convert-bf16-weights", action="store_true",
+                        default=ServerArgs.tablemoe_convert_bf16_weights)
+    parser.add_argument("--tablemoe-prefill-keep-rate", type=float, default=ServerArgs.tablemoe_prefill_keep_rate)
+    parser.add_argument("--tablemoe-prefill-chunk-size", type=int,
+                        default=ServerArgs.tablemoe_prefill_chunk_size,
+                        help="Optimized TableMoE prefill subchunk size; 0 uses the scheduler chunk. CPU execution remains capacity limited.")
+    parser.add_argument("--tablemoe-decode-keep-k", type=int, default=ServerArgs.tablemoe_decode_keep_k)
+    parser.add_argument("--tablemoe-online-cache-size", type=int, default=ServerArgs.tablemoe_online_cache_size)
+    parser.add_argument("--tablemoe-offline-cosine-threshold-vision", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_vision)
+    parser.add_argument("--tablemoe-offline-cosine-threshold-text", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_text)
+    parser.add_argument("--tablemoe-decode-offline-cosine-threshold", type=float,
+                        default=ServerArgs.tablemoe_decode_offline_cosine_threshold,
+                        help="Minimum decode PCA cosine similarity for offline reuse; unset uses the legacy positive-dot rule.")
+    parser.add_argument("--tablemoe-decode-online-cosine-threshold", type=float,
+                        default=ServerArgs.tablemoe_decode_online_cosine_threshold,
+                        help="Minimum decode hidden-state cosine similarity for online reuse; unset uses the legacy positive-dot rule.")
+
     parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
@@ -782,6 +820,15 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if kwargs["moe_policy"] != "native":
+        import sys
+
+        provided = sys.argv[1:] if args is None else args
+        conflicts = {"--tablemoe-decode-keep-k"}
+        if kwargs["modes_prefill_policy"] == "modes":
+            conflicts.add("--tablemoe-prefill-keep-rate")
+        if any(flag.split("=", 1)[0] in conflicts for flag in provided):
+            parser.error("MoDES selects exact routes; TableMoE keep-rate/keep-k flags conflict")
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
@@ -842,7 +889,8 @@ def parse_args(
         and not kwargs["moe_cache_auto"]
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )
-    if is_offload_moe_strategy(kwargs["moe_strategy"]) and _no_cache_flag:
+    if (is_offload_moe_strategy(kwargs["moe_strategy"]) and kwargs["moe_strategy"] != "tablemoe"
+            and kwargs["moe_policy"] == "native" and _no_cache_flag):
         kwargs["moe_cache_auto"] = True
 
     if kwargs["model_source"] == "modelscope":

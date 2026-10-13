@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -112,14 +113,31 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if args.silent_output:
             logging.disable(logging.INFO)
 
+        stopping = False
+        previous_handlers = {}
+
+        def stop_with_moe_export(signum, frame):
+            nonlocal stopping
+            if not stopping:
+                stopping = True
+                raise KeyboardInterrupt
+
         try:
+            if args.tablemoe_report_path or args.tablemoe_collect_config:
+                # The frontend's SIGTERM must not interrupt an in-progress audit export.
+                for signum in (signal.SIGINT, signal.SIGTERM):
+                    previous_handlers[signum] = signal.signal(signum, stop_with_moe_export)
             scheduler.run_forever()
         except KeyboardInterrupt:
+            stopping = True
             logger = init_logger(__name__)
             if args.tp_info.is_primary():
                 print()  # for a clean newline after ^C
                 logger.info("Scheduler exiting gracefully...")
             scheduler.shutdown()
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def launch_server(

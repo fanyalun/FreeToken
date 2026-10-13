@@ -69,7 +69,8 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
+             "fp16_routes": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -163,6 +164,11 @@ class CpuMoeExecutor:
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
+        if fmt == "fp16_routes":
+            if not getattr(_cpu_moe, "supports_fp16_routes", lambda: False)():
+                raise RuntimeError("rebuild _cpu_moe with `python setup.py build_ext --inplace` for FP16 routes")
+            if activation != "silu" or apply_router_weight_on_input:
+                raise ValueError("FP16 routes require unweighted SiLU experts")
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
@@ -346,12 +352,13 @@ class CpuMoeExecutor:
         is actually a per-layer table's address (see ``_make_table``), not a single
         bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
         """
-        if fmt == "bf16":
+        if fmt in ("bf16", "fp16_routes"):
             gate_up = banks["gate_up"]
             down = banks["down"]
-            if gate_up[0].dtype != torch.bfloat16 or down[0].dtype != torch.bfloat16:
+            dtype = torch.float16 if fmt == "fp16_routes" else torch.bfloat16
+            if gate_up[0].dtype != dtype or down[0].dtype != dtype:
                 raise NotImplementedError(
-                    f"bf16 CPU MoE requires bf16 banks, got {gate_up[0].dtype}/{down[0].dtype}"
+                    f"{fmt} CPU MoE requires {dtype} banks, got {gate_up[0].dtype}/{down[0].dtype}"
                 )
             H = int(gate_up[0].shape[2])
             I = int(gate_up[0].shape[1] // 2)
@@ -493,11 +500,13 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
+            routes = self.quant_format == "fp16_routes"
+            dtype = torch.float16 if routes else torch.bfloat16
             io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "x": alloc_pinned_tensor(bs, self.H, dtype=dtype),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "y": alloc_pinned_tensor(*((bs, self.top_k, self.H) if routes else (bs, self.H)), dtype=dtype),
             }
             self._io[bs] = io
         return io
@@ -546,6 +555,7 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *, mapped_output: bool = False,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node, then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -569,10 +579,13 @@ class CpuMoeExecutor:
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        if self.quant_format != "fp16_routes":
+            io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         task = self._task_for(layer_id, bs)
-        out = torch.empty_like(hidden_states)
+        out = (io["y"] if mapped_output else
+               torch.empty((bs, self.top_k, self.H), device=hidden_states.device, dtype=hidden_states.dtype)
+               if self.quant_format == "fp16_routes" else torch.empty_like(hidden_states))
         slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
@@ -601,7 +614,8 @@ class CpuMoeExecutor:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
         io = self._io[bs]
-        out.copy_(io["y"], non_blocking=True)
+        if out is not io["y"]:
+            out.copy_(io["y"], non_blocking=True)
         return out
 
     def _watchdog_tick(self, suspects: dict) -> None:

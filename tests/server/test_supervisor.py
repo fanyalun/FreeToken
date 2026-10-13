@@ -8,6 +8,49 @@ from freetoken.utils import progress
 from freetoken.server.supervisor import BackendHandle, LoadProgress, drain_ready, phase_slug
 
 
+def test_tablemoe_export_survives_frontend_termination_during_shutdown(monkeypatch):
+    import signal
+    from types import SimpleNamespace
+    import freetoken.gpu_select as gpu_select
+    import freetoken.scheduler as scheduler_module
+    from freetoken.server.launch import _run_scheduler
+
+    previous = object()
+    handlers, exported = {}, []
+
+    def install(signum, handler):
+        old = handlers.get(signum, previous)
+        handlers[signum] = handler
+        return old
+
+    class Scheduler:
+        def __init__(self, args):
+            pass
+
+        def sync_all_ranks(self):
+            pass
+
+        def run_forever(self):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            raise AssertionError("termination did not enter graceful shutdown")
+
+        def shutdown(self):
+            handlers[signal.SIGINT](signal.SIGINT, None)
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            exported.append(True)
+
+    monkeypatch.setattr(signal, "signal", install)
+    monkeypatch.setattr(gpu_select, "set_assigned_gpu", lambda _: None)
+    monkeypatch.setattr(scheduler_module, "Scheduler", Scheduler)
+    info = SimpleNamespace(rank=0, size=1, is_primary=lambda: False)
+    for report, collect in (("audit.jsonl", None), (None, "collect.json")):
+        args = SimpleNamespace(shell_mode=False, gpu_assigned=None, gpu=("0",), tp_info=info,
+                               silent_output=False, tablemoe_report_path=report, tablemoe_collect_config=collect)
+        _run_scheduler(args, queue.Queue())
+        assert handlers[signal.SIGINT] is previous and handlers[signal.SIGTERM] is previous
+    assert exported == [True, True]
+
+
 def test_drain_ready_counts_ready_acks_and_applies_progress():
     q: "queue.Queue" = queue.Queue()
     q.put(("progress", "Loading weights (FTW)", 5, 10))

@@ -197,16 +197,20 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["swa_full_tokens_ratio"] = float(cfg.swa_full_tokens_ratio) if has_swa_ratio else 0.0
     # Exact total cache VRAM budget (all pools) the engine honors: memory_ratio of the
     # post-weights baseline minus weights — the same figure the rebuild fit-check uses, with
-    # fixed=0 so it's the whole-cache ceiling (KV + MoE + Mamba + SWA), not the KV+MoE remainder.
+    # excluding TableMoE lookup storage so it is the ceiling for the adjustable pools
+    # (KV + MoE + Mamba + SWA), not the KV+MoE remainder.
     # Lets the desktop show the real ceiling instead of reverse-deriving it from the per-pool
     # limits. 0 when the baseline wasn't captured (fake engines in tests).
     from freetoken.engine.cache_budget import net_cache_budget_bytes as _net_budget
 
+    runtime = getattr(engine, "tablemoe_runtime", None)
+    fixed = runtime.resident_gpu_bytes() if runtime is not None else 0
+    meta["tablemoe_fixed_bytes"] = fixed
     try:
         _baseline = int(engine._baseline_free or 0)
         _weights = int(engine._weights_bytes or 0)
-        _mr = float(cfg.memory_ratio) if cfg is not None else 1.0
-        meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
+        _mr = float(getattr(cfg, "memory_ratio", 1.0))
+        meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, fixed)) if _baseline > 0 else 0
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
     return meta

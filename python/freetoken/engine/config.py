@@ -26,6 +26,9 @@ class EngineConfig:
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
+    moe_policy: str = "native"
+    modes_config: str | None = None
+    modes_prefill_policy: str = "modes"
     # old name of moe_strategy; __post_init__ folds it in
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
@@ -63,6 +66,24 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    tablemoe_pca_dir: str | None = None
+    tablemoe_cache_dir: str | None = None
+    tablemoe_convert_bf16_weights: bool = False
+    tablemoe_expert_mode: str = "offload"
+    tablemoe_implementation: str = "optimized"
+    tablemoe_skip_lookup: bool = False
+    tablemoe_renormalize_weights: bool = True
+    tablemoe_stats: bool = False
+    tablemoe_report_path: str | None = None
+    tablemoe_collect_config: str | None = None
+    tablemoe_prefill_keep_rate: float = 0.6
+    tablemoe_prefill_chunk_size: int = 0
+    tablemoe_decode_keep_k: int = 4
+    tablemoe_online_cache_size: int = 64
+    tablemoe_offline_cosine_threshold_vision: float = 0.6
+    tablemoe_offline_cosine_threshold_text: float = 0.7
+    tablemoe_decode_offline_cosine_threshold: float | None = None
+    tablemoe_decode_online_cosine_threshold: float | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1

@@ -6,8 +6,8 @@ from __future__ import annotations
 # missing experts over PCIe into a GPU slot cache, ``cpu`` computes them on the CPU from the
 # host banks, ``hybrid`` fetches at most K missing experts per layer and computes the rest on
 # the CPU, overlapped. ``fused`` keeps every expert resident on the GPU.
-MOE_STRATEGIES = ("fused", "offload", "cpu", "hybrid")
-OFFLOAD_MOE_STRATEGIES = frozenset({"offload", "cpu", "hybrid"})
+MOE_STRATEGIES = ("fused", "offload", "cpu", "hybrid", "tablemoe")
+OFFLOAD_MOE_STRATEGIES = frozenset({"offload", "cpu", "hybrid", "tablemoe"})
 
 
 def is_offload_moe_strategy(strategy: str) -> bool:

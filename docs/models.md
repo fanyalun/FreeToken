@@ -36,7 +36,7 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 ## MoE strategies
 
-`ft serve --moe-strategy {auto,fused,offload,cpu,hybrid}` (`--moe-backend` is the deprecated old spelling):
+`ft serve --moe-strategy {auto,fused,offload,cpu,hybrid,tablemoe}` (`--moe-backend` is the deprecated old spelling):
 
 - **fused** — experts resident on GPU (needs the VRAM); never auto-selected.
 - **offload** — experts live in host RAM, an LRU cache of expert slots on GPU;
@@ -44,6 +44,37 @@ These families accept image input by default; pass `--text-model-only` to skip t
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
+- **tablemoe** — approximate Qwen3-VL-MoE FP16, TP=1 path. Select important-route
+  execution with `--tablemoe-expert-mode`: `offload` (default) uses the shared GPU
+  expert slot cache; `hybrid` uses GPU prefill and computes decode overflow misses
+  on CPU; `cpu` computes all important routes on CPU. The offload/hybrid modes
+  require explicit `--moe-cache-size`, for example 3072, and load only important
+  experts into that cache. Hybrid decode honors `--moe-hybrid-max-fetch` (automatic
+  FP16 selection currently falls back to 1). Remaining routes reuse online or
+  offline `.pt` values. Missing routes are dropped and surviving weights are
+  renormalized. Requires `--tablemoe-pca-dir` and `--tablemoe-cache-dir`.
+  Prefill importance uses the current chunk's last-token attention only. Decode
+  uses the `optimized` implementation by default. It enables fixed request-slot GPU
+  online storage and decode CUDA Graphs for offload/hybrid;
+  hybrid Graph requires the CPU executor's flag handshake. `--tablemoe-stats` enables
+  cumulative CPU/GPU route counters on request release; timing should leave it disabled.
+  PCA, search keys, online values, routing and output merging run on GPU. Offline
+  values remain on CPU. Optimized packs valid FP16 values into mapped pinned storage:
+  a GPU kernel reads hits over PCIe without host index addressing or explicit value
+  H2D copies. Its mapped-read byte counters describe logical traffic, separate from
+  explicit memcpy bytes. CPU mode keeps
+  important expert weights on CPU and its runtime weight H2D counter stays zero;
+  offload/hybrid report bytes fetched into the GPU expert cache. Native CPU
+  workers return unweighted route outputs, with GPU lookup queued before waiting
+  for those outputs. `--tablemoe-implementation reference` selects the eager fallback,
+  which performs one host metadata wait per layer
+  and block of at most 128 tokens. Optimized merges CPU overflow directly from pinned
+  output after the ready/done handshake. Prefill uses offline cosine lookup;
+  decode tries online raw-dot lookup then offline positive-dot lookup, matching
+  the reference defaults. This path reads raw FP16 checkpoint
+  experts, or explicitly converts BF16 source weights with
+  `--tablemoe-convert-bf16-weights`. Conversion changes numeric behavior and has
+  no established quality or speed guarantee.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it.

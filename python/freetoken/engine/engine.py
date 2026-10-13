@@ -378,6 +378,7 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self.tablemoe_runtime = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -385,7 +386,25 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
-        if is_offload_moe_strategy(config.moe_strategy):
+        if config.moe_strategy == "tablemoe" or config.moe_policy != "native":
+            from freetoken.moe.tablemoe import TableMoeRuntime
+            if config.moe_policy != "native":
+                from freetoken.moe.modes_runtime import ModesRuntime
+
+                self.tablemoe_runtime = ModesRuntime(config)
+            elif config.tablemoe_implementation == "optimized":
+                from freetoken.moe.tablemoe_optimized import TableMoeOptimizedRuntime
+
+                self.tablemoe_runtime = TableMoeOptimizedRuntime(config)
+            else:
+                self.tablemoe_runtime = TableMoeRuntime(config)
+            self.cpu_moe_executor = self.tablemoe_runtime.executor
+            self.moe_offload_cache = self.tablemoe_runtime.expert_cache
+            self.ctx.moe_offload_cache = self.moe_offload_cache
+            self.ctx.tablemoe_runtime = self.tablemoe_runtime
+            for layer in iter_offload_moe_layers(self.model):
+                layer.tablemoe_runtime = self.tablemoe_runtime
+        elif is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
@@ -492,6 +511,7 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            tablemoe_runtime=self.tablemoe_runtime,
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -952,7 +972,7 @@ class Engine:
             weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
-            ),
+            ) + (self.tablemoe_runtime.resident_gpu_bytes(target_moe) if self.tablemoe_runtime is not None else 0),
             extra_note=(
                 f", mamba={target_mamba - 1} slots" if target_mamba is not None else ""
             ),
@@ -1015,12 +1035,15 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
+            tablemoe_runtime=self.tablemoe_runtime,
         )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
+        if self.tablemoe_runtime is not None and hasattr(self.tablemoe_runtime, "prepare_batch"):
+            self.tablemoe_runtime.prepare_batch(batch)
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1102,6 +1125,8 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
+        if self.tablemoe_runtime is not None and hasattr(self.tablemoe_runtime, "close"):
+            self.tablemoe_runtime.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1463,6 +1488,18 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
+    from freetoken.moe.modes import prepare_modes_config
+
+    prepare_modes_config(config)
+
+    if config.moe_strategy == "tablemoe":
+        from freetoken.moe.tablemoe import validate_tablemoe_config
+
+        validate_tablemoe_config(config)
+        if config.tablemoe_implementation == "reference":
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has
@@ -1716,7 +1753,7 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_rate", None)
             override("moe_cache_auto", False)
 
-    if is_moe and config.moe_strategy == "cpu":
+    if is_moe and config.moe_strategy == "cpu" and getattr(config, "moe_policy", "native") == "native":
         # CPU-compute decode keeps experts in host RAM and computes them on the CPU;
         # the GPU only holds the two-layer prefill double buffer. So the slot cache is
         # fixed at exactly two expert layers (prefill overlap requires >= 2*num_experts)

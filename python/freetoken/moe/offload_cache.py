@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # dense bf16 expert weights
     "bf16": ("gate_up", "down"),
+    "fp16": ("gate_up", "down"),
     # DeepSeek-V3-style 128x128 block-fp8 experts (Qwen3.5-FP8): fp8-e4m3 weights +
     # bf16 per-block weight_scale_inv. gate_up [L*E, 2I, H] fp8 + gate_up_scale
     # [L*E, 2I//128, H//128] bf16; down [L*E, H, I] fp8 + down_scale [L*E, H//128, I//128].
@@ -85,6 +86,7 @@ from freetoken.kernel.aot_models import fp8_block_scale_pad
 # keyed by the config-time format tag (expert_quant / moe_weight_format), not quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its repacked variants
 _BANK_BYTES_PER_EXPERT = {
     "bf16": lambda H, I: 3 * I * H * 2,
+    "fp16": lambda H, I: 3 * I * H * 2,
     "fp8_block": lambda H, I: 3 * I * H + (
         (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)

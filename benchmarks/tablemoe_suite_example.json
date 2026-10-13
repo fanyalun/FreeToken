@@ -1,0 +1,36 @@
+{
+  "output": "/home/fanya/FreeToken/artifacts/tablemoe_suite_run",
+  "model": "/data/fanya/models/Qwen3-VL-30B-A3B-Instruct",
+  "python": "/home/fanya/FreeToken/.venv/bin/python",
+  "vlmeval_python": "/home/fanya/miniforge/envs/tablemoe/bin/python",
+  "vlmeval_root": "/home/fanya/VLMEvalKit",
+  "dataset_only_import": true,
+  "vlmeval_env": {
+    "LMUData": "/home/fanya/tablemoe/LMUData",
+    "LD_LIBRARY_PATH": "/home/fanya/miniforge/envs/tablemoe/lib"
+  },
+  "server_env": {
+    "CUDA_HOME": "/usr/local/cuda-13.0",
+    "PATH": "/home/fanya/FreeToken/.venv/bin:/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin"
+  },
+  "protocol": "holdout",
+  "media_path_remap": {
+    "/home/fanya/LMUData": "/home/fanya/tablemoe/LMUData"
+  },
+  "smoke_fixed_tokens": [32],
+  "seed": 42,
+  "builder": {
+    "pca_dim": 64,
+    "clusters": 256,
+    "reservoir_size": 30000,
+    "pca_per_expert": 1000,
+    "iterations": 30,
+    "device": "cuda"
+  },
+  "smoke_builder": {
+    "clusters": 4,
+    "reservoir_size": 128,
+    "pca_per_expert": 32,
+    "iterations": 3
+  }
+}

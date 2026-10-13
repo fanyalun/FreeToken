@@ -138,6 +138,8 @@ class Batch:
     # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
     mm_rows: torch.Tensor | None = field(default=None, init=False)
+    tablemoe_attn_scores: dict[int, torch.Tensor] = field(default_factory=dict, init=False)
+    tablemoe_slots: torch.Tensor | None = field(default=None, init=False)
     # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
     mm_block_ends: torch.Tensor | None = field(default=None, init=False)
     # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
@@ -182,6 +184,7 @@ class Context:
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
     moe_offload_cache: OffloadMoeCache | None = None
+    tablemoe_runtime: object | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.

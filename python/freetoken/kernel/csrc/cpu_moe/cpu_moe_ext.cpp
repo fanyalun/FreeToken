@@ -1220,7 +1220,36 @@ q4dot_fn select_q4dot() {
   return q4_0_dot_i8_scalar;
 }
 
-enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4 };
+// TableMoE returns each FP16 route separately so GPU table results can be merged.
+enum WFmt { WF_BF16 = 0, WF_NVFP4 = 1, WF_MXFP4 = 2, WF_DSFP4 = 3, WF_Q4_0 = 4,
+            WF_FP16_ROUTES = 5 };
+
+inline uint16_t f32_to_fp16(float f) {
+  return c10::Half(f).x;
+}
+
+float dot_fp16_scalar(const uint16_t* w, const uint16_t* x, int n) {
+  float acc = 0;
+  for (int i = 0; i < n; ++i) acc += fp16_to_f32(w[i]) * fp16_to_f32(x[i]);
+  return acc;
+}
+
+#if CPU_MOE_X86
+__attribute__((target("avx2,fma,f16c")))
+float dot_fp16_avx2(const uint16_t* w, const uint16_t* x, int n) {
+  __m256 a = _mm256_setzero_ps(), b = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 16 <= n; i += 16) {
+    a = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(w + i))),
+                       _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i))), a);
+    b = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(w + i + 8))),
+                       _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i + 8))), b);
+  }
+  float out = hsum256(_mm256_add_ps(a, b));
+  for (; i < n; ++i) out += fp16_to_f32(w[i]) * fp16_to_f32(x[i]);
+  return out;
+}
+#endif
 
 // Each ctor pointer arg is the address of a CPU int64 array of length
 // num_layers (one base address per layer, built by cpu_executor.py's
@@ -1275,6 +1304,7 @@ struct CpuMoeExecutor {
   const char* isa;
 
   std::vector<bf16_t> g_scratch;   // [max_tokens * top_k * I] intermediate
+  std::vector<int64_t> active_routes;
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
   // ds_fp4 activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
   std::vector<float> xe_scratch, xo_scratch;  // [max_tokens * H/2]   (input)
@@ -1379,6 +1409,16 @@ struct CpuMoeExecutor {
         core_ids(std::move(core_ids_)) {
     DotChoice c = select_dot();
     dot = c.fn;
+    if (weight_format == WF_FP16_ROUTES) {
+      dot = dot_fp16_scalar;
+      c.name = "scalar-fp16";
+#if CPU_MOE_X86
+      if (pick_isa() >= ISA_AVX2 && __builtin_cpu_supports("f16c")) {
+        dot = dot_fp16_avx2;
+        c.name = "avx2-f16c";
+      }
+#endif
+    }
     nvdot = select_nvdot();
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
@@ -1406,6 +1446,7 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    active_routes.reserve(static_cast<size_t>(max_tokens) * top_k);
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
     if (needs_di) {
@@ -1485,7 +1526,7 @@ struct CpuMoeExecutor {
                          const uint8_t* gu_scale_l, const uint16_t* gu_global_l, int e, int row,
                          const bf16_t* x, const float* xe, const float* xo, const int8_t* xi8,
                          const float* xas) {
-    if (fmt == WF_BF16) {
+    if (fmt == WF_BF16 || fmt == WF_FP16_ROUTES) {
       const bf16_t* w = gate_up_l + ((size_t)e * (2 * I) + row) * H;
       return dot(w, x, H);
     }
@@ -1508,7 +1549,7 @@ struct CpuMoeExecutor {
                          const uint8_t* dn_scale_l, const uint16_t* dn_global_l, int e, int row,
                          const bf16_t* g, const float* ge, const float* go, const int8_t* gi8,
                          const float* gas) {
-    if (fmt == WF_BF16) {
+    if (fmt == WF_BF16 || fmt == WF_FP16_ROUTES) {
       const bf16_t* w = down_l + ((size_t)e * H + row) * I;
       return dot(w, g, I);
     }
@@ -1580,6 +1621,9 @@ struct CpuMoeExecutor {
   }
 
   void do_pass1(const MoeTask* t, int64_t p) {
+    if (fmt == WF_FP16_ROUTES) {
+      p = active_routes[p / n_iblk] * n_iblk + p % n_iblk;
+    }
     if (fmt == WF_MXFP4) {
       do_pass1_mxfp4(t, p);
       return;
@@ -1621,6 +1665,13 @@ struct CpuMoeExecutor {
           gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
                            xe, xo, xi8, xas) * w_in;
+      if (fmt == WF_FP16_ROUTES) {
+        gate = fp16_to_f32(f32_to_fp16(gate));
+        up = fp16_to_f32(f32_to_fp16(up));
+        const float activated = fp16_to_f32(f32_to_fp16(act_apply(act, gate)));
+        g_row[i] = f32_to_fp16(activated * up);
+        continue;
+      }
       if (clamped) {
         // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + up_bias)
         // -- swigluoai carries the +1 up bias (gpt-oss/MiniMax); swiglu_clamp
@@ -1637,6 +1688,18 @@ struct CpuMoeExecutor {
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
+    if (fmt == WF_FP16_ROUTES) {
+      const int64_t route = active_routes[p / n_hblk];
+      const int h0 = static_cast<int>(p % n_hblk) * HBLK;
+      const int e = t->ids[route];
+      const auto* down = reinterpret_cast<const uint16_t*>(tbl_at(down_tbl, t->layer_id));
+      const auto* g = g_scratch.data() + route * I;
+      for (int h = h0; h < std::min(H, h0 + HBLK); ++h) {
+        t->y[route * H + h] = (e < 0 || e >= num_experts) ? 0 :
+            f32_to_fp16(dot(down + ((size_t)e * H + h) * I, g, I));
+      }
+      return;
+    }
     if (fmt == WF_MXFP4) {
       do_pass2_mxfp4(t, p);
       return;
@@ -1892,6 +1955,18 @@ struct CpuMoeExecutor {
   void submit(MoeTask* t) {
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
+    if (fmt == WF_FP16_ROUTES) {
+      active_routes.clear();
+      for (int64_t r = 0; r < static_cast<int64_t>(t->num_tokens) * top_k; ++r) {
+        if (t->ids[r] >= 0 && t->ids[r] < num_experts) {
+          active_routes.push_back(r);
+        } else {
+          std::fill(t->y + r * H, t->y + (r + 1) * H, 0);
+        }
+      }
+      // An empty route task needs no worker wakeup; the coordinator still publishes done.
+      if (active_routes.empty()) return;
+    }
     // Grow the per-token intermediate scratch if a larger batch shows up than the
     // construction-time hint (CUDA-graph capture warms the largest bs first, so
     // this happens at most once, before any capture, while the pool is idle).
@@ -1899,6 +1974,10 @@ struct CpuMoeExecutor {
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+    if (fmt == WF_FP16_ROUTES) {
+      p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
+      p2_total = static_cast<int64_t>(active_routes.size()) * n_hblk;
+    }
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
@@ -2157,4 +2236,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
   m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLU_CLAMP); });
+  m.def("supports_fp16_routes", []() { return true; });
 }

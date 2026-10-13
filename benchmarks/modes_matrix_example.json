@@ -1,0 +1,28 @@
+{
+  "output": "/path/to/modes_matrix",
+  "model": "/data/fanya/models/Qwen3-VL-30B-A3B-Instruct",
+  "modes_config": "/path/to/modes_import/modes_config.json",
+  "control_config": "/path/to/modes_full_fp16_control/modes_config.json",
+  "pca_dir": "/path/to/completed_pca",
+  "cache_dir": "/path/to/completed_cache",
+  "prepared_root": "/path/to/frozen_mmbench_prepare",
+  "vlmeval_python": "/home/fanya/miniforge/envs/tablemoe/bin/python",
+  "vlmeval_root": "/home/fanya/VLMEvalKit",
+  "dataset_only_import": true,
+  "datasets": ["MMBench_DEV_EN_V11"],
+  "backends": ["hybrid"],
+  "executions": ["eager", "graph"],
+  "gpu_expert_slots": 3072,
+  "fetch_cap": 0,
+  "cpu_threads": 16,
+  "fixed_sample_limit": 100,
+  "natural_max_tokens": 128,
+  "vlmeval_env": {
+    "LMUData": "/home/fanya/tablemoe/LMUData",
+    "LD_LIBRARY_PATH": "/home/fanya/miniforge/envs/tablemoe/lib"
+  },
+  "server_env": {
+    "CUDA_HOME": "/usr/local/cuda-13.0",
+    "PATH": "/home/fanya/FreeToken/.venv/bin:/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin"
+  }
+}

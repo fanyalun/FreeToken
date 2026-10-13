@@ -79,16 +79,34 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
+| `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`/`tablemoe`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
+| `--moe-policy` | native | `native`, `modes`, or `modes_tablemoe`; MoDES policies require FP16 Qwen3-VL-MoE, TP=1 and an explicit offload/hybrid/cpu backend. See [MoDES](modes.md) |
+| `--modes-config` | required for MoDES | Imported calibration JSON with checkpoint binding, layer importance and modality tau; validated together with its manifest |
+| `--modes-prefill-policy` | modes | `modes` uses MoDES in prefill; `tablemoe` uses TableMoE attention-ranked experts, offline lookup and survivor renormalization. Decode follows `--moe-policy` |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
-| `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
+| `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid/tablemoe executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--tablemoe-pca-dir`, `--tablemoe-cache-dir` | required for approximate tablemoe | Existing PCA and offline table `.pt` asset roots, each containing `layer_N` directories. Optimized full-expert control (`keep-rate=1`, `keep-k=top-k`) needs neither asset |
+| `--tablemoe-expert-mode` | offload | Important routes: `cpu`, `offload`, or `hybrid`. Offload/hybrid require explicit `--moe-cache-size`; hybrid uses GPU prefill and capped fetch plus CPU overflow on decode |
+| `--tablemoe-implementation` | optimized | `reference` uses eager host-addressed value fetch; `optimized` uses mapped CPU values, fixed GPU request state, fused merge/update, and decode CUDA Graphs for offload/hybrid |
+| `--tablemoe-stats` | off | Collect route and transfer counters on GPU; read at request release. Use only for independent audit, disable for timing |
+| `--tablemoe-no-renormalize-weights` | off | Preserve original top-k router weights for exact routes and table hits in prefill and decode; misses contribute zero. By default TableMoE renormalizes surviving weights; MoDES phases always preserve weights |
+| `--tablemoe-report-path` | off | Optimized implementation only: write request/layer/phase/modality counters, startup IO, shared expert fetch/padding IO and shutdown reconciliation to a fresh JSONL path; implies statistics |
+| `--tablemoe-collect-config` | off | Full-expert eager calibration only: collect original routed inputs using a builder JSON with `output`, `builder`, and `input_sha256`; performance runs omit this flag |
+| `--tablemoe-convert-bf16-weights` | off | Explicitly allow a BF16 source checkpoint and convert its CPU expert banks to FP16 |
+| `--tablemoe-prefill-keep-rate` | 0.6 | Fraction of active experts computed exactly in each request's current prefill chunk |
+| `--tablemoe-prefill-chunk-size` | 0 | Optimized TableMoE subchunk size; 0 uses the scheduler prefill chunk without extra splitting. CPU execution remains bounded by its executor capacity |
+| `--tablemoe-decode-keep-k` | 4 | Number of leading decode routes computed exactly |
+| `--tablemoe-online-cache-size` | 64 | Maximum prior token entries per request and MoE layer |
+| `--tablemoe-offline-cosine-threshold-vision`, `--tablemoe-offline-cosine-threshold-text` | 0.6, 0.7 | Minimum prefill PCA cosine similarity for offline reuse; decode uses the reference positive-dot rule |
+| `--tablemoe-decode-offline-cosine-threshold` | unset | Optional minimum decode PCA cosine similarity for offline reuse; unset preserves the positive-dot rule |
+| `--tablemoe-decode-online-cosine-threshold` | unset | Optional minimum decode hidden-state cosine similarity for online reuse; normalizes queries and cached keys; unset preserves the positive-dot rule |
 
 ### API behaviour
 
@@ -201,4 +219,3 @@ profile that `ft serve --moe-strategy auto` and `--moe-hybrid-max-fetch -1` then
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
-

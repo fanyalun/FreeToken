@@ -199,6 +199,7 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    return_routes: bool = False,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
@@ -256,7 +257,11 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    align = moe_align_block_size
+    if return_routes:
+        # The native sorter assumes valid expert ids; TableMoE masks unused routes with -1.
+        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
+    sorted_token_ids, expert_ids, num_tokens_post_padded = align(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
 
@@ -290,6 +295,8 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
 
+    if return_routes:
+        return intermediate_cache3.masked_fill((topk_ids < 0)[:, :, None], 0)
     moe_sum_reduce_triton(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
@@ -307,6 +314,8 @@ def fused_experts_decode_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    return_routes: bool = False,
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
@@ -335,7 +344,7 @@ def fused_experts_decode_impl(
         "num_warps": 8,
     }
 
-    intermediate_cache1 = torch.empty(
+    intermediate_cache1 = workspace[0] if workspace is not None else torch.empty(
         (M, top_k, gate_up_dim),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -352,14 +361,14 @@ def fused_experts_decode_impl(
         compute_type=hidden_states.dtype,
     )
 
-    intermediate_cache2 = torch.empty(
+    intermediate_cache2 = workspace[1] if workspace is not None else torch.empty(
         (M * top_k, intermediate_size),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     gated_act_and_mul(activation, intermediate_cache1.view(-1, gate_up_dim), intermediate_cache2, alpha=act_alpha, limit=act_limit)
 
-    intermediate_cache3 = torch.empty(
+    intermediate_cache3 = workspace[2] if workspace is not None else torch.empty(
         (M, top_k, w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
@@ -376,6 +385,8 @@ def fused_experts_decode_impl(
         compute_type=hidden_states.dtype,
     )
 
+    if return_routes:
+        return intermediate_cache3
     out_hidden_states = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
     return out_hidden_states

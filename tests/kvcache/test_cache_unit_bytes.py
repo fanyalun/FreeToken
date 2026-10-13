@@ -292,3 +292,15 @@ def test_status_meta_includes_pools():
     meta = compute_cache_status_meta(eng)
     assert meta["pools"]["num_pages"] == 100
     assert meta["pools"]["page_size"] == 16
+
+
+def test_status_meta_subtracts_tablemoe_fixed_storage_once():
+    eng = _mha_engine()
+    eng.config = _config()
+    eng._baseline_free = 8 * 2**30
+    eng._weights_bytes = 2 * 2**30
+    before = compute_cache_status_meta(eng)["cache_budget_bytes"]
+    eng.tablemoe_runtime = SimpleNamespace(resident_gpu_bytes=lambda: 300_000_000)
+    meta = compute_cache_status_meta(eng)
+    assert meta["tablemoe_fixed_bytes"] == 300_000_000
+    assert meta["cache_budget_bytes"] == before - 300_000_000
