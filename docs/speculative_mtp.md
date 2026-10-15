@@ -205,3 +205,13 @@ so its TTFT is not HTTP/SSE TTFT. Audit phase event intervals are stream elapsed
 costs and can include CPU waits; they are not sums of GPU kernel time. The matrix
 records exact token comparisons across each AR/MTP pair and timing/audit replay.
 Failures and partial cells remain incomplete and are retained.
+
+Resume preflights every completed cell against the current checkpoint path and
+metadata, dataset and tokenized prompts, production source/native-extension
+hashes, benchmark scripts, runtime versions, relevant environment variables and
+requested cell settings before launching any missing cells. A mismatch or
+missing identity field refuses reuse and leaves existing evidence and reports
+untouched; use a new output directory for a changed experiment or legacy results
+without this metadata. Matching cells keep their raw files. Weight-shard size
+and nanosecond modification time are checked without hashing all checkpoint
+weights, so these signatures are not cryptographic weight-content verification.

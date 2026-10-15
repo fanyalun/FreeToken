@@ -10,21 +10,39 @@ import subprocess
 import sys
 import signal
 import os
+from types import SimpleNamespace
+
+from qwen_mtp_config import benchmark_config, prepare_experiment, validate_cell_config
 
 
 def read_rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
+    _, experiment = prepare_experiment(args.model, args.data, root)
+    expected = {}
+    for budget in (16, 24, 40):
+        for backend in ("hybrid", "offload"):
+            for mode in ("ar", "mtp"):
+                name = f"formal_{mode}_{backend}_graph_{budget}"
+                directory = output / name
+                cell_args = SimpleNamespace(model=args.model, data=args.data, output=str(directory),
+                    mode=mode, backend=backend, budget_gib=budget, samples=16, tokens=256,
+                    eager=False, purpose="formal", audit=True)
+                expected[name] = benchmark_config(cell_args, experiment)
+                marker = directory / "complete.json"
+                if marker.exists() and json.loads(marker.read_text()).get("status") == "cell_completed":
+                    # Check every reusable cell before launching any new work or writing reports.
+                    validate_cell_config(directory, expected[name])
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -36,7 +54,8 @@ def main():
                 directory = output / name
                 command = [sys.executable, str(root / "benchmarks/bench_qwen_mtp.py"),
                            "--model", args.model, "--data", args.data, "--output", str(directory),
-                           "--mode", mode, "--backend", backend, "--budget-gib", str(budget), "--audit"]
+                           "--mode", mode, "--backend", backend, "--budget-gib", str(budget),
+                           "--samples", "16", "--tokens", "256", "--purpose", "formal", "--audit"]
                 if directory.exists():
                     # Existing evidence is immutable; resume only cells with a completed marker.
                     returncode = None
@@ -55,7 +74,7 @@ def main():
                     failures.append({"cell": name, "returncode": returncode, "completion": marker})
                     print(json.dumps({"failed": failures[-1]}), flush=True)
                     continue
-                config = json.loads((directory / "config.json").read_text())
+                config = validate_cell_config(directory, expected[name])
                 summary = json.loads((directory / "summary.json").read_text())
                 rows = read_rows(directory / "requests.jsonl")
                 audit = read_rows(directory / "audit_requests.jsonl")
@@ -103,7 +122,8 @@ def main():
                           "mismatches": mismatches,
                           "throughput_ratio_mtp_over_ar": mtp["throughput_tokens_per_second"] / ar["throughput_tokens_per_second"]})
     complete = len(cells) == 12 and not failures and len(pairs) == 6 and all(p["strict_token_parity"] for p in pairs)
-    report = {"matrix_complete": complete, "cells": cells, "pairs": pairs, "failures": failures}
+    report = {"matrix_complete": complete, "experiment": experiment,
+              "cells": cells, "pairs": pairs, "failures": failures}
     (output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n")
     fields = ["cell", "budget_gib", "backend", "mode", "slots", "throughput_tokens_per_second",
               "ttft_mean_seconds", "tpot_mean_seconds", "accepted", "drafted", "acceptance_rate",

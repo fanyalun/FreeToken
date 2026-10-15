@@ -2,26 +2,21 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import hashlib
 import json
 from pathlib import Path
-import subprocess
 import os
 import threading
 import time
 
 import torch
-from transformers import AutoTokenizer
+
+from qwen_mtp_config import benchmark_config, prepare_experiment
 
 from freetoken.distributed import DistributedInfo
 from freetoken.engine import Engine
 from freetoken.engine.qwen_mtp import QwenMTPRunner
 from freetoken.mm.config import MultimodalConfig
 from freetoken.scheduler.config import SchedulerConfig
-
-
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 class ProcessMemoryMonitor:
@@ -102,33 +97,9 @@ def main():
     (out / "complete.json").write_text(json.dumps({"status": "incomplete", "matrix_complete": False}) + "\n")
     if args.samples < 1 or args.tokens < 1:
         raise ValueError("samples and tokens must be positive")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    data = [json.loads(line) for line in Path(args.data).read_text().splitlines()][:args.samples]
-    if len(data) != args.samples:
-        raise ValueError("dataset has fewer requested samples")
-    prompts = [tokenizer.apply_chat_template(
-        [{"role": "user", "content": row["question"]}], tokenize=True,
-        add_generation_prompt=True, enable_thinking=False, return_dict=False,
-    ) for row in data]
     root = Path(__file__).resolve().parents[1]
-    source_paths = list((root / "python/freetoken").rglob("*.py")) + list((root / "python/freetoken/kernel/csrc").rglob("*.cpp"))
-    source_paths += [Path(__file__).resolve(), root / "benchmarks/audit_qwen_mtp.py"]
-    source = {str(p.relative_to(root)): digest(p) for p in sorted(source_paths)}
-    config = {
-        **vars(args), "source_root": str(root), "source_sha256": source,
-        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
-        "model_config_sha256": digest(Path(args.model) / "config.json"),
-        "weight_index_sha256": digest(Path(args.model) / "model.safetensors.index.json"),
-        "data_sha256": digest(args.data), "prompt_sha256": hashlib.sha256(json.dumps(prompts).encode()).hexdigest(),
-        "sample_ids": list(range(args.samples)), "max_active_requests": 1,
-        "target_dtype": "bfloat16", "draft_dtype": "bfloat16", "depth": 3 if args.mode == "mtp" else 0,
-        "ignore_eos": True, "temperature": 0, "prompt_chunk_size": 128,
-        "torch": torch.__version__, "cuda": torch.version.cuda,
-        "timing_scope": "complete programmatic single-request generation through resource drain",
-        "ttft_scope": "generation start through first target token materialization",
-        "warmups": 5,
-        "expert_cache_start": "cold metadata after kernel warmups, before each complete 16-request pass",
-    }
+    prompts, experiment = prepare_experiment(args.model, args.data, root, args.samples)
+    config = benchmark_config(args, experiment)
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     engine = Engine(SchedulerConfig(
         model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
