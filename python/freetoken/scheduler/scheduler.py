@@ -65,6 +65,8 @@ class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
+        if config.speculative_mtp_depth:
+            raise ValueError("native MTP currently uses Engine.generate_speculative with one active request")
         self.engine = Engine(config)
 
         # use another stream to overlap metadata processing with computation

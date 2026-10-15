@@ -154,6 +154,8 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        self._hybrid_window_plans = {}
+        self._pending_copy_plan = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
@@ -483,6 +485,8 @@ class OffloadMoeCache:
         self._prefill_buffer_released = [True, True]
         self._prefill_buffer_has_release_event = [False, False]
         # 2. Drop old GPU tensors (free-before-alloc).
+        self._pending_copy_plan = None
+        self._hybrid_window_plans.clear()
         self.banks = []
         self.bank_caches = {}
         self.cache_size = cache_size
@@ -850,6 +854,7 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._pending_copy_plan = None
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -869,15 +874,40 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._pending_copy_plan = None
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
+
+    def ensure_experts_hybrid_window(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        from freetoken.moe.offload_kernels import ensure_experts_hybrid_window
+
+        rows, top_k = expert_ids.shape
+        if not expert_ids.is_cuda or self.cache_size < expert_ids.numel():
+            raise ValueError("hybrid window needs CUDA and at least one slot per route")
+        key = (rows, top_k)
+        if key not in self._hybrid_window_plans:
+            self._hybrid_window_plans[key] = (
+                torch.empty(rows * top_k, dtype=torch.int32, device=self.device),
+                torch.empty(rows * top_k, dtype=torch.int32, device=self.device),
+                torch.zeros(1, dtype=torch.int64, device=self.device),
+                torch.empty(1, dtype=torch.int64, device=self.device),
+            )
+        plan = self._hybrid_window_plans[key]
+        if self.collect_decode_freq:
+            ids = expert_ids.reshape(-1).long()
+            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        ensure_experts_hybrid_window(self, layer_id, expert_ids, plan)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self._pending_copy_plan = plan[:3]
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        self._pending_copy_plan = None
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -908,13 +938,13 @@ class OffloadMoeCache:
         was eight torch ops per layer per step, all captured into the decode graph.
         """
 
-    def record_decode_stats_hybrid(self, layer_id: int) -> None:
+    def record_decode_stats_hybrid(self, layer_id: int, *, fetched=None) -> None:
         """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
         the active count. The CPU computes (missing - fetched) experts. Device-side;
         accumulates both the scalar totals and the per-layer breakdown."""
         assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
         missing = self.num_missing_full.sum()
-        fetched = self.num_indices.sum()
+        fetched = (self.num_indices if fetched is None else fetched).sum()
         active = self.active_mask.sum()
         self.stat_missing += missing
         self.stat_fetched += fetched
@@ -1012,6 +1042,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        dst, src, count = self._pending_copy_plan or (self.evict_slots, self.src_indices, self.num_indices)
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -1035,9 +1066,9 @@ class OffloadMoeCache:
                 self._copy_dst_ptrs,
                 self._copy_src_ptrs[layer_id],
                 self._copy_feat_bytes,
-                self.evict_slots,
-                self.src_indices,
-                self.num_indices,
+                dst,
+                src,
+                count,
             )
             return
 
@@ -1046,10 +1077,10 @@ class OffloadMoeCache:
         for per_layer, cache in self.banks:
             fast_index_copy_jit(
                 cache,
-                self.evict_slots,
+                dst,
                 per_layer[layer_id],
-                self.src_indices,
-                self.num_indices,
+                src,
+                count,
             )
 
 

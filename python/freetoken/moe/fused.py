@@ -297,6 +297,25 @@ def fused_experts_impl(
     return out_hidden_states
 
 
+_GROUPED_DECODE = os.getenv("FREETOKEN_MOE_GROUPED_DECODE", "1") != "0"
+
+
+def prepare_decode_groups(topk_ids, topk_weights):
+    import triton
+    from freetoken.kernel.triton.decode_moe import group_decode_routes
+
+    rows, top_k = topk_ids.shape
+    slots = torch.empty(rows * top_k, dtype=torch.int32, device=topk_ids.device)
+    routes = torch.empty(rows * top_k, rows, dtype=torch.int32, device=topk_ids.device)
+    count = torch.empty((), dtype=torch.int32, device=topk_ids.device)
+    group_decode_routes[(1,)](
+        topk_ids, topk_weights, slots, routes, count,
+        ROWS=rows, TOP_K=top_k, BLOCK=triton.next_power_of_2(rows * top_k),
+        TABLE=triton.next_power_of_2(rows * rows * top_k), num_warps=4,
+    )
+    return slots, routes, count
+
+
 def fused_experts_decode_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -334,6 +353,9 @@ def fused_experts_decode_impl(
         "BLOCK_SIZE_K": 64,
         "num_warps": 8,
     }
+    route_groups = None
+    if _GROUPED_DECODE and 2 <= M <= 4 and M * top_k <= 32:
+        route_groups = prepare_decode_groups(topk_ids, topk_weights)
 
     intermediate_cache1 = torch.empty(
         (M, top_k, gate_up_dim),
@@ -350,6 +372,7 @@ def fused_experts_decode_impl(
         False,
         config,
         compute_type=hidden_states.dtype,
+        route_groups=route_groups,
     )
 
     intermediate_cache2 = torch.empty(
@@ -374,6 +397,7 @@ def fused_experts_decode_impl(
         True,
         config,
         compute_type=hidden_states.dtype,
+        route_groups=route_groups,
     )
 
     out_hidden_states = torch.empty_like(hidden_states)

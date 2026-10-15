@@ -333,6 +333,8 @@ def fused_moe_decode_kernel_triton(
     a_row_is_route: bool,
     config: Dict[str, Any],
     compute_type: torch.dtype,
+    *,
+    route_groups=None,
 ) -> None:
     import triton
     import triton.language as tl
@@ -362,6 +364,17 @@ def fused_moe_decode_kernel_triton(
     else:
         dtype = tl.float16
     even_Ks = K % config["BLOCK_SIZE_K"] == 0
+    if route_groups is not None:
+        from .triton.decode_moe import fused_moe_decode_grouped_kernel
+
+        fused_moe_decode_grouped_kernel[(total_routes, triton.cdiv(B.shape[1], 64))](
+            A, B, C, topk_weights, topk_ids, *route_groups,
+            B.shape[1], K, A.stride(0), B.stride(0), B.stride(1),
+            ROWS=M, TOP_K=top_k, A_ROW_IS_ROUTE=a_row_is_route,
+            MUL_ROUTED_WEIGHT=mul_routed_weight, BLOCK_N=64,
+            BLOCK_K=64, num_warps=4,
+        )
+        return
     grid = (total_routes, triton.cdiv(B.shape[1], config["BLOCK_SIZE_N"]))
 
     fused_moe_decode_kernel[grid](

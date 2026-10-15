@@ -344,12 +344,29 @@ class Engine:
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        if config.speculative_mtp_depth:
+            from freetoken.kvcache.qwen_mtp_pool import QwenMTPKVCache
+            if config.active_encoders or config.max_running_req != 1 or config.attention_backend != "triton":
+                raise ValueError("native MTP requires text-only, max_running_req=1 and triton attention")
+            if config.model_config.model_type not in ("qwen3_5_moe", "qwen3_5_moe_text"):
+                raise ValueError("native MTP requires Qwen3.5/3.6 MoE")
+            self._pool_cls = QwenMTPKVCache
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
+        physical_baseline_free = free_min
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        self._budget_initial_used = 0
+        if config.gpu_memory_budget_bytes is not None:
+            total = torch.cuda.mem_get_info(self.device)[1]
+            self._budget_initial_used = total - free_min
+            free_min = min(free_min, config.gpu_memory_budget_bytes - self._budget_initial_used)
+            if free_min <= 0:
+                raise ValueError("absolute GPU budget is already consumed before model load")
+            init_free_memory = free_min
+            torch.cuda.set_per_process_memory_fraction(free_min / total, self.device)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -358,6 +375,16 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
+        self.mtp = None
+        if config.speculative_mtp_depth:
+            from freetoken.models.qwen3_5_moe.mtp import QwenNativeMTP
+            with torch.device("meta"), torch_dtype(torch.bfloat16):
+                self.mtp = QwenNativeMTP(
+                    config.model_config, self.model.model.embed_tokens,
+                    self.model.lm_head, config.model_config.num_layers,
+                )
+            self.mtp.load_checkpoint(config.model_path, config.model_config, self.device)
+            finalize_quant(self.mtp)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -369,7 +396,7 @@ class Engine:
             # before the residency snapshot, so streamed blocks are not charged as resident weights
             self.model.place_encoder_weights(config.mm.encoder_weights)
         post_weights_free = self._sync_get_memory()[0]
-        self._weights_bytes = self._baseline_free - post_weights_free
+        self._weights_bytes = physical_baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -413,6 +440,8 @@ class Engine:
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
+        if config.gpu_memory_budget_bytes is not None:
+            new_free = init_free_memory - (physical_baseline_free - new_free)
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -496,6 +525,18 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self.speculative_runner = None
+        if config.speculative_mtp_depth:
+            from .qwen_mtp import QwenMTPRunner
+            self.speculative_runner = QwenMTPRunner(self)
+
+    def generate_speculative(self, input_ids, *, max_tokens: int, eos_ids=(), cancel=None, prompt_chunk_size=128):
+        if self.speculative_runner is None:
+            raise ValueError("enable speculative_mtp_depth=3 for native MTP generation")
+        return self.speculative_runner.generate(
+            input_ids, max_tokens=max_tokens, eos_ids=tuple(eos_ids),
+            cancel=cancel, prompt_chunk_size=prompt_chunk_size,
+        )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -791,7 +832,10 @@ class Engine:
             )
         # Decode batches never exceed max_running_req, but CUDA-graph padding can
         # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        max_tokens = max(
+            config.max_running_req, config.cuda_graph_max_bs or 0,
+            getattr(config, "speculative_mtp_depth", 0) + 1,
+        )
         executor = CpuMoeExecutor(
             cache,
             top_k=sample.top_k,
@@ -888,6 +932,9 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        runner = getattr(self, "speculative_runner", None)
+        if runner is not None and runner.active:
+            raise CacheRebuildRejected("cache rebuild requires an idle speculative request")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -969,6 +1016,8 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
+        if runner is not None:
+            runner.invalidate()
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
@@ -1016,6 +1065,10 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
             mrope=config.model_config.model_is_mrope,
         )
+
+        if config.speculative_mtp_depth:
+            from .qwen_mtp import QwenMTPRunner
+            self.speculative_runner = QwenMTPRunner(self)
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1101,7 +1154,12 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        torch.cuda.synchronize(self.device)
+        if self.speculative_runner is not None:
+            self.speculative_runner.invalidate()
         self.graph_runner.destroy_cuda_graphs()
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -1521,8 +1579,11 @@ def _adjust_config(config: EngineConfig):
     if has_linear_attention:
         override(
             "cache_type",
-            _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
+            "naive" if getattr(config, "speculative_mtp_depth", 0) else _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
+    if getattr(config, "speculative_mtp_depth", 0) and config.cuda_graph_max_bs != 0:
+        override("cuda_graph_max_bs", 4)
+        override("cuda_graph_bs", [1, 2, 3, 4])
 
     # Type x backend capability matrix: resolve auto from the per-type priority
     # lists, then validate whatever is now selected (explicit or auto) -- every

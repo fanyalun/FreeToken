@@ -67,6 +67,8 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    gpu_memory_budget_bytes: int | None = None
+    speculative_mtp_depth: int = 0
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -93,6 +95,12 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.gpu_memory_budget_bytes is not None and self.gpu_memory_budget_bytes <= 0:
+            raise ValueError("gpu_memory_budget_bytes must be positive")
+        if self.speculative_mtp_depth not in (0, 3):
+            raise ValueError("native MTP currently supports depth 3")
+        if self.speculative_mtp_depth and (self.dtype != torch.bfloat16 or self.tp_info.size != 1):
+            raise ValueError("native MTP requires BF16 and TP=1")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":

@@ -1890,6 +1890,18 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    bool active = false;
+    for (int i = 0; i < t->num_tokens * top_k; ++i) {
+      if (t->ids[i] >= 0) {
+        active = true;
+        break;
+      }
+    }
+    if (!active) {
+      // The previous task has drained before this submit; sync can keep its generation.
+      std::fill(t->y, t->y + static_cast<size_t>(t->num_tokens) * H, bf16_t{0});
+      return;
+    }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2138,6 +2150,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
+      .def("worker_dispatch_count", [](CpuMoeExecutor& e) {
+        return e.submitted.load(std::memory_order_acquire);
+      })
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))

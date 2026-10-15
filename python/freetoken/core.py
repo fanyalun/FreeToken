@@ -127,6 +127,8 @@ class Batch:
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
+    gdn_verify_state: object | None = field(default=None, init=False)
+    rowwise_linear: bool = field(default=False, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read
@@ -215,3 +217,7 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def get_active_batch() -> Batch | None:
+    return _GLOBAL_CTX._batch if _GLOBAL_CTX is not None else None

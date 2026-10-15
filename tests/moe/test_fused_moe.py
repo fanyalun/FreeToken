@@ -2,6 +2,25 @@ import pytest
 import torch
 
 
+def _staged_decode_reference(hidden, gate_up, down, weights, ids, on_input=False):
+    partials = torch.zeros((*ids.shape, hidden.shape[1]), device=hidden.device, dtype=hidden.dtype)
+    for row in range(ids.shape[0]):
+        for route in range(ids.shape[1]):
+            expert, weight = int(ids[row, route]), weights[row, route]
+            if expert < 0 or weight == 0:
+                continue
+            projection = gate_up[expert].float() @ hidden[row].float()
+            if on_input:
+                projection *= weight
+            projection = projection.to(hidden.dtype)
+            activation = _activation_and_mul(projection.float(), "silu").to(hidden.dtype)
+            result = down[expert].float() @ activation.float()
+            if not on_input:
+                result *= weight
+            partials[row, route] = result.to(hidden.dtype)
+    return partials.float().sum(1).to(hidden.dtype)
+
+
 def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu":
@@ -9,6 +28,107 @@ def _activation_and_mul(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
     if activation == "gelu":
         return torch.nn.functional.gelu(gate) * up
     raise AssertionError(f"unsupported test activation {activation}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_decode_skips_zero_and_negative_routes_with_poisoned_weights(monkeypatch, rows, grouped):
+    import freetoken.moe.fused as fused
+
+    monkeypatch.setattr(fused, "_GROUPED_DECODE", grouped, raising=False)
+    torch.manual_seed(27)
+    hidden = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16) * 0.25
+    gate = torch.randn(2, 128, 128, device="cuda", dtype=hidden.dtype) * 0.03
+    down = torch.randn(2, 128, 64, device="cuda", dtype=hidden.dtype) * 0.03
+    gate[0].fill_(float("nan"))
+    down[0].fill_(float("nan"))
+    ids = torch.tensor([[0, 1, 0, 0]], device="cuda", dtype=torch.int32).repeat(rows, 1)
+    weights = torch.tensor([[0.0, 0.75, 0.0, 0.0]], device="cuda").repeat(rows, 1)
+    actual = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    expected = _staged_decode_reference(hidden, gate, down, weights, ids)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+    ids[:, 2] = -1
+    weights[:, 2] = 0.25
+    actual = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+    weights.zero_()
+    actual = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    assert torch.count_nonzero(actual) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("on_input", [False, True])
+def test_grouped_decode_preserves_routes_and_matches_unshared_gemm(monkeypatch, rows, dtype, on_input):
+    import freetoken.moe.fused as fused
+
+    monkeypatch.setattr(fused, "_GROUPED_DECODE", True)
+    torch.manual_seed(92 + rows)
+    hidden = torch.randn(rows, 96, device="cuda", dtype=dtype) * 0.25
+    gate = torch.randn(4, 160, 96, device="cuda", dtype=dtype) * 0.05
+    down = torch.randn(4, 96, 80, device="cuda", dtype=dtype) * 0.05
+    ids = torch.tensor([[2, 0, 2, -1], [0, 2, 3, 0], [3, 0, 2, 2], [2, 3, 0, 3]],
+                       device="cuda", dtype=torch.int32)[:rows].contiguous()
+    weights = torch.rand(rows, 4, device="cuda")
+    weights[:, 1] = 0
+    slots, routes, count = fused.prepare_decode_groups(ids, weights)
+    host_ids, host_weights = ids.tolist(), weights.tolist()
+    expected_groups = {}
+    for row in range(rows):
+        occurrences = {}
+        for route, expert in enumerate(host_ids[row]):
+            if expert < 0 or host_weights[row][route] == 0:
+                continue
+            occurrence = occurrences.get(expert, 0)
+            occurrences[expert] = occurrence + 1
+            expected_groups.setdefault((expert, occurrence), [-1] * rows)[row] = row * 4 + route
+    n = count.item()
+    assert n == len(expected_groups)
+    assert slots[:n].tolist() == [key[0] for key in expected_groups]
+    assert routes[:n].tolist() == list(expected_groups.values())
+    actual = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids, apply_router_weight_on_input=on_input)
+    independent_ids = torch.arange(rows * 4, device="cuda", dtype=torch.int32).reshape(rows, 4)
+    independent_gate = gate[ids.clamp_min(0).long()].reshape(rows * 4, 160, 96).contiguous()
+    independent_down = down[ids.clamp_min(0).long()].reshape(rows * 4, 96, 80).contiguous()
+    independent_weights = weights.masked_fill(ids < 0, 0)
+    unshared = fused.fused_experts_decode_impl(hidden, independent_gate, independent_down,
+        independent_weights, independent_ids, apply_router_weight_on_input=on_input)
+    assert torch.equal(actual, unshared)
+    expected = _staged_decode_reference(hidden, gate, down, weights, ids, on_input)
+    torch.testing.assert_close(actual, expected, rtol=0.015 if dtype == torch.bfloat16 else 0.003,
+                               atol=0.0002 if dtype == torch.bfloat16 else 0.00003)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_grouped_decode_graph_rebuilds_groups_and_clears_inactive_rows(monkeypatch):
+    import freetoken.moe.fused as fused
+
+    monkeypatch.setattr(fused, "_GROUPED_DECODE", True)
+    torch.manual_seed(19)
+    hidden = torch.randn(4, 96, device="cuda", dtype=torch.bfloat16) * 0.25
+    gate = torch.randn(8, 160, 96, device="cuda", dtype=hidden.dtype) * 0.03
+    down = torch.randn(8, 96, 80, device="cuda", dtype=hidden.dtype) * 0.03
+    ids = torch.zeros(4, 4, device="cuda", dtype=torch.int32)
+    weights = torch.ones(4, 4, device="cuda")
+    for _ in range(3):
+        fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    for step in range(8):
+        ids.copy_(torch.randint(-1, 8, ids.shape, device="cuda", dtype=ids.dtype))
+        weights.copy_(torch.rand_like(weights))
+        weights[:, step % 4] = 0
+        if step % 3 == 0:
+            weights.zero_()
+        graph.replay()
+        expected = fused.fused_experts_decode_impl(hidden, gate, down, weights, ids)
+        assert torch.equal(actual, expected)
 
 
 def _reference_fused_experts_decode(

@@ -555,6 +555,8 @@ class CpuMoeExecutor:
         computes only the routes assigned to it. Returns an opaque handle to pass to
         :meth:`decode_sync`. The output tensor is allocated here so it stays live (and
         distinct from the interleaved GPU work) across the overlap window."""
+        if self._ext is None:
+            raise RuntimeError("CPU MoE executor is closed")
         bs = hidden_states.shape[0]
         io = self._io_for(bs)
 
@@ -658,6 +660,22 @@ class CpuMoeExecutor:
                 "engine, or set FREETOKEN_CPU_MOE_FLAG_SYNC=0 to use the "
                 "cudaLaunchHostFunc sync."
             )
+
+    def close(self) -> None:
+        if self._ext is None:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self._watchdog_stop = True
+        watchdog = getattr(self, "_watchdog", None)
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.join()
+        # The C++ destructor joins its coordinator while the mapped flags still exist.
+        self._ext = None
+        self._tasks.clear()
+        self._io.clear()
+        self._flag_slots.clear()
+        self._ready = self._done = self._err = None
 
 
 def _watchdog_main(executor_ref) -> None:

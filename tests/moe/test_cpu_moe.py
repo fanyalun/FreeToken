@@ -509,6 +509,47 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+@pytest.mark.parametrize("flag_sync", [False, True])
+def test_empty_routes_skip_workers_and_clear_previous_output(flag_sync):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    cache = _make_cache(1, 8, 512, 256)
+    previous_stream = torch.cuda.current_stream()
+    stream = torch.cuda.Stream()
+    ex = CpuMoeExecutor(cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
+                        num_threads=4, max_tokens=4, device=torch.device("cuda"))
+    if flag_sync and not ex._flag_sync:
+        ex.close()
+        pytest.skip("stream memops unavailable")
+    ex._flag_sync = flag_sync
+    try:
+        with torch.cuda.stream(stream):
+            hidden = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
+            ids = torch.zeros(4, 2, device="cuda", dtype=torch.int32)
+            weights = torch.ones(4, 2, device="cuda")
+            ex.decode(0, hidden, weights, ids)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                output = ex.decode(0, hidden, weights, ids)
+            for active in (False, True, False, False, True):
+                ids.fill_(0 if active else -1)
+                before = ex._ext.worker_dispatch_count()
+                graph.replay()
+                stream.synchronize()
+                assert ex._ext.worker_dispatch_count() - before == int(active)
+                if active:
+                    expected = _reference(cache, 0, hidden, ids.cpu(), weights.cpu()).bfloat16()
+                    torch.testing.assert_close(output.cpu(), expected, rtol=0.02, atol=0.002)
+                else:
+                    assert torch.count_nonzero(output).item() == 0
+                ex.raise_if_unhealthy()
+    finally:
+        stream.synchronize()
+        ex.close()
+        torch.cuda.set_stream(previous_stream)
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
@@ -661,3 +702,19 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+def test_cpu_moe_close_joins_watchdog_and_releases_tasks():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    cache = _make_cache(2, 4, 64, 32)
+    executor = CpuMoeExecutor(
+        cache, top_k=2, activation="silu", apply_router_weight_on_input=False,
+        num_threads=2, max_tokens=4, device=torch.device("cuda"),
+    )
+    watchdog = getattr(executor, "_watchdog", None)
+    executor.close()
+    executor.close()
+    assert executor._ext is None and not executor._tasks and not executor._io
+    if watchdog is not None:
+        assert not watchdog.is_alive()

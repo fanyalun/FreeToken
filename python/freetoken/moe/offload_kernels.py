@@ -95,11 +95,14 @@ def reset_cache(cache) -> None:
 
 
 def _ensure_experts_hybrid_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
+    cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int, *, plan=None
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
+    dst, src, count, row_count = plan if plan is not None else (
+        cache.evict_slots, cache.src_indices, cache.num_indices, cache.num_indices
+    )
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -107,9 +110,10 @@ def _ensure_experts_hybrid_gpu(
         cache.usage,
         cache.step,
         cache.active_mask,
-        cache.evict_slots,
-        cache.src_indices,
-        cache.num_indices,
+        dst,
+        src,
+        count,
+        row_count,
         cache.num_missing_full,
         cache.expert_recency,
         layer_id,
@@ -121,7 +125,25 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        APPEND_PLAN=plan is not None,
         num_warps=num_warps,
+    )
+
+
+def ensure_experts_hybrid_window(cache, layer_id, expert_ids, plan):
+    rows, top_k = expert_ids.shape
+    frac_q16 = min(1 << 16, max(0, round(cache.hybrid_fetch_fraction * (1 << 16))))
+    block_c = triton.next_power_of_2(cache.cache_size)
+    _ensure_experts_hybrid_window_kernel[(1,)](
+        expert_ids, cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
+        cache.active_mask, *plan, cache.num_indices, cache.num_missing_full, cache.expert_recency,
+        cache.stat_missing, cache.stat_fetched, cache.stat_active, cache.stat_calls,
+        cache.stat_missing_layer, cache.stat_fetched_layer, cache.stat_active_layer,
+        cache.stat_steps_layer, layer_id, cache.hybrid_max_fetch, frac_q16,
+        cache.num_experts, cache.cache_size, ROWS=rows, TOP_K=top_k,
+        BLOCK_E=triton.next_power_of_2(cache.num_experts), BLOCK_C=block_c,
+        BY_RECENCY=_HYBRID_FETCH_BY_RECENCY, COLLECT_STATS=cache.collect_stats,
+        num_warps=8 if block_c >= 2048 else 4,
     )
 
 
@@ -298,6 +320,7 @@ def _ensure_experts_hybrid_kernel(
     evict_slots_ptr,
     src_indices_ptr,
     num_indices_ptr,
+    row_count_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
     layer_id,
@@ -309,6 +332,8 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    APPEND_PLAN: tl.constexpr,
+    WINDOW_ROUTES: tl.constexpr = 0,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -333,10 +358,15 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+    if WINDOW_ROUTES:
+        off_r = tl.arange(0, triton.next_power_of_2(WINDOW_ROUTES))
+        route_ids = tl.load(expert_ids_ptr + off_r, off_r < WINDOW_ROUTES, -1)
+        is_active = tl.sum((off_e[:, None] == route_ids[None, :]).to(tl.int32), 1) > 0
+    else:
+        is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+        for i in tl.range(num_active):
+            e = tl.load(expert_ids_ptr + i)
+            is_active = is_active | (off_e == e)
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -354,7 +384,9 @@ def _ensure_experts_hybrid_kernel(
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
     num_fetch = tl.minimum(num_missing, max_fetch)
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    tl.store(num_indices_ptr, num_fetch.to(tl.int64))
+    offset = tl.load(num_indices_ptr) if APPEND_PLAN else 0
+    tl.store(row_count_ptr, num_fetch.to(tl.int64))
+    tl.store(num_indices_ptr, (offset + num_fetch).to(tl.int64))
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
@@ -375,10 +407,15 @@ def _ensure_experts_hybrid_kernel(
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | (oid == base + ei)
+        if WINDOW_ROUTES:
+            tl.debug_barrier()
+            current_layer = (oid >= base) & (oid < base + num_experts) & c_mask
+            owner_active = tl.load(active_mask_ptr + oid - base, current_layer, 0) != 0
+        else:
+            owner_active = c_mask & False
+            for i in tl.range(num_active):
+                ei = tl.load(expert_ids_ptr + i)
+                owner_active = owner_active | (oid == base + ei)
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -393,21 +430,60 @@ def _ensure_experts_hybrid_kernel(
             tl.store(id_of_slot_ptr + victim, base + e)
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
-            tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
+            tl.store(evict_slots_ptr + offset + i, victim)
+            tl.store(src_indices_ptr + offset + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e)
-        tl.store(expert_ids_ptr + i, s)
+    if WINDOW_ROUTES:
+        tl.debug_barrier()
+        mapped = tl.load(slot_for_id_ptr + base + route_ids, off_r < WINDOW_ROUTES, -1)
+        tl.store(expert_ids_ptr + off_r, mapped, off_r < WINDOW_ROUTES)
+    else:
+        for i in tl.range(num_active):
+            e = tl.load(expert_ids_ptr + i)
+            s = tl.load(slot_for_id_ptr + base + e)
+            tl.store(expert_ids_ptr + i, s)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
     if BY_RECENCY:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
+
+
+@triton.jit(do_not_specialize=["layer_id", "max_fetch", "frac_q16"])
+def _ensure_experts_hybrid_window_kernel(
+    ids, slots, owners, usage, step, active, dst, src, count, row_count,
+    final_count, missing, recency, stat_missing, stat_fetched, stat_active, stat_calls,
+    missing_layer, fetched_layer, active_layer, calls_layer,
+    layer_id, max_fetch, frac_q16, num_experts: tl.constexpr, cache_size: tl.constexpr,
+    ROWS: tl.constexpr, TOP_K: tl.constexpr, BLOCK_E: tl.constexpr, BLOCK_C: tl.constexpr,
+    BY_RECENCY: tl.constexpr, COLLECT_STATS: tl.constexpr,
+):
+    # Protect the whole window's hit set before selecting victims. Each unique
+    # expert gets one placement decision, even when several tokens use it.
+    _ensure_experts_hybrid_kernel(
+        ids, slots, owners, usage, step, active, dst, src, count,
+        row_count, missing, recency, layer_id, ROWS * TOP_K, max_fetch * ROWS, frac_q16,
+        num_experts, cache_size, BLOCK_E, BLOCK_C, BY_RECENCY, False,
+        WINDOW_ROUTES=ROWS * TOP_K,
+    )
+    tl.debug_barrier()
+    tl.store(final_count, tl.load(count))
+    if COLLECT_STATS:
+        total_missing = tl.load(missing)
+        total_fetched = tl.load(count)
+        off_e = tl.arange(0, BLOCK_E)
+        total_active = tl.sum(tl.load(active + off_e, off_e < num_experts, 0).to(tl.int64))
+        tl.store(stat_missing, tl.load(stat_missing) + total_missing)
+        tl.store(stat_fetched, tl.load(stat_fetched) + total_fetched)
+        tl.store(stat_active, tl.load(stat_active) + total_active)
+        tl.store(stat_calls, tl.load(stat_calls) + 1)
+        tl.store(missing_layer + layer_id, tl.load(missing_layer + layer_id) + total_missing)
+        tl.store(fetched_layer + layer_id, tl.load(fetched_layer + layer_id) + total_fetched)
+        tl.store(active_layer + layer_id, tl.load(active_layer + layer_id) + total_active)
+        tl.store(calls_layer + layer_id, tl.load(calls_layer + layer_id) + 1)
 
 
 @triton.jit(do_not_specialize=["buffer_base"])

@@ -24,6 +24,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+_HYBRID_WINDOW = os.getenv("FREETOKEN_HYBRID_WINDOW", "1") != "0"
 
 
 class MoELayer(BaseOP):
@@ -302,7 +303,7 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
+        """Hybrid decode: GPU computes cache hits + capped freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
 
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
@@ -311,11 +312,21 @@ class OffloadMoELayer(MoELayer):
         Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
         """
+        window = get_global_ctx().batch.rowwise_linear and hidden_states.shape[0] > 1
+        if window and (not _HYBRID_WINDOW or cache.cache_size < topk_ids.numel()):
+            # Preserve the per-token fetch cap and CPU/GPU partial-sum rounding of AR.
+            return torch.cat([
+                self._decode_hybrid(cache, hidden_states[i:i + 1], topk_weights[i:i + 1], topk_ids[i:i + 1])
+                for i in range(hidden_states.shape[0])
+            ], dim=0)
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
-        if cache.collect_stats:
+        if window:
+            cache.ensure_experts_hybrid_window(self.layer_id, topk_ids)
+        else:
+            cache.ensure_experts_hybrid(self.layer_id, topk_ids)
+        if cache.collect_stats and not window:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 

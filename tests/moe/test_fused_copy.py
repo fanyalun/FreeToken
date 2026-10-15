@@ -74,3 +74,15 @@ def test_fused_copy_matches_per_bank(num_indices):
 
     for b, (r, (_, c)) in enumerate(zip(ref, cache.banks)):
         assert torch.equal(r, c), f"bank {b} (feat={FEATS[b]}) fused != per-bank at num_indices={num_indices}"
+
+
+@CUDA
+def test_offload_window_copy_plan_deduplicates_experts():
+    cache = OffloadMoeCache(2, 16, 16, torch.device("cuda"))
+    ids = torch.tensor([[2, 7], [7, 2], [2, 7], [7, 2]], dtype=torch.int32, device="cuda")
+    cache.ensure_experts(1, ids)
+    assert cache.num_indices.item() == 2
+    assert cache.src_indices[:2].tolist() == [2, 7]
+    assert torch.unique(ids).numel() == 2
+    for row in ids:
+        assert set(row.tolist()) == set(ids[0].tolist())

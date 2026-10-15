@@ -85,6 +85,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
+    if getattr(config, "speculative_mtp_depth", 0):
+        from .qwen_mtp_pool import QwenMTPKVCache
+        return QwenMTPKVCache.create(config, num_pages, device, dtype)
     if resolve_pool_class(model_config) is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
