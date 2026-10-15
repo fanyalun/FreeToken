@@ -179,6 +179,73 @@ def test_decode_metadata_matches_backend_without_host_staging(monkeypatch, width
     runner._batch(ids, 5)
 
 
+@pytest.mark.parametrize("page_size,max_seq_len,tail", [
+    (4, 10, (12, 12)), (64, 70, (128, 128)), (4, 12, (12, 12)), (1, 10, (9, 10)),
+])
+def test_reservation_accepts_final_page_without_advancing_valid_lengths(monkeypatch, page_size, max_seq_len, tail):
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.engine.config.page_size = page_size
+    runner.engine.max_seq_len = max_seq_len
+    capacity = (max_seq_len + page_size - 1) // page_size * page_size
+    runner.engine.num_pages = capacity // page_size
+    runner.engine.page_table.resize_(1, capacity + page_size).fill_(-1)
+    length = max_seq_len - 1
+    frontier = SpeculativeFrontier(page_size, length, length, capacity)
+
+    assert runner._reserve(frontier.reserve_end(1)) == capacity
+    assert runner.engine.page_table[0, :capacity].tolist() == list(range(capacity))
+    assert runner.engine.page_table[0, capacity:].tolist() == [-1] * page_size
+    assert frontier.target_valid_len == frontier.draft_valid_len == length
+    assert frontier.releasable_tail() == tail
+
+
+@pytest.mark.parametrize("num_pages,table_width,end", [(3, 32, 16), (2, 32, 12), (3, 8, 12)])
+def test_reservation_rejects_physical_overflow_before_writing(monkeypatch, num_pages, table_width, end):
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.engine.max_seq_len, runner.engine.num_pages = 10, num_pages
+    runner.engine.page_table.resize_(1, table_width).fill_(-1)
+    runner._reserve(8)
+    before = runner.engine.page_table.clone()
+
+    with pytest.raises(ValueError, match="KV capacity"):
+        runner._reserve(end)
+    assert runner._reserved_len == 8
+    assert torch.equal(runner.engine.page_table, before)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 4, 128])
+def test_prefill_reserves_non_page_aligned_context_tail_on_cpu(monkeypatch, chunk_size):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.engine.max_seq_len, runner.engine.num_pages = 10, 3
+    runner.engine.page_table.fill_(-1)
+    runner.engine.model = SimpleNamespace(forward_host_ctx=lambda *args: nullcontext())
+    runner.mtp_enabled = False
+    observed = []
+
+    def target(batch):
+        positions = batch.positions.tolist()
+        assert batch.out_loc.tolist() == positions
+        observed.extend(positions)
+        return batch.input_ids + 1, torch.zeros(batch.input_ids.numel(), 2)
+
+    runner._target = target
+    assert runner._prefill(torch.arange(9, dtype=torch.int32), chunk_size).tolist() == [9]
+    assert observed == list(range(9))
+    assert runner._reserved_len == 12
+    assert runner.engine.page_table[0, 12:].eq(-1).all()
+
+
+@pytest.mark.parametrize("max_tokens", [2, 5])
+def test_generate_keeps_logical_context_limit_before_cuda(monkeypatch, max_tokens):
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.engine.max_seq_len = 10
+    with pytest.raises(ValueError, match="prompt plus output cap"):
+        runner.generate(list(range(9)), max_tokens=max_tokens)
+
+
 def test_reservation_preserves_prefix_and_reopens_released_tail(monkeypatch):
     from types import SimpleNamespace
     from freetoken.engine.qwen_mtp import _QwenReservation

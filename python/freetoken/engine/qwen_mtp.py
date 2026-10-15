@@ -174,8 +174,16 @@ class QwenMTPRunner:
         return req
 
     def _reserve(self, end):
-        if end > self.engine.max_seq_len or end > self.engine.num_pages * self.engine.config.page_size:
-            raise ValueError("request plus speculative lookahead exceeds KV capacity")
+        page_size = self.engine.config.page_size
+        # Whole-page reservation may include padding beyond the logical context.
+        aligned_context = (self.engine.max_seq_len + page_size - 1) // page_size * page_size
+        capacity = min(
+            aligned_context,
+            self.engine.num_pages * page_size,
+            self.engine.page_table.shape[1],
+        )
+        if end > capacity:
+            raise ValueError("physical reservation exceeds KV capacity")
         if end > self._reserved_len:
             start = self._reserved_len
             self.engine.page_table[0, start:end] = torch.arange(start, end, dtype=torch.int32, device=self.engine.device)
