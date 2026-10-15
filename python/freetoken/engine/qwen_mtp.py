@@ -105,6 +105,10 @@ class QwenMTPRunner:
         self.use_graph = engine.graph_runner.max_graph_bs > 0
         self.model_state = _QwenState(self)
         self.coordinator = SpeculativeCoordinator(_QwenProposer(self), self.model_state, _QwenReservation(self))
+        self.three_level = None
+        if getattr(engine.config, "speculative_three_level", False) and not reference_ar:
+            from .qwen_three_level import ThreeLevelCoordinator
+            self.three_level = ThreeLevelCoordinator(self)
 
     def _batch(self, ids, start: int, *, prefill=False, state=None):
         n = ids.numel()
@@ -213,7 +217,7 @@ class QwenMTPRunner:
         if self.reference_ar:
             return self._target(batch)
         key = (phase, batch.input_ids.numel())
-        graph_ok = self.use_graph and batch.is_decode and batch.size in (1, 2, 3, 4)
+        graph_ok = self.use_graph and batch.is_decode and 1 <= batch.size <= getattr(self, "max_verify_width", 4)
         if not graph_ok:
             self.graph_fallbacks[phase] = self.graph_fallbacks.get(phase, 0) + 1
             with self.engine.model.forward_host_ctx(batch, False):
@@ -339,6 +343,14 @@ class QwenMTPRunner:
                 self.frontier = SpeculativeFrontier(page_size, length, length, (length + page_size - 1) // page_size * page_size)
                 while len(output) < max_tokens and not cancelled() and output[-1] not in eos_ids:
                     remaining = max_tokens - len(output)
+                    three_level = getattr(self, "three_level", None)
+                    if three_level is not None:
+                        emitted, anchor, row = three_level.step(anchor, remaining, eos_ids, cancelled)
+                        rounds.append(row)
+                        if cancelled():
+                            break
+                        output.extend(emitted)
+                        continue
                     width = min(4, remaining) if self.mtp_enabled else 1
                     proposal = self.coordinator.prepare(self.frontier, anchor, width - 1)
                     state = self.states.get(width)
@@ -397,6 +409,8 @@ class QwenMTPRunner:
     def invalidate(self):
         if self.active:
             raise RuntimeError("cache rebuild requires an idle speculative runner")
+        if getattr(self, "three_level", None) is not None:
+            self.three_level.invalidate()
         self.engine.stream.synchronize()
         self.graphs.clear()
         self._decode_batches.clear()

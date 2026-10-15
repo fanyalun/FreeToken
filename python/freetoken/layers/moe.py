@@ -277,6 +277,9 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        speculative = getattr(cache, "speculative_controller", None)
+        if speculative is not None:
+            return speculative.route(self, hidden_states, topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"

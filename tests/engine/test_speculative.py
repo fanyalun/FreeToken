@@ -6,6 +6,213 @@ from freetoken.engine.speculative import (
 )
 
 
+@pytest.mark.parametrize("slots", [5120, 512, 8])
+def test_window_workspace_uses_loop_limit_and_counts_anchor(slots):
+    from freetoken.engine.speculative_window import WindowBudget
+    budget = WindowBudget.resolve(slots, 40, 8, 256)
+    assert budget.submit_rows == 25
+    assert budget.candidates == 24
+    assert budget.max_loops == 6
+    assert WindowBudget.resolve(slots, 40, 8, 256, max_loops=9).submit_rows == 37
+    assert WindowBudget.resolve(slots, 40, 8, 256, 1).submit_rows == 1
+
+
+def test_pressure_forecast_uses_strict_greater_than_and_completes_current_loop():
+    from freetoken.engine.speculative_window import WindowBudget
+    budget = WindowBudget.resolve(24, 2, 2, 16)
+    assert budget.stop_after_loop(3, 8, 4) is None
+    assert budget.stop_after_loop(4, 12, 4) == "cache_pressure"
+    assert budget.stop_after_loop(6, 0, 1) == "loop_limit"
+
+
+def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
+    from freetoken.engine.speculative_window import SpeculativeWindow
+    window = SpeculativeWindow(1, 10, 12)
+    while window.next_width(3, 20):
+        window.append([len(window.candidates)], {"drafted": 3, "accepted": 0})
+    assert len(window.loops) == 12
+    survival = window.survival(5)
+    assert [loop["survived"] for loop in survival] == [1] * 5 + [0] * 7
+    with pytest.raises(ValueError, match="budget"):
+        window.append([13], {})
+
+
+@pytest.mark.parametrize("values", [
+    {"speculative_three_level": True},
+    {"speculative_submit_tokens": -1},
+    {"speculative_submit_tokens": 8},
+    {"speculative_max_loops": 0},
+    {"speculative_max_loops": -1},
+])
+def test_three_level_configuration_rejects_invalid_combinations(values):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    with pytest.raises(ValueError):
+        EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, **values)
+
+
+def test_route_metrics_align_consumed_input_rows_and_leave_final_correction_unknown():
+    from freetoken.engine.qwen_three_level import route_metrics
+    records = [
+        {"phase": "preverify", "loop": 0, "layer": 0, "ids": [[1, 2], [2, 3], [7, 8]]},
+        {"phase": "preverify", "loop": 1, "layer": 0, "ids": [[3, 4]]},
+        {"phase": "verify", "layer": 0, "ids": [[1, 2], [2, 4], [3, 4], [8, 9]]},
+    ]
+    metrics = route_metrics(records, [{"offset": 0, "returned": 2}, {"offset": 2, "returned": 1}], 16)
+    assert metrics["route_matches"] == 5 and metrics["route_compared"] == 6
+    assert metrics["routes_without_prediction"] == 2
+    assert metrics["predicted_unique_experts"] == 4
+    assert metrics["expert_intersection"] == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("loss_at", [None, 0, 3, 8])
+@pytest.mark.parametrize("early_commit", [False, True])
+@pytest.mark.parametrize("max_loops,slots,repeated,expected_loops,reason,perfect_draft", [
+    (9, 128, True, 9, "loop_limit", False),
+    (6, 24, True, 6, "loop_limit", False),
+    (6, 24, False, 4, "cache_pressure", False),
+    (6, 16, True, 2, "cache_pressure", False),
+    (6, 8, True, 1, "cache_pressure", False),
+    (6, 24, True, 6, "loop_limit", True),
+])
+def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
+        monkeypatch, graph_mode, loss_at, early_commit, max_loops, slots, repeated, expected_loops, reason, perfect_draft):
+    from contextlib import nullcontext
+    import threading
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_mtp import _QwenState, _QwenProposer, _QwenReservation
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+    from freetoken.engine.speculative import SpeculativeCoordinator
+    monkeypatch.setattr("freetoken.engine.qwen_mtp._EARLY_COMMIT", early_commit)
+
+    runner = _metadata_runner(monkeypatch, torch.device("cuda:0"))
+    engine = runner.engine
+    engine.stream = torch.cuda.Stream(device=engine.device)
+    engine.stream.wait_stream(torch.cuda.current_stream())
+    engine.model = SimpleNamespace(forward_host_ctx=lambda *args: nullcontext(),
+                                   model=SimpleNamespace(layers=SimpleNamespace(op_list=[])))
+    engine.linear_state_pool = SimpleNamespace(recurrent_states=torch.zeros(1, 2, 2, 4, 4, device=engine.device),
+                                              conv_states=torch.zeros(1, 2, 24, 3, device=engine.device),
+                                              local_index=lambda _: 0, num_slots=2)
+    engine.config.speculative_mtp_depth = 3
+    engine.config.speculative_submit_tokens = 0
+    engine.config.speculative_max_loops = max_loops
+    engine.config.speculative_prefetch = True
+    engine.config.speculative_audit = True
+    engine.config.model_config = SimpleNamespace(num_moe_layers=2, num_experts_per_tok=2)
+    engine.cpu_moe_executor = None
+    engine.mtp = True
+    engine.moe_offload_cache = SimpleNamespace(cache_size=slots, num_experts=32)
+
+    class State:
+        def __init__(self, pool, layers, width, slot):
+            self.pool, self.width, self.slot = pool, width, slot
+        def commit(self, count):
+            self.pool.recurrent_states[:, self.slot].add_(count)
+
+    class Cache:
+        def __init__(self, cache, stream, **kwargs):
+            from freetoken.moe.speculative_cache import ExpertLeases
+            self.ledger, self.cache = ExpertLeases([-1] * cache.cache_size), cache
+            self.records, self.stats, self.graph_replays = [], {}, 0
+            self.prefetched, self.used_prefetch, self.graphs = set(), set(), {}
+            self.audit = kwargs["audit"]
+        def begin(self, epoch):
+            self.ledger.begin(epoch)
+            self.active = True
+            self.records = []
+        def set_phase(self, phase, loop=0):
+            self.phase, self.loop = phase, loop
+        def decide(self, loop, count):
+            self.ledger.decide(self.ledger.epoch, loop, count)
+        def close(self):
+            self.ledger.end()
+            self.active = False
+        def transfer_audit(self):
+            return {}
+
+    monkeypatch.setattr("freetoken.engine.qwen_three_level.QwenGDNVerifyState", State)
+    monkeypatch.setattr("freetoken.engine.qwen_three_level.SpeculativeExpertCache", Cache)
+    runner.states = {w: State(engine.linear_state_pool, [], w, 1) for w in range(1, 5)}
+    runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
+    runner.use_graph, runner.active = graph_mode, False
+    runner.last_event, runner.frontier = None, None
+    runner._request_lock = threading.Lock()
+    runner.model_state = _QwenState(runner)
+    runner.coordinator = SpeculativeCoordinator(_QwenProposer(runner), runner.model_state, _QwenReservation(runner))
+    runner.three_level = ThreeLevelCoordinator(runner)
+    seen = []
+    cancellation = threading.Event()
+    cancel_after_inner = False
+    inner_calls = 0
+
+    def prefill(ids, chunk_size):
+        runner._reserve(4)
+        engine.linear_state_pool.recurrent_states.zero_()
+        runner.next_draft = torch.tensor([8 if perfect_draft else 108], device=engine.device, dtype=torch.int32)
+        runner.last_draft_hidden = torch.zeros(1, 2, device=engine.device)
+        return torch.tensor([7], device=engine.device, dtype=torch.int32)
+
+    def target(batch):
+        nonlocal inner_calls
+        tokens = batch.input_ids + 1
+        if runner.three_level.experts.phase == "preverify":
+            control = runner.three_level.experts
+            first = 0 if repeated else control.loop * 2
+            for li in range(2):
+                control.ledger.observe(control.ledger.epoch, control.loop, li,
+                                       [[first + 2 * (0 if perfect_draft else i), first + 2 * (0 if perfect_draft else i) + 1]
+                                        for i in range(len(tokens))], 32)
+            inner_calls += 1
+            if cancel_after_inner and inner_calls == min(2, expected_loops):
+                cancellation.set()
+            if loss_at is not None:
+                tokens = tokens + (batch.positions == 3 + loss_at).to(tokens.dtype)
+        else:
+            expected_start = float(batch.positions[0].item()) - 3
+            assert engine.linear_state_pool.recurrent_states[0, 1, 0, 0, 0].item() == expected_start
+            seen.append(batch.positions.cpu().tolist())
+        return tokens, torch.zeros(len(tokens), 2, device=engine.device)
+
+    runner._prefill, runner._target = prefill, target
+    def draft(batch, hidden, count=None):
+        delta = 1 if perfect_draft else 101
+        if count is not None:
+            return (batch.input_ids + delta).index_select(0, (count - 1).reshape(1).long()), hidden[:1].clone()
+        return batch.input_ids + delta, hidden.clone()
+    runner._draft = draft
+    max_tokens = 33 if perfect_draft else 17
+    for _ in range(2):
+        result = runner.generate([1, 2, 3], max_tokens=max_tokens)
+        assert result.token_ids == list(range(7, 7 + max_tokens))
+        assert engine.linear_state_pool.recurrent_states[0, 1, 0, 0, 0].item() == max_tokens - 1
+        if loss_at is None:
+            first_row = result.rounds[0]
+            assert first_row["loop_count"] == expected_loops
+            assert first_row["flush_reason"] == reason
+            assert first_row["loops"][-1]["verify_rows"] == 4
+            assert first_row["loops"][-1]["stop_after_loop"] == reason
+            assert first_row["loops"][-1]["previous_unique_experts"] == (
+                4 if repeated and expected_loops > 1 else 4 * (expected_loops - 1))
+            if perfect_draft:
+                assert first_row["submit_rows"] == 25
+        assert runner.frontier is None and runner.last_event is None
+        assert not runner.active and not runner._request_lock.locked()
+        assert not bool(engine.page_table.any())
+        assert not runner.three_level.experts.active
+    stopped = runner.generate([1, 2, 3], max_tokens=17, eos_ids=(12,))
+    assert stopped.token_ids == list(range(7, 13))
+    assert engine.linear_state_pool.recurrent_states[0, 1, 0, 0, 0].item() == 5
+    cancel_after_inner, inner_calls = True, 0
+    aborted = runner.generate([1, 2, 3], max_tokens=17, cancel=cancellation)
+    assert aborted.token_ids == [7]
+    assert engine.linear_state_pool.recurrent_states[0, 1, 0, 0, 0].item() == 0
+    assert not runner.three_level.experts.active and not runner.active
+    assert not bool(engine.page_table.any())
+
+
 @pytest.mark.parametrize("accepted", range(4))
 def test_accepts_only_matching_prefix(accepted):
     proposal = Proposal(torch.tensor(7), torch.tensor([10, 11, 12]))

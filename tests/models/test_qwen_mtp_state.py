@@ -17,7 +17,7 @@ def test_runner_import_does_not_initialize_cuda():
     )
 
 
-@pytest.mark.parametrize("width,count", [(w, c) for w in range(1, 5) for c in range(w + 1)])
+@pytest.mark.parametrize("width,count", [(w, c) for w in range(1, 5) for c in range(w + 1)] + [(9, 3), (17, 0), (17, 11), (17, 17), (25, 0), (25, 13), (25, 25)])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("head_ratio", [1, 2])

@@ -2,6 +2,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kvcache.linear_state_pool import LinearStatePool
@@ -11,7 +12,8 @@ from freetoken.models.config import ModelConfig, RotaryConfig, LinearGatedDeltaG
 from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
 
 
-def test_joint_pool_cost_and_contents_match_allocation():
+@pytest.mark.parametrize("submit_limit", [0, 1, 9])
+def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     rotary = RotaryConfig(32, 32, 128, 10000, None)
@@ -45,3 +47,17 @@ def test_joint_pool_cost_and_contents_match_allocation():
     joint.rebuild_from_config(config, 12)
     assert joint._kv_buffer.shape[2] == 13
     assert joint.k_cache(1).data_ptr() != joint.k_cache(2).data_ptr()
+    config.model_config = replace(mc, num_experts=64)
+    config.speculative_three_level = True
+    config.speculative_submit_tokens = submit_limit
+    config.speculative_max_loops = 6
+    config.speculative_mtp_depth = 3
+    from freetoken.engine.speculative_window import WindowBudget
+    from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+    maximum = WindowBudget.resolve(128, 2, 2, 64, submit_limit).submit_rows
+    wide = [QwenGDNVerifyState(pool, [layer], w, 1) for w in range(1, max(4, maximum) + 1)]
+    private = [QwenGDNVerifyState(pool, [layer], w, 0) for w in range(1, 5)]
+    hybrid_plan = 9 * mc.num_experts_per_tok * 8 + 3 * 16
+    expected = sum(s.bytes() for s in [*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16) + hybrid_plan
+    expected += min(64, max(4, maximum) * mc.num_experts_per_tok) * 3 * mc.hidden_size * mc.moe_intermediate_size * config.dtype.itemsize
+    assert QwenMTPKVCache.kv_cost(config)[1] == expected

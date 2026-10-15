@@ -215,3 +215,116 @@ untouched; use a new output directory for a changed experiment or legacy results
 without this metadata. Matching cells keep their raw files. Weight-shard size
 and nanosecond modification time are checked without hashing all checkpoint
 weights, so these signatures are not cryptographic weight-content verification.
+
+## Multi-loop three-level decoding
+
+The optional programmatic three-level path chains native MTP proposals and a
+sparse Pre-Verify model before one complete Target verification. Enable it with
+`speculative_three_level=True` alongside `speculative_mtp_depth=3` in the engine
+configuration. It supports the existing text-only, BF16, TP=1, single-request
+offload/hybrid adapter. CPU-only layers and unpinned or quantized expert banks
+are rejected. Hybrid requires `FREETOKEN_HYBRID_WINDOW=1`, the default.
+
+```python
+config = SchedulerConfig(
+    model_path=model_path, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+    speculative_mtp_depth=3, speculative_three_level=True,
+    speculative_submit_tokens=0, speculative_max_loops=6, speculative_prefetch=True,
+    speculative_audit=False, max_running_req=1,
+    attention_backend="triton", moe_strategy="offload", moe_cache_auto=True,
+    kv_reserve_tokens=4096, max_seq_len_override=4096,
+    gpu_memory_budget_bytes=40 << 30, cuda_graph_max_bs=4, cache_type="naive",
+    mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
+)
+```
+
+Import `SchedulerConfig` from `freetoken.scheduler.config`. `speculative_submit_tokens`
+counts actual Target input rows, including the pending anchor; zero applies no
+additional row cap. `speculative_max_loops` defaults to six and must be positive.
+A loop appends its accepted
+draft prefix and one correction/bonus to a provisional window, then continues
+from that window's private state. Sparse verification keeps the four largest
+router weights, with stable original-order ties, plus ready GPU-resident experts;
+other route contributions are zeroed without renormalizing.
+
+Before each loop, `m` counts distinct `(layer, expert)` identities referenced by
+the consumed input rows of all earlier loops, after rejected rows are released.
+`w` is this loop's verification input row count, including its anchor; `L` is
+the number of MoE layers and `k` is top-k. If `m + w * L * k > cache_slots`,
+the current loop still runs at its planned width and finishes before full Target
+verification. Equality does not trigger this stop. Reaching the loop limit also
+flushes after the current loop. Cache pressure never shortens or skips that loop;
+an explicit row cap or the remaining output count can shorten it. Expert reuse
+therefore permits many more tokens than a total-token worst-case cache bound.
+The default workspace supports up to `6 * (3 + 1) + 1 = 25` Target input rows;
+this allocation bound is independent of cache capacity.
+Provisional EOS forces full verification; only
+verified EOS or the final output cap terminates generation.
+
+Pre-Verify owns private recurrent/conv state and a provisional suffix in the
+shared token allocation. The canonical prefix remains read-only. Full Target
+verification restarts at the canonical recurrent state and overwrites the
+provisional suffix. Only its accepted input prefix advances canonical state;
+MTP reconciliation rewrites the suffix using actual Target hidden states.
+Cancellation drains transfers/readers and returns only already published tokens.
+Cache rebuild invalidates graphs and creates a new coordinator against the new
+slot geometry. Private state and wide verification workspaces are included in
+startup/rebuild fixed-memory accounting.
+
+Each observed router window prefetches all top-k expert identities, including
+skipped routes. References are attached to processed input positions, not newly
+predicted output positions. Inner rejection releases only rejected-row references;
+shared resident experts remain locked. In-flight copies and expert readers cannot be
+evicted. Transfers have completion events, and pending experts are not considered
+ready resident weights. Zero-weight route indices also point to a protected,
+ready expert: reading an arbitrary slot can race with prefetch or propagate NaN
+despite a zero route weight. A hybrid layer with no GPU routes skips the GPU
+expert kernel entirely. Full Target computes all routes, supplementing any
+incorrect prefetch prediction by normal demand fetch or hybrid CPU computation.
+When no cache slot can be evicted, prefetch is deferred. If demand also cannot
+fit, a separate reusable layer workspace computes that layer's GPU routes without
+evicting locked experts, including during full Target verification. Nonresident
+accepted expert identities remain in the reference set used for `m`. This BF16
+workspace holds at most `min(E, max(4, submit_row_limit) * k)` experts, is included
+in fixed-memory planning, and does not add slots to the pressure threshold.
+`scratch_layers`, `scratch_loads_bytes` and `deferred_prefetch_experts` expose
+this fallback's cost. Per-loop audit rows record `previous_unique_experts`,
+`verify_rows`, `worst_case_experts` and `stop_after_loop`.
+
+Routing admission runs on the host. With graphs enabled, expert compute and
+MTP/accept/Target-commit phases use captured graphs; the whole Target forward is
+host-scheduled. `graph_fallbacks.target_host_schedule` and per-window
+`expert_graph_replays` make that boundary explicit. This implementation includes
+route readback, host planning and resource drains in request latency.
+
+`GenerationResult.rounds` contains actual loop counts, inner/outer accepted and
+proposed counts, candidate survival, row limits, flush reasons, raw route-match
+denominators, experts copied, bytes and protected-set peaks. Route comparisons
+align identical teacher-forced input positions; the final unprocessed correction
+has no Pre-Verify route prediction and is counted separately. Accepted-input
+comparisons and per-loop route counts are separate fields. With
+`speculative_audit=True`, rounds also contain raw router IDs and CUDA-event
+transfer start/end times and Target consumption events relative to window start.
+The timely-prefetch counter conservatively tests readiness when the Target layer
+is routed; its initial-miss denominator uses that window's initial cache snapshot.
+
+Run the complete-request controls with the same loaded engine, expert slots,
+prompts and token limit:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=python python benchmarks/bench_three_level_mtp.py \
+  --model /data1/fanya/Qwen/Qwen3.6-35B-A3B \
+  --data /home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl \
+  --output /absolute/path/to/a/new/result/directory \
+  --backend offload --budget-gib 40 --samples 1 --tokens 24 --purpose smoke
+```
+
+Use `--eager` for eager controls and `--backend hybrid` for the existing mixed
+expert backend. The script compares AR, standard MTP, three-level without
+prefetch and three-level with prefetch. It warms each method, resets expert
+metadata before timing and before a separate audit pass, saves token IDs and
+first AR differences, and freezes Python sources with hashes. It records
+measurement completion separately from strict AR parity and timing/replay
+parity. As with standard MTP above, floating-point batching and hybrid placement
+can affect exact token parity; a short passing smoke does not certify every
+prompt or establish an end-to-end speedup.

@@ -22,6 +22,23 @@ class QwenMTPKVCache(MHAKVCache):
         if getattr(config, "moe_strategy", None) == "hybrid":
             # Widths 2..4 share plans across layers; each has two route arrays and two counts.
             scratch += 9 * mc.num_experts_per_tok * 8 + 3 * 16
+        if getattr(config, "speculative_three_level", False):
+            from freetoken.engine.speculative_window import WindowBudget
+            from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+            upper = WindowBudget.resolve(mc.num_moe_layers * mc.num_experts, mc.num_moe_layers,
+                                         mc.num_experts_per_tok, mc.num_experts,
+                                         config.speculative_submit_tokens, config.speculative_max_loops,
+                                         config.speculative_mtp_depth).submit_rows
+            widths = list(range(5, upper + 1)) + [1, 2, 3, 4]
+            rows = sum(widths)
+            scratch += (
+                rows * layers * (vectors * config.dtype.itemsize + 2 * group.num_value_heads * 4)
+                + (rows + len(widths) * (group.conv_kernel_dim - 2)) * layers * channels * config.dtype.itemsize
+                + len(widths) * 12
+                + linear_state_bytes_per_req(group, config.tp_info.size, config.dtype)
+                + min(mc.num_experts, max(4, upper) * mc.num_experts_per_tok)
+                * 3 * mc.hidden_size * mc.moe_intermediate_size // config.tp_info.size * config.dtype.itemsize
+            )
         return per_page + draft_page, fixed + scratch, page_tokens, reserve
 
     @classmethod

@@ -7,8 +7,8 @@ from freetoken.kernel.backend import is_sgl_kernel_installed
 
 class QwenGDNVerifyState:
     def __init__(self, pool, layers, width: int, slot: int):
-        if not 1 <= width <= 4 or not 0 <= slot < pool.num_slots:
-            raise ValueError("GDN verification requires width 1..4 and a valid state slot")
+        if width < 1 or not 0 <= slot < pool.num_slots:
+            raise ValueError("GDN verification requires positive width and a valid state slot")
         self.pool = pool
         self.layers = tuple(layers)
         self.width = width
