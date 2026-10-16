@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -163,3 +165,115 @@ def test_resource_model_reproduces_serial_control_and_only_prefetches_observed_i
     assert prefetched["elapsed_ms"] == 19.0 and prefetched["outer_demand_loads"] == 0
     assert prefetched["prefetch_loads"] == 2 and prefetched["unused_prefetch_loads"] == 1
     assert prefetched["timely_original_missing"] == 1
+
+
+@pytest.mark.parametrize("policies", [("cheap", "full"), ("cheap",), ("full",)])
+def test_feedback_analysis_keeps_policy_cohorts_separate(tmp_path, policies):
+    from analyze_multiloop_controls import feedback
+    _feedback_files(tmp_path, policies)
+    result = feedback(tmp_path)
+    for count in (1, 2):
+        groups = result["counts"][str(count)]
+        assert set(groups) == set(policies)
+        for policy, group in groups.items():
+            assert group["no_prefetch"]["windows"] == group["experiment"]["windows"] == 1
+            assert group["feedback_applied"] == (policy == "cheap")
+            if policy == "cheap":
+                assert group["prefetch"]["loaded_experts"] == count
+                assert group["prefetch"]["serialized_prefetch_ms"] == count * 0.5
+            else:
+                assert group["prefetch"] is None
+
+
+def _feedback_files(root, policies):
+    def write(name, value):
+        (root / name).write_text(json.dumps(value))
+    write("config.json", dict(samples=1, tokens=4, loops=[1, 2], policies=policies))
+    write("complete.json", dict(status="completed", expected_windows=len(policies)*2))
+    request = dict(sample_id=0, token_ids=[1, 2, 3, 4], baseline_parity=True)
+    for name in ("baseline_requests.jsonl", "audit_requests.jsonl"):
+        (root/name).write_text(json.dumps(request)+"\n")
+    rows, controls = [], []
+    for policy in policies:
+        for count in (1, 2):
+            layer = dict(layer=0, ids=[[1, 2], [2, 3]], keep=[[True, True], [True, True]],
+                         hits=[[False, False], [False, False]])
+            loop = dict(start=0, inputs=[0, 1], returned=2, accepted=1, record=dict(layers=[layer]))
+            row = dict(case_id=f"{policy}_{count}", policy=policy, loop_count=count, start=0, sample_id=0,
+                prefix_tokens=4, initial_owner=[-1]*4, initial_usage=[0]*4, candidates=[1, 2],
+                loops=[copy.deepcopy(loop) for _ in range(count)],
+                outer=dict(accepted=1, record=dict(layers=[layer])), outer_reference_parity=True,
+                post_commit_next_token_parity=True, matched_baseline_token_parity=True)
+            controls.append(copy.deepcopy(row))
+            if policy == "cheap":
+                for item in row["loops"]:
+                    item["feedback_prefetch"] = dict(loaded=[3], serial_prefetch_ms=0.5,
+                        protected=3, protected_not_resident=0)
+            rows.append(row)
+    (root/"no_prefetch").mkdir()
+    for path, data in [(root/"windows.jsonl", rows), (root/"no_prefetch/windows.jsonl", controls)]:
+        path.write_text("".join(json.dumps(row)+"\n" for row in data))
+
+
+def test_feedback_analysis_rejects_missing_cheap_metrics(tmp_path):
+    from analyze_multiloop_controls import feedback
+    _feedback_files(tmp_path, ("cheap", "full"))
+    path = tmp_path/"windows.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    del rows[0]["loops"][0]["feedback_prefetch"]
+    path.write_text("".join(json.dumps(row)+"\n" for row in rows))
+    with pytest.raises(ValueError, match=r"cheap_1.*loop 0.*feedback_prefetch"):
+        feedback(tmp_path)
+
+
+@pytest.mark.parametrize("backends,failure", [(["offload", "hybrid"], None), (["offload"], None),
+    (["offload", "hybrid"], "exit"), (["offload", "hybrid"], "marker"),
+    (["offload", "hybrid"], "missing"), (["offload", "hybrid"], "counts"),
+    (["offload", "hybrid"], "interrupt")])
+def test_matrix_marks_complete_only_after_all_backends(tmp_path, monkeypatch, backends, failure):
+    import run_multiloop_matrix as matrix
+    repo, output = tmp_path/"repo", tmp_path/"run"
+    (repo/"python/freetoken").mkdir(parents=True)
+    (repo/"benchmarks").mkdir()
+    for name in ("bench_multiloop_sparse_verify.py", "bench_sparse_verify_motivation.py", "qwen_mtp_config.py",
+        "analyze_multiloop_sparse_verify.py", "plot_multiloop_sparse_verify.py",
+        "bench_multiloop_prefetch_feedback.py", "bench_multiloop_overlap.py", "run_multiloop_matrix.py",
+        "simulate_multiloop_prefetch.py"):
+        (repo/"benchmarks"/name).write_text("# frozen fixture\n")
+    launched = []
+    def launch(command, **kwargs):
+        assert json.loads((output/"complete.json").read_text())["status"] == "incomplete"
+        backend = command[command.index("--backend")+1]
+        launched.append(backend)
+        child = output/backend
+        child.mkdir()
+        last = backend == "hybrid"
+        if not (last and failure == "missing"):
+            (child/"complete.json").write_text(json.dumps(dict(
+                status="incomplete" if last and failure == "marker" else "completed",
+                windows=1, expected_windows=2 if last and failure == "counts" else 1,
+                baseline_audit_parity=True, outer_full_ar_parity=False)))
+        class Process:
+            pid = 123
+            returncode = 1 if last and failure == "exit" else 0
+            def poll(self):
+                if last and failure == "interrupt":
+                    raise KeyboardInterrupt()
+                return self.returncode
+        return Process()
+    monkeypatch.chdir(repo)
+    monkeypatch.setattr(matrix.subprocess, "Popen", launch)
+    monkeypatch.setattr(sys, "argv", ["matrix", "--output", str(output), "--samples", "1", "--backends", *backends])
+    if failure:
+        with pytest.raises((RuntimeError, AssertionError, FileNotFoundError, KeyboardInterrupt)):
+            matrix.main()
+        assert json.loads((output/"complete.json").read_text())["status"] == "incomplete"
+    else:
+        matrix.main()
+        complete = json.loads((output/"complete.json").read_text())
+        assert complete["status"] == "completed"
+        assert complete["requested_backends"] == backends
+        assert list(complete["backends"]) == backends
+        assert all(row["windows"] == 1 for row in complete["backends"].values())
+        assert complete["completed_utc"]
+    assert launched == backends

@@ -31,7 +31,7 @@ def main():
         coordinator = getattr(runner, "three_level", None)
         pending[id(runner)].append(({
             "phase": phase, "rows": width, "host_submission_ms": host_ms,
-            "graph_capture": graph_capture,
+            "graph_capture": graph_capture() if callable(graph_capture) else graph_capture,
             "epoch": coordinator.epoch if coordinator else None,
             "loop": coordinator.experts.loop if coordinator else None,
         }, before, after))
@@ -39,24 +39,33 @@ def main():
 
     def execute(runner, phase, batch, hidden=None, *, count=None):
         call = lambda: originals["_execute"](runner, phase, batch, hidden, count=count)
-        if phase != "verify":
+        if phase == "verify":
+            label = "ar_forward" if runner.reference_ar else "mtp_verify"
+        elif phase.startswith("three_level_preverify_"):
+            label = "lossy_verify"
+        elif phase.startswith("three_level_verify_"):
+            label = "full_verify"
+        else:
             return call()
         width = batch.input_ids.numel()
-        capture = not runner.reference_ar and runner.use_graph and (phase, width) not in runner.graphs
-        return measure(runner, "ar_forward" if runner.reference_ar else "mtp_verify", width, call,
-                       graph_capture=capture)
+        key = phase, width
+        existed = key in runner.graphs
+        return measure(runner, label, width, call,
+                       graph_capture=lambda: not existed and key in runner.graphs)
 
     def target(runner, batch):
         call = lambda: originals["_target"](runner, batch)
         coordinator = getattr(runner, "three_level", None)
-        if coordinator is None or not batch.is_decode:
+        if coordinator is None or not batch.is_decode or getattr(coordinator.experts, "gpu_schedule", False):
             return call()
         phase = "lossy_verify" if coordinator.experts.phase == "preverify" else "full_verify"
         return measure(runner, phase, batch.input_ids.numel(), call)
 
     def step(coordinator, *args, **kwargs):
+        graphs = len(coordinator.runner.graphs)
         return measure(coordinator.runner, "outer_cycle", 0,
-                       lambda: original_step(coordinator, *args, **kwargs))
+                       lambda: original_step(coordinator, *args, **kwargs),
+                       graph_capture=lambda: len(coordinator.runner.graphs) > graphs)
 
     def generate(runner, *args, **kwargs):
         coordinator = getattr(runner, "three_level", None)
@@ -109,7 +118,7 @@ def main():
             "excluded": ["batch metadata preparation", "MTP proposal", "acceptance", "state commit", "reconciliation", "prefill"],
             "outer_cycle": "nested diagnostic interval, includes all inner loops, final verify, and window close; do not add to forwards",
             "instrumentation": "independent audit only; no added per-phase synchronization; generation drains before event extraction",
-            "graph_capture": "baseline calls that create a graph are flagged; exclude these from steady-state comparisons",
+            "graph_capture": "calls that create a graph, including enclosing outer cycles, are flagged and excluded from steady-state comparisons",
         }, indent=2) + "\n")
     finally:
         for name, original in originals.items():

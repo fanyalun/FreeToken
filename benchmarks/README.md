@@ -53,6 +53,12 @@ availability control; `bench_multiloop_overlap.py` replays the recorded four-loo
 40-layer expert workload with actual pinned-weight transfers, separately from
 model inference and optionally under Nsight Systems.
 
+`analyze_multiloop_controls.py` writes feedback schema version 2, grouping metrics
+by `counts[loop_count][policy]`. Each group retains its paired `no_prefetch` and
+`experiment` quality metrics. Only `cheap` applies feedback; `full` reports
+`feedback_applied=false` and `prefetch=null`. Missing feedback fields for `cheap`
+remain an error. Existing raw runs can be reanalyzed without regenerating them.
+
 **`analyze_three_level_demo.py`** independently checks the four-mode outputs from
 `bench_three_level_mtp.py`: AR, standard MTP, three-level without prefetch, and
 three-level with prefetch. It verifies complete returned-token requests, independent
@@ -85,7 +91,10 @@ It records AR single-row forward, standard MTP verify, lossy Pre-Verify, full
 Target verify and a nested complete outer-cycle interval. Forward intervals
 exclude batch construction, proposal, acceptance, commit and reconciliation;
 stream elapsed includes host scheduling gaps and dependency waits. Each record
-keeps its actual row count, and baseline Graph creation is flagged separately.
+keeps its actual row count. Calls that create a Graph, including their enclosing
+outer cycle, are flagged and excluded from steady-state phase statistics. GPU
+forward events surround `_execute`, so every Graph replay is recorded without
+including batch metadata preparation.
 
 ```bash
 python benchmarks/profile_three_level_phases.py --model /path/to/model --data /path/to/data --output /path/to/new_run

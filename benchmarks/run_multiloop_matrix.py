@@ -20,6 +20,7 @@ def main():
     args = parser.parse_args()
     root, repo = args.output.resolve(), Path.cwd()
     root.mkdir(parents=True, exist_ok=False)
+    (root / "complete.json").write_text('{"status":"incomplete"}\n')
     source = root / "source"
     paths = sorted((repo / "python/freetoken").rglob("*.py"))
     paths += [repo / "benchmarks" / name for name in (
@@ -36,11 +37,11 @@ def main():
         shutil.copy2(path, destination)
         manifest[str(relative)] = hashlib.sha256(destination.read_bytes()).hexdigest()
     (root / "source_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    (root / "complete.json").write_text('{"status":"incomplete"}\n')
     env = dict(os.environ, CUDA_HOME='/usr/local/cuda-13.0', CUDA_VISIBLE_DEVICES='0',
                PYTHONPATH=str(repo / 'python'),
                PATH='/usr/local/cuda-13.0/bin:' + str(Path(sys.executable).parent) + ':/usr/bin:/bin')
     commands = []
+    completed = {}
     for backend in args.backends:
         command = [sys.executable, str(source / "benchmarks/bench_multiloop_sparse_verify.py"),
                    "--backend", backend, "--samples", str(args.samples), "--output", str(root / backend)]
@@ -64,7 +65,14 @@ def main():
                 raise RuntimeError(f"{backend} failed; inspect {root / (backend + '.log')}")
             complete = json.loads((root / backend / "complete.json").read_text())
             assert complete["status"] == "completed"
+            assert complete["windows"] == complete["expected_windows"]
+            assert complete["baseline_audit_parity"]
+            completed[backend] = {key: complete[key] for key in ("status", "windows", "expected_windows", "baseline_audit_parity")}
             print(json.dumps({"completed": backend, "windows": complete["windows"]}), flush=True)
+    marker = root / "complete.json.tmp"
+    marker.write_text(json.dumps({"status": "completed", "requested_backends": args.backends,
+        "backends": completed, "completed_utc": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n")
+    marker.replace(root / "complete.json")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -177,3 +178,115 @@ def test_graph_creation_is_excluded_from_steady_state_mean(phase_run):
     value = analyze_phases(phase_run)["modes"]["mtp"]
     assert value["excluded_graph_capture_calls"] == 1
     assert value["phase_stream_ms"]["mtp_verify"]["mean"] == 8
+
+
+@pytest.mark.parametrize("gpu,graph,warm", [(True, True, True), (True, True, False),
+                                          (True, False, False), (False, False, False)])
+def test_phase_profiler_records_each_forward_outside_capture(tmp_path, monkeypatch, gpu, graph, warm):
+    import torch
+    import bench_three_level_mtp as benchmark
+    import profile_three_level_phases as profiler
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+
+    recorded, target_calls = [], []
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self, stream):
+            self.position = len(recorded)
+            recorded.append(self)
+
+        def elapsed_time(self, other):
+            return float(other.position - self.position)
+
+    def initialize(control, runner):
+        control.runner, control.epoch = runner, 1
+        control.experts = SimpleNamespace(gpu_schedule=gpu, audit=False, prefetch=True, loop=0, phase="preverify")
+        runner.three_level = control
+
+    def target(runner, batch):
+        target_calls.append(batch.size)
+        return None
+
+    def execute(runner, phase, batch, hidden=None, *, count=None):
+        key = phase, batch.input_ids.numel()
+        if graph:
+            if key not in runner.graphs:
+                runner._target(batch)
+                runner._target(batch)
+                runner.graphs[key] = object()
+        else:
+            runner._target(batch)
+
+    def step(control):
+        for loop, (phase, width) in enumerate((("preverify", 4), ("preverify", 2), ("verify", 5))):
+            control.experts.phase, control.experts.loop = phase, loop
+            batch = SimpleNamespace(input_ids=torch.arange(width), size=width, is_decode=True)
+            if gpu:
+                control.runner._execute(f"three_level_{phase}_1_compact_reference_123", batch)
+            else:
+                control.runner._target(batch)
+
+    def generate(runner):
+        runner.three_level.step()
+        return SimpleNamespace(token_ids=[1, 2, 3, 4])
+
+    def run():
+        source = tmp_path / "source/benchmarks"
+        source.mkdir(parents=True)
+        (tmp_path / "source_manifest.json").write_text("{}")
+        runner = object.__new__(QwenMTPRunner)
+        runner.reference_ar, runner.use_graph, runner.graphs = False, graph, {}
+        runner.engine = SimpleNamespace(stream=object(), speculative_runner=runner)
+        control = ThreeLevelCoordinator(runner)
+        if warm:
+            runner.generate()
+        before = len(target_calls)
+        control.experts.audit = True
+        runner.generate()
+        runner.generate()
+        if gpu and graph and warm:
+            assert len(target_calls) == before
+        control.experts.audit = False
+        runner.generate()
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(QwenMTPRunner, "_target", target)
+    monkeypatch.setattr(QwenMTPRunner, "_execute", execute)
+    monkeypatch.setattr(QwenMTPRunner, "generate", generate)
+    monkeypatch.setattr(ThreeLevelCoordinator, "step", step)
+    monkeypatch.setattr(ThreeLevelCoordinator, "__init__", initialize)
+    monkeypatch.setattr(benchmark, "main", run)
+    monkeypatch.setattr(sys, "argv", ["profile", "--output", str(tmp_path)])
+    profiler.main()
+    rows = [json.loads(line) for line in (tmp_path / "phase_audit.jsonl").read_text().splitlines()]
+    assert [row["sample_id"] for row in rows] == [0, 1]
+    for index, row in enumerate(rows):
+        assert [(e["phase"], e["rows"]) for e in row["events"]] == [
+            ("lossy_verify", 4), ("lossy_verify", 2), ("full_verify", 5), ("outer_cycle", 0)]
+        assert all(e["stream_ms"] > 0 for e in row["events"])
+        assert all(e["graph_capture"] == (gpu and graph and not warm and index == 0) for e in row["events"])
+    assert QwenMTPRunner._target is target and QwenMTPRunner._execute is execute
+    assert QwenMTPRunner.generate is generate and ThreeLevelCoordinator.step is step
+    assert ThreeLevelCoordinator.__init__ is initialize
+
+
+def test_phase_profiler_restores_wrappers_on_benchmark_error(tmp_path, monkeypatch):
+    import bench_three_level_mtp as benchmark
+    import profile_three_level_phases as profiler
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+
+    methods = [(QwenMTPRunner, name) for name in ("generate", "_execute", "_target")]
+    methods += [(ThreeLevelCoordinator, name) for name in ("step", "__init__")]
+    originals = [getattr(owner, name) for owner, name in methods]
+    def fail():
+        raise RuntimeError("injected benchmark error")
+    monkeypatch.setattr(benchmark, "main", fail)
+    monkeypatch.setattr(sys, "argv", ["profile", "--output", str(tmp_path)])
+    with pytest.raises(RuntimeError, match="injected benchmark error"):
+        profiler.main()
+    assert [getattr(owner, name) for owner, name in methods] == originals

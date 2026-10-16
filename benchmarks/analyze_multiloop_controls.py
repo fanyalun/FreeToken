@@ -69,17 +69,30 @@ def feedback(directory):
             assert left["ids"] == right["ids"] and left["keep"] == right["keep"]
     result = {"valid": True, "paired_initial_cache_and_state": True,
               "scope": "same-snapshot real-cache boundary availability control; serialized prefetch, not async timing",
-              "timing_valid_for_async_performance": False, "counts": {}}
+              "timing_valid_for_async_performance": False, "schema_version": 2, "counts": {}}
     for count in config["loops"]:
-        selected = [row for row in rows if row["loop_count"] == count]
-        control = [controls[row["case_id"]] for row in selected]
-        record = {"no_prefetch": quality(control), "boundary_prefetch": quality(selected),
-                  "candidate_lists_changed": sum(a["candidates"] != b["candidates"] for a, b in zip(selected, control)),
-                  "max_missing_protected": max(loop["feedback_prefetch"]["protected_not_resident"] for row in selected for loop in row["loops"]),
-                  "loaded_experts": sum(len(loop["feedback_prefetch"]["loaded"]) for row in selected for loop in row["loops"]),
-                  "serialized_prefetch_ms": sum(loop["feedback_prefetch"]["serial_prefetch_ms"] for row in selected for loop in row["loops"]),
-                  "protected_peak": max(loop["feedback_prefetch"]["protected"] for row in selected for loop in row["loops"])}
-        result["counts"][str(count)] = record
+        groups = {}
+        for policy in config["policies"]:
+            selected = [row for row in rows if row["loop_count"] == count and row["policy"] == policy]
+            control = [controls[row["case_id"]] for row in selected]
+            metrics = []
+            if policy == "cheap":
+                for row in selected:
+                    for index, loop in enumerate(row["loops"]):
+                        if "feedback_prefetch" not in loop:
+                            raise ValueError(f"{row['case_id']} loop {index} missing feedback_prefetch")
+                        metrics.append(loop["feedback_prefetch"])
+            record = {"no_prefetch": quality(control), "experiment": quality(selected),
+                "feedback_applied": policy == "cheap", "prefetch": None,
+                "candidate_lists_changed": sum(a["candidates"] != b["candidates"] for a, b in zip(selected, control))}
+            if metrics:
+                record["prefetch"] = {
+                    "max_missing_protected": max(item["protected_not_resident"] for item in metrics),
+                    "loaded_experts": sum(len(item["loaded"]) for item in metrics),
+                    "serialized_prefetch_ms": sum(item["serial_prefetch_ms"] for item in metrics),
+                    "protected_peak": max(item["protected"] for item in metrics)}
+            groups[policy] = record
+        result["counts"][str(count)] = groups
     return result
 
 
