@@ -17,12 +17,14 @@ def test_window_workspace_uses_loop_limit_and_counts_anchor(slots):
     assert WindowBudget.resolve(slots, 40, 8, 256, 1).submit_rows == 1
 
 
-def test_pressure_forecast_uses_strict_greater_than_and_completes_current_loop():
+def test_pressure_admission_checks_next_loop_and_counts_blocked_slots():
     from freetoken.engine.speculative_window import WindowBudget
     budget = WindowBudget.resolve(24, 2, 2, 16)
-    assert budget.stop_after_loop(3, 8, 4) is None
-    assert budget.stop_after_loop(4, 12, 4) == "cache_pressure"
-    assert budget.stop_after_loop(6, 0, 1) == "loop_limit"
+    assert budget.before_loop(2, 8, 4) is None
+    assert budget.before_loop(3, 12, 4) == "cache_pressure"
+    assert budget.before_loop(2, 8, 4, blocked_slots=1) == "cache_pressure"
+    assert budget.before_loop(6, 0, 1) == "loop_limit"
+    assert WindowBudget.resolve(8, 2, 2, 16).before_loop(0, 0, 4) == "cache_pressure"
 
 
 def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
@@ -43,6 +45,12 @@ def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
     {"speculative_submit_tokens": 8},
     {"speculative_max_loops": 0},
     {"speculative_max_loops": -1},
+    {"speculative_prefetch_layer_experts": -1},
+    {"speculative_prefetch_gap_capacity": -1},
+    {"speculative_expert_scheduler": "unknown"},
+    {"speculative_expert_scheduler": "gpu"},
+    {"speculative_expert_scheduler": "gpu", "speculative_three_level": True,
+     "speculative_mtp_depth": 3, "moe_strategy": "hybrid"},
 ])
 def test_three_level_configuration_rejects_invalid_combinations(values):
     from freetoken.distributed import DistributedInfo
@@ -72,12 +80,12 @@ def test_route_metrics_align_consumed_input_rows_and_leave_final_correction_unkn
 @pytest.mark.parametrize("max_loops,slots,repeated,expected_loops,reason,perfect_draft", [
     (9, 128, True, 9, "loop_limit", False),
     (6, 24, True, 6, "loop_limit", False),
-    (6, 24, False, 4, "cache_pressure", False),
-    (6, 16, True, 2, "cache_pressure", False),
-    (6, 8, True, 1, "cache_pressure", False),
+    (6, 24, False, 3, "cache_pressure", False),
+    (6, 16, True, 1, "cache_pressure", False),
+    (6, 8, True, 0, "cache_pressure", False),
     (6, 24, True, 6, "loop_limit", True),
 ])
-def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
+def test_three_level_request_restarts_exact_state_and_admits_next_loop(
         monkeypatch, graph_mode, loss_at, early_commit, max_loops, slots, repeated, expected_loops, reason, perfect_draft):
     from contextlib import nullcontext
     import threading
@@ -100,6 +108,8 @@ def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
     engine.config.speculative_submit_tokens = 0
     engine.config.speculative_max_loops = max_loops
     engine.config.speculative_prefetch = True
+    engine.config.speculative_prefetch_layer_experts = 4
+    engine.config.speculative_prefetch_gap_capacity = 3
     engine.config.speculative_audit = True
     engine.config.model_config = SimpleNamespace(num_moe_layers=2, num_experts_per_tok=2)
     engine.cpu_moe_executor = None
@@ -127,6 +137,8 @@ def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
             self.phase, self.loop = phase, loop
         def decide(self, loop, count):
             self.ledger.decide(self.ledger.epoch, loop, count)
+        def finish_loop(self, continuing):
+            self.stats["gap_calls"] = self.stats.get("gap_calls", 0) + int(continuing)
         def close(self):
             self.ledger.end()
             self.active = False
@@ -192,10 +204,13 @@ def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
             first_row = result.rounds[0]
             assert first_row["loop_count"] == expected_loops
             assert first_row["flush_reason"] == reason
-            assert first_row["loops"][-1]["verify_rows"] == 4
-            assert first_row["loops"][-1]["stop_after_loop"] == reason
-            assert first_row["loops"][-1]["previous_unique_experts"] == (
-                4 if repeated and expected_loops > 1 else 4 * (expected_loops - 1))
+            if expected_loops:
+                assert first_row["loops"][-1]["verify_rows"] == 4
+                assert first_row["loops"][-1]["next_admission"]["stop_reason"] == reason
+                assert first_row["loops"][-1]["previous_unique_experts"] == (
+                    4 if repeated and expected_loops > 1 else 4 * (expected_loops - 1))
+            else:
+                assert first_row["initial_admission"]["stop_reason"] == "cache_pressure"
             if perfect_draft:
                 assert first_row["submit_rows"] == 25
         assert runner.frontier is None and runner.last_event is None
@@ -205,6 +220,8 @@ def test_three_level_request_restarts_exact_state_and_stops_after_current_loop(
     stopped = runner.generate([1, 2, 3], max_tokens=17, eos_ids=(12,))
     assert stopped.token_ids == list(range(7, 13))
     assert engine.linear_state_pool.recurrent_states[0, 1, 0, 0, 0].item() == 5
+    if not expected_loops:
+        return
     cancel_after_inner, inner_calls = True, 0
     aborted = runner.generate([1, 2, 3], max_tokens=17, cancel=cancellation)
     assert aborted.token_ids == [7]
@@ -386,6 +403,24 @@ def test_decode_metadata_matches_backend_without_host_staging(monkeypatch, width
     runner._batch(ids, 5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 2, 4, 9, 16])
+def test_fused_decode_metadata_matches_noncontiguous_page_table(monkeypatch, width):
+    runner = _metadata_runner(monkeypatch, torch.device("cuda"))
+    runner.metadata_optimized = True
+    runner.engine.page_table.copy_(torch.randperm(64, device="cuda").int().reshape(1, -1) * 7)
+    for start in (0, 3, 29, 1):
+        ids = torch.arange(width, device="cuda", dtype=torch.int32) + start
+        batch = runner._batch(ids, start)
+        expected_indices = torch.cat([runner.engine.page_table[0, :start + row + 1] for row in range(width)])
+        lengths = torch.arange(start + 1, start + width + 1, device="cuda", dtype=torch.int32)
+        torch.testing.assert_close(batch.input_ids, ids)
+        torch.testing.assert_close(batch.positions, lengths - 1)
+        torch.testing.assert_close(batch.out_loc, runner.engine.page_table[0, start:start + width])
+        torch.testing.assert_close(batch.attn_metadata.indptr, torch.cat([lengths.new_zeros(1), lengths.cumsum(0).int()]))
+        torch.testing.assert_close(batch.attn_metadata.indices[:expected_indices.numel()], expected_indices)
+
+
 @pytest.mark.parametrize("page_size,max_seq_len,tail", [
     (4, 10, (12, 12)), (64, 70, (128, 128)), (4, 12, (12, 12)), (1, 10, (9, 10)),
 ])
@@ -535,12 +570,14 @@ def test_terminal_commit_keeps_target_state_and_truthful_draft_frontier(terminal
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_decode_attention_graph_reuses_metadata_across_widths_and_requests(monkeypatch):
+@pytest.mark.parametrize("optimized", [False, True])
+def test_decode_attention_graph_reuses_metadata_across_widths_and_requests(monkeypatch, optimized):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from torch.nn.functional import scaled_dot_product_attention
 
     runner = _metadata_runner(monkeypatch, torch.device("cuda:0"))
+    runner.metadata_optimized = optimized
     backend = runner.engine.attn_backend
     torch.manual_seed(72)
     k = torch.randn(64, 1, 128, dtype=torch.bfloat16, device=runner.engine.device)
@@ -576,6 +613,45 @@ def test_decode_attention_graph_reuses_metadata_across_widths_and_requests(monke
     runner.engine.stream.synchronize()
     assert runner.graph_replays == {"verify": 8}
     assert not runner.graph_fallbacks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_target_capture_exception_joins_copy_fork_before_context_exit(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    runner = _metadata_runner(monkeypatch, torch.device("cuda"))
+    runner.engine.stream = torch.cuda.Stream()
+    runner.engine.stream.wait_stream(torch.cuda.current_stream())
+    runner.engine.linear_state_pool = None
+    runner.engine.model = SimpleNamespace(forward_host_ctx=lambda *args: nullcontext())
+    copy_stream = torch.cuda.Stream()
+    retired = []
+    def retire():
+        runner.engine.stream.wait_stream(copy_stream)
+        retired.append(torch.cuda.is_current_stream_capturing())
+    controller = SimpleNamespace(cross_layer_prefetch=True, retire_layers=retire)
+    runner.engine.moe_offload_cache = SimpleNamespace(speculative_controller=controller)
+    runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
+    runner.use_graph = True
+    value = torch.zeros(1, device="cuda")
+    def target(batch):
+        copy_stream.wait_stream(runner.engine.stream)
+        with torch.cuda.stream(copy_stream):
+            value.add_(1)
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("injected target capture failure")
+        retire()
+        return batch.input_ids, value
+    runner._target = target
+    with torch.cuda.stream(runner.engine.stream):
+        batch = runner._batch(torch.ones(1, dtype=torch.int32, device="cuda"), 0)
+        with pytest.raises(RuntimeError, match="injected target capture failure"):
+            runner._execute("verify", batch)
+        assert not torch.cuda.is_current_stream_capturing()
+    runner.engine.stream.synchronize()
+    assert retired == [False, True]
+    assert not runner.graphs
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

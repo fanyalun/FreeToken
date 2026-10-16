@@ -6,6 +6,8 @@ import time
 import threading
 
 import torch
+import triton
+import triton.language as tl
 
 from freetoken.attention.linear import FLAMetadata, build_fla_metadata
 from freetoken.attention.triton import TritonMetadata
@@ -15,6 +17,24 @@ from .speculative import Proposal, VerifyResult, SpeculativeFrontier, Speculativ
 
 
 _EARLY_COMMIT = os.getenv("FREETOKEN_MTP_EARLY_COMMIT", "1") != "0"
+
+
+@triton.jit
+def _decode_metadata(ids, page_table, inputs, positions, out_loc, indptr, indices,
+                     start, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(1)
+    col = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    end = start + row + 1
+    offset = row * (start + 1) + row * (row - 1) // 2
+    values = tl.load(page_table + col, col < end, 0)
+    tl.store(indices + offset + col, values, col < end)
+    if tl.program_id(0) == 0:
+        tl.store(inputs + row, tl.load(ids + row))
+        tl.store(positions + row, end - 1)
+        tl.store(out_loc + row, tl.load(page_table + end - 1))
+        tl.store(indptr + row, offset)
+        if row == WIDTH - 1:
+            tl.store(indptr + WIDTH, offset + end)
 
 
 @dataclass
@@ -90,6 +110,7 @@ class QwenMTPRunner:
         self._request_lock = threading.Lock()
         self.graphs = {}
         self._decode_batches = {}
+        self.metadata_optimized = getattr(engine.config, "speculative_execution_implementation", "reference") == "optimized"
         self._reserved_len = 0
         self.graph_replays = {}
         self.graph_fallbacks = {}
@@ -155,20 +176,28 @@ class QwenMTPRunner:
             )
             self._decode_batches[n] = batch, offsets
         batch, offsets = self._decode_batches[n]
-        batch.input_ids.copy_(ids)
-        torch.add(offsets, start, out=batch.positions)
-        batch.out_loc.copy_(self.engine.page_table[0, start:start + n])
+        optimized = getattr(self, "metadata_optimized", False) and ids.is_cuda
+        if optimized:
+            _decode_metadata[(triton.cdiv(start + n, 256), n)](ids, self.engine.page_table,
+                batch.input_ids, batch.positions, batch.out_loc, batch.attn_metadata.indptr,
+                batch.attn_metadata.indices, start, n, 256)
+        else:
+            batch.input_ids.copy_(ids)
+            torch.add(offsets, start, out=batch.positions)
+            batch.out_loc.copy_(self.engine.page_table[0, start:start + n])
         batch.gdn_verify_state = state
         batch.rowwise_linear = self.mtp_enabled
         metadata = batch.attn_metadata
-        torch.add(batch.positions, 1, out=metadata.indptr[1:])
-        metadata.indptr[1:].cumsum_(0)
+        if not optimized:
+            torch.add(batch.positions, 1, out=metadata.indptr[1:])
+            metadata.indptr[1:].cumsum_(0)
         offset = 0
         for row, req in enumerate(batch.reqs):
             end = start + row + 1
             req.cached_len, req.device_len = end - 1, end
             req.input_ids = req._ids_buf[:end]
-            metadata.indices[offset:offset + end].copy_(self.engine.page_table[0, :end])
+            if not optimized:
+                metadata.indices[offset:offset + end].copy_(self.engine.page_table[0, :end])
             offset += end
         return batch
 
@@ -226,7 +255,16 @@ class QwenMTPRunner:
             static = batch
             fixed_hidden = hidden.clone() if hidden is not None else None
             fixed_count = count.clone() if count is not None else None
-            fn = lambda: self._target(static) if fixed_hidden is None else self._draft(static, fixed_hidden, fixed_count)
+            def fn():
+                try:
+                    return self._target(static) if fixed_hidden is None else self._draft(static, fixed_hidden, fixed_count)
+                except BaseException:
+                    cache = getattr(self.engine, "moe_offload_cache", None)
+                    controller = getattr(cache, "speculative_controller", None)
+                    if fixed_hidden is None and getattr(controller, "cross_layer_prefetch", False):
+                        # A failed capture must join its forks before the graph context exits.
+                        controller.retire_layers()
+                    raise
             with self.engine.model.forward_host_ctx(static, True):
                 pool = self.engine.linear_state_pool
                 restore = None

@@ -18,10 +18,10 @@ class WindowBudget:
         maximum = max_loops * (depth + 1) + 1
         return cls(min(maximum, limit or maximum), slots, layers * top_k, max_loops)
 
-    def stop_after_loop(self, completed: int, previous_experts: int, width: int):
+    def before_loop(self, completed: int, previous_experts: int, width: int, blocked_slots: int = 0):
         if completed >= self.max_loops:
             return "loop_limit"
-        if previous_experts + width * self.routes_per_row > self.cache_slots:
+        if previous_experts + blocked_slots + width * self.routes_per_row > self.cache_slots:
             return "cache_pressure"
         return None
 

@@ -73,7 +73,12 @@ class EngineConfig:
     speculative_submit_tokens: int = 0
     speculative_max_loops: int = 6
     speculative_prefetch: bool = True
+    speculative_prefetch_layer_experts: int = 4
+    speculative_prefetch_gap_capacity: int = 0
     speculative_audit: bool = False
+    speculative_expert_scheduler: str = "host"
+    speculative_compact_control: bool = True
+    speculative_execution_implementation: str = "reference"
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -110,6 +115,18 @@ class EngineConfig:
             raise ValueError("speculative_submit_tokens must be nonnegative (0 uses the loop limit)")
         if self.speculative_max_loops < 1:
             raise ValueError("speculative_max_loops must be positive")
+        if self.speculative_expert_scheduler not in ("host", "gpu"):
+            raise ValueError("speculative_expert_scheduler must be host or gpu")
+        if self.speculative_execution_implementation not in ("reference", "optimized"):
+            raise ValueError("speculative_execution_implementation must be reference or optimized")
+        if self.speculative_execution_implementation == "optimized" and not self.speculative_compact_control:
+            raise ValueError("optimized execution requires compact control")
+        if self.speculative_expert_scheduler == "gpu" and not self.speculative_three_level:
+            raise ValueError("GPU expert scheduling requires three-level decoding")
+        if self.speculative_expert_scheduler == "gpu" and (self.moe_strategy in ("cpu", "hybrid") or self.moe_cpu_layers):
+            raise ValueError("GPU expert scheduling requires GPU offload")
+        if min(self.speculative_prefetch_layer_experts, self.speculative_prefetch_gap_capacity) < 0:
+            raise ValueError("speculative prefetch quotas must be nonnegative")
         if self.speculative_three_level and self.speculative_mtp_depth != 3:
             raise ValueError("three-level decoding requires speculative_mtp_depth=3")
         if self.speculative_submit_tokens and not self.speculative_three_level:

@@ -64,9 +64,20 @@ class ThreeLevelCoordinator:
         self.budget = WindowBudget.resolve(cache.cache_size, mc.num_moe_layers, mc.num_experts_per_tok,
                                            cache.num_experts, engine.config.speculative_submit_tokens,
                                            engine.config.speculative_max_loops, engine.config.speculative_mtp_depth)
-        self.experts = SpeculativeExpertCache(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
+        cache_type = SpeculativeExpertCache
+        extra = {}
+        if getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu":
+            from freetoken.moe.speculative_gpu import GPUExpertCache
+            cache_type = GPUExpertCache
+            extra = dict(max_loops=self.budget.max_loops, max_rows=self.budget.submit_rows,
+                         top_k=mc.num_experts_per_tok,
+                         compact_control=getattr(engine.config, "speculative_compact_control", True),
+                         implementation=getattr(engine.config, "speculative_execution_implementation", "reference"))
+        self.experts = cache_type(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
                                                use_graph=runner.use_graph, audit=engine.config.speculative_audit,
-                                               max_rows=max(4, self.budget.submit_rows), top_k=mc.num_experts_per_tok)
+                                               layer_quota=engine.config.speculative_prefetch_layer_experts,
+                                               gap_capacity=engine.config.speculative_prefetch_gap_capacity, **extra)
+        self.compact_control = getattr(self.experts, "compact_control", False)
         pool = engine.linear_state_pool
         self.private_pool = SimpleNamespace(
             recurrent_states=torch.empty_like(pool.recurrent_states[:, 1:2]),
@@ -83,10 +94,34 @@ class ThreeLevelCoordinator:
     def _forward(self, inputs, start, state):
         runner = self.runner
         batch = runner._batch(inputs, start, state=state)
+        if getattr(self.experts, "gpu_schedule", False):
+            if self.experts.cross_layer_prefetch:
+                self.experts.join_gap()
+            else:
+                self.engine.stream.wait_stream(self.experts.copy_stream)
+            phase = f"three_level_{self.experts.phase}_{int(self.experts.prefetch)}"
+            if self.compact_control:
+                phase += "_compact"
+            phase += f"_{self.experts.implementation}_{id(self)}"
+            result = runner._execute(phase, batch)
+            if not self.compact_control:
+                self.experts.check_error()
+            return result
         # Host route admission splits the target forward; only expert compute is graphed.
         runner.graph_fallbacks["target_host_schedule"] = runner.graph_fallbacks.get("target_host_schedule", 0) + 1
+        profile = getattr(self.experts, "profiler", None)
+        if profile is not None and self.experts.phase == "preverify":
+            profile.verify_start(self.experts.loop, len(inputs), self.engine.stream)
         with self.engine.model.forward_host_ctx(batch, False):
-            return runner._target(batch)
+            result = runner._target(batch)
+        if profile is not None and self.experts.phase == "preverify":
+            profile.verify_end(self.experts.loop, len(inputs), self.engine.stream)
+        return result
+
+    def _candidate_tokens(self, candidates, anchor):
+        if getattr(self.experts, "stage_candidates", False):
+            return self.experts.candidate_buffer[:len(candidates)]
+        return torch.tensor(candidates, dtype=anchor.dtype, device=anchor.device)
 
     def step(self, anchor, remaining, eos_ids, cancelled):
         runner, engine = self.runner, self.engine
@@ -101,34 +136,63 @@ class ThreeLevelCoordinator:
         first_anchor, current = anchor.clone(), anchor.clone()
         self.experts.begin(self.epoch)
         row = None
+        completed = False
         graph_start = self.experts.graph_replays
         flush_reason = "output_or_submit_limit"
+        width = window.next_width(engine.config.speculative_mtp_depth, remaining)
+        capacity = (dict(protected_experts=0, blocked_slots=0, available_slots=self.budget.cache_slots)
+                    if self.compact_control else self.experts.ledger.capacity())
+        stop_reason = self.budget.before_loop(0, capacity["protected_experts"], width, capacity["blocked_slots"])
+        initial_admission = {**capacity, "verify_rows": width, "required_slots": width * self.budget.routes_per_row,
+                             "stop_reason": stop_reason}
         try:
-            while window.next_width(engine.config.speculative_mtp_depth, remaining) > 0 and not cancelled():
-                width = window.next_width(engine.config.speculative_mtp_depth, remaining)
-                ledger = self.experts.ledger
-                previous_experts = len(ledger.refs)
-                stop_reason = self.budget.stop_after_loop(len(window.loops) + 1, previous_experts, width)
+            while width > 0 and not stop_reason and not cancelled():
+                previous_experts = capacity["protected_experts"]
                 runner.frontier = private
                 proposal = runner.coordinator.prepare(private, current, width - 1)
                 inputs = proposal.verify_inputs()
+                self.experts.input_offset = len(window.candidates)
                 self.experts.set_phase("preverify", len(window.loops))
                 tokens, hidden = self._forward(inputs, private.target_valid_len, self.private_states[width])
                 verified = VerifyResult(tokens, hidden)
                 commit = runner._accept(proposal, verified, width, eos_ids)
-                self.private_states[width].commit(commit.input_count)
-                drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
-                                     commit.terminal.reshape(1))).tolist()
-                count, accepted = drained[-3:-1]
-                self.experts.decide(len(window.loops), count)
-                window.append(drained[:count], {"drafted": width - 1, "accepted": accepted,
-                                                "accepted_before_stop": min(accepted, count - 1),
-                                                "previous_unique_experts": previous_experts, "verify_rows": width,
-                                                "worst_case_experts": previous_experts + width * self.budget.routes_per_row,
-                                                "stop_after_loop": stop_reason})
+                if self.compact_control:
+                    control = self.experts.read_control(tokens, commit, loop=len(window.loops),
+                        candidates=len(window.candidates), candidate_limit=window.candidate_limit,
+                        remaining=remaining, depth=engine.config.speculative_mtp_depth)
+                    count, accepted = control[:2]
+                    drained = control[8:]
+                    # Invalid forwards must never update private or canonical GDN state.
+                    self.private_states[width].commit(commit.input_count)
+                else:
+                    self.private_states[width].commit(commit.input_count)
+                    drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
+                                         commit.terminal.reshape(1))).tolist()
+                    count, accepted = drained[-3:-1]
+                    self.experts.decide(len(window.loops), count)
+                loop = {"drafted": width - 1, "accepted": accepted,
+                        "accepted_before_stop": min(accepted, count - 1),
+                        "previous_unique_experts": previous_experts, "verify_rows": width,
+                        "blocked_slots": capacity["blocked_slots"],
+                        "worst_case_experts": previous_experts + width * self.budget.routes_per_row}
+                window.append(drained[:count], loop)
+                if self.compact_control:
+                    width = control[5]
+                    capacity = dict(protected_experts=control[6], blocked_slots=control[7],
+                                    available_slots=self.budget.cache_slots - control[6] - control[7])
+                    stop_reason = (None, "loop_limit", "cache_pressure")[control[4]]
+                else:
+                    width = window.next_width(engine.config.speculative_mtp_depth, remaining)
+                    capacity = self.experts.ledger.capacity()
+                    stop_reason = self.budget.before_loop(len(window.loops), capacity["protected_experts"], width,
+                                                          capacity["blocked_slots"])
+                window.loops[-1].update(next_admission={**capacity, "verify_rows": width,
+                                                       "required_slots": width * self.budget.routes_per_row,
+                                                       "stop_reason": stop_reason}, stop_after_loop=stop_reason)
                 current = tokens[count - 1:count].clone()
                 inner_eos = drained[count - 1] in eos_ids
-                reconcile_inner = not inner_eos and not stop_reason and window.next_width(engine.config.speculative_mtp_depth, remaining) > 0 and not cancelled()
+                reconcile_inner = not inner_eos and not stop_reason and width > 0 and not cancelled()
+                self.experts.finish_loop(reconcile_inner)
                 if reconcile_inner:
                     runner.coordinator.proposer.reconcile(hidden, commit)
                 private.commit_target(count)
@@ -141,23 +205,34 @@ class ThreeLevelCoordinator:
                     flush_reason = stop_reason
                 if inner_eos or stop_reason:
                     break
+            if stop_reason:
+                flush_reason = stop_reason
             runner.frontier = exact
             if cancelled():
                 return [], anchor, {"cancelled": True}
-            candidates = torch.tensor(window.candidates, dtype=anchor.dtype, device=anchor.device)
+            candidates = self._candidate_tokens(window.candidates, anchor)
             proposal = Proposal(first_anchor, candidates)
             inputs = proposal.verify_inputs()
             end = runner._reserve(exact.reserve_end(len(inputs)))
             exact.begin(end, len(inputs))
             self.experts.set_phase("verify")
+            if getattr(self.experts, "gpu_schedule", False):
+                self.experts.loop_count = len(window.loops)
+                self.experts.verify_rows = len(inputs)
             state = runner.states[len(inputs)]
             tokens, hidden = self._forward(inputs, start, state)
             verified = VerifyResult(tokens, hidden)
             commit = runner._accept(proposal, verified, remaining, eos_ids)
-            runner._commit_state(state, commit.input_count)
-            drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
-                                 commit.terminal.reshape(1))).tolist()
-            count, accepted, terminal = drained[-3:]
+            if self.compact_control:
+                control = self.experts.read_control(tokens, commit)
+                count, accepted, terminal = control[:3]
+                drained = control[8:]
+                runner._commit_state(state, commit.input_count)
+            else:
+                runner._commit_state(state, commit.input_count)
+                drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
+                                     commit.terminal.reshape(1))).tolist()
+                count, accepted, terminal = drained[-3:]
             reconcile = not terminal and not cancelled()
             if reconcile:
                 runner.coordinator.proposer.reconcile(hidden, commit)
@@ -169,21 +244,31 @@ class ThreeLevelCoordinator:
             # Inner rounds can reserve beyond the outer accepted prefix.
             exact.allocated_len = runner._reserved_len
             runner.coordinator.drain(exact, count, reconciled=reconcile)
+            collect_stats = not self.compact_control or self.experts.audit
+            if getattr(self.experts, "gpu_schedule", False) and collect_stats:
+                self.experts.export_records()
             row = {"drafted": len(candidates), "accepted": accepted, "returned": count,
                    "submit_rows": len(inputs), "submit_row_limit": self.budget.submit_rows,
                    "max_loops": self.budget.max_loops, "cache_slots": self.budget.cache_slots,
+                   "target_reserve_slots": 0, "initial_admission": initial_admission,
                    "loop_count": len(window.loops),
                    "loops": window.survival(min(accepted, count)), "epoch": self.epoch,
                    "flush_reason": "provisional_eos" if window.candidates and window.candidates[-1] in eos_ids else
-                                   "single_row_submit" if not window.candidate_limit else flush_reason,
-                   "route_metrics": route_metrics(self.experts.records, window.loops, self.experts.cache.num_experts, count)}
+                                   "single_row_submit" if not window.candidate_limit else flush_reason}
+            if collect_stats:
+                row["route_metrics"] = route_metrics(self.experts.records, window.loops,
+                                                     self.experts.cache.num_experts, count)
             if self.experts.audit:
                 row["routes"] = self.experts.records
+            completed = True
             return drained[:count], tokens[count - 1:count].clone(), row
         finally:
             runner.frontier = exact
-            self.experts.close()
-            if row is not None:
+            if self.compact_control:
+                self.experts.close(abort=not completed)
+            else:
+                self.experts.close()
+            if row is not None and (not self.compact_control or self.experts.audit):
                 row["cache_stats"] = dict(self.experts.stats)
                 row["expert_graph_replays"] = self.experts.graph_replays - graph_start
                 row["prefetched_unique_experts"] = len(self.experts.prefetched)

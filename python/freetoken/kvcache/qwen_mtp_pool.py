@@ -36,8 +36,6 @@ class QwenMTPKVCache(MHAKVCache):
                 + (rows + len(widths) * (group.conv_kernel_dim - 2)) * layers * channels * config.dtype.itemsize
                 + len(widths) * 12
                 + linear_state_bytes_per_req(group, config.tp_info.size, config.dtype)
-                + min(mc.num_experts, max(4, upper) * mc.num_experts_per_tok)
-                * 3 * mc.hidden_size * mc.moe_intermediate_size // config.tp_info.size * config.dtype.itemsize
             )
         return per_page + draft_page, fixed + scratch, page_tokens, reserve
 

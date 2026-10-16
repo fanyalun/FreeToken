@@ -59,5 +59,4 @@ def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
     private = [QwenGDNVerifyState(pool, [layer], w, 0) for w in range(1, 5)]
     hybrid_plan = 9 * mc.num_experts_per_tok * 8 + 3 * 16
     expected = sum(s.bytes() for s in [*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16) + hybrid_plan
-    expected += min(64, max(4, maximum) * mc.num_experts_per_tok) * 3 * mc.hidden_size * mc.moe_intermediate_size * config.dtype.itemsize
     assert QwenMTPKVCache.kv_cost(config)[1] == expected

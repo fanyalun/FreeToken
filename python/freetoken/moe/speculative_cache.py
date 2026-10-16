@@ -66,6 +66,12 @@ class ExpertLeases:
         self.reap()
         return owner in self.slots and self.slots[owner] not in self.pending
 
+    def capacity(self):
+        self.reap()
+        blocked = sum(not self.refs[self.owners[slot]] for slot in self.pending.keys() | self.readers.keys())
+        return {"protected_experts": len(self.refs), "blocked_slots": blocked,
+                "available_slots": len(self.owners) - len(self.refs) - blocked}
+
     def allocate(self, owner, active=()):
         self.reap()
         if owner in self.slots:
@@ -93,7 +99,8 @@ class ExpertLeases:
 
 
 class SpeculativeExpertCache:
-    def __init__(self, cache, stream, *, prefetch=True, use_graph=False, audit=False, max_rows=4, top_k=8):
+    def __init__(self, cache, stream, *, prefetch=True, use_graph=False, audit=False,
+                 layer_quota=4, gap_capacity=0):
         if cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
             raise ValueError("three-level decoding requires BF16 experts with pinned GPU-offload banks")
         from freetoken.layers.moe import _HYBRID_OVERLAP, _HYBRID_WINDOW
@@ -103,8 +110,10 @@ class SpeculativeExpertCache:
         self.cache, self.stream = cache, stream
         self.prefetch, self.use_graph, self.audit = prefetch, use_graph, audit
         self.copy_stream = torch.cuda.Stream(device=cache.device)
-        self.scratch = tuple(torch.empty((min(cache.num_experts, max_rows * top_k), *bank.shape[1:]),
-                                         device=bank.device, dtype=bank.dtype) for _, bank in cache.banks)
+        self.layer_quota, self.gap_capacity = layer_quota, gap_capacity
+        self.input_offset = 0
+        self.profiler = None
+        self.queued = OrderedDict()
         self.ledger = None
         self.graphs = {}
         self.graph_replays = 0
@@ -121,7 +130,9 @@ class SpeculativeExpertCache:
         self.ledger.begin(epoch)
         self.epoch, self.phase, self.loop = epoch, "preverify", 0
         self.records, self.stats = [], Counter()
+        self.queued.clear()
         self.transfers, self.consumers = [], []
+        self.first_demands = []
         self.origin = torch.cuda.Event(enable_timing=True) if self.audit else None
         if self.origin is not None:
             self.origin.record(self.stream)
@@ -137,12 +148,67 @@ class SpeculativeExpertCache:
     def set_phase(self, phase, loop=0):
         self.phase, self.loop = phase, loop
 
+    def _cancel_queued(self, *, all_tasks=False):
+        for owner in list(self.queued):
+            if all_tasks or not self.ledger.refs[owner]:
+                del self.queued[owner]
+                self.stats["discarded_queued_prefetch" if all_tasks else "cancelled_queued_prefetch"] += 1
+
+    def _pump_prefetch(self, limit, *, layer=None):
+        self.ledger.reap()
+        submitted = 0
+        for owner in sorted(self.queued, key=lambda owner: (*self.queued[owner], owner)):
+            if layer is not None and self.queued[owner][0] != layer:
+                continue
+            if owner in self.ledger.slots:
+                del self.queued[owner]
+                continue
+            if submitted >= limit:
+                break
+            try:
+                self._copy(owner, (), prefetch=True)
+            except NoEvictableSlot:
+                break
+            del self.queued[owner]
+            submitted += 1
+        return submitted
+
+    def _queue_prefetch(self, layer, rows, demanded):
+        for index, ids in enumerate(rows):
+            for column, expert in enumerate(ids):
+                owner = layer * self.cache.num_experts + expert
+                if owner not in demanded and owner not in self.ledger.slots:
+                    priority = layer, self.input_offset + index, column
+                    self.queued[owner] = min(priority, self.queued.get(owner, priority))
+        self.stats["queued_prefetch_peak"] = max(self.stats["queued_prefetch_peak"], len(self.queued))
+        self.stats["layer_prefetch_loads"] += self._pump_prefetch(self.layer_quota, layer=layer)
+
+    def finish_loop(self, continuing):
+        if continuing and self.prefetch:
+            self.stats["gap_prefetch_loads"] += self._pump_prefetch(max(0, self.gap_capacity - 1))
+        self._cancel_queued(all_tasks=True)
+
     def _copy(self, owner, active, *, prefetch):
         ledger, cache = self.ledger, self.cache
-        slot, missing = ledger.allocate(owner, active)
+        if not prefetch:
+            self.queued.pop(owner, None)
+        try:
+            slot, missing = ledger.allocate(owner, active)
+        except NoEvictableSlot:
+            blocked = next((slot for slot in ledger.lru
+                            if not ledger.refs[ledger.owners[slot]] and ledger.owners[slot] not in active
+                            and (slot in ledger.pending or slot in ledger.readers)), None)
+            if prefetch or blocked is None:
+                raise
+            for table in (ledger.pending, ledger.readers):
+                if blocked in table:
+                    table[blocked].synchronize()
+            self.stats["demand_slot_waits"] += 1
+            slot, missing = ledger.allocate(owner, active)
         if missing:
             layer, expert = divmod(owner, cache.num_experts)
-            stream = self.copy_stream if prefetch else self.stream
+            # One IO stream preserves demand-before-background submission order.
+            stream = self.copy_stream
             with torch.cuda.stream(stream):
                 begin = torch.cuda.Event(enable_timing=True) if self.audit else None
                 if begin is not None:
@@ -163,14 +229,14 @@ class SpeculativeExpertCache:
             self.stream.wait_event(ledger.pending[slot])
         return slot
 
-    def _compute(self, layer, hidden, weights, slots, *, scratch=False):
+    def _compute(self, layer, hidden, weights, slots):
         cache = self.cache
         def run(x, w, ids):
-            return layer._expert_gemm(cache, x, w, ids, views=self.scratch if scratch else cache.bank_views(), n=None,
+            return layer._expert_gemm(cache, x, w, ids, views=cache.bank_views(), n=None,
                                       alphas=cache.alphas_for_slots(layer.layer_id), is_prefill=False)
         if not self.use_graph:
             return run(hidden, weights, slots)
-        key = layer.layer_id, hidden.shape[0], scratch
+        key = layer.layer_id, hidden.shape[0]
         if key not in self.graphs:
             x, w, ids = hidden.clone(), weights.clone(), slots.clone()
             run(x, w, ids)
@@ -192,10 +258,21 @@ class SpeculativeExpertCache:
         cache, ledger = self.cache, self.ledger
         rows = ids.cpu().tolist()
         li, experts = layer.layer_id, cache.num_experts
+        if self.audit and self.phase == "preverify" and li == 0:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record(self.stream)
+            self.first_demands.append((self.loop, event))
+        profile = self.profiler
+        if profile is not None and self.phase == "preverify":
+            profile.route_start(self.loop, li, len(rows), self.stream)
         ledger.reap()
         ready_owners = {owner for owner, slot in ledger.slots.items() if slot not in ledger.pending}
         if self.phase == "preverify":
             ledger.observe(self.epoch, self.loop, li, rows, experts)
+        else:
+            # Routing is now exact; this layer's predicted experts need no further lease.
+            ledger.release_layer(li)
+            self._cancel_queued()
         ready = [[li * experts + expert in ready_owners for expert in row] for row in rows]
         resident = torch.tensor(ready, dtype=torch.bool, device=ids.device)
         if self.phase == "preverify":
@@ -221,46 +298,25 @@ class SpeculativeExpertCache:
             missing = sorted((owner for owner in demanded if owner not in ledger.slots),
                              key=lambda owner: (-self.recency[owner], owner) if _HYBRID_FETCH_BY_RECENCY else (0, owner))
             fraction = min(65536, max(0, round(cache.hybrid_fetch_fraction * 65536)))
-            fetch = cache.hybrid_max_fetch
+            fetch = cache.hybrid_max_fetch * hidden.shape[0]
             if fraction:
                 lo = len(missing) * fraction // 65536
                 cost_lo = max(lo * (65536 - fraction), (len(missing) - lo) * fraction)
                 cost_hi = max((lo + 1) * (65536 - fraction), (len(missing) - lo - 1) * fraction)
                 fetch = lo if cost_lo <= cost_hi else lo + 1
             gpu.difference_update(missing[max(0, fetch):])
-        scratch = False
         try:
             for owner in sorted(gpu):
                 self._copy(owner, demanded, prefetch=False)
-        except NoEvictableSlot:
-            # The pressure rule finishes this loop; overflow cannot evict a locked prefix.
-            scratch = True
-            self.stats["scratch_layers"] += 1
-        if scratch:
-            mapping = {owner: slot for slot, owner in enumerate(sorted(gpu))}
-            for owner, slot in mapping.items():
-                source_layer, expert = divmod(owner, experts)
-                cached_slot = ledger.slots.get(owner)
-                if cached_slot is not None and cached_slot in ledger.pending:
-                    self.stream.wait_event(ledger.pending[cached_slot])
-                begin = torch.cuda.Event(enable_timing=True) if self.audit else None
-                if begin is not None:
-                    begin.record(self.stream)
-                for (sources, cached), bank in zip(cache.banks, self.scratch):
-                    source = sources[source_layer][expert] if cached_slot is None else cached[cached_slot]
-                    bank[slot].copy_(source, non_blocking=True)
-                if begin is not None:
-                    event = torch.cuda.Event(enable_timing=True)
-                    event.record(self.stream)
-                    self.transfers.append((owner, slot, "scratch_h2d" if cached_slot is None else "scratch_d2d",
-                                           self.phase, self.loop, False, begin, event))
-                if cached_slot is not None:
-                    reader = torch.cuda.Event()
-                    reader.record(self.stream)
-                    ledger.readers[cached_slot] = reader
-                self.stats["scratch_loads" if cached_slot is None else "scratch_d2d_experts"] += 1
-        else:
-            mapping = ledger.slots
+        except NoEvictableSlot as error:
+            self.stats["capacity_failures"] += 1
+            raise NoEvictableSlot(f"{self.phase} layer {li} cannot fit its exact GPU working set with R=0; "
+                                 f"capacity={ledger.capacity()}, demanded={len(gpu)}") from error
+        mapping = ledger.slots
+        if profile is not None and self.phase == "preverify":
+            profile.demand_done(self.loop, li, len(rows), self.stream)
+        if self.phase == "preverify" and self.prefetch:
+            self._queue_prefetch(li, rows, gpu)
         gpu_mask = torch.tensor([[li * experts + expert in gpu and retained
                                   for expert, retained in zip(row, mask)] for row, mask in zip(rows, kept)],
                                 dtype=torch.bool, device=ids.device)
@@ -277,23 +333,17 @@ class SpeculativeExpertCache:
             pending_cpu = cache.cpu_executor.decode_submit(li, hidden, weights, cpu_ids)
             if not self.hybrid_overlap:
                 cpu_result = cache.cpu_executor.decode_sync(pending_cpu)
-        if self.phase == "preverify" and self.prefetch:
-            predicted = {li * experts + expert for row in rows for expert in row}
-            for owner in sorted(predicted - gpu):
-                try:
-                    self._copy(owner, demanded, prefetch=True)
-                except NoEvictableSlot:
-                    self.stats["deferred_prefetch_experts"] += 1
         if self.audit and self.phase == "verify":
             consumer = torch.cuda.Event(enable_timing=True)
             consumer.record(self.stream)
             self.consumers.append((li, consumer))
-        result = self._compute(layer, hidden, gpu_weights, gpu_ids, scratch=scratch) if gpu else torch.zeros_like(hidden)
+        if profile is not None and gpu and self.phase == "preverify":
+            profile.capture_probe(layer, cache, hidden, gpu_weights, gpu_ids)
+        result = self._compute(layer, hidden, gpu_weights, gpu_ids) if gpu else torch.zeros_like(hidden)
         reader = torch.cuda.Event()
         reader.record(self.stream)
-        if not scratch:
-            for owner in gpu:
-                ledger.readers[ledger.slots[owner]] = reader
+        for owner in gpu:
+            ledger.readers[ledger.slots[owner]] = reader
         if pending_cpu is not None:
             result = result + (cpu_result if cpu_result is not None else cache.cpu_executor.decode_sync(pending_cpu))
         self.clock += 1
@@ -306,12 +356,11 @@ class SpeculativeExpertCache:
         self.records.append({"phase": self.phase, "loop": self.loop, "layer": li, "ids": rows,
                              "ready": ready} if self.audit else
                             {"phase": self.phase, "loop": self.loop, "layer": li, "ids": rows})
-        if self.phase == "verify":
-            ledger.release_layer(li)
         return result
 
     def decide(self, loop, consumed):
         self.ledger.decide(self.epoch, loop, consumed)
+        self._cancel_queued()
 
     def transfer_audit(self):
         return {"scope": "CUDA event times relative to window start; expert copies include all weight banks",
@@ -320,11 +369,14 @@ class SpeculativeExpertCache:
                                "end_ms": self.origin.elapsed_time(end)}
                               for owner, slot, storage, phase, loop, prefetch, begin, end in self.transfers],
                 "target_consumers": [{"layer": li, "start_ms": self.origin.elapsed_time(event)}
-                                     for li, event in self.consumers]}
+                                     for li, event in self.consumers],
+                "preverify_first_demands": [{"loop": loop, "start_ms": self.origin.elapsed_time(event)}
+                                            for loop, event in self.first_demands]}
 
     def close(self):
         if not self.active:
             return
+        self._cancel_queued(all_tasks=True)
         self.copy_stream.synchronize()
         self.stream.synchronize()
         ledger, cache = self.ledger, self.cache
@@ -346,6 +398,6 @@ class SpeculativeExpertCache:
         cache.speculative_controller = None
         expert_bytes = sum(bank[0].numel() * bank.element_size() for _, bank in cache.banks)
         self.stats["expert_bytes"] = expert_bytes
-        for key in ("prefetch_loads", "demand_loads", "scratch_loads", "target_timely_prefetch"):
+        for key in ("prefetch_loads", "demand_loads", "target_timely_prefetch"):
             self.stats[key + "_bytes"] = self.stats[key] * expert_bytes
         self.active = False

@@ -230,6 +230,7 @@ config = SchedulerConfig(
     model_path=model_path, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
     speculative_mtp_depth=3, speculative_three_level=True,
     speculative_submit_tokens=0, speculative_max_loops=6, speculative_prefetch=True,
+    speculative_prefetch_layer_experts=4, speculative_prefetch_gap_capacity=0,
     speculative_audit=False, max_running_req=1,
     attention_backend="triton", moe_strategy="offload", moe_cache_auto=True,
     kv_reserve_tokens=4096, max_seq_len_override=4096,
@@ -241,20 +242,22 @@ config = SchedulerConfig(
 Import `SchedulerConfig` from `freetoken.scheduler.config`. `speculative_submit_tokens`
 counts actual Target input rows, including the pending anchor; zero applies no
 additional row cap. `speculative_max_loops` defaults to six and must be positive.
-A loop appends its accepted
-draft prefix and one correction/bonus to a provisional window, then continues
+A loop appends its accepted draft prefix and one correction/bonus to a provisional window, then continues
 from that window's private state. Sparse verification keeps the four largest
 router weights, with stable original-order ties, plus ready GPU-resident experts;
 other route contributions are zeroed without renormalizing.
 
 Before each loop, `m` counts distinct `(layer, expert)` identities referenced by
 the consumed input rows of all earlier loops, after rejected rows are released.
-`w` is this loop's verification input row count, including its anchor; `L` is
-the number of MoE layers and `k` is top-k. If `m + w * L * k > cache_slots`,
-the current loop still runs at its planned width and finishes before full Target
-verification. Equality does not trigger this stop. Reaching the loop limit also
-flushes after the current loop. Cache pressure never shortens or skips that loop;
-an explicit row cap or the remaining output count can shorten it. Expert reuse
+`q` counts slots outside that set with an unfinished submitted copy or reader,
+counting each slot once. `w` is the next loop's verification input row count,
+including its anchor; `L` is the number of MoE layers and `k` is top-k.
+Start the next loop only if `cache_slots - m - q >= w * L * k`; equality admits it.
+Otherwise submit the accumulated candidates directly to full Target verification.
+If the first loop cannot be admitted, perform a single complete Target step.
+Reaching the loop limit also flushes before another loop can start. Cache pressure
+does not shorten a loop to make it fit; an explicit row cap or remaining output
+count can shorten it. Expert reuse
 therefore permits many more tokens than a total-token worst-case cache bound.
 The default workspace supports up to `6 * (3 + 1) + 1 = 25` Target input rows;
 this allocation bound is independent of cache capacity.
@@ -271,8 +274,15 @@ Cache rebuild invalidates graphs and creates a new coordinator against the new
 slot geometry. Private state and wide verification workspaces are included in
 startup/rebuild fixed-memory accounting.
 
-Each observed router window prefetches all top-k expert identities, including
-skipped routes. References are attached to processed input positions, not newly
+Each observed router window queues all top-k expert identities, including skipped
+routes. After submitting its demand copies, each router submits at most
+`speculative_prefetch_layer_experts` background experts from this layer, ranked by
+the earliest input position that activated each expert. Expert identities are
+deduplicated. A host queue keeps the remaining unsubmitted requests cancellable.
+Rejected-row-only queued requests are cancelled, while shared requests survive.
+Once a copy is submitted to CUDA, even if it has not started executing, its slot
+remains protected until its completion event. Queued requests allocate no slot;
+demand promotes a queued request immediately. References attach to processed input positions, not newly
 predicted output positions. Inner rejection releases only rejected-row references;
 shared resident experts remain locked. In-flight copies and expert readers cannot be
 evicted. Transfers have completion events, and pending experts are not considered
@@ -281,15 +291,48 @@ ready expert: reading an arbitrary slot can race with prefetch or propagate NaN
 despite a zero route weight. A hybrid layer with no GPU routes skips the GPU
 expert kernel entirely. Full Target computes all routes, supplementing any
 incorrect prefetch prediction by normal demand fetch or hybrid CPU computation.
-When no cache slot can be evicted, prefetch is deferred. If demand also cannot
-fit, a separate reusable layer workspace computes that layer's GPU routes without
-evicting locked experts, including during full Target verification. Nonresident
-accepted expert identities remain in the reference set used for `m`. This BF16
-workspace holds at most `min(E, max(4, submit_row_limit) * k)` experts, is included
-in fixed-memory planning, and does not add slots to the pressure threshold.
-`scratch_layers`, `scratch_loads_bytes` and `deferred_prefetch_experts` expose
-this fallback's cost. Per-loop audit rows record `previous_unique_experts`,
-`verify_rows`, `worst_case_experts` and `stop_after_loop`.
+No separate expert-weight scratch or Target margin is allocated: `R=0`.
+Nonresident accepted expert identities still count in `m`. Once a Target layer's
+exact routes are known, its predicted leases are released before demand admission;
+future layers remain protected. Demand can wait on the completion events of a
+reusable slot, but never overwrites a pending copy or active reader. If the exact
+Target working set still cannot fit with the future-layer locks, raise a capacity
+error with `R=0`, phase, layer and counts instead of allocating extra expert banks.
+The loop admission rule bounds Pre-Verify routes; it does not prove capacity for
+different Target routes. `cancelled_queued_prefetch`, `queued_prefetch_peak`,
+`demand_slot_waits` and `capacity_failures` expose queue and capacity behavior.
+Each round records `initial_admission`, `target_reserve_slots=0` and each loop's
+`next_admission` with `m`, `q`, available/required slots and the stop reason.
+These checks use existing host metadata after the accepted-count readback;
+counting `m` does not introduce another GPU scalar readback or device-wide fence.
+Demand and background copies use one IO stream, preserving submission order;
+the compute stream waits on the required expert events. A demand for an
+unsubmitted queued expert promotes it immediately. Already submitted prefetch
+can still delay later demand; stream priority does not establish DMA preemption.
+Prefetch can overlap this layer's MoE and the next block's non-MoE computation.
+
+After acceptance and next-loop admission, only a continuation into another lossy
+loop submits a gap burst: at most `max(speculative_prefetch_gap_capacity - 1, 0)`
+experts, sorted by layer and then earliest input position. A branch directly into
+complete Target submits no gap burst. All remaining host-queued tasks are then
+discarded, without releasing accepted expert leases or cancelling submitted IO.
+No first-router deadline query, stream drain, or deadline-based wait is added.
+Slot lifetime checks and necessary demand dependencies remain in place.
+
+For one configured draft length `d`, `--calibrate-prefetch` measures only normal
+`d+1`-row lossy verification. It pools layer windows (demand complete to the next
+router's demand-ready point) and gaps (lossy forward end to the next lossy forward
+start), using medians to set one uniform layer quota and one gap capacity. A copy
+sweep uses complete expert banks and concurrent captured real expert compute.
+It records raw samples, validates copied weights and compute outputs, applies the
+one-expert gap margin, and frees calibration-only buffers before request timing.
+It does not create separate profiles for shortened widths or block types.
+Static calibration and the one-expert margin are empirical, not a hard deadline
+guarantee. Independent audit records first-router events for offline analysis;
+the generation path never branches or waits on a prefetch deadline check.
+`layer_prefetch_loads`, `gap_prefetch_loads` and `discarded_queued_prefetch` report
+the two quotas and dropped work. Defaults of four layer experts and zero gap
+capacity are manual settings, not a claimed measured optimum.
 
 Routing admission runs on the host. With graphs enabled, expert compute and
 MTP/accept/Target-commit phases use captured graphs; the whole Target forward is
@@ -316,7 +359,8 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=python python benchmarks/bench_three_level_mtp
   --model /data1/fanya/Qwen/Qwen3.6-35B-A3B \
   --data /home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl \
   --output /absolute/path/to/a/new/result/directory \
-  --backend offload --budget-gib 40 --samples 1 --tokens 24 --purpose smoke
+  --backend offload --budget-gib 40 --samples 1 --tokens 32 --purpose smoke \
+  --calibrate-prefetch
 ```
 
 Use `--eager` for eager controls and `--backend hybrid` for the existing mixed
