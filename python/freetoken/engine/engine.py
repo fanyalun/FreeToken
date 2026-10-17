@@ -534,7 +534,7 @@ class Engine:
 
     def generate_speculative(self, input_ids, *, max_tokens: int, eos_ids=(), cancel=None, prompt_chunk_size=128):
         if self.speculative_runner is None:
-            raise ValueError("enable speculative_mtp_depth=3 for native MTP generation")
+            raise ValueError("enable positive speculative_mtp_depth for native MTP generation")
         return self.speculative_runner.generate(
             input_ids, max_tokens=max_tokens, eos_ids=tuple(eos_ids),
             cancel=cancel, prompt_chunk_size=prompt_chunk_size,

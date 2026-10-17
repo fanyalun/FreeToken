@@ -1,7 +1,8 @@
 # Native Qwen MTP
 
 The first adapter supports Qwen3.6-35B-A3B BF16 with its native BF16 MTP layer,
-greedy text generation, TP=1, one active request, and draft depth 3. It provides
+greedy text generation, TP=1, and one active request. Draft depth is a positive
+integer `speculative_mtp_depth`; depth 3 remains the default benchmark setting. It provides
 a programmatic engine API. HTTP serving, scheduler streaming, continuous
 batching, cross-request prefix reuse, quantized checkpoints and other proposers
 require additional adapters and integration.
@@ -220,7 +221,7 @@ weights, so these signatures are not cryptographic weight-content verification.
 
 The optional programmatic three-level path chains native MTP proposals and a
 sparse Pre-Verify model before one complete Target verification. Enable it with
-`speculative_three_level=True` alongside `speculative_mtp_depth=3` in the engine
+`speculative_three_level=True` alongside a positive `speculative_mtp_depth` in the engine
 configuration. It supports the existing text-only, BF16, TP=1, single-request
 offload/hybrid adapter. CPU-only layers and unpinned or quantized expert banks
 are rejected. Hybrid requires `FREETOKEN_HYBRID_WINDOW=1`, the default.

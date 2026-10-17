@@ -17,6 +17,25 @@ def test_runner_import_does_not_initialize_cuda():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gdn_workspace_views_are_contiguous_and_share_only_scratch():
+    pool = SimpleNamespace(
+        recurrent_states=torch.zeros(2, 2, 2, 4, 4, device="cuda"),
+        conv_states=torch.zeros(2, 2, 16, 3, device="cuda", dtype=torch.bfloat16),
+        num_slots=2, local_index=lambda layer: layer)
+    private = SimpleNamespace(recurrent_states=torch.zeros_like(pool.recurrent_states[:, :1]),
+        conv_states=torch.zeros_like(pool.conv_states[:, :1]), num_slots=1, local_index=pool.local_index)
+    workspace = QwenGDNVerifyState(pool, [], 31, 1)
+    outer = QwenGDNVerifyState(pool, [], 31, 1, workspace=workspace)
+    inner = QwenGDNVerifyState(private, [], 5, 0, workspace=workspace)
+    for a, b in zip((inner.conv_windows, *inner.replay_inputs), (outer.conv_windows, *outer.replay_inputs)):
+        assert a.is_contiguous() and b.is_contiguous()
+        assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    assert inner.pool.recurrent_states.data_ptr() != outer.pool.recurrent_states.data_ptr()
+    with pytest.raises(ValueError, match="incompatible GDN"):
+        QwenGDNVerifyState(pool, [], 32, 1, workspace=workspace)
+
+
 @pytest.mark.parametrize("width,count", [(w, c) for w in range(1, 5) for c in range(w + 1)] + [(9, 3), (17, 0), (17, 11), (17, 17), (25, 0), (25, 13), (25, 25)])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])

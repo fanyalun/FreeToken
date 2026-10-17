@@ -15,7 +15,89 @@ The six-loop limit, ready-or-top-4 selection, capacity formula, stop priority,
 and complete top-8 final verification are unchanged. MTP reconcile still executes
 the full batch width and writes the valid KV prefix using the existing semantics;
 only its selected hidden row reaches the LM head. No early submission, delayed
-trial, larger cache, or graph-pool change is included.
+trial or larger cache is included in those execution stages. The separate coarse
+graph implementation below changes the graph pools and workspace layout.
+
+## Graphs for a fixed run configuration
+
+`speculative_graph_implementation="reference"` retains the width-specific graph
+path. Set it to `"coarse"` to capture four graphs for one fixed run configuration:
+inner body, inner commit/reconcile, outer body, and outer commit/reconcile. This
+requires optimized compact GPU scheduling, BF16, TP=1, one active request, and
+the Triton attention backend. It is an opt-in implementation; fewer graphs and
+lower memory usage alone do not qualify it for default use.
+
+Coarse graphs are experimental. Batched BF16 dense kernels can round differently
+when the same effective prefix is padded to a larger physical width. This can
+change routes, cache history, accepted lengths, and committed values even when
+the returned text agrees. Independent replay within an implementation does not
+establish trace or state parity with reference. Keep reference as the default
+unless both correctness and fixed-slot complete-request performance gates pass.
+
+Native MTP accepts a positive integer `speculative_mtp_depth=D`; zero disables
+MTP. The inner graph width is `D+1`. With loop limit `L`, the outer width is
+`L*(D+1)+1`, capped by `speculative_submit_tokens` when that existing explicit
+limit is nonzero. This is the configured theoretical maximum, not an average
+window length. There is one outer bucket. EOS, output tails, and acceptance
+change the GPU effective-row parameter without adding graph keys.
+
+The body graphs include metadata preparation, forward, acceptance, and GPU
+control. Each body still has one control readback before state commit. Continuing
+execution uses the matching commit/reconcile graph; a terminating branch only
+commits state. Reconciliation preserves all effective rows and selects only the
+last committed hidden row for the LM head. Gap copies are launched outside the
+graphs and signal an external CUDA event. The next body can execute its Draft
+chain before waiting on that event immediately before Target consumes experts.
+Layer-prefetch forks still join inside each body graph. The ordinary Engine
+graphs remain separate.
+
+The graphs share a managed pool, while cross-graph hidden states, tokens,
+and seeds use persistent buffers. Inner and outer GDN verification reuse one
+maximum-sized contiguous scratch allocation. Canonical and private GDN states
+remain distinct. Padding is excluded before admission, LRU, lease, and prefetch
+updates. Masked Triton KV stores do not allocate or write padding pages; attention
+uses empty KV intervals for those rows.
+
+Set `speculative_graph_implementation="full"` for exact physical shapes at every
+legal width. Outer graphs cover `1..L*(D+1)+1`, capped by the submission limit;
+inner graphs cover `1..D+1`. This includes early window stops and request tails,
+not only windows that complete all L loops. Each width has a body and a matching
+commit/reconcile graph, so D=3 and L=6 capture 58 speculative graphs. Runtime
+selection uses the CPU-known effective width and adds no control readback or
+steady-state capture. No padding or eager fallback is needed for these widths.
+
+Full graphs preserve the coarse body/commit boundaries, external gap event,
+persistent outputs, and one shared maximum-sized GDN workspace. Each width keeps
+its own state metadata and batch buffers. Captures proceed from largest to
+smallest within each phase and record allocator deltas in `capture_memory`.
+Graph count alone does not predict process memory; driver allocations and peak
+request activations also need measurement. Exact physical shapes remove the
+coarse padding difference, but cross-implementation state parity still requires
+an independent audit before enabling this mode by default.
+
+Capture completes before request timing. Changing D, the window limit, cache
+geometry, or execution configuration requires an idle runner rebuild or a new
+process. Graphs are not serialized across processes or cached by old configuration.
+Do not mutate a running engine configuration. Failed initialization leaves the
+graph set unusable until rebuild.
+
+Run each configuration in a separate process using the existing environment:
+
+```bash
+PYTHONPATH=python uv run --no-sync python benchmarks/bench_speculative_graph.py \
+  --graph-implementation reference --depth 3 --output /absolute/new_reference_run --audit
+PYTHONPATH=python uv run --no-sync python benchmarks/bench_speculative_graph.py \
+  --graph-implementation coarse --depth 3 --output /absolute/new_coarse_run --audit
+PYTHONPATH=python uv run --no-sync python benchmarks/bench_speculative_graph.py \
+  --graph-implementation full --budget-gib 40 --depth 3 --output /absolute/new_full_run --audit
+```
+
+Defaults are four fixed GSM8K prompts, 128 returned tokens, three repetitions,
+4907 expert slots, 4300 KV pages, six loops, 2/12 prefetch, and a 64 GiB limit.
+Warmup stabilizes graph keys before timing. Independent audits check per-window
+state hashes, leases, and pending retirement. Compare complete-request TPOT and
+throughput at the fixed slot count before considering expert-cache growth.
+`--profile` is for a separate diagnostic run under Nsight, not performance claims.
 
 ## Ownership and streams
 
@@ -128,3 +210,29 @@ comparison. Cross-layer execution overlaps prefetch, but also increases demand
 copy duration through contention; complete request measurements determine the
 accepted configuration. The native report and raw timing/audit records are in the
 `execution_optimized_implementation` experiment archive for 2026-10-16.
+
+## Layer prefetch budgets and demand ordering
+
+GPU expert scheduling accepts `speculative_prefetch_layer_quotas`, one nonnegative
+integer per MoE layer, and `speculative_prefetch_demand_fence=True`. A missing
+quota list preserves the scalar `speculative_prefetch_layer_experts` setting.
+The list is fixed before graph capture; changing it requires rebuilding the graphs.
+
+The demand fence makes the next layer's demand wait on previously submitted layer
+prefetch through a GPU stream dependency. It adds no host readback or CPU completion
+polling. If prefetch outlasts the compute window, its remaining duration becomes
+visible waiting; this option does not preempt a running copy or guarantee a speedup.
+The last layer still retires all pending layer copies when its own quota is zero.
+
+`benchmarks/analyze_speculative_io_budget.py` calibrates fixed quotas from a native
+no-prefetch trace and measured production-copy costs. It uses a lower quantile of
+each demand-end to next-demand-start interval, a safety factor and a launch margin.
+The last layer receives zero because it has no following layer window. These
+budgets are workload-specific estimates; the stream fence enforces IO ordering
+when an estimate is exceeded. Gap prefetch remains a separate setting.
+
+The execution benchmark compares `optimized_selected`, `demand_fenced` and
+`layer_budget` on the same source and cache geometry; `layer_budget` requires
+`--layer-budget /absolute/calibration.json`. The `io_calibration` method disables
+both layer and gap prefetch for calibration. Keep profiled calibration separate
+from unprofiled complete-request timing and independent cache/state audits.

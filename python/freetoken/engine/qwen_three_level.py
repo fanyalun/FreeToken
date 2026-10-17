@@ -61,15 +61,22 @@ class ThreeLevelCoordinator:
         if cache is None or engine.mtp is None or runner.reference_ar:
             raise ValueError("three-level decoding requires native MTP and an offload expert cache")
         mc = engine.config.model_config
+        self.draft_width = engine.config.speculative_mtp_depth + 1
+        coarse = getattr(engine.config, "speculative_graph_implementation", "reference") in ("coarse", "full")
         self.budget = WindowBudget.resolve(cache.cache_size, mc.num_moe_layers, mc.num_experts_per_tok,
                                            cache.num_experts, engine.config.speculative_submit_tokens,
                                            engine.config.speculative_max_loops, engine.config.speculative_mtp_depth)
+        if coarse and max(self.draft_width, self.budget.submit_rows) > engine.max_seq_len:
+            raise ValueError("speculative graph width exceeds context capacity")
         cache_type = SpeculativeExpertCache
         extra = {}
         if getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu":
             from freetoken.moe.speculative_gpu import GPUExpertCache
             cache_type = GPUExpertCache
             extra = dict(max_loops=self.budget.max_loops, max_rows=self.budget.submit_rows,
+                         inner_rows=self.draft_width,
+                         layer_quotas=getattr(engine.config, "speculative_prefetch_layer_quotas", None),
+                         demand_fence=getattr(engine.config, "speculative_prefetch_demand_fence", False),
                          top_k=mc.num_experts_per_tok,
                          compact_control=getattr(engine.config, "speculative_compact_control", True),
                          implementation=getattr(engine.config, "speculative_execution_implementation", "reference"))
@@ -85,10 +92,11 @@ class ThreeLevelCoordinator:
             local_index=pool.local_index, num_slots=1,
         )
         layers = [layer.linear_attn for layer in engine.model.model.layers.op_list if layer._is_linear]
-        self.private_states = {w: QwenGDNVerifyState(self.private_pool, layers, w, 0) for w in range(1, 5)}
-        for width in range(5, self.budget.submit_rows + 1):
+        self.private_states = {} if coarse else {
+            w: QwenGDNVerifyState(self.private_pool, layers, w, 0) for w in range(1, self.draft_width + 1)}
+        for width in (() if coarse else range(self.draft_width + 1, self.budget.submit_rows + 1)):
             runner.states[width] = QwenGDNVerifyState(pool, layers, width, 1)
-        runner.max_verify_width = max(4, self.budget.submit_rows)
+        runner.max_verify_width = max(self.draft_width, self.budget.submit_rows)
         self.epoch = 0
 
     def _forward(self, inputs, start, state):
@@ -125,6 +133,10 @@ class ThreeLevelCoordinator:
 
     def step(self, anchor, remaining, eos_ids, cancelled):
         runner, engine = self.runner, self.engine
+        coarse = getattr(runner, "coarse_graphs", None)
+        if coarse is not None:
+            coarse.seed.copy_(runner.next_draft)
+            coarse.seed_hidden.copy_(runner.last_draft_hidden)
         exact = runner.frontier
         start = exact.target_valid_len
         self.epoch += 1
@@ -149,21 +161,32 @@ class ThreeLevelCoordinator:
             while width > 0 and not stop_reason and not cancelled():
                 previous_experts = capacity["protected_experts"]
                 runner.frontier = private
-                proposal = runner.coordinator.prepare(private, current, width - 1)
-                inputs = proposal.verify_inputs()
+                if coarse is None:
+                    proposal = runner.coordinator.prepare(private, current, width - 1)
+                    inputs = proposal.verify_inputs()
+                else:
+                    end = runner._reserve(private.reserve_end(width))
+                    private.begin(end, width)
                 self.experts.input_offset = len(window.candidates)
                 self.experts.set_phase("preverify", len(window.loops))
-                tokens, hidden = self._forward(inputs, private.target_valid_len, self.private_states[width])
-                verified = VerifyResult(tokens, hidden)
-                commit = runner._accept(proposal, verified, width, eos_ids)
+                if coarse is None:
+                    tokens, hidden = self._forward(inputs, private.target_valid_len, self.private_states[width])
+                    verified = VerifyResult(tokens, hidden)
+                    commit = runner._accept(proposal, verified, width, eos_ids)
+                else:
+                    tokens, hidden, commit, control = coarse.body(current, inner=True,
+                        start=private.target_valid_len, rows=width, loop=len(window.loops),
+                        candidates=len(window.candidates), limit=window.candidate_limit, remaining=remaining)
                 if self.compact_control:
-                    control = self.experts.read_control(tokens, commit, loop=len(window.loops),
-                        candidates=len(window.candidates), candidate_limit=window.candidate_limit,
-                        remaining=remaining, depth=engine.config.speculative_mtp_depth)
+                    if coarse is None:
+                        control = self.experts.read_control(tokens, commit, loop=len(window.loops),
+                            candidates=len(window.candidates), candidate_limit=window.candidate_limit,
+                            remaining=remaining, depth=engine.config.speculative_mtp_depth)
                     count, accepted = control[:2]
                     drained = control[8:]
                     # Invalid forwards must never update private or canonical GDN state.
-                    self.private_states[width].commit(commit.input_count)
+                    if coarse is None:
+                        self.private_states[width].commit(commit.input_count)
                 else:
                     self.private_states[width].commit(commit.input_count)
                     drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
@@ -192,9 +215,12 @@ class ThreeLevelCoordinator:
                 current = tokens[count - 1:count].clone()
                 inner_eos = drained[count - 1] in eos_ids
                 reconcile_inner = not inner_eos and not stop_reason and width > 0 and not cancelled()
-                self.experts.finish_loop(reconcile_inner)
-                if reconcile_inner:
-                    runner.coordinator.proposer.reconcile(hidden, commit)
+                if coarse is not None:
+                    coarse.tail(True, reconcile_inner)
+                else:
+                    self.experts.finish_loop(reconcile_inner)
+                    if reconcile_inner:
+                        runner.coordinator.proposer.reconcile(hidden, commit)
                 private.commit_target(count)
                 if reconcile_inner:
                     private.reconcile_done()
@@ -210,31 +236,41 @@ class ThreeLevelCoordinator:
             runner.frontier = exact
             if cancelled():
                 return [], anchor, {"cancelled": True}
-            candidates = self._candidate_tokens(window.candidates, anchor)
-            proposal = Proposal(first_anchor, candidates)
-            inputs = proposal.verify_inputs()
-            end = runner._reserve(exact.reserve_end(len(inputs)))
-            exact.begin(end, len(inputs))
+            verify_rows = len(window.candidates) + 1
+            if coarse is None:
+                candidates = self._candidate_tokens(window.candidates, anchor)
+                proposal = Proposal(first_anchor, candidates)
+                inputs = proposal.verify_inputs()
+            end = runner._reserve(exact.reserve_end(verify_rows))
+            exact.begin(end, verify_rows)
             self.experts.set_phase("verify")
             if getattr(self.experts, "gpu_schedule", False):
                 self.experts.loop_count = len(window.loops)
-                self.experts.verify_rows = len(inputs)
-            state = runner.states[len(inputs)]
-            tokens, hidden = self._forward(inputs, start, state)
-            verified = VerifyResult(tokens, hidden)
-            commit = runner._accept(proposal, verified, remaining, eos_ids)
+                self.experts.verify_rows = verify_rows
+            if coarse is None:
+                state = runner.states[verify_rows]
+                tokens, hidden = self._forward(inputs, start, state)
+                verified = VerifyResult(tokens, hidden)
+                commit = runner._accept(proposal, verified, remaining, eos_ids)
+            else:
+                tokens, hidden, commit, control = coarse.body(first_anchor, inner=False,
+                    start=start, rows=verify_rows, remaining=remaining)
             if self.compact_control:
-                control = self.experts.read_control(tokens, commit)
+                if coarse is None:
+                    control = self.experts.read_control(tokens, commit)
                 count, accepted, terminal = control[:3]
                 drained = control[8:]
-                runner._commit_state(state, commit.input_count)
+                if coarse is None:
+                    runner._commit_state(state, commit.input_count)
             else:
                 runner._commit_state(state, commit.input_count)
                 drained = torch.cat((tokens, commit.input_count.reshape(1), commit.accepted_drafts.reshape(1),
                                      commit.terminal.reshape(1))).tolist()
                 count, accepted, terminal = drained[-3:]
             reconcile = not terminal and not cancelled()
-            if reconcile:
+            if coarse is not None:
+                coarse.tail(False, reconcile)
+            elif reconcile:
                 runner.coordinator.proposer.reconcile(hidden, commit)
             runner.last_event = torch.cuda.Event()
             runner.last_event.record(engine.stream)
@@ -247,8 +283,8 @@ class ThreeLevelCoordinator:
             collect_stats = not self.compact_control or self.experts.audit
             if getattr(self.experts, "gpu_schedule", False) and collect_stats:
                 self.experts.export_records()
-            row = {"drafted": len(candidates), "accepted": accepted, "returned": count,
-                   "submit_rows": len(inputs), "submit_row_limit": self.budget.submit_rows,
+            row = {"drafted": len(window.candidates), "accepted": accepted, "returned": count,
+                   "submit_rows": verify_rows, "submit_row_limit": self.budget.submit_rows,
                    "max_loops": self.budget.max_loops, "cache_slots": self.budget.cache_slots,
                    "target_reserve_slots": 0, "initial_admission": initial_admission,
                    "loop_count": len(window.loops),

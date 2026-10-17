@@ -120,9 +120,13 @@ class QwenMTPRunner:
         self.next_draft = None
         self.last_event = None
         self.states = {}
+        self.draft_width = engine.config.speculative_mtp_depth + 1
+        self.coarse_graphs = None
         if self.mtp_enabled:
             layers = [l.linear_attn for l in engine.model.model.layers.op_list if l._is_linear]
-            self.states = {w: QwenGDNVerifyState(engine.linear_state_pool, layers, w, slot=1) for w in range(1, 5)}
+            if getattr(engine.config, "speculative_graph_implementation", "reference") == "reference":
+                self.states = {w: QwenGDNVerifyState(engine.linear_state_pool, layers, w, slot=1)
+                               for w in range(1, self.draft_width + 1)}
         self.use_graph = engine.graph_runner.max_graph_bs > 0
         self.model_state = _QwenState(self)
         self.coordinator = SpeculativeCoordinator(_QwenProposer(self), self.model_state, _QwenReservation(self))
@@ -130,6 +134,11 @@ class QwenMTPRunner:
         if getattr(engine.config, "speculative_three_level", False) and not reference_ar:
             from .qwen_three_level import ThreeLevelCoordinator
             self.three_level = ThreeLevelCoordinator(self)
+            if getattr(engine.config, "speculative_graph_implementation", "reference") in ("coarse", "full"):
+                from .qwen_speculative_graph import QwenSpeculativeGraphSet
+                self.coarse_graphs = QwenSpeculativeGraphSet(self.three_level)
+                with torch.cuda.stream(engine.stream):
+                    self.coarse_graphs.prepare(())
 
     def _batch(self, ids, start: int, *, prefill=False, state=None):
         n = ids.numel()
@@ -246,7 +255,7 @@ class QwenMTPRunner:
         if self.reference_ar:
             return self._target(batch)
         key = (phase, batch.input_ids.numel())
-        graph_ok = self.use_graph and batch.is_decode and 1 <= batch.size <= getattr(self, "max_verify_width", 4)
+        graph_ok = self.use_graph and batch.is_decode and 1 <= batch.size <= getattr(self, "max_verify_width", getattr(self, "draft_width", 4))
         if not graph_ok:
             self.graph_fallbacks[phase] = self.graph_fallbacks.get(phase, 0) + 1
             with self.engine.model.forward_host_ctx(batch, False):
@@ -359,6 +368,13 @@ class QwenMTPRunner:
             raise ValueError("prompt plus output cap exceeds context capacity")
         if not self._request_lock.acquire(blocking=False):
             raise RuntimeError("native MTP runner supports one active request")
+        try:
+            if getattr(self, "coarse_graphs", None) is not None:
+                with torch.cuda.stream(self.engine.stream):
+                    self.coarse_graphs.prepare(eos_ids)
+        except BaseException:
+            self._request_lock.release()
+            raise
         cancelled = lambda: cancel is not None and cancel.is_set()
         self.active = True
         output, rounds = [], []
@@ -389,7 +405,7 @@ class QwenMTPRunner:
                             break
                         output.extend(emitted)
                         continue
-                    width = min(4, remaining) if self.mtp_enabled else 1
+                    width = min(getattr(self, "draft_width", 4), remaining) if self.mtp_enabled else 1
                     proposal = self.coordinator.prepare(self.frontier, anchor, width - 1)
                     state = self.states.get(width)
                     self.model_state.current = state
@@ -447,6 +463,9 @@ class QwenMTPRunner:
     def invalidate(self):
         if self.active:
             raise RuntimeError("cache rebuild requires an idle speculative runner")
+        if getattr(self, "coarse_graphs", None) is not None:
+            self.coarse_graphs.close()
+            self.coarse_graphs = None
         if getattr(self, "three_level", None) is not None:
             self.three_level.invalidate()
         self.engine.stream.synchronize()

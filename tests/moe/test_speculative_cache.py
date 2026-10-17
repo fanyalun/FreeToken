@@ -126,6 +126,165 @@ def toy_layer(li):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("quotas", [(1, 0), (0, 1), (0, 0)])
+@pytest.mark.parametrize("graph", [False, True])
+def test_layer_prefetch_budget_fences_next_demand_and_retires_zero_tail(quotas, graph):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), slots=32)
+        control = GPUExpertCache(cache, stream, max_loops=6, max_rows=25,
+            compact_control=True, implementation="optimized", layer_quotas=quotas, demand_fence=True)
+        ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        weights = torch.arange(8, 0, -1, device="cuda").float().reshape(1, 8)
+        hidden = torch.zeros(1, 1, device="cuda")
+        pf_end, demand_start = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(2)]
+        original = control._copy
+
+        def copy(layer, plan, **kwargs):
+            prefetch = torch.cuda.current_stream() == control.copy_stream
+            if prefetch and layer == 0:
+                torch.cuda._sleep(1_000_000)
+            if not prefetch and layer == 1:
+                demand_start.record(stream)
+            original(layer, plan, **kwargs)
+            if prefetch and layer == 0:
+                pf_end.record(control.copy_stream)
+
+        control._copy = copy
+
+        def forward():
+            control.route(toy_layer(0), hidden, weights, ids)
+            control.route(toy_layer(1), hidden, weights, ids)
+
+        control.begin(1)
+        forward()
+        control.close()
+        cache.slot_for_id.fill_(-1)
+        cache.id_of_slot.fill_(-1)
+        control.begin(2)
+        if graph:
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured, stream=stream):
+                forward()
+            captured.replay()
+        else:
+            forward()
+        stream.synchronize()
+        assert not control.pending.any()
+        assert not control.layer_plan_counts.any()
+        assert control.counters[9].item() == sum(quotas)
+        if quotas[0]:
+            assert pf_end.elapsed_time(demand_start) >= 0
+        for li, quota in enumerate(quotas):
+            resident = (cache.slot_for_id[li] >= 0).nonzero().flatten()
+            assert resident.tolist() == list(range(4 + quota))
+            slots = cache.slot_for_id[li, resident].long()
+            assert torch.equal(cache.banks[0][1][slots, 0], resident.float() + li * 16)
+        control.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("quotas", [(1,), (-1, 0), (True, 0), (1.5, 0)])
+def test_layer_prefetch_budget_rejects_wrong_geometry(quotas):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    with pytest.raises(ValueError, match="one nonnegative integer"):
+        GPUExpertCache(toy_cache(torch.device("cuda")), torch.cuda.Stream(),
+                       max_loops=6, max_rows=25, layer_quotas=quotas)
+
+
+def test_demand_fence_with_prefetch_disabled_has_no_stream_dependency():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    control = object.__new__(GPUExpertCache)
+    control.prefetch, control.demand_fence = False, True
+    control.cross_layer_prefetch, control.phase = True, "preverify"
+    control.wait_demand()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("depth", [1, 2, 4, 8])
+@pytest.mark.parametrize("phase", ["preverify", "verify"])
+def test_gpu_padding_preserves_admission_lru_and_variable_history(depth, phase):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    width, valid = depth + 1, min(depth + 1, 2)
+    def run(padded):
+        cache = toy_cache(device, layers=1, slots=32)
+        control = GPUExpertCache(cache, stream, max_loops=6, max_rows=6 * width + 1,
+            inner_rows=width, prefetch=False, implementation="optimized", compact_control=True)
+        control.begin(1)
+        control.set_phase(phase, 2)
+        rows = width if padded else valid
+        control.valid_rows = torch.tensor([valid], device=device, dtype=torch.int32) if padded else None
+        ids = (torch.arange(rows * 8, device=device).reshape(rows, 8) % 16).int()
+        if padded:
+            ids[valid:] = 2147483647
+        weights = torch.arange(8, 0, -1, device=device).float().expand(rows, 8).contiguous()
+        hidden = torch.zeros(rows, 1, device=device)
+        output = control.route(toy_layer(0), hidden, weights, ids)
+        if phase == "preverify":
+            control.decide(2, 1)
+        stream.synchronize()
+        result = [getattr(cache, name).clone() for name in ("slot_for_id", "id_of_slot", "usage", "step")]
+        result += [control.refs.clone(), control.counters.clone(), output[:valid].clone()]
+        if phase == "preverify":
+            assert control.widths[2, 0].item() == valid
+            assert control.history[2, 0, valid:].eq(-1).all()
+        control.close(abort=True)
+        return result
+    with torch.cuda.stream(stream):
+        actual, expected = run(True), run(False)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("keep_hits,renormalize", [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize("phase", ["preverify", "verify"])
+def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, phase):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(device, layers=1, slots=16)
+        for slot, expert in enumerate((5, 7)):
+            cache.slot_for_id[0, expert] = slot
+            cache.id_of_slot[slot] = expert
+            cache.banks[0][1][slot, 0] = expert
+        control = GPUExpertCache(cache, stream, max_loops=6, max_rows=25, prefetch=False,
+            keep_hits=keep_hits, renormalize=renormalize, collect_signals=True)
+        control.begin(1)
+        control.set_phase(phase)
+        ids = torch.arange(8, device=device, dtype=torch.int32).reshape(1, 8)
+        weights = torch.tensor([[.30, .20, .15, .10, .08, .07, .06, .04]], device=device)
+        result = control.route(toy_layer(0), torch.zeros(1, 1, device=device), weights, ids)
+        selected = weights.clone()
+        if phase == "preverify":
+            selected[:, 4:] = 0
+            if keep_hits:
+                selected[:, [5, 7]] = weights[:, [5, 7]]
+            if renormalize:
+                selected /= selected.sum(-1, keepdim=True)
+            torch.testing.assert_close(control.weight_history[0, 0, :1], weights)
+            assert torch.equal(control.keep_history[0, 0, :1], selected != 0)
+        torch.testing.assert_close(result, (ids.float() * selected).sum(-1, keepdim=True))
+        torch.testing.assert_close(control.outputs[0, 1][1], selected)
+        control.close()
+        expected_loads = 4 if phase == "preverify" else 6
+        assert control.stats["demand_loads"] == expected_loads
+        assert control.stats[phase + "_demand_loads"] == expected_loads
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_real_copy_reads_ready_weights_and_preserves_locked_owners(graph_mode):
     device = torch.device("cuda:0")
@@ -711,7 +870,7 @@ def test_optimized_admission_matches_reference_including_failed_prefix(prefetch,
         inputs = [mapping, owners, usage, torch.tensor(100, dtype=torch.int64), refs, pending,
                   demand, queue, *(torch.full((experts * layers,), -99, dtype=torch.int32) for _ in range(3)),
                   torch.zeros(1, dtype=torch.int64), torch.zeros(1, dtype=torch.int32),
-                  torch.zeros(12, dtype=torch.int64), torch.zeros(experts * layers, dtype=torch.bool)]
+                  torch.zeros(14, dtype=torch.int64), torch.zeros(experts * layers, dtype=torch.bool)]
         runs = [[v.to(device) for v in inputs] for _ in range(2)]
         for kernel, args in zip((_admit, _admit_optimized), runs):
             kernel[(1,)](*args, -1 if gap else 1, experts, slots, experts * layers,

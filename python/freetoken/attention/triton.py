@@ -147,7 +147,12 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if getattr(batch, "speculative_valid_rows", None) is None:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        else:
+            from freetoken.kernel.store import store_cache_masked
+            store_cache_masked(self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id),
+                               batch.out_loc, k, v, batch.speculative_valid_rows)
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)

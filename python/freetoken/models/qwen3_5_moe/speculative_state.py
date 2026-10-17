@@ -6,7 +6,7 @@ from freetoken.kernel.backend import is_sgl_kernel_installed
 
 
 class QwenGDNVerifyState:
-    def __init__(self, pool, layers, width: int, slot: int):
+    def __init__(self, pool, layers, width: int, slot: int, *, workspace=None):
         if width < 1 or not 0 <= slot < pool.num_slots:
             raise ValueError("GDN verification requires positive width and a valid state slot")
         self.pool = pool
@@ -22,14 +22,24 @@ class QwenGDNVerifyState:
             raise ValueError("GDN conv and recurrent pool geometry disagree")
         self.indices = torch.tensor([slot], dtype=torch.int32, device=device)
         self.cu_seqlens = torch.tensor([0, width], dtype=torch.int32, device=device)
-        self.conv_windows = torch.empty(
-            layers_count, channels, history + width - 1, dtype=pool.conv_states.dtype, device=device,
-        )
+        def allocate(shape, dtype, source=None):
+            if source is not None:
+                size = 1
+                for dim in shape:
+                    size *= dim
+                if source.numel() < size or source.dtype != dtype or source.device != device:
+                    raise ValueError("incompatible GDN scratch workspace")
+                return source.view(-1)[:size].view(shape)
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        self.conv_windows = allocate((layers_count, channels, history + width - 1), pool.conv_states.dtype,
+                                     None if workspace is None else workspace.conv_windows)
+        sources = (None,) * 4 if workspace is None else workspace.replay_inputs
         self.replay_inputs = (
-            torch.empty(layers_count, width, key_heads, key_dim, dtype=pool.conv_states.dtype, device=device),
-            torch.empty(layers_count, width, heads, value_dim, dtype=pool.conv_states.dtype, device=device),
-            torch.empty(layers_count, width, heads, dtype=torch.float32, device=device),
-            torch.empty(layers_count, width, heads, dtype=torch.float32, device=device),
+            allocate((layers_count, width, key_heads, key_dim), pool.conv_states.dtype, sources[0]),
+            allocate((layers_count, width, heads, value_dim), pool.conv_states.dtype, sources[1]),
+            allocate((layers_count, width, heads), torch.float32, sources[2]),
+            allocate((layers_count, width, heads), torch.float32, sources[3]),
         )
         self.snapshots = None
         self.snapshot_index = None

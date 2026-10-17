@@ -11,6 +11,7 @@ STAT_NAMES = (
     "demand_loads", "prefetch_loads", "preverify_native_routes", "preverify_retained_routes",
     "verify_native_routes", "verify_retained_routes", "target_unique_experts", "target_initial_missing",
     "target_timely_prefetch", "layer_prefetch_loads", "gap_prefetch_loads", "route_calls",
+    "preverify_demand_loads", "verify_demand_loads",
 )
 
 
@@ -19,9 +20,12 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           queue, demand, output_slots, output_weights, cursor, stats, initial, prefetched, used,
           LAYER, LAYERS: tl.constexpr, EXPERTS: tl.constexpr, ROWS: tl.constexpr,
           TOPK: tl.constexpr, MAX_ROWS: tl.constexpr, PREVERIFY: tl.constexpr,
-          N: tl.constexpr, E: tl.constexpr, error, CHECK_PENDING: tl.constexpr):
+          N: tl.constexpr, E: tl.constexpr, error, CHECK_PENDING: tl.constexpr,
+          weight_history, keep_history, KEEP_HITS: tl.constexpr, RENORMALIZE: tl.constexpr,
+          COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None):
     k = tl.arange(0, N)
-    valid = k < ROWS * TOPK
+    rows = ROWS if valid_rows is None else tl.load(valid_rows)
+    valid = k < rows * TOPK
     e = tl.load(ids + k, valid, 0)
     w = tl.load(weights + k, valid, 0)
     loop = tl.load(cursor)
@@ -34,19 +38,25 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
     experts = tl.arange(0, E)
     if PREVERIFY:
         # Replacing a layer observation is idempotent during graph warmup/replay.
-        base = (loop * LAYERS + LAYER) * 4 * TOPK
-        old = tl.load(history + base + k, k < 4 * TOPK, -1)
+        base = (loop * LAYERS + LAYER) * INNER_ROWS * TOPK
+        old = tl.load(history + base + k, k < INNER_ROWS * TOPK, -1)
         old_count = tl.histogram(old, E, mask=old >= 0)
         new_count = tl.histogram(e, E, mask=valid)
         value = tl.load(refs + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
         tl.store(refs + LAYER * EXPERTS + experts, value + new_count - old_count, experts < EXPERTS)
-        tl.store(history + base + k, tl.where(valid, e, -1), k < 4 * TOPK)
-        tl.store(ready_history + base + k, ready, k < 4 * TOPK)
-        tl.store(widths + loop * LAYERS + LAYER, ROWS)
+        tl.store(history + base + k, tl.where(valid, e, -1), k < INNER_ROWS * TOPK)
+        tl.store(ready_history + base + k, ready, k < INNER_ROWS * TOPK)
+        tl.store(widths + loop * LAYERS + LAYER, rows)
         same_row = k[:, None] // TOPK == k[None, :] // TOPK
         better = (w[None, :] > w[:, None]) | ((w[None, :] == w[:, None]) & (k[None, :] < k[:, None]))
         rank = tl.sum((same_row & better & valid[None, :]).to(tl.int32), 1)
-        keep = valid & (ready | (rank < 4))
+        keep = valid & ((ready & KEEP_HITS) | (rank < 4))
+        if COLLECT_SIGNALS:
+            tl.store(weight_history + base + k, w, k < INNER_ROWS * TOPK)
+            tl.store(keep_history + base + k, keep, k < INNER_ROWS * TOPK)
+        if RENORMALIZE:
+            mass = tl.sum(tl.where(same_row & keep[None, :], w[None, :], 0), 1)
+            w = w / tl.where(mass > 0, mass, 1)
     else:
         tl.store(refs + LAYER * EXPERTS + experts, 0, experts < EXPERTS)
         tl.store(final_history + LAYER * MAX_ROWS * TOPK + k, e, valid)
@@ -62,7 +72,7 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         priority += LAYER * MAX_ROWS * TOPK
         priority = tl.where(actual & (count == 0) & ~occupied, priority, 2147483647)
         tl.store(queue + LAYER * EXPERTS + experts, tl.minimum(priority, old_priority), experts < EXPERTS)
-        tl.atomic_add(stats + 2, ROWS * TOPK)
+        tl.atomic_add(stats + 2, rows * TOPK)
         tl.atomic_add(stats + 3, tl.sum(keep.to(tl.int32), 0))
     else:
         initial_hit = tl.load(initial + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
@@ -71,13 +81,13 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         local_ready = (local_slot >= 0) & (tl.load(pending + tl.maximum(local_slot, 0), experts < EXPERTS, 0) == 0)
         timely = actual & was_prefetched & local_ready
         tl.store(used + LAYER * EXPERTS + experts, 1, (experts < EXPERTS) & timely)
-        tl.atomic_add(stats + 4, ROWS * TOPK)
-        tl.atomic_add(stats + 5, ROWS * TOPK)
+        tl.atomic_add(stats + 4, rows * TOPK)
+        tl.atomic_add(stats + 5, rows * TOPK)
         tl.atomic_add(stats + 6, tl.sum(actual.to(tl.int32), 0))
         tl.atomic_add(stats + 7, tl.sum((actual & ~initial_hit).to(tl.int32), 0))
         tl.atomic_add(stats + 8, tl.sum((timely & ~initial_hit).to(tl.int32), 0))
-    tl.store(output_weights + k, tl.where(keep, w, 0), valid)
-    tl.store(output_slots + k, e, valid)
+    tl.store(output_weights + k, tl.where(keep, w, 0), k < ROWS * TOPK)
+    tl.store(output_slots + k, e, k < ROWS * TOPK)
     tl.atomic_add(stats + 11, 1)
 
 
@@ -86,7 +96,7 @@ def _admit(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_ptr, demand,
            plan_owners, plan_slots, plan_src, plan_count, error, stats, prefetched,
            LAYER, EXPERTS: tl.constexpr, SLOTS: tl.constexpr, TOTAL: tl.constexpr,
            PREFETCH: tl.constexpr, QUOTA: tl.constexpr, GAP: tl.constexpr,
-           C: tl.constexpr, E: tl.constexpr):
+           C: tl.constexpr, E: tl.constexpr, PREVERIFY: tl.constexpr = False):
     c = tl.arange(0, C)
     e = tl.arange(0, E)
     base = 0 if GAP else LAYER * EXPERTS
@@ -153,6 +163,8 @@ def _admit(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_ptr, demand,
     tl.atomic_add(stats + (1 if PREFETCH else 0), count)
     if PREFETCH:
         tl.atomic_add(stats + (10 if GAP else 9), count)
+    else:
+        tl.atomic_add(stats + (12 if PREVERIFY else 13), count)
 
 
 @triton.jit
@@ -160,7 +172,7 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
            plan_owners, plan_slots, plan_src, plan_count, error, stats, prefetched,
            LAYER, EXPERTS: tl.constexpr, SLOTS: tl.constexpr, TOTAL: tl.constexpr,
            PREFETCH: tl.constexpr, QUOTA: tl.constexpr, GAP: tl.constexpr,
-           C: tl.constexpr, E: tl.constexpr):
+           C: tl.constexpr, E: tl.constexpr, PREVERIFY: tl.constexpr = False):
     e = tl.arange(0, E)
     base = 0 if GAP else LAYER * EXPERTS
     limit: tl.constexpr = TOTAL if GAP else EXPERTS
@@ -234,20 +246,25 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
     tl.atomic_add(stats + (1 if PREFETCH else 0), count)
     if PREFETCH:
         tl.atomic_add(stats + (10 if GAP else 9), count)
+    else:
+        tl.atomic_add(stats + (12 if PREVERIFY else 13), count)
 
 
 @triton.jit
 def _resolve(mapping, pending, local_ids, slots, weights, plan_slots, plan_count,
-             LAYER, EXPERTS: tl.constexpr, SIZE: tl.constexpr, N: tl.constexpr):
+             LAYER, EXPERTS: tl.constexpr, SIZE: tl.constexpr, N: tl.constexpr,
+             valid_rows=None, TOPK: tl.constexpr = 1):
     k = tl.arange(0, N)
     valid = k < SIZE
+    if valid_rows is not None:
+        valid &= k < tl.load(valid_rows) * TOPK
     e = tl.load(local_ids + k, valid, 0)
     slot = tl.load(mapping + LAYER * EXPERTS + e, valid, -1)
     w = tl.load(weights + k, valid, 0)
     fallback = tl.min(tl.where(valid & (slot >= 0), slot, 2147483647), 0)
     fallback = tl.where(fallback == 2147483647, 0, fallback)
-    tl.store(slots + k, tl.where(valid & (w != 0) & (slot >= 0), slot, fallback), valid)
-    tl.store(weights + k, tl.where(slot >= 0, w, 0), valid)
+    tl.store(slots + k, tl.where(valid & (w != 0) & (slot >= 0), slot, fallback), k < SIZE)
+    tl.store(weights + k, tl.where(valid & (slot >= 0), w, 0), k < SIZE)
 
 
 @triton.jit
@@ -314,14 +331,17 @@ def _copy_global_vectorized(src_ptrs, dst_ptrs, feature_bytes, owners, slots, co
 @triton.jit
 def _decide(refs, history, widths, queue, consumed, LOOP, LAYERS: tl.constexpr,
             EXPERTS: tl.constexpr, TOPK: tl.constexpr, E: tl.constexpr,
-            protected=None, error=None, DEVICE_COUNT: tl.constexpr = False):
+            protected=None, error=None, DEVICE_COUNT: tl.constexpr = False,
+            INNER_ROWS: tl.constexpr = 4, context=None):
+    if context is not None:
+        LOOP = tl.load(context + 2)
     if DEVICE_COUNT:
         if tl.load(error) != 0:
             return
         consumed = tl.load(consumed)
     layer = tl.program_id(0)
-    k = tl.arange(0, triton.next_power_of_2(4 * TOPK))
-    base = (LOOP * LAYERS + layer) * 4 * TOPK
+    k = tl.arange(0, triton.next_power_of_2(INNER_ROWS * TOPK))
+    base = (LOOP * LAYERS + layer) * INNER_ROWS * TOPK
     width = tl.load(widths + LOOP * LAYERS + layer)
     ids = tl.load(history + base + k, k < width * TOPK, -1)
     rejected = k // TOPK >= consumed
@@ -340,7 +360,13 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
              candidate_buffer, candidates, candidate_limit, remaining, completed,
              ROWS: tl.constexpr, LAYERS: tl.constexpr, SLOTS: tl.constexpr,
              ROUTES: tl.constexpr, DEPTH: tl.constexpr, MAX_LOOPS: tl.constexpr,
-             INNER: tl.constexpr, AUDIT: tl.constexpr, STAGE_CANDIDATES: tl.constexpr):
+             INNER: tl.constexpr, AUDIT: tl.constexpr, STAGE_CANDIDATES: tl.constexpr,
+             context=None):
+    if context is not None:
+        completed = tl.load(context + 2) + 1
+        candidates = tl.load(context + 3)
+        candidate_limit = tl.load(context + 4)
+        remaining = tl.load(context + 5)
     count = tl.load(consumed)
     failure = tl.load(error)
     total, blocked, width, stop = 0, 0, 0, 0
@@ -376,7 +402,8 @@ class GPUExpertCache:
 
     def __init__(self, cache, stream, *, max_loops, max_rows, top_k=8, prefetch=True,
                  use_graph=False, audit=False, layer_quota=4, gap_capacity=0, compact_control=False,
-                 implementation="reference"):
+                 implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
+                 inner_rows=4, layer_quotas=None, demand_fence=False):
         if cache.device.type != "cuda" or cache.decode_target != "gpu" or cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
             raise ValueError("GPU speculative scheduling requires pinned BF16 GPU-offload experts")
         if min(max_loops, max_rows, top_k) < 1 or min(layer_quota, gap_capacity) < 0:
@@ -389,10 +416,17 @@ class GPUExpertCache:
         if implementation == "optimized" and not compact_control:
             raise ValueError("optimized execution requires compact control")
         self.implementation = implementation
+        self.keep_hits, self.renormalize, self.collect_signals = keep_hits, renormalize, collect_signals
         optimized = implementation == "optimized"
         self.optimize_admission = self.optimize_copy = self.cross_layer_prefetch = self.stage_candidates = optimized
         self.layer_quota, self.gap_capacity = layer_quota, gap_capacity
+        if layer_quotas is not None and (len(layer_quotas) != cache.num_layers
+                or any(type(q) is not int or q < 0 for q in layer_quotas)):
+            raise ValueError("layer prefetch quotas must have one nonnegative integer per MoE layer")
+        self.layer_quotas = tuple(layer_quotas) if layer_quotas is not None else None
+        self.demand_fence = demand_fence
         self.max_loops, self.max_rows, self.top_k = max_loops, max_rows, top_k
+        self.inner_rows, self.valid_rows = inner_rows, None
         self.plan_capacity = max(cache.num_experts, min(max(0, gap_capacity - 1), cache.num_layers * cache.num_experts))
         self.copy_stream = torch.cuda.Stream(device=cache.device)
         self.refs = torch.zeros_like(cache.slot_for_id, dtype=torch.int32)
@@ -404,14 +438,16 @@ class GPUExpertCache:
         self.cursor = torch.zeros(1, dtype=torch.int32, device=cache.device)
         self.error = torch.zeros_like(self.cursor)
         self.protected = torch.zeros(cache.num_layers, dtype=torch.int32, device=cache.device)
-        self.control_device = torch.empty(max_rows + 8, dtype=torch.int64, device=cache.device)
-        self.control_host = torch.empty(max_rows + 8, dtype=torch.int64, pin_memory=True)
+        self.control_device = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, device=cache.device)
+        self.control_host = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, pin_memory=True)
         self.control_event = torch.cuda.Event()
         self.candidate_buffer = torch.empty(max_rows, dtype=torch.int32, device=cache.device)
         self.counters = torch.zeros(len(STAT_NAMES), dtype=torch.int64, device=cache.device)
-        shape = (max_loops, cache.num_layers, 4, top_k)
+        shape = (max_loops, cache.num_layers, inner_rows, top_k)
         self.history = torch.full(shape, -1, dtype=torch.int32, device=cache.device)
         self.ready_history = torch.zeros(shape, dtype=torch.bool, device=cache.device)
+        self.weight_history = torch.zeros(shape, dtype=torch.float32, device=cache.device)
+        self.keep_history = torch.zeros(shape, dtype=torch.bool, device=cache.device)
         self.widths = torch.zeros(shape[:2], dtype=torch.int32, device=cache.device)
         self.final_history = torch.full((cache.num_layers, max_rows, top_k), -1, dtype=torch.int32, device=cache.device)
         self.plans = [self._new_plan() for _ in range(2)]
@@ -441,6 +477,10 @@ class GPUExpertCache:
     def _new_plan(self):
         arrays = [torch.empty(self.plan_capacity, dtype=torch.int32, device=self.cache.device) for _ in range(3)]
         return (*arrays, torch.zeros(1, dtype=torch.int64, device=self.cache.device))
+
+    @property
+    def layer_prefetch_enabled(self):
+        return any(self.layer_quotas) if self.layer_quotas is not None else bool(self.layer_quota)
 
     def begin(self, epoch):
         if self.active or getattr(self.cache, "speculative_controller", None) is not None:
@@ -479,6 +519,7 @@ class GPUExpertCache:
             layer, c.num_experts, c.cache_size, c.num_experts * c.num_layers,
             prefetch, quota, gap, triton.next_power_of_2(c.cache_size),
             triton.next_power_of_2(c.num_experts * c.num_layers if layer < 0 else c.num_experts),
+            self.phase == "preverify",
             num_warps=8 if c.cache_size >= 2048 else 4)
 
     def _copy(self, layer, plan, *, retire=True):
@@ -505,9 +546,14 @@ class GPUExpertCache:
         _ready_layers[(self.cache.num_layers,)](self.pending, self.layer_plan_arrays[1],
             self.layer_plan_counts, self.plan_capacity, triton.next_power_of_2(self.plan_capacity))
 
+    def wait_demand(self):
+        if self.prefetch and self.demand_fence and self.cross_layer_prefetch and self.phase == "preverify":
+            # A device dependency bounds quota overruns without a host round trip.
+            self.stream.wait_stream(self.copy_stream)
+
     def route(self, layer, hidden, weights, ids):
         c, li, rows = self.cache, layer.layer_id, hidden.shape[0]
-        if not 0 <= li < c.num_layers or not 1 <= rows <= (4 if self.phase == "preverify" else self.max_rows):
+        if not 0 <= li < c.num_layers or not 1 <= rows <= (self.inner_rows if self.phase == "preverify" else self.max_rows):
             raise ValueError("GPU speculative route exceeds layer or row capacity")
         if ids.shape != (rows, self.top_k) or weights.shape != ids.shape:
             raise ValueError("GPU speculative route shape mismatch")
@@ -524,22 +570,27 @@ class GPUExpertCache:
             self.widths, self.final_history, self.queue, self.demand, slots, selected, self.cursor,
             self.counters, self.initial, self.prefetched_device, self.used_device,
             li, c.num_layers, c.num_experts, rows, ids.shape[1], self.max_rows, self.phase == "preverify",
-            triton.next_power_of_2(max(4 * ids.shape[1], ids.numel())), triton.next_power_of_2(c.num_experts),
-            self.error, self.cross_layer_prefetch)
+            triton.next_power_of_2(max(self.inner_rows * ids.shape[1], ids.numel())), triton.next_power_of_2(c.num_experts),
+            self.error, self.cross_layer_prefetch, self.weight_history, self.keep_history,
+            self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows)
+        prior_prefetch = self.layer_quota if self.layer_quotas is None else any(self.layer_quotas[:li])
+        if li > 0 and prior_prefetch:
+            self.wait_demand()
         self._allocate(li, self.plans[0])
         self._copy(li, self.plans[0])
         _resolve[(1,)](c.slot_for_id, self.pending, ids, slots, selected, *self.plans[0][1::2],
-            li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()))
-        if self.phase == "preverify" and self.prefetch and self.layer_quota:
+            li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()), self.valid_rows, self.top_k)
+        quota = self.layer_quotas[li] if self.layer_quotas is not None else self.layer_quota
+        if self.phase == "preverify" and self.prefetch and quota:
             plan = self.layer_plans[li] if self.cross_layer_prefetch else self.plans[1]
-            self._allocate(li, plan, prefetch=True, quota=self.layer_quota)
+            self._allocate(li, plan, prefetch=True, quota=quota)
             self.copy_stream.wait_stream(self.stream)
             with torch.cuda.stream(self.copy_stream):
                 self._copy(li, plan, retire=not self.cross_layer_prefetch)
         result = layer._expert_gemm(c, hidden, selected, slots, views=c.bank_views(), n=None,
                                     alphas=c.alphas_for_slots(li), is_prefill=False)
         if li == c.num_layers - 1:
-            if self.cross_layer_prefetch and self.phase == "preverify" and self.prefetch and self.layer_quota:
+            if self.cross_layer_prefetch and self.phase == "preverify" and self.prefetch and self.layer_prefetch_enabled:
                 self.retire_layers()
             elif not self.cross_layer_prefetch:
                 self.stream.wait_stream(self.copy_stream)
@@ -548,21 +599,33 @@ class GPUExpertCache:
     def decide(self, loop, consumed):
         c = self.cache
         _decide[(c.num_layers,)](self.refs, self.history, self.widths, self.queue, consumed,
-            loop, c.num_layers, c.num_experts, self.top_k, triton.next_power_of_2(c.num_experts))
+            loop, c.num_layers, c.num_experts, self.top_k, triton.next_power_of_2(c.num_experts),
+            INNER_ROWS=self.inner_rows)
 
     def read_control(self, tokens, commit, *, loop=None, candidates=0, candidate_limit=0,
                      remaining=0, depth=3):
+        self.write_control(tokens, commit, inner=loop is not None, loop=loop,
+                           candidates=candidates, candidate_limit=candidate_limit,
+                           remaining=remaining, depth=depth)
+        return self.drain_control(tokens.numel())
+
+    def write_control(self, tokens, commit, *, inner, loop=None, candidates=0, candidate_limit=0,
+                      remaining=0, depth=3, context=None):
         c = self.cache
-        if loop is not None:
+        if inner:
             _decide[(c.num_layers,)](self.refs, self.history, self.widths, self.queue, commit.input_count,
-                loop, c.num_layers, c.num_experts, self.top_k, triton.next_power_of_2(c.num_experts),
-                self.protected, self.error, True)
+                0 if loop is None else loop, c.num_layers, c.num_experts, self.top_k,
+                triton.next_power_of_2(c.num_experts), self.protected, self.error, True,
+                self.inner_rows, context)
         _control[(1,)](tokens, commit.input_count, commit.accepted_drafts, commit.terminal,
             self.error, self.protected, self.pending, self.control_device,
             self.candidate_buffer, candidates, candidate_limit, remaining, 0 if loop is None else loop + 1,
             tokens.numel(), c.num_layers, c.cache_size, c.num_layers * self.top_k,
-            depth, self.max_loops, loop is not None, self.audit, self.stage_candidates)
-        size = tokens.numel() + 8
+            depth, self.max_loops, inner, self.audit or context is not None, self.stage_candidates,
+            context)
+
+    def drain_control(self, rows):
+        size = rows + 8
         self.control_host[:size].copy_(self.control_device[:size], non_blocking=True)
         self.control_event.record(self.stream)
         self.control_event.synchronize()
@@ -606,6 +669,8 @@ class GPUExpertCache:
         history, widths = self.history.cpu().tolist(), self.widths.cpu().tolist()
         final = self.final_history.cpu().tolist()
         ready = self.ready_history.cpu().tolist() if self.audit else None
+        weights = self.weight_history.cpu().tolist() if self.collect_signals else None
+        kept = self.keep_history.cpu().tolist() if self.collect_signals else None
         records = []
         for loop in range(self.loop_count):
             for layer in range(self.cache.num_layers):
@@ -613,6 +678,9 @@ class GPUExpertCache:
                 row = dict(phase="preverify", loop=loop, layer=layer, ids=history[loop][layer][:width])
                 if ready is not None:
                     row["ready"] = ready[loop][layer][:width]
+                if weights is not None:
+                    row["weights"] = weights[loop][layer][:width]
+                    row["kept"] = kept[loop][layer][:width]
                 records.append(row)
         records.extend(dict(phase="verify", loop=0, layer=layer, ids=ids[:self.verify_rows])
                        for layer, ids in enumerate(final))
@@ -637,7 +705,8 @@ class GPUExpertCache:
         self.stats = dict(zip(STAT_NAMES, self.counters.cpu().tolist()))
         self.stats.update(pending_demand_experts=0, demand_slot_waits=0, capacity_failures=int(self.error.item()))
         self.stats["expert_bytes"] = sum(bank[0].numel() * bank.element_size() for _, bank in self.cache.banks)
-        for key in ("demand_loads", "prefetch_loads", "target_timely_prefetch"):
+        for key in ("demand_loads", "prefetch_loads", "target_timely_prefetch",
+                    "preverify_demand_loads", "verify_demand_loads"):
             self.stats[key + "_bytes"] = self.stats[key] * self.stats["expert_bytes"]
         self.prefetched = set(self.prefetched_device.flatten().nonzero().flatten().cpu().tolist())
         self.used_prefetch = set(self.used_device.flatten().nonzero().flatten().cpu().tolist())

@@ -17,6 +17,275 @@ def test_window_workspace_uses_loop_limit_and_counts_anchor(slots):
     assert WindowBudget.resolve(slots, 40, 8, 256, 1).submit_rows == 1
 
 
+@pytest.mark.parametrize("depth", [1, 2, 3, 4, 8])
+def test_variable_draft_depth_configuration(depth):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.speculative_window import WindowBudget
+
+    config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
+        speculative_mtp_depth=depth, speculative_three_level=True)
+    assert config.speculative_mtp_depth == depth
+    assert WindowBudget.resolve(4907, 40, 8, 256, depth=depth).submit_rows == 6 * (depth + 1) + 1
+
+
+@pytest.mark.parametrize("values", [
+    {"speculative_mtp_depth": -1}, {"speculative_mtp_depth": 1.5},
+    {"speculative_mtp_depth": True}, {"speculative_graph_implementation": "unknown"},
+    {"speculative_graph_implementation": "coarse"},
+    {"speculative_graph_implementation": "full"},
+])
+def test_graph_configuration_rejects_invalid_modes(values):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    with pytest.raises(ValueError):
+        EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, **values)
+
+
+@pytest.mark.parametrize("implementation", ["coarse", "full"])
+def test_coarse_graph_configuration_accepts_variable_depth(implementation):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
+        speculative_mtp_depth=4, speculative_three_level=True, speculative_expert_scheduler="gpu",
+        speculative_execution_implementation="optimized", speculative_graph_implementation=implementation,
+        attention_backend="triton", max_running_req=1, cuda_graph_max_bs=4)
+    assert config.speculative_mtp_depth == 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [2, 4, 5, 25, 31])
+def test_coarse_metadata_replays_valid_rows_and_noncontiguous_pages(width):
+    from freetoken.engine.qwen_speculative_graph import _metadata, _stage
+    import triton
+
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ids = torch.arange(width, dtype=torch.int32, device=device) + 7
+        table = torch.randperm(64, device=device).int()
+        inputs, positions, slots = (torch.empty_like(ids) for _ in range(3))
+        indptr = torch.empty(width + 1, dtype=torch.int32, device=device)
+        indices = torch.full((width * 64,), -1, dtype=torch.int32, device=device)
+        context = torch.zeros(7, dtype=torch.int32, device=device)
+        valid = torch.zeros(1, dtype=torch.int32, device=device)
+        def fn():
+            _metadata[(1, width)](ids, table, inputs, positions, slots, indptr, indices, valid,
+                                  context, width, -1, 256)
+        fn()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            fn()
+        for start, n in ((0, width), (9, 1), (64 - width, width), (63, 1)):
+            _stage[(1,)](context, start, n, 0, 0, width, width, width)
+            graph.replay()
+            lengths = [start + row + 1 for row in range(n)] + [0] * (width - n)
+            expected = torch.tensor([0] + lengths, device=device).cumsum(0).int()
+            torch.testing.assert_close(indptr, expected)
+            expected_indices = torch.cat([table[:length] for length in lengths])
+            torch.testing.assert_close(indices[:expected_indices.numel()], expected_indices)
+            torch.testing.assert_close(inputs[:n], ids[:n])
+            assert inputs[n:].eq(0).all() and positions[n:].eq(0).all()
+            assert valid.item() == n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [2, 4, 5, 25])
+def test_coarse_accept_ignores_poisoned_padding_and_matches_reference(width):
+    from freetoken.engine.qwen_speculative_graph import _accept, _stage
+    import triton
+
+    device = torch.device("cuda")
+    inputs = torch.arange(width, dtype=torch.int32, device=device) + 10
+    predicted = inputs + 1
+    tokens = torch.empty_like(inputs)
+    accepted, count, terminal = (torch.zeros((), dtype=torch.int32, device=device) for _ in range(3))
+    eos = torch.zeros(128, dtype=torch.bool, device=device)
+    context = torch.zeros(7, dtype=torch.int32, device=device)
+    for n in (1, width - 1, width):
+        for loss in (None, 0, n - 1):
+            for remaining in (1, n + 2):
+                for eos_id in ((), (11,)):
+                    predictions = predicted.clone()
+                    if loss is not None:
+                        predictions[loss] += 3
+                    predictions[n:] = -1000000
+                    eos.zero_()
+                    if eos_id:
+                        eos[list(eos_id)] = True
+                    _stage[(1,)](context, 0, n, 0, 0, width, remaining, remaining)
+                    _accept[(1,)](inputs, predictions, tokens, accepted, count, terminal, eos,
+                                   context, width, triton.next_power_of_2(width))
+                    oracle = greedy_commit(Proposal(inputs[:1], inputs[1:n]),
+                        VerifyResult(predictions[:n], torch.empty(n, 0, device=device)),
+                        remaining=remaining, eos_ids=eos_id)
+                    assert accepted.item() == oracle.accepted_drafts.item()
+                    assert count.item() == oracle.input_count.item()
+                    assert bool(terminal.item()) == bool(oracle.terminal.item())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_masked_kv_store_never_writes_padding_slots():
+    from freetoken.kernel.store import store_cache_masked
+
+    k_cache, v_cache = (torch.full((16, 2, 128), -1., device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    k, v = (torch.randn(5, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    slots = torch.tensor([8, 3, -1000000, -1000000, -1000000], device="cuda", dtype=torch.int32)
+    valid = torch.tensor([2], device="cuda", dtype=torch.int32)
+    store_cache_masked(k_cache, v_cache, slots, k, v, valid)
+    torch.testing.assert_close(k_cache[8], k[0])
+    torch.testing.assert_close(v_cache[3], v[1])
+    for slot in set(range(16)) - {8, 3}:
+        assert k_cache[slot].eq(-1).all() and v_cache[slot].eq(-1).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("implementation", ["coarse", "full"])
+@pytest.mark.parametrize("depth,limit", [(1, 0), (2, 0), (3, 0), (4, 0), (4, 1), (4, 3)])
+def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth, limit, implementation):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    from freetoken.engine.qwen_speculative_graph import QwenSpeculativeGraphSet
+    from freetoken.engine.speculative_window import WindowBudget
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        sources = [torch.arange(16, dtype=torch.float32).reshape(16, 1).pin_memory()]
+        bank = torch.empty(32, 1, device=device)
+        cache = SimpleNamespace(device=device, quant_format="bf16", decode_target="gpu",
+            cpu_layer_ids=set(), _unpinned_layers=set(), num_layers=1, num_experts=16, cache_size=32,
+            banks=[(sources, bank)], id_of_slot=torch.full((32,), -1, device=device, dtype=torch.int32),
+            slot_for_id=torch.full((1, 16), -1, device=device, dtype=torch.int32),
+            usage=torch.zeros(32, device=device, dtype=torch.int64),
+            step=torch.zeros((), device=device, dtype=torch.int64),
+            bank_views=lambda: (bank,), alphas_for_slots=lambda _: None)
+        def reset():
+            cache.slot_for_id.fill_(-1)
+            cache.id_of_slot.fill_(-1)
+            cache.usage.zero_()
+            cache.step.zero_()
+        cache.reset = reset
+        config = SimpleNamespace(speculative_mtp_depth=depth, speculative_max_loops=6,
+            speculative_submit_tokens=limit, speculative_graph_implementation=implementation,
+            speculative_execution_implementation="optimized", speculative_prefetch=True,
+            speculative_prefetch_layer_experts=1, speculative_prefetch_gap_capacity=3,
+            model_config=SimpleNamespace(hidden_size=2, vocab_size=128), page_size=1)
+        pool = SimpleNamespace(recurrent_states=torch.zeros(1, 2, 1, 1, 1, device=device),
+            conv_states=torch.zeros(1, 2, 3, 2, device=device), num_slots=2, local_index=lambda _: 0)
+        private = SimpleNamespace(recurrent_states=torch.zeros(1, 1, 1, 1, 1, device=device),
+            conv_states=torch.zeros(1, 1, 3, 2, device=device), num_slots=1, local_index=lambda _: 0)
+        engine = SimpleNamespace(config=config, device=device, stream=stream, max_seq_len=64,
+            num_pages=64, page_table=torch.zeros(1, 64, device=device, dtype=torch.int32),
+            linear_state_pool=pool, model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[])),
+                forward_host_ctx=lambda *a: nullcontext()))
+        runner = object.__new__(QwenMTPRunner)
+        runner.engine, runner._reserved_len, runner.graph_replays = engine, 0, {}
+        budget = WindowBudget.resolve(32, 1, 8, 16, limit, depth=depth)
+        experts = GPUExpertCache(cache, stream, max_loops=6, max_rows=budget.submit_rows,
+            inner_rows=depth + 1, layer_quota=1, gap_capacity=3, implementation="optimized", compact_control=True)
+        original_copy = experts._copy
+        def delayed_copy(*a, **kw):
+            if torch.cuda.current_stream() == experts.copy_stream:
+                torch.cuda._sleep(1000000)
+            return original_copy(*a, **kw)
+        monkeypatch.setattr(experts, "_copy", delayed_copy)
+        coordinator = SimpleNamespace(runner=runner, engine=engine, experts=experts,
+                                       budget=budget, private_pool=private)
+        class State:
+            def __init__(self, pool, layers, width, slot, **kwargs):
+                self.pool, self.width, self.slot = pool, width, slot
+            def commit(self, count):
+                self.pool.recurrent_states[:, self.slot].add_(count)
+        monkeypatch.setattr("freetoken.engine.qwen_speculative_graph.QwenGDNVerifyState", State)
+        def gemm(cache, hidden, weights, slots, **kwargs):
+            return hidden + (kwargs["views"][0][slots.long(), 0] * weights).sum(-1, keepdim=True) * 0
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        def target(batch):
+            ids = (batch.input_ids[:, None] + torch.arange(8, device=device)) % 16
+            weights = torch.ones(ids.shape, device=device) / 8
+            hidden = torch.zeros(batch.size, 2, device=device, dtype=torch.bfloat16)
+            return batch.input_ids + 1, experts.route(layer, hidden, weights, ids.int())
+        runner._target = target
+        def draft(batch, hidden, count=None):
+            tokens = batch.input_ids + 1
+            if count is not None:
+                return tokens.index_select(0, (count - 1).reshape(1).long()), hidden[:1].clone()
+            return tokens, hidden.clone()
+        runner._draft = draft
+        graphs = QwenSpeculativeGraphSet(coordinator)
+        graphs.prepare(())
+        expected_graphs = 2 * (depth + 1 + budget.submit_rows) if implementation == "full" else 4
+        assert graphs.ready and len(graphs.graphs) == graphs.captures == expected_graphs
+        for n in (1, min(depth + 1, budget.submit_rows), 1):
+            experts.begin(1)
+            experts.set_phase("preverify")
+            graphs.seed.fill_(11)
+            anchor = torch.tensor([10], device=device, dtype=torch.int32)
+            tokens, hidden, commit, control = graphs.body(anchor, inner=True, start=2, rows=n,
+                limit=budget.submit_rows - 1, remaining=32)
+            assert tokens.numel() == (n if graphs.exact else depth + 1)
+            assert control[0] == n and control[1] == n - 1
+            assert tokens[:n].tolist() == list(range(11, 11 + n))
+            graphs.tail(True, True)
+            experts.set_phase("verify")
+            tokens, hidden, commit, control = graphs.body(anchor, inner=False, start=2, rows=1, remaining=1)
+            assert control[:3] == [1, 0, 1]
+            graphs.tail(False, False)
+            experts.close(abort=True)
+            assert not experts.pending.any() and not experts.refs.any()
+        if graphs.exact:
+            widths = list(range(1, budget.submit_rows + 1))
+            for n in widths[::-1] + widths[::2] + widths[1::2]:
+                experts.begin(1)
+                experts.set_phase("verify")
+                experts.candidate_buffer.copy_(torch.arange(experts.candidate_buffer.numel(), device=device) + 11)
+                tokens, hidden, commit, control = graphs.body(anchor, inner=False, start=2, rows=n, remaining=64)
+                assert tokens.numel() == hidden.shape[0] == n
+                assert control[:2] == [n, n - 1]
+                assert tokens.tolist() == list(range(11, 11 + n))
+                graphs.tail(False, True)
+                experts.close(abort=True)
+                assert not experts.pending.any() and not experts.refs.any()
+            assert set(graphs.outer_lanes) == set(widths)
+            assert set(graphs.inner_lanes) == set(range(1, depth + 2))
+            assert len(graphs.capture_memory) == depth + 1 + budget.submit_rows
+        assert len(graphs.graphs) == graphs.captures == expected_graphs
+        graphs.prepare((11,))
+        experts.begin(2)
+        experts.set_phase("preverify")
+        graphs.seed.fill_(11)
+        eos_rows = min(depth + 1, budget.submit_rows)
+        _, _, _, control = graphs.body(anchor, inner=True, start=2, rows=eos_rows,
+            limit=budget.submit_rows - 1, remaining=32)
+        assert control[:3] == [1, eos_rows - 1, 1]
+        graphs.tail(True, False)
+        experts.close(abort=True)
+        experts.begin(3)
+        experts.set_phase("preverify")
+        before = private.recurrent_states.clone()
+        experts.error.fill_(1)
+        from freetoken.moe.speculative_cache import NoEvictableSlot
+        with pytest.raises(NoEvictableSlot):
+            graphs.body(anchor, inner=True, start=2, rows=1,
+                limit=budget.submit_rows - 1, remaining=32)
+        torch.testing.assert_close(private.recurrent_states, before, atol=0, rtol=0)
+        experts.close(abort=True)
+        runner.three_level = SimpleNamespace()
+        with pytest.raises(RuntimeError, match="configuration changed"):
+            graphs.prepare(())
+        runner.three_level = coordinator
+        config.speculative_mtp_depth += 1
+        with pytest.raises(RuntimeError, match="configuration changed"):
+            graphs.prepare(())
+        graphs.close()
+        assert not graphs.ready and not graphs.graphs
+
+
 def test_pressure_admission_checks_next_loop_and_counts_blocked_slots():
     from freetoken.engine.speculative_window import WindowBudget
     budget = WindowBudget.resolve(24, 2, 2, 16)
@@ -47,6 +316,11 @@ def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
     {"speculative_max_loops": -1},
     {"speculative_prefetch_layer_experts": -1},
     {"speculative_prefetch_gap_capacity": -1},
+    {"speculative_prefetch_layer_quotas": []},
+    {"speculative_prefetch_layer_quotas": [-1]},
+    {"speculative_prefetch_layer_quotas": [True]},
+    {"speculative_prefetch_layer_quotas": [1]},
+    {"speculative_prefetch_demand_fence": True},
     {"speculative_expert_scheduler": "unknown"},
     {"speculative_expert_scheduler": "gpu"},
     {"speculative_expert_scheduler": "gpu", "speculative_three_level": True,

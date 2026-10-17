@@ -8,6 +8,76 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_graph_audit_semantics_ignore_global_epoch_and_wall_time(monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from bench_speculative_graph import semantic_requests
+    first = [{"token_ids": [1, 2], "complete_wall_seconds": 1,
+              "rounds": [{"epoch": 1, "accepted": 0, "returned": 1}]}]
+    second = copy.deepcopy(first)
+    second[0]["complete_wall_seconds"] = 2
+    second[0]["rounds"][0]["epoch"] = 100
+    assert semantic_requests(first) == semantic_requests(second)
+    second[0]["rounds"][0]["accepted"] = 1
+    assert semantic_requests(first) != semantic_requests(second)
+
+
+def test_graph_state_digest_supports_scalar_clock(monkeypatch):
+    import hashlib
+    import torch
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from bench_speculative_graph import tensor_digest
+    clock = torch.tensor(7, dtype=torch.int64)
+    assert tensor_digest(clock) == hashlib.sha256(clock.numpy().tobytes()).hexdigest()
+
+
+def test_graph_timing_journal_keeps_requests_before_later_validation_failure(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from bench_speculative_graph import append_timing_request
+    row = dict(sample_id=0, token_ids=[1, 2], rounds=[])
+    with pytest.raises(RuntimeError):
+        append_timing_request(tmp_path, 0, row)
+        append_timing_request(tmp_path, 1, row)
+        raise RuntimeError("later GPU exclusivity failure")
+    assert [json.loads(line) for line in (tmp_path / "timing_raw.jsonl").read_text().splitlines()] == [
+        dict(repeat=repeat, **row) for repeat in (0, 1)]
+
+
+@pytest.mark.parametrize("tpot,throughput,eligible,repeat", [
+    (11., 32., True, False), (13., 30., False, False),
+    (11., 30., False, True), (11.99, 32., False, True),
+])
+def test_graph_comparison_requires_fixed_slot_performance_and_parity(
+        tmp_path, monkeypatch, tpot, throughput, eligible, repeat):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from analyze_speculative_graph import compare
+    roots = [tmp_path / "reference", tmp_path / "coarse"]
+    for root, mode in zip(roots, ("reference", "coarse")):
+        root.mkdir()
+        def write(name, value):
+            (root / name).write_text(json.dumps(value))
+        write("config.json", dict(graph_implementation=mode, output=str(root),
+            depth=3, slots=4907, profile=False, audit=True, source_sha256={"runtime.py": "same"}))
+        write("complete.json", dict(status="complete", validated=True))
+        write("audit_validation.json", dict(states=True, trajectory=True, timing_tokens=True))
+        write("summary.json", dict(tpot_ms=12. if mode == "reference" else tpot,
+            throughput=31. if mode == "reference" else throughput,
+            peak_nvml_mib=1000 if mode == "reference" else 900, gpu_exclusive=True,
+            peak_reserved_bytes=1000 if mode == "reference" else 900))
+        write("audit.json", dict(requests=[], events=[{"state": "same"}]))
+    result = compare(*roots)
+    assert result["eligible_for_default"] is eligible
+    assert result["requires_repeat"] is repeat
+    audit = roots[1] / "audit.json"
+    audit.write_text(json.dumps(dict(requests=[], events=[{"state": "different"}])))
+    assert not compare(*roots)["eligible_for_default"]
+    config_path = roots[1] / "config.json"
+    config = json.loads(config_path.read_text())
+    config["slots"] += 1
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="configuration mismatch"):
+        compare(*roots)
+
+
 @pytest.fixture
 def benchmark(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))

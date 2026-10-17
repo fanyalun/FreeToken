@@ -129,6 +129,7 @@ class Batch:
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
     gdn_verify_state: object | None = field(default=None, init=False)
     rowwise_linear: bool = field(default=False, init=False)
+    speculative_valid_rows: torch.Tensor | None = field(default=None, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
     # This decode batch's padded per-row page-table rows. Attention backends that must read

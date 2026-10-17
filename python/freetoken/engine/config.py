@@ -74,11 +74,14 @@ class EngineConfig:
     speculative_max_loops: int = 6
     speculative_prefetch: bool = True
     speculative_prefetch_layer_experts: int = 4
+    speculative_prefetch_layer_quotas: List[int] | None = None
+    speculative_prefetch_demand_fence: bool = False
     speculative_prefetch_gap_capacity: int = 0
     speculative_audit: bool = False
     speculative_expert_scheduler: str = "host"
     speculative_compact_control: bool = True
     speculative_execution_implementation: str = "reference"
+    speculative_graph_implementation: str = "reference"
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -107,8 +110,8 @@ class EngineConfig:
     def __post_init__(self):
         if self.gpu_memory_budget_bytes is not None and self.gpu_memory_budget_bytes <= 0:
             raise ValueError("gpu_memory_budget_bytes must be positive")
-        if self.speculative_mtp_depth not in (0, 3):
-            raise ValueError("native MTP currently supports depth 3")
+        if type(self.speculative_mtp_depth) is not int or self.speculative_mtp_depth < 0:
+            raise ValueError("speculative_mtp_depth must be a nonnegative integer")
         if self.speculative_mtp_depth and (self.dtype != torch.bfloat16 or self.tp_info.size != 1):
             raise ValueError("native MTP requires BF16 and TP=1")
         if self.speculative_submit_tokens < 0:
@@ -127,8 +130,26 @@ class EngineConfig:
             raise ValueError("GPU expert scheduling requires GPU offload")
         if min(self.speculative_prefetch_layer_experts, self.speculative_prefetch_gap_capacity) < 0:
             raise ValueError("speculative prefetch quotas must be nonnegative")
-        if self.speculative_three_level and self.speculative_mtp_depth != 3:
-            raise ValueError("three-level decoding requires speculative_mtp_depth=3")
+        if self.speculative_prefetch_layer_quotas is not None:
+            if not self.speculative_prefetch_layer_quotas or any(type(q) is not int or q < 0
+                    for q in self.speculative_prefetch_layer_quotas):
+                raise ValueError("layer prefetch quotas must be nonnegative integers")
+        if (self.speculative_prefetch_layer_quotas is not None or self.speculative_prefetch_demand_fence):
+            if self.speculative_expert_scheduler != "gpu":
+                raise ValueError("layer prefetch budgets and demand fences require GPU scheduling")
+        if self.speculative_three_level and self.speculative_mtp_depth < 1:
+            raise ValueError("three-level decoding requires positive speculative_mtp_depth")
+        if self.speculative_graph_implementation not in ("reference", "coarse", "full"):
+            raise ValueError("speculative_graph_implementation must be reference, coarse or full")
+        if self.speculative_graph_implementation in ("coarse", "full"):
+            if (self.speculative_expert_scheduler != "gpu"
+                    or self.speculative_execution_implementation != "optimized"
+                    or not self.speculative_compact_control):
+                raise ValueError("coarse/full graphs require GPU scheduling and optimized compact execution")
+            if self.attention_backend != "triton" or self.max_running_req != 1:
+                raise ValueError("coarse/full graphs require Triton attention and one active request")
+            if self.cuda_graph_max_bs == 0 or self.cuda_graph_bs == []:
+                raise ValueError("coarse/full graphs require CUDA Graph enabled")
         if self.speculative_submit_tokens and not self.speculative_three_level:
             raise ValueError("speculative_submit_tokens requires three-level decoding")
         if self.moe_backend is None:

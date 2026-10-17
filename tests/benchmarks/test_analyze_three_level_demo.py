@@ -11,6 +11,103 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 from analyze_three_level_demo import MODES, analyze
+from analyze_speculative_policy import analyze_stopping, evaluate_threshold
+from analyze_speculative_io_budget import make_budget, io_summary
+
+
+def test_io_budget_uses_only_no_prefetch_calibration_and_zeroes_last_layer():
+    rows = []
+    for forward, gap in enumerate([300_000, 500_000, 900_000]):
+        for start in (0, 100_000 + gap):
+            rows.append(dict(method="io_calibration", phase="preverify", forward=forward,
+                             kind="demand_io", start=start, end=start + 100_000))
+    rows.append(dict(method="layer_budget", phase="preverify", forward=99,
+                     kind="demand_io", start=0, end=10**10))
+    budget = make_budget(rows, {1: .25, 2: .5}, layers=2, margin_ms=.025)
+    assert budget["calibration_forwards"] == 3
+    assert budget["layer_quotas"] == [0, 0]
+    assert budget["layers"][0]["safe_copy_budget_ms"] == pytest.approx(.245)
+    budget = make_budget(rows, {1: .25, 2: .5}, layers=2, margin_ms=0)
+    assert budget["layer_quotas"] == [1, 0]
+    rows.append(dict(method="io_calibration", phase="preverify", forward=0,
+                     kind="prefetch_io", start=0, end=1))
+    with pytest.raises(ValueError, match="no prefetch"):
+        make_budget(rows, {1: .25}, layers=2)
+
+
+@pytest.mark.parametrize("gaps,expected", [([100_000, 400_000], 1), ([625_000], 3), ([100_000], 0)])
+def test_io_budget_median_round_uses_true_median_and_half_up_without_guards(gaps, expected):
+    rows = [dict(method="io_calibration", phase="preverify", forward=forward,
+                 kind="demand_io", start=start, end=start + 100_000)
+            for forward, gap in enumerate(gaps) for start in (0, 100_000 + gap)]
+    budget = make_budget(rows, {1: .25, 2: .5, 3: .75}, layers=2, max_experts=256,
+                         policy="median_round")
+    assert budget["layer_quotas"] == [expected, 0]
+    assert budget["safety"] == 1 and budget["launch_margin_ms"] == 0
+    assert budget["layers"][0]["safe_copy_budget_ms"] == budget["layers"][0]["median_window_ms"]
+    assert make_budget(rows, {1: .25}, layers=2, max_experts=1,
+                       policy="median_round")["layer_quotas"] == [min(expected, 1), 0]
+    with pytest.raises(ValueError, match="single-expert"):
+        make_budget(rows, {2: .5}, layers=2, policy="median_round")
+
+
+def test_io_summary_separates_overlap_from_pre_demand_residual():
+    rows = [dict(kind="demand_io", name="copy", start=0, end=100),
+            dict(kind="prefetch_io", name="copy", start=110, end=300),
+            dict(kind="schedule", name="_plan", start=190, end=200),
+            dict(kind="demand_io", name="copy", start=310, end=400)]
+    rows = [dict(r, method="layer_budget", phase="preverify", forward=0) for r in rows]
+    result = io_summary(rows, layers=2)["layer_budget/preverify"]
+    assert result["prefetch_demand_overlap_ms"] == 0
+    assert result["residual_at_next_admission_ms"] == pytest.approx(.0001)
+    assert result["boundaries"] == result["positive_residual_boundaries"] == 1
+
+
+def test_early_stop_uses_first_trigger_once_and_counts_premature_stops():
+    rows = [dict(sample_id=0, window=0, loop=2, risk=.9, future_wasted=True,
+                 future_accepted=0, future_preverify_ms=80),
+            dict(sample_id=0, window=0, loop=3, risk=.95, future_wasted=True,
+                 future_accepted=0, future_preverify_ms=60),
+            dict(sample_id=1, window=0, loop=2, risk=.8, future_wasted=False,
+                 future_accepted=5, future_preverify_ms=90)]
+    result = evaluate_threshold(rows, "risk", .8)
+    assert result["stopped_windows"] == 2
+    assert result["correct_stops"] == 1 and result["premature_stops"] == 1
+    assert result["sacrificed_future_accepted"] == 5
+    assert result["avoidable_preverify_ms_upper_bound"] == 80
+
+
+def test_early_stop_threshold_is_fitted_on_training_requests_only():
+    rows = []
+    for sample, risk, wasted in [(0, .8, True), (1, .2, False), (2, .9, False), (3, .1, True)]:
+        rows.append(dict(sample_id=sample, window=0, loop=2, future_wasted=wasted,
+            future_accepted=0 if wasted else 4, future_preverify_ms=50,
+            **{name: risk for name in ("current_inner_rejection", "negative_prefix_min_margin",
+                "negative_prefix_min_probability", "prefix_mean_dropped_mass", "prefix_max_dropped_mass")}))
+    result = analyze_stopping(rows, 4)
+    for feature in result["features"].values():
+        assert feature["threshold"] == .8
+        assert feature["train"]["premature_stops"] == 0
+        assert feature["test"]["premature_stops"] == 1
+
+
+def test_diagnostic_shared_lm_head_does_not_replace_preverify_logits(tmp_path, monkeypatch):
+    import torch
+    from freetoken.layers.moe import OffloadMoELayer
+    from speculative_policy_diagnostics import PolicyDiagnostics
+
+    monkeypatch.setattr(OffloadMoELayer, "_expert_gemm", OffloadMoELayer._expert_gemm)
+    head = SimpleNamespace(forward=lambda hidden: hidden)
+    control = SimpleNamespace(experts=SimpleNamespace(active=True, phase="preverify"))
+    runner = SimpleNamespace(three_level=control,
+        engine=SimpleNamespace(moe_offload_cache=SimpleNamespace(collect_stats=False),
+                               model=SimpleNamespace(lm_head=head)))
+    runner._execute = lambda phase, batch, hidden, count=None: head.forward(hidden)
+    diagnostic = PolicyDiagnostics(runner, tmp_path)
+    target, draft = torch.tensor([[1., 2.]]), torch.tensor([[9., 10.]])
+    runner._execute("three_level_preverify_test", None, target)
+    runner._execute("draft", None, draft)
+    assert torch.equal(diagnostic.logits[id(control), 1], target)
 
 
 @pytest.fixture
