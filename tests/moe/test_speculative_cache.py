@@ -126,6 +126,38 @@ def toy_layer(li):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_demand_only_windows_do_not_pin_routes_and_replay_after_eviction():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        cache = toy_cache(device, layers=2, experts=16, slots=8)
+        control = GPUExpertCache(cache, stream, max_loops=1, max_rows=8, inner_rows=8,
+            top_k=8, prefetch=False, layer_quota=0, gap_capacity=0, compact_control=True,
+            implementation="optimized")
+        control.retain_routes = False
+        control.begin(1)
+        control.set_phase("preverify", 0)
+        ids = torch.arange(8, dtype=torch.int32, device=device).reshape(1, 8)
+        weights = torch.arange(8, 0, -1, dtype=torch.float32, device=device).reshape(1, 8) / 36
+        hidden = torch.zeros(1, 1, device=device)
+        first = control.route(toy_layer(0), hidden, weights, ids).clone()
+        assert not control.refs.any()
+        assert torch.allclose(first, (weights[0, :4] * torch.arange(4, device=device)).sum())
+        control.route(toy_layer(1), hidden, weights, ids)
+        control.route(toy_layer(0), hidden, weights, ids + 8)
+        assert (cache.slot_for_id[0, :4] < 0).all()
+        replayed = control.route(toy_layer(0), hidden, weights, ids)
+        assert torch.equal(first, replayed)
+        assert not control.refs.any()
+        assert not control.pending.any()
+        assert not control.prefetched_device.any()
+        control.check_error()
+        control.close(abort=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("quotas", [(1, 0), (0, 1), (0, 0)])
 @pytest.mark.parametrize("graph", [False, True])
 def test_layer_prefetch_budget_fences_next_demand_and_retires_zero_tail(quotas, graph):

@@ -22,7 +22,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           TOPK: tl.constexpr, MAX_ROWS: tl.constexpr, PREVERIFY: tl.constexpr,
           N: tl.constexpr, E: tl.constexpr, error, CHECK_PENDING: tl.constexpr,
           weight_history, keep_history, KEEP_HITS: tl.constexpr, RENORMALIZE: tl.constexpr,
-          COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None):
+          COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None,
+          RETAIN_ROUTES: tl.constexpr = True):
     k = tl.arange(0, N)
     rows = ROWS if valid_rows is None else tl.load(valid_rows)
     valid = k < rows * TOPK
@@ -43,7 +44,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         old_count = tl.histogram(old, E, mask=old >= 0)
         new_count = tl.histogram(e, E, mask=valid)
         value = tl.load(refs + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
-        tl.store(refs + LAYER * EXPERTS + experts, value + new_count - old_count, experts < EXPERTS)
+        tl.store(refs + LAYER * EXPERTS + experts,
+                 value + new_count - old_count if RETAIN_ROUTES else 0, experts < EXPERTS)
         tl.store(history + base + k, tl.where(valid, e, -1), k < INNER_ROWS * TOPK)
         tl.store(ready_history + base + k, ready, k < INNER_ROWS * TOPK)
         tl.store(widths + loop * LAYERS + LAYER, rows)
@@ -417,6 +419,7 @@ class GPUExpertCache:
             raise ValueError("optimized execution requires compact control")
         self.implementation = implementation
         self.keep_hits, self.renormalize, self.collect_signals = keep_hits, renormalize, collect_signals
+        self.retain_routes = True
         optimized = implementation == "optimized"
         self.optimize_admission = self.optimize_copy = self.cross_layer_prefetch = self.stage_candidates = optimized
         self.layer_quota, self.gap_capacity = layer_quota, gap_capacity
@@ -572,7 +575,8 @@ class GPUExpertCache:
             li, c.num_layers, c.num_experts, rows, ids.shape[1], self.max_rows, self.phase == "preverify",
             triton.next_power_of_2(max(self.inner_rows * ids.shape[1], ids.numel())), triton.next_power_of_2(c.num_experts),
             self.error, self.cross_layer_prefetch, self.weight_history, self.keep_history,
-            self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows)
+            self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows,
+            self.retain_routes)
         prior_prefetch = self.layer_quota if self.layer_quotas is None else any(self.layer_quotas[:li])
         if li > 0 and prior_prefetch:
             self.wait_demand()

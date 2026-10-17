@@ -1267,6 +1267,10 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
+  bool expert_grouped = false;
+  std::vector<std::vector<int>> grouped_routes;
+  std::vector<int> grouped_experts;
+  std::vector<float> grouped_down;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -1840,12 +1844,51 @@ struct CpuMoeExecutor {
     }
   }
 
+  void grouped_pass1(const MoeTask* t, int64_t p) {
+    const int ib = p % n_iblk;
+    const int e = grouped_experts[p / n_iblk];
+    for (int route : grouped_routes[e]) do_pass1(t, (int64_t)route * n_iblk + ib);
+  }
+
+  void grouped_pass2(const MoeTask* t, int64_t p) {
+    const int hb = p % n_hblk;
+    const int e = grouped_experts[p / n_hblk];
+    const auto* down = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
+    for (int h = hb * HBLK; h < std::min(H, (hb + 1) * HBLK); ++h) {
+      for (int route : grouped_routes[e]) {
+        const bf16_t* g = g_scratch.data() + (size_t)route * I;
+        grouped_down[(size_t)route * H + h] =
+            gemm2_dot(down, nullptr, nullptr, nullptr, e, h, g, nullptr, nullptr, nullptr, nullptr);
+      }
+    }
+  }
+
+  void grouped_reduce(const MoeTask* t, int64_t p) {
+    const int tok = p / n_hblk, hb = p % n_hblk;
+    for (int h = hb * HBLK; h < std::min(H, (hb + 1) * HBLK); ++h) {
+      float acc = 0.0f;
+      for (int k = 0; k < top_k; ++k) {
+        const size_t route = (size_t)tok * top_k + k;
+        if (t->ids[route] >= 0 && t->ids[route] < num_experts)
+          acc += grouped_down[route * H + h] * t->w[route];
+      }
+      t->y[(size_t)tok * H + h] = f32_to_bf16(acc);
+    }
+  }
+
+  void set_expert_grouped(bool enabled) {
+    if (enabled && (fmt != WF_BF16 || apply_on_input))
+      throw std::invalid_argument("expert grouping requires BF16 output-weighted experts");
+    expert_grouped = enabled;
+  }
+
   void run_task_body(const MoeTask* t) {
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
-      do_pass1(t, p);
+      if (expert_grouped) grouped_pass1(t, p);
+      else do_pass1(t, p);
     }
     barrier(local_sense);
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
@@ -1862,7 +1905,16 @@ struct CpuMoeExecutor {
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
-      do_pass2(t, p);
+      if (expert_grouped) grouped_pass2(t, p);
+      else do_pass2(t, p);
+    }
+    if (expert_grouped) {
+      barrier(local_sense);
+      for (;;) {
+        int64_t p = prt_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= prt_total) break;
+        grouped_reduce(t, p);
+      }
     }
   }
 
@@ -1912,6 +1964,20 @@ struct CpuMoeExecutor {
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
     p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
+    if (expert_grouped) {
+      grouped_routes.assign(num_experts, {});
+      grouped_experts.clear();
+      for (int route = 0; route < t->num_tokens * top_k; ++route) {
+        const int e = t->ids[route];
+        if (e >= 0 && e < num_experts) grouped_routes[e].push_back(route);
+      }
+      for (int e = 0; e < num_experts; ++e)
+        if (!grouped_routes[e].empty()) grouped_experts.push_back(e);
+      grouped_down.resize((size_t)t->num_tokens * top_k * H);
+      p1_total = (int64_t)grouped_experts.size() * n_iblk;
+      p2_total = (int64_t)grouped_experts.size() * n_hblk;
+      prt_total = (int64_t)t->num_tokens * n_hblk;
+    }
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -2147,6 +2213,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("run_task", &CpuMoeExecutor::run_task, py::arg("task"),
            py::call_guard<py::gil_scoped_release>())
+      .def("set_expert_grouped", &CpuMoeExecutor::set_expert_grouped, py::arg("enabled"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
