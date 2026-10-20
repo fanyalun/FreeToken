@@ -453,7 +453,7 @@ class QwenMTPRunner:
 
     def _commit_state(self, state, count):
         # Keep the binding alive as well as distinguishing equal-width workspaces.
-        key = ("commit", state.width, state)
+        key = ("commit", state.width, id(state))
         if not self.use_graph:
             self.graph_fallbacks["commit"] = self.graph_fallbacks.get("commit", 0) + 1
             state.commit(count)
@@ -465,8 +465,8 @@ class QwenMTPRunner:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=self.engine.stream):
                 state.commit(fixed_count)
-            self.graphs[key] = (graph, fixed_count)
-        graph, fixed_count = self.graphs[key]
+            self.graphs[key] = (graph, fixed_count, state)
+        graph, fixed_count, _ = self.graphs[key]
         fixed_count.copy_(count)
         graph.replay()
         self.graph_replays["commit"] = self.graph_replays.get("commit", 0) + 1
