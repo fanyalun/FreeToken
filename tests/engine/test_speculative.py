@@ -273,6 +273,9 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 forward_host_ctx=lambda *a: nullcontext()))
         runner = object.__new__(QwenMTPRunner)
         runner.engine, runner._reserved_len, runner.graph_replays = engine, 0, {}
+        runner.states, runner.graphs, runner._decode_batches = {}, {}, {}
+        runner.active, runner.coarse_graphs = False, None
+        runner.model_state = SimpleNamespace(current=None)
         budget = WindowBudget.resolve(64, 2, 8, 16, limit, depth=depth)
         experts = GPUExpertCache(cache, stream, max_loops=6, max_rows=budget.submit_rows,
             inner_rows=depth + 1, layer_quota=1, gap_capacity=3, implementation="optimized", compact_control=True,
@@ -292,6 +295,7 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             def commit(self, count):
                 self.pool.recurrent_states[:, self.slot].add_(count)
         monkeypatch.setattr("freetoken.engine.qwen_speculative_graph.QwenGDNVerifyState", State)
+        monkeypatch.setattr("freetoken.engine.qwen_mtp.QwenGDNVerifyState", State)
         def gemm(cache, hidden, weights, slots, **kwargs):
             return hidden + (kwargs["views"][0][slots.long(), 0] * weights).sum(-1, keepdim=True) * 0
         def target(batch):
@@ -468,6 +472,108 @@ def test_reference_verify_prefetch_configuration_changes_require_rebuild():
         control._forward(None, None, None)
 
 
+@pytest.mark.parametrize("gpu", [False, True])
+def test_reference_prefetch_toggle_without_verify_prefetch_keeps_signature(gpu):
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+    control = object.__new__(ThreeLevelCoordinator)
+    control.engine = SimpleNamespace(config=SimpleNamespace(speculative_graph_implementation="reference"))
+    control.experts = SimpleNamespace(prefetch=True, gpu_schedule=gpu, verify_prefetch_enabled=False)
+    signature = control._verify_prefetch_signature()
+    control.experts.prefetch = False
+    assert control._verify_prefetch_signature() == signature
+    control.experts.prefetch = True
+    assert control._verify_prefetch_signature() == signature
+
+
+@pytest.mark.parametrize("config", [
+    {"speculative_graph_implementation": "full"},
+    {"speculative_verify_prefetch_layer_experts": 1},
+    {"speculative_verify_prefetch_layer_quotas": [0, 1]},
+])
+def test_captured_prefetch_toggle_still_requires_rebuild(config):
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+    control = object.__new__(ThreeLevelCoordinator)
+    control.engine = SimpleNamespace(config=SimpleNamespace(**config))
+    control.experts = SimpleNamespace(prefetch=True)
+    control.verify_prefetch_signature = control._verify_prefetch_signature()
+    control.experts.prefetch = False
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        control._forward(None, None, None)
+
+
+def test_graph_set_close_preserves_replacement_state_owners():
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_speculative_graph import QwenSpeculativeGraphSet
+    graphs = object.__new__(QwenSpeculativeGraphSet)
+    target, private = {1: object()}, {1: object()}
+    graphs.runner = SimpleNamespace(states=target)
+    graphs.coordinator = SimpleNamespace(private_states=private)
+    graphs.target_states, graphs.private_states = {1: object()}, {1: object()}
+    graphs.engine = SimpleNamespace(stream=SimpleNamespace(synchronize=lambda: None))
+    graphs.experts = SimpleNamespace(close=lambda **kwargs: None)
+    graphs.graphs, graphs.inner_lanes, graphs.outer_lanes, graphs.active_lanes = {}, {}, {}, {}
+    graphs.close()
+    assert graphs.runner.states is target and target
+    assert graphs.coordinator.private_states is private and private
+    assert not graphs.target_states and not graphs.private_states
+
+
+def test_gdn_workspace_reuse_and_growth_invalidates_graphs():
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    calls = []
+    pool = SimpleNamespace(recurrent_states=torch.zeros(1, 2, 2, 4, 4),
+                           conv_states=torch.zeros(1, 2, 16, 3), num_slots=2)
+    runner = object.__new__(QwenMTPRunner)
+    runner.engine = SimpleNamespace(linear_state_pool=pool,
+                                   stream=SimpleNamespace(synchronize=lambda: calls.append("sync")))
+    runner.states, runner.graphs, runner._decode_batches = {}, {}, {}
+    runner.active, runner.coarse_graphs = False, None
+    runner.model_state = SimpleNamespace(current=None)
+    workspace = runner._gdn_workspace(4, [])
+    state = runner.states[2]
+    runner.graphs[("commit", 2)] = object()
+    assert runner._gdn_workspace(2, []) is workspace
+    assert runner.states[2] is state and runner.graphs
+    runner.active = True
+    with pytest.raises(RuntimeError, match="idle"):
+        runner._gdn_workspace(8, [])
+    assert runner.states[2] is state and runner.graphs
+    runner.active = False
+    runner._decode_batches[2] = object()
+    grown = runner._gdn_workspace(8, [])
+    assert grown.width == 8 and grown is not workspace
+    assert not runner.graphs and not runner._decode_batches
+    assert calls == ["sync"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_commit_graph_uses_replacement_state_storage():
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    runner = object.__new__(QwenMTPRunner)
+    runner.engine = SimpleNamespace(stream=torch.cuda.Stream())
+    runner.engine.stream.wait_stream(torch.cuda.current_stream())
+    runner.graphs, runner.graph_replays = {}, {}
+    runner.use_graph = True
+    output = torch.zeros(1, device="cuda")
+    class State:
+        width = 2
+        def __init__(self, value):
+            self.replay = torch.full_like(output, value)
+        def commit(self, count):
+            output.copy_(self.replay * count)
+    with torch.cuda.stream(runner.engine.stream):
+        first, second = State(3), State(7)
+        count = torch.ones(1, dtype=torch.int32, device="cuda")
+        runner._commit_state(first, count)
+        runner._commit_state(second, count)
+    runner.engine.stream.synchronize()
+    assert output.item() == 7
+
+
 def test_route_metrics_align_consumed_input_rows_and_leave_final_correction_unknown():
     from freetoken.engine.qwen_three_level import route_metrics
     records = [
@@ -556,6 +662,7 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
             return {}
 
     monkeypatch.setattr("freetoken.engine.qwen_three_level.QwenGDNVerifyState", State)
+    monkeypatch.setattr("freetoken.engine.qwen_mtp.QwenGDNVerifyState", State)
     monkeypatch.setattr("freetoken.engine.qwen_three_level.SpeculativeExpertCache", Cache)
     runner.states = {w: State(engine.linear_state_pool, [], w, 1) for w in range(1, 5)}
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
@@ -847,6 +954,22 @@ def test_tiny_engine_audit_mapping_and_valid_rows(options):
     result = subprocess.run(command, capture_output=True, text=True, timeout=240)
     assert result.returncode == 0, result.stdout + result.stderr
     assert '"audit_lifecycle": true' in result.stdout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("scheduler", ["host", "gpu"])
+def test_tiny_engine_controller_replacement_and_prefetch(scheduler):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")),
+               "--controller-lifecycle", "--backend", "offload", "--three-level",
+               "--scheduler", scheduler]
+    env = dict(os.environ, FREETOKEN_MOE_GROUPED_DECODE="0")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"controller_lifecycle": true' in result.stdout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--compatibility-export', type=Path)
     parser.add_argument('--expect-pressure-error', action='store_true')
     parser.add_argument('--audit-lifecycle', action='store_true')
+    parser.add_argument('--controller-lifecycle', action='store_true')
     args = parser.parse_args()
     torch.manual_seed(123)
     with tempfile.TemporaryDirectory(prefix='baseline_sd_tiny_') as directory:
@@ -153,6 +154,37 @@ def main():
                 reset()
                 assert engine.generate_speculative(prompt, max_tokens=4).token_ids == expected
                 print(json.dumps(dict(status="passed", audit_lifecycle=True, three_level=args.three_level)))
+                return
+
+            if args.controller_lifecycle:
+                from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+                original = runner.three_level
+                assert original is not None and runner.coarse_graphs is None
+                states = dict(runner.states)
+                prompt = list(range(9))
+                def canonical_state():
+                    pool = engine.linear_state_pool
+                    values = [pool.recurrent_states[:, 1], pool.conv_states[:, 1]]
+                    full_ids = engine.config.model_config.kv_cache_group_specs()[0].layer_ids
+                    for layer_id in full_ids:
+                        values.extend(cache(layer_id).flatten(0, 1)[:len(prompt) + 7]
+                                      for cache in (engine.kv_cache.k_cache, engine.kv_cache.v_cache))
+                    return [value.clone() for value in values]
+                reset()
+                expected = engine.generate_speculative(prompt, max_tokens=8).token_ids
+                reference_state = canonical_state()
+                replacement = ThreeLevelCoordinator(runner)
+                assert all(runner.states[w] is state for w, state in states.items())
+                runner.three_level = replacement
+                for prefetch in (False, True, False):
+                    replacement.experts.prefetch = prefetch
+                    reset()
+                    result = engine.generate_speculative(prompt, max_tokens=8)
+                    assert result.token_ids == expected
+                    for actual, reference in zip(canonical_state(), reference_state):
+                        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                original.invalidate()
+                print(json.dumps(dict(status="passed", controller_lifecycle=True)))
                 return
 
             if args.expect_pressure_error:

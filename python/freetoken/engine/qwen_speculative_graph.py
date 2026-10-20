@@ -110,15 +110,15 @@ class QwenSpeculativeGraphSet:
                                device=self.engine.device)
         self.indices = torch.arange(self.engine.max_seq_len, dtype=torch.int32,
                                     device=self.engine.device).repeat(max(self.width, self.outer_width))
-        pool = self.engine.linear_state_pool
         layers = [layer.linear_attn for layer in self.engine.model.model.layers.op_list if layer._is_linear]
-        workspace = QwenGDNVerifyState(pool, layers, max(self.width, self.outer_width), 1)
+        workspace = self.runner._gdn_workspace(max(self.width, self.outer_width), layers)
         inner_widths = range(1, self.width + 1) if self.exact else (self.width,)
         outer_widths = range(1, self.outer_width + 1) if self.exact else (self.outer_width,)
         coordinator.private_states = {n: QwenGDNVerifyState(coordinator.private_pool, layers, n, 0,
                                       workspace=workspace) for n in inner_widths}
-        self.runner.states = {n: QwenGDNVerifyState(pool, layers, n, 1, workspace=workspace)
-                              for n in outer_widths}
+        self.runner.states = {n: self.runner.states[n] for n in outer_widths}
+        self.target_states = self.runner.states
+        self.private_states = coordinator.private_states
         self.inner_lanes = {n: self._lane(n, state, hidden_size)
                             for n, state in coordinator.private_states.items()}
         self.outer_lanes = {n: self._lane(n, state, hidden_size) for n, state in self.runner.states.items()}
@@ -144,6 +144,7 @@ class QwenSpeculativeGraphSet:
                 self.engine.page_table.data_ptr(), self.engine.linear_state_pool.recurrent_states.data_ptr(),
                 self.coordinator.private_pool.recurrent_states.data_ptr(),
                 self.coordinator.private_pool.conv_states.data_ptr(),
+                id(self.runner.states), id(self.coordinator.private_states),
                 tuple(bank.data_ptr() for _, bank in cache.banks),
                 self.experts.prefetch, self.experts.layer_quota, self.experts.gap_capacity,
                 self.experts.keep_hits, self.experts.renormalize, self.experts.collect_signals,
@@ -391,6 +392,10 @@ class QwenSpeculativeGraphSet:
         self.inner_lanes.clear()
         self.outer_lanes.clear()
         self.active_lanes.clear()
-        self.coordinator.private_states.clear()
-        self.runner.states.clear()
+        if self.coordinator.private_states is self.private_states:
+            self.coordinator.private_states = {}
+        if self.runner.states is self.target_states:
+            self.runner.states = {}
+        self.private_states.clear()
+        self.target_states.clear()
         self.ready, self.closed = False, True
