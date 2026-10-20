@@ -142,6 +142,8 @@ class _QwenReservation:
                    and torch.cuda.current_stream(runner.engine.device) == runner.engine.stream)
         if runner.last_event is None or (not ordered and not runner.last_event.query()):
             raise RuntimeError("shared token mapping still has an in-flight reader")
+        if getattr(runner, "fixed_mapping", False):
+            return
         # The private mapping and its next writer use the reader's stream; no host fence is needed.
         self.runner.engine.page_table[0, start:end].zero_()
         self.runner._reserved_len = start
@@ -326,6 +328,12 @@ class QwenMTPRunner:
                 self.engine.page_table[0, start:end] = torch.arange(start, end, dtype=torch.int32, device=self.engine.device)
             self._reserved_len = end
         return self._reserved_len
+
+    def _reset_request_mapping(self):
+        # Call after readers drain; fixed mappings belong to the runtime, not the request.
+        if not getattr(self, "fixed_mapping", False):
+            self.engine.page_table[0].zero_()
+        self._reserved_len = 0
 
     def _target(self, batch, *, need_logits=True):
         if self.reference_ar:
@@ -636,7 +644,8 @@ class QwenMTPRunner:
                     if not _EARLY_COMMIT:
                         self.last_event.synchronize()
                     emitted = drained[:count]
-                    self.coordinator.drain(self.frontier, count, reconciled=reconcile, retain_reservation=baseline)
+                    self.coordinator.drain(self.frontier, count, reconciled=reconcile,
+                                           retain_reservation=getattr(self, "fixed_mapping", baseline))
                     length += count
                     if baseline:
                         self.anchor_buffer.copy_(predicted[count - 1:count])
@@ -660,10 +669,8 @@ class QwenMTPRunner:
             try:
                 with torch.cuda.stream(self.engine.stream):
                     self.engine.stream.synchronize()
-                    if not getattr(self, "fixed_mapping", False):
-                        self.engine.page_table[0].zero_()
+                    self._reset_request_mapping()
                     self.engine.stream.synchronize()
-                self._reserved_len = 0
                 self.frontier = None
                 self.next_draft = None
                 self.last_draft_hidden = None

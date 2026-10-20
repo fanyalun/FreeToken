@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--layers', type=int, default=4)
     parser.add_argument('--compatibility-export', type=Path)
     parser.add_argument('--expect-pressure-error', action='store_true')
+    parser.add_argument('--audit-lifecycle', action='store_true')
     args = parser.parse_args()
     torch.manual_seed(123)
     with tempfile.TemporaryDirectory(prefix='baseline_sd_tiny_') as directory:
@@ -107,6 +108,54 @@ def main():
                 if engine.moe_offload_cache:
                     engine.moe_offload_cache.reset()
                 torch.cuda.synchronize()
+
+            if args.audit_lifecycle:
+                import sys
+                sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
+                prompt = list(range(9))
+                reset()
+                expected = engine.generate_speculative(prompt, max_tokens=4).token_ids
+                if args.three_level:
+                    from bench_speculative_hybrid import teacher_forced_audit
+                    experts = runner.three_level.experts
+                    saved_rows = experts.valid_rows
+                    assert saved_rows is not None and saved_rows.item() < len(prompt) - 2
+                    original_target = runner._target
+                    observed = []
+                    def target(batch, **kwargs):
+                        if experts.active:
+                            assert experts.valid_rows is None
+                            observed.append(batch.size)
+                        return original_target(batch, **kwargs)
+                    runner._target = target
+                    try:
+                        audit = teacher_forced_audit(engine, prompt)
+                    finally:
+                        runner._target = original_target
+                    assert observed == [audit["width"]] * 2
+                    assert experts.final_history[:, :audit["width"]].ge(0).all()
+                    assert experts.valid_rows is saved_rows
+                else:
+                    from freetoken.engine.qwen_mtp import _QwenReservation
+                    with torch.cuda.stream(engine.stream):
+                        runner._reserve(16)
+                        runner.last_event = torch.cuda.Event()
+                        runner.last_event.record(engine.stream)
+                        _QwenReservation(runner).release(4, 16)
+                        assert runner._reserved_len == 16
+                    engine.stream.synchronize()
+                    reset()
+                    runner.baseline = False
+                    try:
+                        assert engine.generate_speculative(prompt, max_tokens=4).token_ids == expected
+                    finally:
+                        runner.baseline = True
+                capacity = engine.num_pages * engine.config.page_size
+                assert engine.page_table[0, :capacity].tolist() == list(range(capacity))
+                reset()
+                assert engine.generate_speculative(prompt, max_tokens=4).token_ids == expected
+                print(json.dumps(dict(status="passed", audit_lifecycle=True, three_level=args.three_level)))
+                return
 
             if args.expect_pressure_error:
                 from freetoken.moe.speculative_cache import NoEvictableSlot

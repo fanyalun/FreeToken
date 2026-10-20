@@ -58,6 +58,7 @@ def teacher_forced_audit(engine, prompt):
     labels = torch.tensor(prompt[start + 1:start + width + 1], device=engine.device, dtype=torch.long)
     pool = engine.linear_state_pool
     phases, audit = experts.hybrid_phases, experts.audit
+    valid_rows = experts.valid_rows
     original_route = experts.route
     captures, modes = [], {}
     def observed(*args):
@@ -65,13 +66,14 @@ def teacher_forced_audit(engine, prompt):
         captures.append(result.clone())
         return result
     with torch.cuda.stream(engine.stream):
-        pool.recurrent_states[:, 1].zero_()
-        pool.conv_states[:, 1].zero_()
-        runner._prefill(torch.tensor(prompt[:start], dtype=torch.int32), 128)
-        runner._reserve(start + width)
-        initial = pool.recurrent_states[:, 1].clone(), pool.conv_states[:, 1].clone()
-        experts.route, experts.audit = observed, True
         try:
+            experts.valid_rows = None
+            pool.recurrent_states[:, 1].zero_()
+            pool.conv_states[:, 1].zero_()
+            runner._prefill(torch.tensor(prompt[:start], dtype=torch.int32), 128)
+            runner._reserve(start + width)
+            initial = pool.recurrent_states[:, 1].clone(), pool.conv_states[:, 1].clone()
+            experts.route, experts.audit = observed, True
             for mode in ("gpu", "hybrid"):
                 captures.clear()
                 pool.recurrent_states[:, 1].copy_(initial[0])
@@ -118,12 +120,14 @@ def teacher_forced_audit(engine, prompt):
                 route_agreement=(actual["routes"] == reference["routes"]).float().mean().item(),
                 scope="one fixed teacher-forced window; numerical audit, not task quality or strict parity")
         finally:
-            experts.close(abort=True)
-            experts.route, experts.hybrid_phases, experts.audit = original_route, phases, audit
-            engine.stream.synchronize()
-            engine.moe_offload_cache.reset()
-            engine.page_table[0].zero_()
-            runner._reserved_len = 0
+            try:
+                experts.close(abort=True)
+            finally:
+                experts.route, experts.hybrid_phases, experts.audit = original_route, phases, audit
+                experts.valid_rows = valid_rows
+                engine.stream.synchronize()
+                engine.moe_offload_cache.reset()
+                runner._reset_request_mapping()
 
 
 def main():

@@ -833,6 +833,23 @@ def test_baseline_diagnostic_width_preserves_production_metadata(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("options", [
+    ["--backend", "offload"],
+    ["--backend", "hybrid", "--three-level", "--graph-implementation", "full"],
+])
+def test_tiny_engine_audit_mapping_and_valid_rows(options):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")),
+               "--audit-lifecycle", *options]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"audit_lifecycle": true' in result.stdout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("backend", ["fused", "offload", "hybrid"])
 @pytest.mark.parametrize("eager", [False, True])
 def test_baseline_tiny_engine_lifecycle(backend, eager):
@@ -1066,12 +1083,15 @@ def test_generate_keeps_logical_context_limit_before_cuda(monkeypatch, max_token
         runner.generate(list(range(9)), max_tokens=max_tokens)
 
 
-def test_reservation_preserves_prefix_and_reopens_released_tail(monkeypatch):
+@pytest.mark.parametrize("fixed_mapping", [False, True])
+def test_reservation_preserves_prefix_and_reopens_released_tail(monkeypatch, fixed_mapping):
     from types import SimpleNamespace
     from freetoken.engine.qwen_mtp import _QwenReservation
 
     runner = _metadata_runner(monkeypatch, torch.device("cpu"))
-    runner.engine.page_table.zero_()
+    runner.fixed_mapping = fixed_mapping
+    if not fixed_mapping:
+        runner.engine.page_table.zero_()
     assert runner._reserve(8) == 8
     runner.engine.page_table[0, :4].fill_(99)
     assert runner._reserve(8) == 8
@@ -1085,8 +1105,8 @@ def test_reservation_preserves_prefix_and_reopens_released_tail(monkeypatch):
     assert runner._reserved_len == 12
     runner.last_event = SimpleNamespace(query=lambda: True)
     reservation.release(8, 12)
-    assert runner._reserved_len == 8
-    assert runner.engine.page_table[0, 8:12].tolist() == [0] * 4
+    assert runner._reserved_len == (12 if fixed_mapping else 8)
+    assert runner.engine.page_table[0, 8:12].tolist() == (list(range(8, 12)) if fixed_mapping else [0] * 4)
     assert runner._reserve(12) == 12
     assert runner.engine.page_table[0, 8:12].tolist() == list(range(8, 12))
 
@@ -1265,11 +1285,11 @@ def test_target_capture_exception_does_not_join_idle_branches(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph_mode", [False, True])
-@pytest.mark.parametrize("baseline", [False, True])
+@pytest.mark.parametrize("baseline,fixed_mapping", [(False, False), (False, True), (True, True)])
 @pytest.mark.parametrize("cancel_after_verify", [False, True])
 @pytest.mark.parametrize("cap,eos_ids,expected", [(2, (), [7, 8]), (5, (), [7, 8, 9, 10, 11]),
                                                     (8, (9,), [7, 8, 9]), (8, (12,), [7, 8, 9, 10, 11, 12])])
-def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_mode, baseline, cap, eos_ids, expected, cancel_after_verify):
+def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_mode, baseline, fixed_mapping, cap, eos_ids, expected, cancel_after_verify):
     import threading
     from contextlib import nullcontext
     from types import SimpleNamespace
@@ -1285,6 +1305,7 @@ def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_m
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
     runner.use_graph, runner.active = graph_mode, False
     runner.baseline, runner.draft_width, runner._shared_indices = baseline, 4, None
+    runner.fixed_mapping, runner.three_level = fixed_mapping, None
     if baseline:
         device = runner.engine.device
         runner.engine.config.speculative_max_input_tokens = 32
@@ -1342,6 +1363,10 @@ def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_m
         if baseline:
             assert all(r["metrics_version"] == 2 for r in result.rounds)
             assert sum(r["returned_tokens"] for r in result.rounds) == len(visible) - 1
-        assert runner._reserved_len == 0 and not bool(runner.engine.page_table.any())
+        assert runner._reserved_len == 0
+        if fixed_mapping:
+            assert runner.engine.page_table[0].tolist() == list(range(64))
+        else:
+            assert not bool(runner.engine.page_table.any())
         assert runner.frontier is runner.last_event is runner.model_state.current is None
         assert not runner.active and not runner._request_lock.locked()
