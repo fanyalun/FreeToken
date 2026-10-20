@@ -55,6 +55,8 @@ def route_metrics(records, loops, experts, valid_rows=None):
 
 class ThreeLevelCoordinator:
     def __init__(self, runner):
+        if runner.active or getattr(runner, "coarse_graphs", None) is not None:
+            raise RuntimeError("coordinator replacement requires an idle runner without captured coarse/full graphs")
         self.runner, self.engine = runner, runner.engine
         engine = self.engine
         cache = engine.moe_offload_cache
@@ -115,9 +117,7 @@ class ThreeLevelCoordinator:
         runner.max_verify_width = self.outer_width
         self.private_states = {}
         if not coarse:
-            workspace = QwenGDNVerifyState(pool, layers, runner.max_verify_width, 1)
-            runner.states = {w: QwenGDNVerifyState(pool, layers, w, 1, workspace=workspace)
-                             for w in range(1, runner.max_verify_width + 1)}
+            workspace = runner._gdn_workspace(runner.max_verify_width, layers)
             self.private_states = {w: QwenGDNVerifyState(self.private_pool, layers, w, 0, workspace=workspace)
                                    for w in range(1, self.inner_width + 1)}
         device = engine.device
@@ -144,6 +144,8 @@ class ThreeLevelCoordinator:
                 if runner.coarse_graphs is None:
                     for phase, states in (("preverify", self.private_states), ("verify", runner.states)):
                         for width, state in states.items():
+                            if phase == "verify" and width > self.outer_width:
+                                continue
                             self.experts.begin(0)
                             self.experts.set_phase(phase)
                             ids = self.inputs[:width].zero_()
@@ -173,9 +175,15 @@ class ThreeLevelCoordinator:
 
     def _verify_prefetch_signature(self):
         c = self.engine.config
+        fixed_prefetch = (getattr(c, "speculative_graph_implementation", "reference") != "reference"
+                          or getattr(c, "speculative_verify_prefetch_layer_experts", 0)
+                          or any(getattr(c, "speculative_verify_prefetch_layer_quotas", None) or ())
+                          or getattr(self.experts, "verify_prefetch_enabled", False))
+        # Reference GPU forwards key their graphs by prefetch; host admission is eager.
+        prefetch = (getattr(c, "speculative_prefetch", True), getattr(self.experts, "prefetch", True))
         return (getattr(c, "speculative_verify_prefetch_layer_experts", 0),
                 tuple(getattr(c, "speculative_verify_prefetch_layer_quotas", None) or ()),
-                getattr(c, "speculative_prefetch", True), getattr(self.experts, "prefetch", True),
+                prefetch if fixed_prefetch else None,
                 getattr(self.experts, "verify_layer_quotas", None),
                 getattr(self.experts, "verify_prefetch_enabled", False),
                 tuple(getattr(c, "speculative_hybrid_phases", ())),

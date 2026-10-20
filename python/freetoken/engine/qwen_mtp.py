@@ -429,8 +429,31 @@ class QwenMTPRunner:
         self.graph_replays[phase] = self.graph_replays.get(phase, 0) + 1
         return output
 
+    def _gdn_workspace(self, width, layers):
+        pool = self.engine.linear_state_pool
+        workspace = self.states[max(self.states)] if self.states else None
+        if workspace is not None and workspace.pool is pool and workspace.width >= width:
+            for w in range(1, width + 1):
+                if w not in self.states:
+                    self.states[w] = QwenGDNVerifyState(pool, layers, w, 1, workspace=workspace)
+            return workspace
+        if self.active or getattr(self, "coarse_graphs", None) is not None:
+            raise RuntimeError("GDN workspace replacement requires an idle runner without captured coarse/full graphs")
+        if workspace is not None or self.graphs:
+            self.engine.stream.synchronize()
+        self.graphs.clear()
+        self._decode_batches.clear()
+        self._shared_indices = None
+        self.model_state.current = None
+        workspace = QwenGDNVerifyState(pool, layers, width, 1)
+        self.states = {width: workspace}
+        self.states.update({w: QwenGDNVerifyState(pool, layers, w, 1, workspace=workspace)
+                            for w in range(1, width)})
+        return workspace
+
     def _commit_state(self, state, count):
-        key = ("commit", state.width)
+        # Keep the binding alive as well as distinguishing equal-width workspaces.
+        key = ("commit", state.width, state)
         if not self.use_graph:
             self.graph_fallbacks["commit"] = self.graph_fallbacks.get("commit", 0) + 1
             state.commit(count)
