@@ -14,6 +14,27 @@ if TYPE_CHECKING:
     import torch
 
 
+def speculative_hybrid_workspace_bytes(config, *, include_cpu_partials=True) -> int:
+    if (getattr(config, "moe_strategy", "offload") != "hybrid"
+            or getattr(config, "speculative_expert_scheduler", "host") != "gpu"
+            or not getattr(config, "speculative_hybrid_phases", ())):
+        return 0
+    mc = config.model_config
+    inner = config.speculative_mtp_depth + 1
+    outer = min(config.speculative_submit_tokens or config.speculative_max_loops * inner + 1,
+                config.speculative_max_loops * inner + 1)
+    limit = getattr(config, "speculative_max_output_tokens", None) or outer
+    inner, outer = min(inner, limit), min(outer, limit)
+    maximum = max(inner, outer)
+    widths = maximum * (maximum + 1) // 2
+    routes = maximum * mc.num_experts_per_tok
+    tables = 4 * (2 * (maximum + 1) * (routes + 1) + 4 * (maximum + 1) + routes + 1)
+    routing = widths * mc.num_experts_per_tok * 8
+    # The CPU branch joins before merge; the next layer forks after that merge.
+    partials = 2 * widths * mc.hidden_size if include_cpu_partials else 0
+    return tables + routing + partials + 7 * 8
+
+
 def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
 

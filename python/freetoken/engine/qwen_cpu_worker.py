@@ -6,26 +6,42 @@ from dataclasses import asdict
 from contextlib import nullcontext
 import multiprocessing as mp
 import os
+from pathlib import Path
 import time
 import traceback
 
 import torch
 
-from .qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, _linear
+from .qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, bitwise_equal
 
 
-def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped):
+def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, backend,
+              kernel_profile="v1", components=None, bind_openmp=False):
     target = None
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.sched_setaffinity(0, core_ids)
         torch.set_num_threads(len(core_ids))
         torch.set_num_interop_threads(1)
+        if bind_openmp:
+            os.sched_setaffinity(0, [core_ids[0]])
+        initialization_start = time.perf_counter()
         target = QwenCpuTarget.from_checkpoint(model, core_ids=core_ids, max_context=max_context,
-                                               max_rows=max_rows, grouped=grouped)
+                                               max_rows=max_rows, grouped=grouped, backend=backend,
+                                               kernel_profile=kernel_profile, components=components)
         if torch.cuda.is_initialized():
             raise RuntimeError("CPU worker created a CUDA context")
-        pipe.send({"kind": "ready", "pid": os.getpid(), "cuda_initialized": False})
+        import hashlib
+        from freetoken.kernel import _cpu_moe
+        with open(_cpu_moe.__file__, "rb") as binary:
+            extension_sha256 = hashlib.sha256(binary.read()).hexdigest()
+        pipe.send({"kind": "ready", "pid": os.getpid(), "cuda_initialized": False,
+                   "initialization_seconds": time.perf_counter() - initialization_start,
+                   **target.arithmetic_metadata(), "extension_sha256": extension_sha256,
+                   "core_ids": core_ids, "main_thread_affinity": sorted(os.sched_getaffinity(0)),
+                   "thread_affinity": {p.name: sorted(os.sched_getaffinity(int(p.name)))
+                       for p in Path("/proc/self/task").iterdir()},
+                   "expert_isa": target.experts.ext.isa_name()})
         while True:
             command = pipe.recv()
             kind = command["kind"]
@@ -90,16 +106,17 @@ def _rss_kib():
 
 
 def audit_cpu_blocks(target, tokens, first_logits=None):
+    import hashlib
     if not 2 <= tokens <= target.max_rows:
         raise ValueError("audit length must fit one reserved block and contain at least two rows")
     checkpoint, epoch = target.snapshot(), target.epoch
     reference = []
-    for block in range(tokens):
+    for block in range(tokens + 1):
         s = target.state
         reference.append(target.verify(VerifyJob(epoch, block, s.length, s.anchor, (), tokens + 1)))
     if first_logits is not None:
-        first_logits.copy_(_linear(reference[0].hidden, target.weights["lm_head.weight"])[0].float())
-    candidates = tuple(r.tokens[0] for r in reference[:-1])
+        first_logits.copy_(target.logits(reference[0].hidden)[0].float())
+    candidates = tuple(r.tokens[0] for r in reference[:tokens - 1])
     checks = []
     for reject in (0, (tokens - 1) // 2, None):
         target.initialize(checkpoint, epoch)
@@ -110,20 +127,43 @@ def audit_cpu_blocks(target, tokens, first_logits=None):
         count = tokens if reject is None else reject + 1
         expected = reference[count - 1]
         equal = (result.tokens == tuple(r.tokens[0] for r in reference[:count])
-            and torch.equal(result.checkpoint.recurrent, expected.checkpoint.recurrent)
-            and torch.equal(result.checkpoint.conv, expected.checkpoint.conv)
-            and torch.equal(result.hidden, torch.cat([r.hidden for r in reference[:count]]))
-            and torch.equal(result.checkpoint.keys, torch.cat([r.checkpoint.keys for r in reference[:count]], 1))
-            and torch.equal(result.checkpoint.values, torch.cat([r.checkpoint.values for r in reference[:count]], 1)))
-        checks.append(dict(reject_at=reject, input_count=result.input_count, exact_state_and_tokens=equal))
+            and result.accepted == count - 1 and result.input_count == count
+            and result.checkpoint.length == checkpoint.length + count
+            and result.checkpoint.anchor == expected.checkpoint.anchor
+            and bitwise_equal(result.checkpoint.recurrent, expected.checkpoint.recurrent)
+            and bitwise_equal(result.checkpoint.conv, expected.checkpoint.conv)
+            and bitwise_equal(result.hidden, torch.cat([r.hidden for r in reference[:count]]))
+            and bitwise_equal(result.checkpoint.keys, torch.cat([r.checkpoint.keys for r in reference[:count]], 1))
+            and bitwise_equal(result.checkpoint.values, torch.cat([r.checkpoint.values for r in reference[:count]], 1)))
+        s = target.state
+        following = target.verify(VerifyJob(epoch, 1, s.length, s.anchor, (), tokens + 1))
+        next_ref = reference[count]
+        next_equal = (following.tokens == next_ref.tokens and bitwise_equal(following.hidden, next_ref.hidden)
+            and all(bitwise_equal(getattr(following.checkpoint, field), getattr(next_ref.checkpoint, field))
+                    for field in ("keys", "values", "recurrent", "conv")))
+        checks.append(dict(reject_at=reject, input_count=result.input_count,
+                           exact_state_and_tokens=equal and next_equal, next_step_exact=next_equal))
     target.initialize(checkpoint, epoch)
     if not all(row["exact_state_and_tokens"] for row in checks):
         raise RuntimeError(f"CPU serial/block state mismatch: {checks}")
-    return dict(tokens=[r.tokens[0] for r in reference], checks=checks, cuda_initialized=torch.cuda.is_initialized())
+    hashes = []
+    for result in reference:
+        tensors = dict(hidden=result.hidden, predictions=result.predictions,
+                       **{field: getattr(result.checkpoint, field)
+                          for field in ("keys", "values", "recurrent", "conv")})
+        if any(not bool(torch.isfinite(t).all()) for t in tensors.values() if t.is_floating_point()):
+            raise RuntimeError("CPU serial audit produced a nonfinite valid hidden/KV/state tensor")
+        hashes.append({key: hashlib.sha256(t.contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
+                       for key, t in tensors.items()})
+    return dict(tokens=[r.tokens[0] for r in reference[:tokens]], checks=checks,
+                serial_tensor_sha256=hashes, valid_state_finite=True, cuda_initialized=torch.cuda.is_initialized())
 
 
 class CpuVerifierWorker:
-    def __init__(self, model, config, core_ids, *, max_context=4096, max_rows=33, grouped=True):
+    def __init__(self, model, config, core_ids, *, max_context=4096, max_rows=33, grouped=True, backend="optimized",
+                 kernel_profile="v1", components=None, bind_openmp=False):
+        if backend not in ("legacy", "optimized") or (backend == "optimized" and not grouped):
+            raise ValueError("optimized backend requires grouped experts; ungrouped is legacy-only")
         if not core_ids or max_context < 1 or max_rows < 1:
             raise ValueError("positive CPU worker capacity and affinity required")
         c = config
@@ -153,8 +193,20 @@ class CpuVerifierWorker:
         context = mp.get_context("spawn")
         self.pipe, child = context.Pipe()
         self.process = context.Process(target=_cpu_main,
-            args=(child, self.slots, str(model), list(core_ids), max_context, max_rows, grouped), daemon=True)
-        self.process.start()
+            args=(child, self.slots, str(model), list(core_ids), max_context, max_rows, grouped, backend,
+                  kernel_profile, components, bind_openmp), daemon=True)
+        saved_environment = {key: os.environ.get(key) for key in ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND")}
+        try:
+            if bind_openmp:
+                os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, core_ids))
+                os.environ["OMP_PROC_BIND"] = "TRUE"
+            self.process.start()
+        finally:
+            for key, value in saved_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         child.close()
         self.ready = False
         self.metadata = {}

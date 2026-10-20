@@ -62,6 +62,8 @@ class EngineConfig:
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
+    # Baseline SD balanced policy instead minimizes calibrated IO+GPU vs CPU time;
+    # nonnegative values remain a per-row upper bound, and -1 imposes no cap.
     moe_hybrid_max_fetch: int = -1
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
@@ -69,6 +71,8 @@ class EngineConfig:
     memory_ratio: float = 0.9
     gpu_memory_budget_bytes: int | None = None
     speculative_mtp_depth: int = 0
+    speculative_max_input_tokens: int | None = None
+    speculative_max_output_tokens: int | None = None
     speculative_three_level: bool = False
     speculative_submit_tokens: int = 0
     speculative_max_loops: int = 6
@@ -78,11 +82,17 @@ class EngineConfig:
     speculative_prefetch_layer_quotas: List[int] | None = None
     speculative_prefetch_demand_fence: bool = False
     speculative_prefetch_gap_capacity: int = 0
+    speculative_verify_prefetch_layer_experts: int = 0
+    speculative_verify_prefetch_layer_quotas: List[int] | None = None
     speculative_audit: bool = False
     speculative_expert_scheduler: str = "host"
     speculative_compact_control: bool = True
     speculative_execution_implementation: str = "reference"
     speculative_graph_implementation: str = "reference"
+    speculative_hybrid_phases: tuple[str, ...] = ("verify",)
+    speculative_hybrid_profile: str | None = None
+    speculative_hybrid_window_policy: str = "balanced"
+    speculative_hybrid_cpu_backend: str = "grouped"
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -109,12 +119,21 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        if self.speculative_hybrid_window_policy not in ("balanced", "legacy"):
+            raise ValueError("speculative_hybrid_window_policy must be balanced or legacy")
+        if self.speculative_hybrid_cpu_backend not in ("grouped", "legacy"):
+            raise ValueError("speculative_hybrid_cpu_backend must be grouped or legacy")
         if self.gpu_memory_budget_bytes is not None and self.gpu_memory_budget_bytes <= 0:
             raise ValueError("gpu_memory_budget_bytes must be positive")
         if type(self.speculative_mtp_depth) is not int or self.speculative_mtp_depth < 0:
             raise ValueError("speculative_mtp_depth must be a nonnegative integer")
         if self.speculative_mtp_depth and (self.dtype != torch.bfloat16 or self.tp_info.size != 1):
             raise ValueError("native MTP requires BF16 and TP=1")
+        if self.speculative_mtp_depth:
+            for name in ("speculative_max_input_tokens", "speculative_max_output_tokens"):
+                value = getattr(self, name)
+                if type(value) is not int or value < 1:
+                    raise ValueError(f"baseline SD requires explicit positive {name}")
         if self.speculative_submit_tokens < 0:
             raise ValueError("speculative_submit_tokens must be nonnegative (0 uses the loop limit)")
         if self.speculative_max_loops < 1:
@@ -129,10 +148,33 @@ class EngineConfig:
             raise ValueError("optimized execution requires compact control")
         if self.speculative_expert_scheduler == "gpu" and not self.speculative_three_level:
             raise ValueError("GPU expert scheduling requires three-level decoding")
-        if self.speculative_expert_scheduler == "gpu" and (self.moe_strategy in ("cpu", "hybrid") or self.moe_cpu_layers):
+        phases = self.speculative_hybrid_phases
+        if (not isinstance(phases, (tuple, list)) or len(set(phases)) != len(phases)
+                or any(p not in ("preverify", "verify") for p in phases)):
+            raise ValueError("speculative_hybrid_phases must contain distinct preverify/verify phases")
+        if self.speculative_expert_scheduler == "gpu" and (self.moe_strategy == "cpu" or self.moe_cpu_layers):
             raise ValueError("GPU expert scheduling requires GPU offload")
+        if self.speculative_expert_scheduler == "gpu" and self.moe_strategy == "hybrid":
+            if (self.speculative_execution_implementation != "optimized" or not self.speculative_compact_control
+                    or self.speculative_graph_implementation == "coarse"):
+                raise ValueError("speculative Hybrid requires optimized compact reference/full execution")
+            if self.moe_hybrid_max_fetch < -1:
+                raise ValueError("moe_hybrid_max_fetch must be -1 or nonnegative")
         if min(self.speculative_prefetch_layer_experts, self.speculative_prefetch_gap_capacity) < 0:
             raise ValueError("speculative prefetch quotas must be nonnegative")
+        if (type(self.speculative_verify_prefetch_layer_experts) is not int
+                or self.speculative_verify_prefetch_layer_experts < 0):
+            raise ValueError("verify prefetch quota must be a nonnegative integer")
+        quotas = self.speculative_verify_prefetch_layer_quotas
+        if quotas is not None and (not quotas or quotas[0] != 0
+                or any(type(q) is not int or q < 0 for q in quotas)):
+            raise ValueError("verify prefetch quotas must be nonnegative integers with first quota 0")
+        enabled = any(quotas) if quotas is not None else self.speculative_verify_prefetch_layer_experts > 0
+        if self.speculative_prefetch and enabled:
+            if (self.speculative_expert_scheduler != "gpu"
+                    or self.speculative_execution_implementation != "optimized"
+                    or not self.speculative_compact_control):
+                raise ValueError("verify prefetch requires optimized compact GPU offload scheduling")
         if self.speculative_prefetch_layer_quotas is not None:
             if not self.speculative_prefetch_layer_quotas or any(type(q) is not int or q < 0
                     for q in self.speculative_prefetch_layer_quotas):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 import os
@@ -83,68 +84,161 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--mode", choices=("ar", "mtp"), required=True)
-    parser.add_argument("--backend", choices=("offload", "hybrid"), required=True)
-    parser.add_argument("--budget-gib", type=int, choices=(16, 24, 40), required=True)
+    parser.add_argument("--mode", choices=("ar", "mtp", "three_level"), required=True)
+    parser.add_argument("--backend", choices=("fused", "offload", "hybrid"), required=True)
+    parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
+    parser.add_argument("--hybrid-window-policy", choices=("balanced", "legacy"), default="balanced")
+    parser.add_argument("--hybrid-cpu-backend", choices=("grouped", "legacy"), default="grouped")
+    parser.add_argument("--hybrid-profile", default=None)
+    parser.add_argument("--budget-gib", type=int, choices=(8, 16, 24, 32, 40, 80), required=True)
+    parser.add_argument("--max-input-tokens", type=int, default=3840)
+    parser.add_argument("--prompt-chunk-size", type=int, default=None)
+    parser.add_argument("--moe-slots", type=int, default=None)
+    parser.add_argument("--kv-pages", type=int, default=None)
+    parser.add_argument("--cpu-threads", type=int, default=23)
+    parser.add_argument("--frozen-prompts", default=None)
+    parser.add_argument("--prefix-length", type=int, default=None)
+    parser.add_argument("--graph-implementation", choices=("reference", "full"), default="reference")
+    parser.add_argument("--max-loops", type=int, default=6)
+    parser.add_argument("--small-prefetch", type=int, default=0)
+    parser.add_argument("--verify-prefetch", type=int, default=0)
     parser.add_argument("--samples", type=int, default=16)
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--purpose", choices=("smoke", "formal", "diagnostic"), default="formal")
     parser.add_argument("--audit", action="store_true")
     args = parser.parse_args()
+    if args.mode == "three_level" and args.backend != "offload":
+        parser.error("this comparison uses GPU offload for three-level execution")
+    if min(args.cpu_threads, args.max_loops) < 1 or min(args.small_prefetch, args.verify_prefetch) < 0:
+        parser.error("positive threads/loops and nonnegative prefetch quotas required")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
     (out / "complete.json").write_text(json.dumps({"status": "incomplete", "matrix_complete": False}) + "\n")
-    if args.samples < 1 or args.tokens < 1:
+    if args.samples < 1 or args.tokens < 1 or args.repeats < 1:
         raise ValueError("samples and tokens must be positive")
-    root = Path(__file__).resolve().parents[1]
+    import freetoken
+    root = Path(freetoken.__file__).resolve().parents[2]
     prompts, experiment = prepare_experiment(args.model, args.data, root, args.samples)
+    if args.frozen_prompts:
+        source = Path(args.frozen_prompts)
+        prompts = json.loads(source.read_text())
+        if len(prompts) != args.samples or any(not p or any(type(t) is not int or t < 0 for t in p) for p in prompts):
+            raise ValueError("frozen prompts must match samples and contain nonempty token lists")
+        experiment["frozen_prompts_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    if args.prefix_length is not None:
+        if not 1 <= args.prefix_length <= args.max_input_tokens:
+            raise ValueError("prefix length must fit input capacity")
+        prompts = [(p*((args.prefix_length+len(p)-1)//len(p)))[:args.prefix_length] for p in prompts]
+        experiment["input_purpose"] = "deterministic repeated-token length diagnostic, not natural long-document quality"
+    experiment["prompt_sha256"] = hashlib.sha256(json.dumps(prompts).encode()).hexdigest()
+    (out / "prompts.json").write_text(json.dumps(prompts)+"\n")
     config = benchmark_config(args, experiment)
+    config["driver_sha256"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                               for name in ("bench_qwen_mtp.py", "qwen_mtp_config.py")}
+    if any(len(prompt) > args.max_input_tokens for prompt in prompts):
+        raise ValueError("tokenized prompt exceeds --max-input-tokens")
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    engine = Engine(SchedulerConfig(
-        model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
-        max_running_req=1, attention_backend="triton", moe_strategy=args.backend,
-        moe_cache_auto=True, kv_reserve_tokens=4096, memory_ratio=0.9,
-        max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
-        speculative_mtp_depth=3 if args.mode == "mtp" else 0,
-        cuda_graph_max_bs=0 if args.eager else 4,
-        cuda_graph_bs=[] if args.eager else [1, 2, 3, 4],
-        cache_type="naive", max_extend_tokens=128,
-        mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
-    ))
-    runner = engine.speculative_runner or QwenMTPRunner(engine)
+    limits = {}
+    if "speculative_max_input_tokens" in SchedulerConfig.__dataclass_fields__:
+        limits = dict(speculative_max_input_tokens=args.max_input_tokens, speculative_max_output_tokens=args.tokens)
+    config["round_metrics_version"] = 2 if limits else 1
     monitor = ProcessMemoryMonitor()
     monitor.start()
+    initialized = time.perf_counter()
+    try:
+        engine = Engine(SchedulerConfig(
+            model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+            max_running_req=1, attention_backend="triton", moe_strategy=args.backend,
+            moe_cpu_threads=args.cpu_threads,
+            moe_hybrid_max_fetch=args.hybrid_max_fetch,
+            speculative_hybrid_window_policy=args.hybrid_window_policy,
+            speculative_hybrid_cpu_backend=args.hybrid_cpu_backend,
+            speculative_hybrid_profile=args.hybrid_profile,
+            moe_cache_auto=args.moe_slots is None and args.backend != "fused",
+            moe_cache_size=args.moe_slots or 0, kv_reserve_tokens=args.max_input_tokens + args.tokens, memory_ratio=0.9,
+            num_page_override=args.kv_pages or args.max_input_tokens + args.tokens,
+            max_seq_len_override=args.max_input_tokens + args.tokens, gpu_memory_budget_bytes=args.budget_gib << 30,
+            speculative_mtp_depth=3 if args.mode != "ar" else 0,
+            speculative_three_level=args.mode == "three_level",
+            speculative_expert_scheduler="gpu" if args.mode == "three_level" else "host",
+            speculative_max_loops=args.max_loops,
+            speculative_execution_implementation="optimized",
+            speculative_graph_implementation=args.graph_implementation,
+            speculative_compact_control=True,
+            speculative_prefetch=bool(args.small_prefetch or args.verify_prefetch),
+            speculative_prefetch_layer_experts=args.small_prefetch,
+            speculative_prefetch_gap_capacity=12 if args.small_prefetch else 0,
+            speculative_verify_prefetch_layer_experts=args.verify_prefetch,
+            cuda_graph_max_bs=0 if args.eager else (4 if args.mode != "ar" else 1),
+            cuda_graph_bs=[] if args.eager else ([1, 2, 3, 4] if args.mode != "ar" else [1]),
+            cache_type="naive", page_size=1, max_extend_tokens=args.prompt_chunk_size or args.max_input_tokens,
+            mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
+            **limits,
+        ))
+    except BaseException as exc:
+        monitor.close()
+        (out / "complete.json").write_text(json.dumps({"status": "initialization_failed",
+            "error_type": type(exc).__name__, "error": str(exc), "matrix_complete": False}) + "\n")
+        raise
+    config["initialization_seconds"] = time.perf_counter() - initialized
+    runner = engine.speculative_runner or QwenMTPRunner(engine, reference_ar=True)
+    cache = engine.moe_offload_cache
+    def generate(prompt, *, max_tokens):
+        chunk = args.prompt_chunk_size
+        if chunk is None and not limits:
+            chunk = len(prompt)
+        return runner.generate(prompt, max_tokens=max_tokens, prompt_chunk_size=chunk)
     config["gpu"] = torch.cuda.get_device_name(engine.device)
     rows = []
     try:
         for tail in (2, 3, 4, 5):
-            runner.generate(prompts[0], max_tokens=tail)
-        runner.generate(prompts[0], max_tokens=args.tokens)
+            if tail <= args.tokens:
+                generate(prompts[0], max_tokens=tail)
+        generate(prompts[0], max_tokens=args.tokens)
         torch.cuda.synchronize(engine.device)
         torch.cuda.reset_peak_memory_stats(engine.device)
-        config["moe_slots"] = engine.moe_offload_cache.cache_size
+        config["moe_slots"] = cache.cache_size if cache is not None else 0
+        if args.moe_slots is not None and config["moe_slots"] != args.moe_slots:
+            raise ValueError("actual expert slots differ from the fixed-slot contract")
+        if args.kv_pages is not None and engine.num_pages != args.kv_pages:
+            raise ValueError("actual KV pages differ from the fixed-page contract")
+        config["hybrid_max_fetch_effective"] = cache.hybrid_max_fetch if cache is not None else None
+        config["hybrid_fetch_fraction"] = cache.hybrid_fetch_fraction if cache is not None else None
         config["kv_pages"] = engine.num_pages
-        config["gdn_replay_bytes"] = sum(s.bytes() for s in runner.states.values())
+        storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+                    for s in runner.states.values()
+                    for t in (s.conv_windows, s.indices, s.cu_seqlens, *s.replay_inputs)}
+        config["gdn_replay_bytes"] = sum(storages.values())
+        plan = getattr(engine, "baseline_sd_memory_plan", None)
+        config["baseline_sd_memory_plan"] = plan.as_dict() if plan is not None else None
+        config["baseline_sd_final_peak_bytes"] = getattr(engine, "baseline_sd_final_peak_bytes", None)
         config["resident_mtp_bytes"] = sum(t.numel() * t.element_size() for t in engine.mtp.state_dict().values()) if engine.mtp else 0
         config["ssm_dtype"] = str(engine.linear_state_pool.recurrent_states.dtype)
         config["conv_dtype"] = str(engine.linear_state_pool.conv_states.dtype)
         (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        engine.moe_offload_cache.reset()
+        if cache is not None:
+            cache.reset()
         torch.cuda.synchronize(engine.device)
         with (out / "requests.jsonl").open("w") as f:
-            for index, prompt in enumerate(prompts):
+            for repeat, index, prompt in ((r, i, p) for r in range(args.repeats) for i, p in enumerate(prompts)):
+                if index == 0 and cache is not None:
+                    cache.reset()
+                    torch.cuda.synchronize(engine.device)
                 started = time.perf_counter()
-                result = runner.generate(prompt, max_tokens=args.tokens)
+                result = generate(prompt, max_tokens=args.tokens)
                 torch.cuda.synchronize(engine.device)
                 wall = time.perf_counter() - started
                 if len(result.token_ids) != args.tokens:
                     raise ValueError("incomplete returned-token request")
-                row = {"sample_id": index, **dataclasses.asdict(result), "complete_wall_seconds": wall,
+                row = {"sample_id": index, "repeat": repeat, **dataclasses.asdict(result), "complete_wall_seconds": wall,
                        "tpot_seconds": (wall - result.ttft_seconds) / (args.tokens - 1) if args.tokens > 1 else None}
                 f.write(json.dumps(row) + "\n")
                 f.flush()
                 rows.append(row)
+                if repeat and row["token_ids"] != rows[index]["token_ids"]:
+                    raise ValueError(f"timing repeat token mismatch at repeat {repeat}, sample {index}")
                 print(json.dumps({"sample_id": index, "returned": args.tokens, "wall": wall}), flush=True)
         summary = {
             "requests": len(rows), "returned_tokens": sum(len(r["token_ids"]) for r in rows),
@@ -161,13 +255,14 @@ def main():
             raise ValueError("observed process memory exceeds absolute budget")
         (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         if args.audit:
-            engine.moe_offload_cache.reset()
+            if cache is not None:
+                cache.reset()
             torch.cuda.synchronize(engine.device)
             audit = PhaseAudit(runner)
             try:
                 with (out / "audit_requests.jsonl").open("w") as f:
                     for index, prompt in enumerate(prompts):
-                        result = runner.generate(prompt, max_tokens=args.tokens)
+                        result = generate(prompt, max_tokens=args.tokens)
                         torch.cuda.synchronize(engine.device)
                         stages = audit.drain()
                         parity = result.token_ids == rows[index]["token_ids"]
@@ -181,6 +276,11 @@ def main():
                 audit.close()
             summary["independent_audit_complete"] = True
             (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        summary["peak_process_bytes_nvml"] = monitor.peak
+        summary["nvml_samples"] = monitor.samples
+        if monitor.peak > args.budget_gib << 30:
+            raise ValueError("audit process memory exceeds absolute budget")
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         (out / "complete.json").write_text(json.dumps({"status": "cell_completed", "matrix_complete": False}) + "\n")
     finally:
         monitor.close()

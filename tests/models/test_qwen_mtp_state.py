@@ -60,7 +60,8 @@ def test_replay_matches_sequential_decode_and_snapshot(width, count, graph_mode,
     )
     raw = torch.randn(width, channels, dtype=torch.bfloat16, device=device)
     a, b = [torch.randn(width, value_heads, dtype=torch.bfloat16, device=device) for _ in range(2)]
-    state = QwenGDNVerifyState(pool, [layer], width, slot=1)
+    workspace = QwenGDNVerifyState(pool, [layer], 4, slot=1) if width < 4 else None
+    state = QwenGDNVerifyState(pool, [layer], width, slot=1, workspace=workspace)
     state.enable_snapshot_reference()
     before_rec, before_conv = rec.clone(), conv.clone()
     candidate = state.verify_layer(layer, raw, a, b)

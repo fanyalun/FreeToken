@@ -1,0 +1,16 @@
+{
+  "commit": "0ce8cd11416c8840498e6701bcbe39ad4b858c2b",
+  "files": {
+    "LICENSE": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d",
+    "ggml/src/ggml-cpu/ops.cpp": "b565fea101889b8b73011ad26c5cafc242e3d10b0eb65d3aba4b53808d0f2e71",
+    "ggml/src/ggml-cpu/simd-gemm.h": "e82a07445059ec4a4c7d8dd75a2663d459025274d817be3f83c1f5989a79208d"
+  },
+  "adaptation": "cpu_target_v2.h and cpu_moe_ext.cpp: AVX-512 outer-product SIMD adapted from simd_gemm_ukernel and masked tail, with explicit strides, per-row K bounds and BF16 banks. BF16 packing, absolute segments, fixed merge, dispatch and cpu_target.h GDN SIMD are local adaptations. ops.cpp is a design reference only; no GGML executor linked.",
+  "compile_options": [
+    "-O3",
+    "-std=c++17",
+    "-fopenmp",
+    "-pthread"
+  ],
+  "isa": "local target(avx512f); explicit runtime check; no fast-math"
+}

@@ -112,7 +112,8 @@ def _requested(state, mode="ar", backend="hybrid", budget=16):
     directory = state.output / f"formal_{mode}_{backend}_graph_{budget}"
     args = SimpleNamespace(model=str(state.model), data=str(state.data), output=str(directory),
         mode=mode, backend=backend, budget_gib=budget, samples=16, tokens=256,
-        eager=False, purpose="formal", audit=True)
+        eager=False, purpose="formal", audit=True, hybrid_max_fetch=-1,
+        max_input_tokens=3840, prompt_chunk_size=None, moe_slots=None)
     return directory, state.config.benchmark_config(args, experiment)
 
 
@@ -122,7 +123,7 @@ def _write_cell(directory, config):
     (directory / "complete.json").write_text('{"status":"cell_completed"}')
     (directory / "summary.json").write_text(json.dumps({
         "independent_audit_complete": True, "throughput_tokens_per_second": 256,
-        "peak_process_bytes_nvml": 1,
+        "peak_process_bytes_nvml": 1, "returned_tokens": 4096,
     }))
     rows = [dict(sample_id=i, token_ids=[i] * 256, rounds=[], graph_fallbacks={},
                  ttft_seconds=0.1, tpot_seconds=0.01) for i in range(16)]
@@ -132,8 +133,8 @@ def _write_cell(directory, config):
 
 
 def _write_matrix(state):
-    for budget in (16, 24, 40):
-        for backend in ("hybrid", "offload"):
+    for budget in (16, 24, 40, 80):
+        for backend in (("fused",) if budget == 80 else ("hybrid", "offload")):
             for mode in ("ar", "mtp"):
                 _write_cell(*_requested(state, mode, backend, budget))
 
@@ -253,7 +254,7 @@ def test_matrix_reuses_matching_complete_cells_without_changing_raw_evidence(ben
     monkeypatch.setattr(state.matrix.subprocess, "Popen", _no_launch)
     _invoke(state)
     marker = json.loads((state.output / "matrix_complete.json").read_text())
-    assert marker == {"matrix_complete": True, "completed_cells": 12, "strict_pairs": 6}
+    assert marker == {"matrix_complete": True, "completed_cells": 14, "strict_pairs": 7}
     report = json.loads((state.output / "matrix.json").read_text())
     assert report['experiment']['source_sha256'] == _requested(state)[1]['source_sha256']
     assert all(p.read_bytes() == contents for p, contents in raw.items())
@@ -278,6 +279,35 @@ def test_matrix_rejects_old_matching_ar_mtp_pairs_without_overwriting_reports(be
     with pytest.raises(ValueError, match="experiment configuration mismatch"):
         _invoke(state)
     assert {p: p.read_bytes() for p in state.output.rglob('*') if p.is_file()} == before
+
+
+def test_matrix_completion_is_independent_of_strict_ar_parity(benchmark, monkeypatch):
+    state = benchmark
+    _write_matrix(state)
+    directory, _ = _requested(state, "mtp", "fused", 80)
+    for name in ("requests.jsonl", "audit_requests.jsonl"):
+        path = directory / name
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["token_ids"][0] = 999
+        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    monkeypatch.setattr(state.matrix.subprocess, "Popen", _no_launch)
+    _invoke(state)
+    report = json.loads((state.output / "matrix.json").read_text())
+    assert report["matrix_complete"] and not report["strict_ar_parity"]
+
+
+@pytest.mark.parametrize("field", ["sample_id", "token_ids", "timing_parity"])
+def test_matrix_rechecks_audit_evidence_instead_of_trusting_summary(benchmark, monkeypatch, field):
+    state = benchmark
+    _write_matrix(state)
+    directory, _ = _requested(state)
+    path = directory / "audit_requests.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0][field] = {"sample_id": 15, "token_ids": [999] * 256, "timing_parity": False}[field]
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    monkeypatch.setattr(state.matrix.subprocess, "Popen", _no_launch)
+    with pytest.raises(ValueError, match="identity|audit token mismatch"):
+        _invoke(state)
 
 
 def test_matrix_checks_late_existing_cell_before_launching_early_missing_cells(benchmark, monkeypatch):

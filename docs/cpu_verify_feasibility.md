@@ -1,5 +1,11 @@
 # Independent CPU Target feasibility
 
+The resumed isolated optimization experiment is documented in
+[CPU Target optimization](cpu_verify_optimization.md). The numerical and
+performance descriptions below refer to the preserved `legacy` prototype.
+The current harness defaults to `optimized`; historical comparisons must select
+`--backend legacy --prompt-chunk-size 128` explicitly.
+
 This branch adds the first feasibility milestone for asynchronous CPU Target
 verification of Qwen3.6-35B-A3B. It exposes experimental primitives and a bounded
 measurement harness. The ordinary AR, native MTP, and existing three-level
@@ -113,7 +119,9 @@ parity and accepted GPU-state installation are checked inside the harness.
 PYTHONPATH=python CUDA_HOME=/usr/local/cuda-13.0 CUDA_VISIBLE_DEVICES=0 \
   uv run --no-sync python benchmarks/bench_cpu_verify_feasibility.py \
   --model /path/to/Qwen3.6-35B-A3B --data /path/to/gsm8k_test.jsonl \
-  --output /absolute/new_run --samples 4 --repeats 3 --audit-tokens 16
+  --output /absolute/new_run --samples 4 --repeats 3 --audit-tokens 16 \
+  --backend legacy --prompt-chunk-size 128 \
+  --max-input-tokens 2048 --max-output-tokens 2048
 ```
 
 The default matrix enumerates overlap loops `{1,2,3,4,6,8}` and both 23 physical

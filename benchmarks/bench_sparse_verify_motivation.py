@@ -329,6 +329,7 @@ def main():
         moe_cache_auto=True, kv_reserve_tokens=4096, memory_ratio=0.9,
         max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
         speculative_mtp_depth=3, cuda_graph_max_bs=4, cuda_graph_bs=[1, 2, 3, 4],
+        speculative_max_input_tokens=4096 - max(args.tokens, 6), speculative_max_output_tokens=max(args.tokens, 6),
         cache_type="naive", max_extend_tokens=128,
         mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
     ))

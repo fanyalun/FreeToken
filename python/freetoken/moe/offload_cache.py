@@ -155,6 +155,7 @@ class OffloadMoeCache:
         # for the GPU decode path.
         self.cpu_executor = None
         self._hybrid_window_plans = {}
+        self.baseline_hybrid = None
         self._pending_copy_plan = None
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
@@ -487,6 +488,7 @@ class OffloadMoeCache:
         # 2. Drop old GPU tensors (free-before-alloc).
         self._pending_copy_plan = None
         self._hybrid_window_plans.clear()
+        self.baseline_hybrid = None
         self.banks = []
         self.bank_caches = {}
         self.cache_size = cache_size

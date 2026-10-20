@@ -112,13 +112,14 @@ def main():
         moe_cache_auto=False, moe_cache_size=args.slots, num_page_override=4300,
         max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
         speculative_mtp_depth=args.depth, speculative_three_level=True,
+        speculative_max_input_tokens=max(map(len, prompts)), speculative_max_output_tokens=args.tokens,
         speculative_max_loops=args.max_loops, speculative_submit_tokens=args.submit_rows,
         speculative_expert_scheduler="gpu", speculative_compact_control=True,
         speculative_execution_implementation="optimized",
         speculative_graph_implementation=args.graph_implementation,
         speculative_prefetch=True, speculative_prefetch_layer_experts=2,
         speculative_prefetch_gap_capacity=12, cuda_graph_max_bs=4, cache_type="naive",
-        max_extend_tokens=128, mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio")))))
+        mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio")))))
     runner, cache = engine.speculative_runner, engine.moe_offload_cache
     config.update(actual_slots=cache.cache_size, actual_kv_pages=engine.num_pages,
         gpu=torch.cuda.get_device_name(engine.device), W=args.depth + 1,

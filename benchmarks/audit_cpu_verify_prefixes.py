@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 
 import torch
 
@@ -17,8 +18,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run", type=Path)
     parser.add_argument("--tokens", type=int, default=16)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     run = args.run.resolve()
+    output = args.output or run / "cpu_prefix_correctness.json"
+    if args.output is not None and output.exists():
+        raise ValueError("explicit audit output already exists")
     config = json.loads((run / "config.json").read_text())
     repo = Path(__file__).resolve().parents[1]
     for relative in ("engine/qwen_cpu_target.py", "engine/qwen_cpu_worker.py", "moe/cpu_target.py",
@@ -40,7 +45,9 @@ def main():
     os.sched_setaffinity(0, {0, 24})
     rows, lifecycle, epoch = [], [], 0
     for threads in config["threads"]:
-        worker = CpuVerifierWorker(model, text, core_sets[threads], max_rows=33)
+        worker = CpuVerifierWorker(model, text, core_sets[threads], max_rows=33,
+            max_context=config.get("max_input_tokens", 2048) + config.get("max_output_tokens", 2048),
+            backend=config.get("backend", "legacy"), grouped=not config.get("ungrouped", False))
         try:
             worker.wait_ready()
             for sample in range(config["samples"]):
@@ -82,8 +89,10 @@ def main():
     report = dict(status="validated", scope="CPU serial/block token and accepted-state parity after saved GPU prefill",
         tokens_per_serial_reference=args.tokens, configurations=len(rows), rows=rows,
         lifecycle=lifecycle,
+        command=[sys.executable, *sys.argv],
+        audit_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         cuda_contexts_created=any(row["cuda_initialized"] for row in rows))
-    (run / "cpu_prefix_correctness.json").write_text(json.dumps(report, indent=2) + "\n")
+    output.write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":

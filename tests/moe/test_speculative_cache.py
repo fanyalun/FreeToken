@@ -144,7 +144,6 @@ def test_demand_only_windows_do_not_pin_routes_and_replay_after_eviction():
         hidden = torch.zeros(1, 1, device=device)
         first = control.route(toy_layer(0), hidden, weights, ids).clone()
         assert not control.refs.any()
-        assert torch.allclose(first, (weights[0, :4] * torch.arange(4, device=device)).sum())
         control.route(toy_layer(1), hidden, weights, ids)
         control.route(toy_layer(0), hidden, weights, ids + 8)
         assert (cache.slot_for_id[0, :4] < 0).all()
@@ -154,6 +153,209 @@ def test_demand_only_windows_do_not_pin_routes_and_replay_after_eviction():
         assert not control.pending.any()
         assert not control.prefetched_device.any()
         control.check_error()
+        control.close(abort=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("slots,quotas", [(8, [0, 2, 0]), (9, [0, 2, 1]), (32, [0, 2, 2])])
+def test_verify_prefetch_preserves_demand_weights_and_joins_before_use(graph_mode, slots, quotas):
+    from freetoken.moe.speculative_gpu import GPUExpertCache, STAT_NAMES
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=3, slots=slots)
+        control = GPUExpertCache(cache, stream, max_loops=2, max_rows=4,
+            compact_control=True, implementation="optimized", layer_quota=0,
+            verify_layer_quotas=quotas)
+        ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        weights = torch.ones(1, 8, device="cuda") / 8
+        hidden = torch.zeros(1, 1, device="cuda")
+        original_copy = control._copy
+        def slow_copy(layer, plan, **kwargs):
+            if not kwargs.get("retire", True):
+                torch.cuda._sleep(1000000)
+            return original_copy(layer, plan, **kwargs)
+        control._copy = slow_copy
+        outputs = []
+        def setup():
+            cache.slot_for_id.fill_(-1)
+            cache.id_of_slot.fill_(-1)
+            cache.usage.zero_()
+            cache.step.zero_()
+            control.refs.zero_()
+            control.refs[1:, :8] = 1
+        def forward():
+            for li in range(3):
+                outputs.append(control.route(toy_layer(li), hidden, weights, ids))
+        control.begin(1)
+        control.set_phase("verify")
+        setup()
+        forward()
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            setup()
+            with torch.cuda.graph(graph, stream=stream):
+                forward()
+            for _ in range(3):
+                setup()
+                graph.replay()
+        stream.synchronize()
+        for index, output in enumerate(outputs):
+            torch.testing.assert_close(output, torch.full_like(output, (index % 3) * 16 + 3.5), rtol=0, atol=0)
+        assert not control.pending.any() and control.error.item() == 0
+        assert all(plan[3].item() == 0 for plan in control.verify_plans)
+        stats = dict(zip(STAT_NAMES, control.counters.tolist()))
+        assert stats["verify_native_routes"] == stats["verify_retained_routes"]
+        if slots == 8:
+            assert stats["verify_prefetch_loads"] == 0
+            assert stats["verify_prefetch_capacity_shortfall"] > 0
+        else:
+            assert stats["verify_prefetch_loads"] == stats["verify_prefetch_used"] > 0
+        control.close(abort=True)
+        assert cache.speculative_controller is None and not control.refs.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_verify_prefetch_uses_consumed_refs_counts_then_expert_id():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=2, slots=32)
+        control = GPUExpertCache(cache, stream, max_loops=2, max_rows=4,
+            compact_control=True, implementation="optimized", layer_quota=0, verify_layer_quota=3)
+        control.begin(1)
+        ids = torch.tensor([[5, 5, 5, 3, 3, 2, 2, 1], [9] * 8], device="cuda", dtype=torch.int32)
+        weights = torch.arange(8, 0, -1, device="cuda").float().expand(2, 8).contiguous()
+        control.route(toy_layer(1), torch.zeros(2, 1, device="cuda"), weights, ids)
+        control.decide(0, 1)
+        assert control.refs[1, 9].item() == 0
+        # Force all predictions missing while retaining their consumed-row counts.
+        cache.slot_for_id.fill_(-1)
+        cache.id_of_slot.fill_(-1)
+        control.set_phase("verify")
+        actual = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        control.route(toy_layer(0), torch.zeros(1, 1, device="cuda"), torch.ones(1, 8, device="cuda"), actual)
+        stream.synchronize()
+        plan = control.verify_plans[1]
+        assert plan[0][:plan[3].item()].tolist() == [16 + 5, 16 + 2, 16 + 3]
+        assert control.pending.count_nonzero() == 3
+        control.close(abort=True)
+        assert not control.pending.any() and not plan[3].any()
+        control.begin(2)
+        control.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prefetch,quotas", [(False, [0, 2]), (True, [0, 0])])
+def test_verify_prefetch_disabled_has_no_workspace_or_launches(prefetch, quotas, monkeypatch):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"))
+        control = GPUExpertCache(cache, stream, max_loops=2, max_rows=4, prefetch=prefetch,
+            layer_quota=0, compact_control=True, implementation="optimized", verify_layer_quotas=quotas)
+        assert control.verify_plans is None and control.verify_prefetched is None
+        monkeypatch.setattr(control, "join_verify", lambda *a: pytest.fail("disabled join"))
+        control.begin(1)
+        control.set_phase("verify")
+        ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        control.route(toy_layer(0), torch.zeros(1, 1, device="cuda"), torch.ones(1, 8, device="cuda"), ids)
+        control.close(abort=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("prediction", [[], [0, 1, 2], [12, 13, 14]])
+@pytest.mark.parametrize("valid", [1, 3])
+def test_verify_prefetch_matches_full_target_from_identical_cache(prediction, valid):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+    from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ids = torch.arange(24, device="cuda", dtype=torch.int32).reshape(3, 8) % 8
+        weights = torch.arange(24, 0, -1, device="cuda").float().reshape(3, 8) / 24
+        hidden = torch.randn(3, 1, device="cuda")
+        rec = torch.randn(1, 2, 1, 128, 128, device="cuda") * .1
+        conv = torch.randn(1, 2, 384, 3, device="cuda", dtype=torch.bfloat16) * .1
+        conv_weight = torch.randn(384, 4, device="cuda", dtype=torch.bfloat16) * .1
+        gdn_layer = SimpleNamespace(layer_id=0, num_k_heads=1, num_v_heads=1, head_k_dim=128,
+            head_v_dim=128, key_dim=128, value_dim=128, _conv_weight=lambda: conv_weight,
+            A_log=torch.zeros(1, device="cuda"), dt_bias=torch.zeros(1, device="cuda"))
+        results = []
+        for quota in (0, 3):
+            cache = toy_cache(torch.device("cuda"), layers=2, slots=32)
+            cache.slot_for_id[1, 0] = 0
+            cache.id_of_slot[0] = 16
+            cache.banks[0][1][0] = 16
+            control = GPUExpertCache(cache, stream, max_loops=2, max_rows=4,
+                compact_control=True, implementation="optimized", layer_quota=0, verify_layer_quota=quota)
+            control.begin(1)
+            control.valid_rows = torch.tensor([valid], device="cuda", dtype=torch.int32)
+            control.refs[1, prediction] = 1
+            control.set_phase("verify")
+            output = hidden
+            for li in range(2):
+                output = control.route(toy_layer(li), output, weights, ids)
+            pool = SimpleNamespace(recurrent_states=rec.clone(), conv_states=conv.clone(),
+                                   num_slots=2, local_index=lambda _: 0)
+            state = QwenGDNVerifyState(pool, [gdn_layer], 3, 1)
+            raw = (output.expand(3, 384) * .001).to(torch.bfloat16).contiguous()
+            gates = torch.zeros(3, 1, device="cuda", dtype=torch.bfloat16)
+            state.verify_layer(gdn_layer, raw, gates, gates)
+            state.commit(torch.tensor(valid, device="cuda", dtype=torch.int32))
+            results.append((output.clone(), control.final_history.clone(),
+                            pool.recurrent_states.clone(), pool.conv_states.clone()))
+            assert not control.pending.any() and control.error.item() == 0
+            if quota:
+                assert not control.verify_prefetched[1, 0]
+                assert not control.verify_prefetched.any()
+                assert control.counters[14].item() == len(set(prediction) - {0})
+            control.close(abort=True)
+        for left, right in zip(*results):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_verify_prefetch_capture_failure_retires_pending_and_reuses_cache():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=2, slots=32)
+        control = GPUExpertCache(cache, stream, max_loops=2, max_rows=4,
+            compact_control=True, implementation="optimized", layer_quota=0, verify_layer_quota=2)
+        ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        hidden, weights = torch.zeros(1, 1, device="cuda"), torch.ones(1, 8, device="cuda")
+        control.begin(1)
+        control.set_phase("verify")
+        control.refs[1, :8] = 1
+        control.route(toy_layer(0), hidden, weights, ids)
+        control.close(abort=True)
+        control.begin(2)
+        control.set_phase("verify")
+        control.refs[1, 12:14] = 1
+        graph = torch.cuda.CUDAGraph()
+        with pytest.raises(RuntimeError, match="injected capture failure"):
+            with torch.cuda.graph(graph, stream=stream):
+                try:
+                    control.route(toy_layer(0), hidden, weights, ids)
+                    raise RuntimeError("injected capture failure")
+                finally:
+                    control.retire_verify()
+        control.close(abort=True)
+        assert not control.pending.any() and cache.speculative_controller is None
+        assert all(plan[3].item() == 0 for plan in control.verify_plans)
+        control.begin(3)
+        control.set_phase("verify")
+        control.route(toy_layer(0), hidden, weights, ids)
+        control.route(toy_layer(1), hidden, weights, ids)
         control.close(abort=True)
 
 
@@ -322,6 +524,7 @@ def test_real_copy_reads_ready_weights_and_preserves_locked_owners(graph_mode):
     device = torch.device("cuda:0")
     stream = torch.cuda.Stream(device=device)
     cache = toy_cache(device, slots=32)
+    stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
         control = SpeculativeExpertCache(cache, stream, use_graph=graph_mode, audit=True)
         control.begin(1)

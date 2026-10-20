@@ -275,7 +275,8 @@ def test_window_scratch_is_shared_across_layers_and_matches_budget():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("rows", [2, 3, 4])
 @pytest.mark.parametrize("grouped", [False, True])
-def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped):
+@pytest.mark.parametrize("balanced", [False, True])
+def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped, balanced):
     from types import SimpleNamespace
     import freetoken.core as core
     import freetoken.layers.moe as moe
@@ -296,12 +297,24 @@ def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped):
             torch.randn(experts, hidden_size, intermediate) * 0.03)],
     }
     caches = []
-    for _ in range(2):
+    for index in range(2):
         cache = OffloadMoeCache(1, experts, experts, torch.device("cuda"), decode_target="hybrid", hybrid_max_fetch=1)
         cache.set_bank_sources(sources)
         cache.cpu_executor = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
-                                           num_threads=4, max_tokens=rows, device=torch.device("cuda"))
+            num_threads=4, max_tokens=rows, device=torch.device("cuda"),
+            grouped_widths=tuple(range(1, rows + 1)) if balanced and index == 1 else (),
+            grouped_compat=balanced and index == 1)
         caches.append(cache)
+    if balanced:
+        from freetoken.moe.baseline_hybrid import BaselineHybridPlanner
+        routes = rows * top_k
+        profile = dict(identity=dict(widths=list(range(1, rows + 1)),
+            geometry=[1, experts, hidden_size, intermediate, top_k]),
+            cpu=[[0.] + [100.] * routes for _ in range(rows + 1)],
+            gpu=[[0.] * (routes + 1) for _ in range(rows + 1)],
+            fixed=[0.] * (rows + 1), dispatch=[0.] * (rows + 1), gpu_fixed=[0.] * (rows + 1),
+            contention=[1.] * (rows + 1), io=[10. * n for n in range(routes + 1)])
+        caches[1].baseline_hybrid = BaselineHybridPlanner(caches[1], profile, 1)
     ctx = Context(1)
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
     batch = Batch([], "decode")
@@ -317,6 +330,20 @@ def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped):
                 hidden = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
                 ids = torch.stack([torch.randperm(experts, device="cuda")[:top_k] for _ in range(rows)]).int()
                 weights = torch.rand(rows, top_k, device="cuda")
+                if balanced:
+                    weights[0, 0] = 0
+                    monkeypatch.setattr(moe, "_HYBRID_WINDOW", True)
+                    actual = layer._decode_hybrid(caches[1], hidden, weights, ids.clone())
+                    slots = caches[1].slot_for_id[0, ids.long()]
+                    on_gpu = (slots >= 0) & (weights != 0)
+                    cpu_ids = torch.where(on_gpu | (weights == 0), -1, ids).contiguous()
+                    cpu = caches[0].cpu_executor.decode(0, hidden, weights, cpu_ids)
+                    gpu_weights = torch.where(on_gpu, weights, 0).contiguous()
+                    gpu = fused_experts_decode_impl(hidden, *caches[1].bank_views(), gpu_weights, slots.clamp_min(0))
+                    expected = gpu + cpu
+                    torch.cuda.synchronize()
+                    assert torch.equal(actual, expected)
+                    continue
                 reference = caches[0]
                 slots = ids.clone()
                 reference.ensure_experts_hybrid(0, slots.view(-1))

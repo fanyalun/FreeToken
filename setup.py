@@ -116,8 +116,10 @@ setup(
             include_dirs=[KERNEL_INCLUDE, *runtime_include_dirs],
             library_dirs=runtime_library_dirs,
             libraries=[runtime_lib],
-            extra_compile_args=extra_compile + ["-pthread"],
-            extra_link_args=runtime_link_args,
+            extra_compile_args=extra_compile + ["-pthread", "-fopenmp"],
+            extra_link_args=runtime_link_args + ["-fopenmp"],
+            depends=["python/freetoken/kernel/csrc/cpu_moe/cpu_target.h",
+                     "python/freetoken/kernel/csrc/cpu_moe/cpu_target_v2.h"],
         ),
         # disk-backed row store (PLE / Engram tables); Linux-only until the TableFile/BatchReader seams grow Windows bodies
         *([

@@ -92,9 +92,21 @@ class QwenGDNVerifyState:
         )
 
     def bytes(self) -> int:
+        return self.workspace_bytes((self,))
+
+    @staticmethod
+    def workspace_bytes(states) -> int:
+        storages = {}
+        for state in states:
+            for tensor in state.tensors():
+                storage = tensor.untyped_storage()
+                storages[(tensor.device, storage.data_ptr())] = storage.nbytes()
+        return sum(storages.values())
+
+    def tensors(self):
         tensors = [self.conv_windows, self.indices, self.cu_seqlens, *self.replay_inputs]
         if self.snapshots is not None:
             tensors.extend(group[0] for group in self.snapshots.values())
         if self.snapshot_index is not None:
             tensors.append(self.snapshot_index)
-        return sum(t.numel() * t.element_size() for t in tensors)
+        return tensors

@@ -11,6 +11,103 @@ from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budg
 from freetoken.engine.engine import _pin_budget_bytes
 
 
+@pytest.mark.parametrize("page_size,pages", [(1, 10), (4, 3), (16, 1)])
+def test_baseline_capacity_is_bounded_independently_of_chunk(page_size, pages):
+    from freetoken.engine.baseline_sd import resolve_capacity
+    config = SimpleNamespace(speculative_max_input_tokens=7, speculative_max_output_tokens=3,
+                             max_seq_len=16, page_size=page_size, num_page_override=None)
+    assert resolve_capacity(config) == (10, pages)
+    config.num_page_override = pages + 2
+    assert resolve_capacity(config) == (10, pages + 2)
+    config.num_page_override = pages - 1
+    with pytest.raises(ValueError, match="KV pages"):
+        resolve_capacity(config)
+    config.num_page_override = None
+    config.max_seq_len = 9
+    with pytest.raises(ValueError, match="context"):
+        resolve_capacity(config)
+
+
+@pytest.mark.parametrize("automatic,expected", [(True, 8), (False, 2)])
+def test_baseline_measured_budget_preserves_runtime_and_caps_experts(automatic, expected):
+    from freetoken.engine.baseline_sd import plan_measured_memory
+    plan = plan_measured_memory(capacity_tokens=10, kv_pages=3, budget_bytes=1200,
+        measured_peak_bytes=600, initial_slots=2, expert_slot_bytes=100, minimum_slots=2,
+        maximum_slots=20, automatic=automatic)
+    assert plan.non_expert_peak_bytes == 400 and plan.final_slots == expected
+    plan.validate(expected)
+    with pytest.raises(ValueError, match="shortfall"):
+        plan.validate(9)
+
+
+def test_baseline_budget_rejects_minimum_and_fused_overcommit():
+    from freetoken.engine.baseline_sd import plan_measured_memory
+    for slots, unit in ((2, 100), (0, 0)):
+        with pytest.raises(ValueError, match="shortfall"):
+            plan_measured_memory(capacity_tokens=10, kv_pages=3, budget_bytes=500,
+                measured_peak_bytes=600, initial_slots=slots, expert_slot_bytes=unit,
+                minimum_slots=slots, maximum_slots=20, automatic=True)
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
+    engine = object.__new__(Engine)
+    engine.config = SimpleNamespace(model_config=SimpleNamespace(num_experts=2), moe_prefill_overlap=False)
+    engine.moe_offload_cache = SimpleNamespace(cache_size=8)
+    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 2, 8, 400, 0)
+    engine._sd_sizing = automatic
+    peaks = iter((1200, 900))
+    engine._measure_baseline_sd_peak = lambda: next(peaks)
+    rebuilt = []
+    def rebuild(*, moe_cache_size):
+        rebuilt.append(moe_cache_size)
+        engine.moe_offload_cache.cache_size = moe_cache_size
+        engine._validate_baseline_sd_peak()
+    engine.rebuild_runtime_cache = rebuild
+    if automatic:
+        engine._validate_baseline_sd_peak()
+        assert rebuilt == [6]
+        assert engine.baseline_sd_memory_plan.final_slots == 6
+        assert engine.baseline_sd_final_peak_bytes == 900
+    else:
+        with pytest.raises(ValueError, match="final boundary warmup"):
+            engine._validate_baseline_sd_peak()
+        assert rebuilt == []
+
+
+def test_hybrid_partial_reservation_does_not_charge_preallocated_storage_twice():
+    from freetoken.engine.cache_budget import speculative_hybrid_workspace_bytes
+    config = SimpleNamespace(moe_strategy="hybrid", speculative_expert_scheduler="gpu",
+        speculative_hybrid_phases=("preverify", "verify"), speculative_mtp_depth=3,
+        speculative_submit_tokens=0, speculative_max_loops=6, speculative_max_output_tokens=3,
+        model_config=SimpleNamespace(num_experts_per_tok=8, hidden_size=64))
+    full = speculative_hybrid_workspace_bytes(config)
+    pending = speculative_hybrid_workspace_bytes(config, include_cpu_partials=False)
+    assert full - pending == 2 * (1 + 2 + 3) * 64
+
+
+def test_baseline_rebuild_accounts_for_previously_expanded_state_pool(monkeypatch):
+    from freetoken.engine.engine import Engine
+    from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
+    from freetoken.kvcache.base import CacheRebuildRejected
+
+    engine = object.__new__(Engine)
+    engine.config = SimpleNamespace(speculative_max_input_tokens=7, speculative_max_output_tokens=3, page_size=1)
+    engine.moe_offload_cache = SimpleNamespace(validate_rebuild=lambda slots: None)
+    engine.linear_state_pool = SimpleNamespace(num_slots=4)
+    engine.num_pages = 10
+    engine._pool_cls = SimpleNamespace(kv_cost=lambda config: (10, 0, 1, 0))
+    engine._target_moe_and_expert_bytes = lambda slots: (slots, 100)
+    engine._baseline_sd_initial_state_bytes = 200
+    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 10, 500, 200, 100, 2, 2, 400, 0)
+    monkeypatch.setattr("freetoken.engine.engine.state_pool_bytes", lambda config, slots: slots * 100)
+    with pytest.raises(CacheRebuildRejected, match="shortfall=100"):
+        engine.rebuild_runtime_cache(moe_cache_size=2)
+    assert not getattr(engine, "rebuild_teardown_started", False)
+
+
 def test_moe_priority_fills_experts_up_to_total():
     # budget large enough to cache every expert; KV gets the remainder.
     # per_expert=100, cache_per_page=10, total=8 experts (L*E), E=4.

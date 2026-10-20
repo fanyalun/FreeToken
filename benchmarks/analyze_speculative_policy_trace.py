@@ -89,7 +89,8 @@ def analyze(path):
             node = aliases[node]
         return nodes.get(node)
     prefixes = {"DEMAND_COPY/": "demand_io", "BASELINE_DEMAND/": "demand_io",
-                "LAYER_PREFETCH/": "prefetch_io", "EXPERT_COMPUTE/": "expert_compute",
+                "LAYER_PREFETCH/": "prefetch_io", "VERIFY_PREFETCH/": "verify_prefetch_io",
+                "EXPERT_COMPUTE/": "expert_compute",
                 "ADMISSION/": "admission", "BASELINE_ADMISSION/": "admission"}
     projected = defaultdict(list)
     for label in labels:
@@ -113,9 +114,9 @@ def analyze(path):
             if i >= 0 and point <= rows[i]["end"]:
                 kind = category
                 break
-        if name in ("_plan", "_resolve", "_ready", "_ready_layers"):
+        if name in ("_plan", "_resolve", "_ready", "_ready_layers", "_retire_verify"):
             kind = "schedule"
-        if name in ("_copy_global", "_copy_global_vectorized"):
+        if name in ("_copy_global", "_copy_global_vectorized") and kind == "other_compute":
             kind = "gap_prefetch_io"
         if node:
             kind_cache[cache_key] = kind
@@ -145,12 +146,21 @@ def analyze(path):
         assert rows, forward
         copies = [row for row in rows if row["name"] == "fast_index_copy_multi"]
         expected = 40 if forward["method"] == "io_calibration" or forward["phase"] != "preverify" else 80
-        if forward["method"] in ("layer_budget", "median_budget") and forward["phase"] == "preverify":
+        if forward["phase"] != "preverify":
+            assert sum(r["kind"] == "demand_io" for r in copies) == 40
+            prefetched = sum(r["kind"] == "verify_prefetch_io" for r in copies)
+            assert 0 <= prefetched <= 39 and len(copies) == 40 + prefetched
+        elif forward["method"].startswith("verify_"):
+            assert sum(r["kind"] == "demand_io" for r in copies) == 40
+            small, quota = map(int, forward["method"].removeprefix("verify_s").split("_q"))
+            expected = 40 + (40 if small else 0)
+            assert len(copies) == expected, (forward, len(copies), expected)
+        elif forward["method"] in ("layer_budget", "median_budget") and forward["phase"] == "preverify":
             assert sum(r["kind"] == "demand_io" for r in copies) == 40
             assert 40 <= len(copies) <= 80
         else:
             assert len(copies) == expected, (forward, len(copies), expected)
-        assert all(row["kind"] in ("demand_io", "prefetch_io") for row in copies)
+        assert all(row["kind"] in ("demand_io", "prefetch_io", "verify_prefetch_io") for row in copies)
         forward["kernels"] = rows
         groups[forward["method"], forward["phase"]].append(forward)
     for index, outer in enumerate(outers):
@@ -165,8 +175,8 @@ def analyze(path):
         rows = [row for f in forwards for row in f["kernels"]]
         spans = lambda selected: [(r["start"], r["end"]) for r in selected]
         categories = {kind: spans([r for r in rows if r["kind"] == kind])
-                      for kind in ("demand_io", "prefetch_io", "gap_prefetch_io", "expert_compute", "admission", "schedule", "other_compute")}
-        compute = spans([r for r in rows if r["kind"] not in ("demand_io", "prefetch_io", "gap_prefetch_io")])
+                      for kind in ("demand_io", "prefetch_io", "verify_prefetch_io", "gap_prefetch_io", "expert_compute", "admission", "schedule", "other_compute")}
+        compute = spans([r for r in rows if r["kind"] not in ("demand_io", "prefetch_io", "verify_prefetch_io", "gap_prefetch_io")])
         envelopes = [(min(r["start"] for r in f["kernels"]), max(r["end"] for r in f["kernels"])) for f in forwards]
         durations = Counter()
         for row in rows:
@@ -187,9 +197,23 @@ def analyze(path):
                 prefetched = [r for r in current if r["kind"] == "prefetch_io"]
                 join_wait.append(max(0, max(r["end"] for r in prefetched)
                                      - max(r["end"] for r in before_join)) / 1e6)
+        verify_wait = []
+        if phase == "verify":
+            for forward in forwards:
+                current = forward["kernels"]
+                joins = sorted([r for r in current if r["name"] == "_retire_verify"], key=lambda r: r["start"])
+                copies = sorted([r for r in current if r["kind"] == "verify_prefetch_io"], key=lambda r: r["start"])
+                assert len(joins) == len(copies)
+                for copy, join in zip(copies, joins):
+                    preceding = [r["end"] for r in current if r["streamId"] == join["streamId"] and r["end"] <= join["start"]]
+                    assert preceding
+                    verify_wait.append(max(0, copy["end"] - max(preceding)) / 1e6)
         value = dict(forwards=len(forwards), gpu_envelope_ms=ms(envelopes), kernel_union_ms=active,
             envelope_gap_ms=ms(envelopes) - active, category_union_ms={k: ms(v) for k, v in categories.items()},
             prefetch_overlap_non_io_ms=ms(intersection(categories["prefetch_io"], compute)),
+            verify_prefetch_overlap_non_io_ms=ms(intersection(categories["verify_prefetch_io"], compute)),
+            verify_prefetch_entry_exposed_ms=sum(verify_wait),
+            verify_prefetch_entry_wait_scope="copy completion beyond preceding compute-stream kernel; excludes event/retirement overhead",
             gap_prefetch_overlap_non_io_ms=ms(intersection(categories["gap_prefetch_io"], compute)),
             demand_overlap_non_io_ms=ms(intersection(categories["demand_io"], compute)),
             prefetch_overlap_demand_ms=ms(intersection(categories["prefetch_io"], categories["demand_io"])),

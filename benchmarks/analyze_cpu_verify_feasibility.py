@@ -92,7 +92,8 @@ def main():
     notes = ["# CPU verification feasibility curves", "",
         "Fixed-window measurements on Qwen3.6-35B-A3B, BF16, TP=1, one A100 80GB PCIe. "
         "The independent CPU Target uses 23 NUMA-local or 46 cross-NUMA physical cores. "
-        "GPU slots=4907, KV pages=4300, budget=64 GiB, D=3, eager, no prefetch.", "",
+        f"GPU slots={config['gpu_slots']}, KV pages={config['kv_pages']}, "
+        f"budget={config['budget_gib']} GiB, D={config['depth']}, eager, no prefetch.", "",
         "Each point is the median across four fixed GSM8K inputs and three repetitions. "
         "Error bars show the inclusive 25th and 75th percentiles, not confidence intervals. "
         "Candidate lengths vary with inner acceptance; all raw lengths remain in the table. "

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+import time
 
 import torch
 
@@ -38,8 +39,9 @@ def retained_tail(result, block):
 
 
 class QwenAsyncGpuWindow:
-    def __init__(self, runner):
+    def __init__(self, runner, *, instrument_components=True):
         self.runner, self.engine = runner, runner.engine
+        self.instrument_components = instrument_components
         e = self.engine
         c = e.config
         if (not runner.mtp_enabled or runner.three_level is not None or c.tp_info.size != 1
@@ -60,25 +62,45 @@ class QwenAsyncGpuWindow:
             recurrent_states=torch.empty_like(pool.recurrent_states[:, 1:2]),
             conv_states=torch.empty_like(pool.conv_states[:, 1:2]),
             local_index=pool.local_index, num_slots=1)
-        self.states = {w: QwenGDNVerifyState(self.private_pool, self.layers, w, 0)
-                       for w in range(1, REPLAY_ROWS + 1)}
+        workspace = QwenGDNVerifyState(self.private_pool, self.layers, REPLAY_ROWS, 0)
+        self.states = {REPLAY_ROWS: workspace}
+        self.states.update({w: QwenGDNVerifyState(self.private_pool, self.layers, w, 0, workspace=workspace)
+                            for w in range(1, REPLAY_ROWS)})
+        self.token_buffer = torch.empty(REPLAY_ROWS, dtype=torch.int32, device=e.device)
+        self.shift_buffer = torch.empty_like(self.token_buffer)
+        self.hidden_buffer = torch.empty(REPLAY_ROWS, mc.hidden_size, dtype=c.dtype, device=e.device)
+        self.count_buffer = torch.empty((), dtype=torch.int32, device=e.device)
+        self.reader_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.reader_generation = 0
+        self.timing_events = {name: torch.cuda.Event(enable_timing=True) for name in
+                              ("install", "state", "refresh", "replay_start", "replay_end",
+                               "prefill_start", "prefill_end")}
+        runner.reserve_eager_width(REPLAY_ROWS)
         self.epoch, self.active = 0, False
         self.canonical_length = 0
 
-    def initialize(self, input_ids, *, chunk_size=128):
+    def initialize(self, input_ids, *, chunk_size=None):
         if self.active or self.runner.active:
             raise RuntimeError("GPU window already active")
         r, e = self.runner, self.engine
         ids = torch.as_tensor(input_ids, dtype=torch.int32, device="cpu")
+        if chunk_size is not None and (type(chunk_size) is not int or chunk_size < 1):
+            raise ValueError("prompt chunk size must be None or a positive integer")
         if ids.ndim != 1 or not 0 < ids.numel() < e.max_seq_len:
             raise ValueError("nonempty text prompt below context capacity required")
+        if ids.numel() > e.config.speculative_max_input_tokens:
+            raise ValueError("prompt exceeds configured input capacity")
         if not r._request_lock.acquire(blocking=False):
             raise RuntimeError("GPU runner already owns a request")
         self.active, r.active = True, True
+        prefill_started = time.perf_counter()
         try:
             with torch.cuda.stream(e.stream):
+                self._record_timing("prefill_start")
                 anchor = r._prefill(ids, chunk_size)
+                self._record_timing("prefill_end")
                 length = ids.numel()
+                self.output_end = length + e.config.speculative_max_output_tokens
                 r.frontier = SpeculativeFrontier(1, length, length, r._reserved_len)
                 self.canonical_length = length
                 pool = e.linear_state_pool
@@ -90,6 +112,9 @@ class QwenAsyncGpuWindow:
                 values = torch.stack([e.kv_cache.v_cache(i)[:length, 0] for i in attention]).cpu()
                 checkpoint = PrefixCheckpoint(length, int(anchor.item()), keys, values,
                     pool.recurrent_states[:, 1].cpu(), pool.conv_states[:, 1].cpu())
+                self.prefill_seconds = (self.timing_events["prefill_start"].elapsed_time(
+                    self.timing_events["prefill_end"]) / 1000 if self.instrument_components else None)
+                self.prefill_wall_seconds = time.perf_counter() - prefill_started
                 self.epoch += 1
                 self.experts.begin(self.epoch)
                 self.experts.set_phase("preverify", 0)
@@ -98,10 +123,10 @@ class QwenAsyncGpuWindow:
             self.close_request()
             raise
 
-    def _lossy(self, inputs, start):
+    def _lossy(self, inputs, start, *, need_logits=True):
         r = self.runner
         batch = r._batch(inputs, start, state=self.states[inputs.numel()])
-        return r._execute("cpu_async_lossy", batch)
+        return r._execute("cpu_async_lossy", batch, need_logits=need_logits)
 
     def audit_gpu_anchor(self, anchor):
         r, e = self.runner, self.engine
@@ -115,7 +140,7 @@ class QwenAsyncGpuWindow:
             try:
                 cache.speculative_controller = None
                 with e.model.forward_host_ctx(batch, False):
-                    _, hidden = r._target(batch)
+                    _, hidden = r._target(batch, need_logits=False)
                     with e.ctx.forward_batch(batch):
                         logits = e.model.lm_head.forward(hidden)[0].float().cpu()
             finally:
@@ -134,6 +159,49 @@ class QwenAsyncGpuWindow:
                 r._execute("cpu_async_warm_mtp", r._batch(ids, start), hidden)
             e.stream.synchronize()
             self.experts.check_error()
+            self.validate_budget()
+
+    def validate_budget(self):
+        e = self.engine
+        if self.experts.cache is not e.moe_offload_cache:
+            raise RuntimeError("recreate CPU async GPU window after runtime cache rebuild")
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(e.device) - e._baseline_allocated
+        external = max(0, e._physical_baseline_free - torch.cuda.mem_get_info(e.device)[0] - allocated)
+        peak = torch.cuda.max_memory_allocated(e.device) - e._baseline_allocated + external
+        budget = e.config.gpu_memory_budget_bytes
+        plan = getattr(e, "baseline_sd_memory_plan", None)
+        if plan is not None:
+            budget = min(budget, plan.budget_bytes) if budget is not None else plan.budget_bytes
+        if budget is not None and peak > budget:
+            raise ValueError(f"CPU async GPU peak {peak} exceeds fixed budget {budget}")
+        self.gpu_peak_bytes = peak
+
+    def _refresh(self, phase, tokens, hidden, start, final):
+        r = self.runner
+        rows = len(tokens)
+        ids = self.shift_buffer[:rows]
+        ids.copy_(torch.as_tensor(tokens, dtype=torch.int32))
+        saved = self.hidden_buffer[:rows]
+        saved.copy_(hidden)
+        seeds, states = r._execute(phase, r._batch(ids, start), saved,
+                                  need_logits=final, last_only=final)
+        if final:
+            r.seed_token.copy_(seeds[-1:])
+            r.seed_hidden.copy_(states[-1:])
+            r.next_draft, r.last_draft_hidden = r.seed_token, r.seed_hidden
+
+    def _record_timing(self, name):
+        if self.instrument_components:
+            self.timing_events[name].record(self.engine.stream)
+
+    def component_timings(self):
+        if not self.instrument_components:
+            return {}
+        events = self.timing_events
+        return dict(state_install_seconds=events["install"].elapsed_time(events["state"]) / 1000,
+                    confirmed_mtp_refresh_seconds=events["state"].elapsed_time(events["refresh"]) / 1000,
+                    fixed_replay_seconds=events["replay_start"].elapsed_time(events["replay_end"]) / 1000)
 
     def generate_block(self, anchor, loops, *, candidate_cap=None):
         if not self.active or loops < 1:
@@ -147,7 +215,7 @@ class QwenAsyncGpuWindow:
                 width = e.config.speculative_mtp_depth + 1
                 if candidate_cap is not None:
                     width = min(width, candidate_cap - len(candidates))
-                width = min(width, e.max_seq_len - r.frontier.target_valid_len)
+                width = min(width, self.output_end - r.frontier.target_valid_len)
                 if width < 1:
                     break
                 proposal = r.coordinator.prepare(r.frontier, current, width - 1)
@@ -169,10 +237,13 @@ class QwenAsyncGpuWindow:
         if (not self.active or result.request_epoch != self.epoch
                 or result.start != self.canonical_length):
             raise ValueError("CPU result does not extend the confirmed GPU prefix")
+        if result.checkpoint.length > self.output_end:
+            raise ValueError("CPU result exceeds configured output capacity")
         r, e = self.runner, self.engine
         with torch.cuda.stream(e.stream):
             # Boundary wait protects private readers before canonical suffix installation.
             e.stream.synchronize()
+            self._record_timing("install")
             checkpoint = result.checkpoint
             end = checkpoint.length
             r._reserve(end)
@@ -186,17 +257,18 @@ class QwenAsyncGpuWindow:
             pool.conv_states[:, 1].copy_(checkpoint.conv)
             self.private_pool.recurrent_states.copy_(pool.recurrent_states[:, 1:2])
             self.private_pool.conv_states.copy_(pool.conv_states[:, 1:2])
+            self._record_timing("state")
             # Chunk only the confirmed MTP suffix; the prefix remains read-only.
             for offset in range(0, result.input_count, REPLAY_ROWS):
                 count = min(REPLAY_ROWS, result.input_count - offset)
-                tokens = torch.tensor(result.tokens[offset:offset + count], dtype=torch.int32, device=e.device)
-                hidden = result.hidden[offset:offset + count].to(e.device)
-                batch = r._batch(tokens, result.start + offset)
-                seeds, states = r._execute("cpu_async_confirmed_mtp", batch, hidden)
-                r.next_draft, r.last_draft_hidden = seeds[-1:].clone(), states[-1:].clone()
+                self._refresh("cpu_async_confirmed_mtp", result.tokens[offset:offset + count],
+                    result.hidden[offset:offset + count], result.start + offset,
+                    offset + count == result.input_count)
+            self._record_timing("refresh")
             self.canonical_length = end
             r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
-            event = torch.cuda.Event()
+            event = self.reader_events[self.reader_generation % 2]
+            self.reader_generation += 1
             event.record(e.stream)
             return event
 
@@ -204,23 +276,30 @@ class QwenAsyncGpuWindow:
         r, e = self.runner, self.engine
         if block.start != r.frontier.target_valid_len or block.start != self.canonical_length:
             raise ValueError("fixed-token replay must start at the refreshed CPU frontier")
+        if block.start + len(block.candidates) > self.output_end:
+            raise ValueError("fixed-token replay exceeds configured output capacity")
         if not block.candidates:
+            self._record_timing("replay_start")
+            self._record_timing("replay_end")
             return
         inputs = (block.anchor, *block.candidates[:-1])
         with torch.cuda.stream(e.stream):
+            self._record_timing("replay_start")
             for offset in range(0, len(inputs), REPLAY_ROWS):
                 count = min(REPLAY_ROWS, len(inputs) - offset)
                 start = block.start + offset
                 r._reserve(start + count)
-                ids = torch.tensor(inputs[offset:offset + count], dtype=torch.int32, device=e.device)
-                _, hidden = self._lossy(ids, start)
-                self.states[count].commit(torch.tensor(count, dtype=torch.int32, device=e.device))
-                shifted = torch.tensor(block.candidates[offset:offset + count], dtype=torch.int32, device=e.device)
-                seeds, states = r._execute("cpu_async_replay_mtp", r._batch(shifted, start), hidden)
-                r.next_draft, r.last_draft_hidden = seeds[-1:].clone(), states[-1:].clone()
+                ids = self.token_buffer[:count]
+                ids.copy_(torch.as_tensor(inputs[offset:offset + count], dtype=torch.int32))
+                _, hidden = self._lossy(ids, start, need_logits=False)
+                self.count_buffer.fill_(count)
+                self.states[count].commit(self.count_buffer)
+                self._refresh("cpu_async_replay_mtp", block.candidates[offset:offset + count],
+                              hidden, start, offset + count == len(inputs))
             end = block.start + len(inputs)
             r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
             self.experts.check_error()
+            self._record_timing("replay_end")
 
     def close_request(self):
         if not self.active:
@@ -231,7 +310,8 @@ class QwenAsyncGpuWindow:
                 e.stream.synchronize()
                 if self.experts.active:
                     self.experts.close(abort=True)
-                e.page_table[0].zero_()
+                if not r.fixed_mapping:
+                    e.page_table[0].zero_()
                 e.stream.synchronize()
             r._reserved_len = 0
             r.frontier = r.next_draft = r.last_draft_hidden = None

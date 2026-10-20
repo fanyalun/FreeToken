@@ -87,13 +87,15 @@ def main():
         max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
         num_page_override=args.kv_pages or None,
         speculative_mtp_depth=3, speculative_three_level=True,
+        speculative_max_input_tokens=max(map(len, prompts)), speculative_max_output_tokens=args.tokens,
         speculative_max_loops=args.max_loops,
         speculative_expert_scheduler=args.expert_scheduler,
+        speculative_execution_implementation="optimized" if args.expert_scheduler == "gpu" else "reference",
         speculative_compact_control=not args.legacy_control,
         speculative_prefetch_layer_experts=args.layer_prefetch_experts,
         speculative_prefetch_gap_capacity=args.gap_prefetch_capacity,
         speculative_submit_tokens=args.submit_tokens, cuda_graph_max_bs=0 if args.eager else 4,
-        cache_type="naive", max_extend_tokens=128,
+        cache_type="naive",
         mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
     ))
     runner = engine.speculative_runner

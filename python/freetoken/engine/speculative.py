@@ -35,6 +35,7 @@ def greedy_commit(
     *,
     remaining: int | torch.Tensor,
     eos_ids: tuple[int, ...] = (),
+    eos_mask: torch.Tensor | None = None,
 ) -> Commit:
     depth = proposal.tokens.numel()
     if (isinstance(remaining, int) and remaining < 1) or verified.token_ids.shape != (depth + 1,):
@@ -50,6 +51,8 @@ def greedy_commit(
     eos = torch.zeros(depth + 1, dtype=torch.bool, device=device)
     for token in eos_ids:
         eos |= verified.token_ids == token
+    if eos_mask is not None:
+        eos |= eos_mask[verified.token_ids.long()]
     first_eos = torch.where(eos & (rows < count), rows + 1, depth + 2).amin()
     count = torch.minimum(count, first_eos).to(torch.int32)
     terminal = (first_eos <= count) | (count == remaining)
@@ -141,13 +144,16 @@ class SpeculativeCoordinator:
         if reconcile:
             self.proposer.reconcile(verified.hidden_states, commit)
 
-    def drain(self, frontier: SpeculativeFrontier, count: int, *, reconciled: bool = True) -> None:
+    def drain(self, frontier: SpeculativeFrontier, count: int, *, reconciled: bool = True,
+              retain_reservation: bool = False) -> None:
         frontier.commit_target(count)
         if reconciled:
             frontier.reconcile_done()
         else:
             frontier.in_flight = False
             frontier.check()
+        if retain_reservation:
+            return
         start, end = frontier.releasable_tail()
         self.reservation.release(start, end)
         frontier.allocated_len = start
