@@ -90,7 +90,7 @@ def forced_acceptance(engine, runner, prompt, checks):
             runner.last_event = torch.cuda.Event()
             runner.last_event.record(engine.stream)
             runner.last_event.synchronize()
-            runner.coordinator.drain(runner.frontier, accepted + 1)
+            runner.coordinator.drain(runner.frontier, accepted + 1, retain_reservation=runner.fixed_mapping)
             row_checks = [
                 compare("target_ssm_ar", pool.recurrent_states[:, 1], states[accepted][0]),
                 compare("target_conv_ar", pool.conv_states[:, 1], states[accepted][1]),
@@ -109,8 +109,7 @@ def forced_acceptance(engine, runner, prompt, checks):
             print(json.dumps({"accepted_drafts": accepted, "state_checks": "passed"}), flush=True)
         engine.stream.synchronize()
         state.snapshots = None
-        engine.page_table[0].zero_()
-        runner._reserved_len = 0
+        runner._reset_request_mapping()
     return checks
 
 

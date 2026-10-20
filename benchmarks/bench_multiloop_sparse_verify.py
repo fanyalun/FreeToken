@@ -241,7 +241,7 @@ class MultiloopExperiment(WindowExperiment):
         count = int(commit.input_count.item())
         self.runner.last_event = torch.cuda.Event()
         self.runner.last_event.record(self.engine.stream)
-        self.runner.coordinator.drain(self.runner.frontier, count)
+        self.runner.coordinator.drain(self.runner.frontier, count, retain_reservation=self.runner.fixed_mapping)
         return count
 
     def loop(self, anchor, *, policy="cheap", remaining=4, audit=True):
@@ -468,9 +468,8 @@ def checkpointed_request(experiment, prompt, sample, args, *, probe):
             for policy in args.policies:
                 experiment.case(sample, goal, anchor, args.loops, policy)
     engine.stream.synchronize()
-    engine.page_table[0].zero_()
+    runner._reset_request_mapping()
     engine.stream.synchronize()
-    runner._reserved_len = 0
     runner.frontier, runner.next_draft, runner.last_draft_hidden = None, None, None
     runner.model_state.current, runner.last_event = None, None
     return output

@@ -15,6 +15,32 @@ from analyze_multiloop_sparse_verify import capacity_replay, next_transfer, reta
 from simulate_multiloop_prefetch import TransferCache, simulate
 
 
+@pytest.mark.parametrize("fixed_mapping", [False, True])
+def test_checkpointed_requests_preserve_mapping_lifetime(fixed_mapping):
+    from bench_multiloop_sparse_verify import checkpointed_request
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+
+    runner = QwenMTPRunner.__new__(QwenMTPRunner)
+    runner.engine = SimpleNamespace(
+        device=torch.device("cpu"), config=SimpleNamespace(page_size=4),
+        max_seq_len=16, num_pages=4, page_table=torch.arange(16, dtype=torch.int32)[None],
+        stream=SimpleNamespace(synchronize=lambda: None))
+    runner.fixed_mapping, runner._reserved_len = fixed_mapping, 0
+    runner.model_state = SimpleNamespace(current=None)
+    def prefill(ids, chunk_size):
+        runner._reserve(4)
+        assert runner.engine.page_table[0, :4].tolist() == list(range(4))
+        return torch.tensor([7])
+    runner._prefill = prefill
+    experiment = SimpleNamespace(runner=runner, engine=runner.engine)
+    args = SimpleNamespace(prefixes=(), tokens=1)
+    for _ in range(2):
+        assert checkpointed_request(experiment, [1, 2, 3], 0, args, probe=False) == [7]
+        expected = list(range(16)) if fixed_mapping else [0] * 16
+        assert runner.engine.page_table[0].tolist() == expected
+        assert runner._reserved_len == 0
+
+
 @pytest.mark.parametrize("inputs,predictions,expected,accepted", [
     ([10, 11, 12, 13], [11, 12, 13, 14], [11, 12, 13, 14], 3),
     ([10, 11, 99, 13], [11, 12, 13, 14], [11, 12], 1),
