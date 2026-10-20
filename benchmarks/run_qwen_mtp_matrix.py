@@ -30,14 +30,15 @@ def main(argv=None):
     root = Path(__file__).resolve().parents[1]
     _, experiment = prepare_experiment(args.model, args.data, root)
     expected = {}
-    for budget in (16, 24, 40):
-        for backend in ("hybrid", "offload"):
+    for budget in (16, 24, 40, 80):
+        for backend in (("fused",) if budget == 80 else ("hybrid", "offload")):
             for mode in ("ar", "mtp"):
                 name = f"formal_{mode}_{backend}_graph_{budget}"
                 directory = output / name
                 cell_args = SimpleNamespace(model=args.model, data=args.data, output=str(directory),
                     mode=mode, backend=backend, budget_gib=budget, samples=16, tokens=256,
-                    eager=False, purpose="formal", audit=True)
+                    eager=False, purpose="formal", audit=True, hybrid_max_fetch=-1,
+                    max_input_tokens=3840, prompt_chunk_size=None, moe_slots=None)
                 expected[name] = benchmark_config(cell_args, experiment)
                 marker = directory / "complete.json"
                 if marker.exists() and json.loads(marker.read_text()).get("status") == "cell_completed":
@@ -47,8 +48,8 @@ def main(argv=None):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
     cells, failures = [], []
-    for budget in (16, 24, 40):
-        for backend in ("hybrid", "offload"):
+    for budget in (16, 24, 40, 80):
+        for backend in (("fused",) if budget == 80 else ("hybrid", "offload")):
             for mode in ("ar", "mtp"):
                 name = f"formal_{mode}_{backend}_graph_{budget}"
                 directory = output / name
@@ -82,9 +83,17 @@ def main(argv=None):
                     raise ValueError(f"invalid request coverage: {name}")
                 if not summary["independent_audit_complete"]:
                     raise ValueError(f"missing independent audit: {name}")
+                if ([row["sample_id"] for row in rows] != list(range(16))
+                        or [row["sample_id"] for row in audit] != list(range(16))
+                        or summary["returned_tokens"] != sum(len(row["token_ids"]) for row in rows)):
+                    raise ValueError(f"invalid sample identity or returned-token count: {name}")
+                if any(not a.get("timing_parity") or a["token_ids"] != r["token_ids"]
+                       for r, a in zip(rows, audit)):
+                    raise ValueError(f"independent audit token mismatch: {name}")
                 rounds = [r for row in rows for r in row["rounds"]]
                 drafted = sum(r["drafted"] for r in rounds)
-                accepted = sum(r["accepted"] for r in rounds)
+                accepted = sum(r.get("matched_drafts", r.get("accepted", 0)) for r in rounds)
+                returned_drafts = sum(r["returned_drafts"] for r in rounds) if all("returned_drafts" in r for r in rounds) else None
                 phases = {}
                 for row in audit:
                     for phase, timing in row["phases"].items():
@@ -96,15 +105,16 @@ def main(argv=None):
                               "ttft_mean_seconds": statistics.mean(r["ttft_seconds"] for r in rows),
                               "tpot_mean_seconds": statistics.mean(r["tpot_seconds"] for r in rows),
                               "drafted": drafted, "accepted": accepted,
+                              "returned_drafts": returned_drafts,
                               "acceptance_rate": accepted / drafted if drafted else None,
-                              "commit_ms_per_returned_token": phases.get("commit", 0) / 4096,
-                              "reconcile_ms_per_returned_token": phases.get("reconcile", 0) / 4096,
+                              "commit_ms_per_returned_token": phases.get("commit", 0) / summary["returned_tokens"],
+                              "reconcile_ms_per_returned_token": phases.get("reconcile", 0) / summary["returned_tokens"],
                               "audit_phase_ms": phases, "graph_fallbacks": fallback,
                               "source_sha256": config["source_sha256"], "prompt_sha256": config["prompt_sha256"]})
                 print(json.dumps({"completed": name, "throughput": summary["throughput_tokens_per_second"]}), flush=True)
     pairs = []
-    for budget in (16, 24, 40):
-        for backend in ("offload", "hybrid"):
+    for budget in (16, 24, 40, 80):
+        for backend in (("fused",) if budget == 80 else ("offload", "hybrid")):
             ar = next((r for r in cells if r["budget_gib"] == budget and r["backend"] == backend and r["mode"] == "ar"), None)
             mtp = next((r for r in cells if r["budget_gib"] == budget and r["backend"] == backend and r["mode"] == "mtp"), None)
             if ar is None or mtp is None:
@@ -121,8 +131,8 @@ def main(argv=None):
             pairs.append({"budget_gib": budget, "backend": backend, "strict_token_parity": not mismatches,
                           "mismatches": mismatches,
                           "throughput_ratio_mtp_over_ar": mtp["throughput_tokens_per_second"] / ar["throughput_tokens_per_second"]})
-    complete = len(cells) == 12 and not failures and len(pairs) == 6 and all(p["strict_token_parity"] for p in pairs)
-    report = {"matrix_complete": complete, "experiment": experiment,
+    complete = len(cells) == 14 and not failures and len(pairs) == 7
+    report = {"matrix_complete": complete, "strict_ar_parity": complete and all(p["strict_token_parity"] for p in pairs), "experiment": experiment,
               "cells": cells, "pairs": pairs, "failures": failures}
     (output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n")
     fields = ["cell", "budget_gib", "backend", "mode", "slots", "throughput_tokens_per_second",

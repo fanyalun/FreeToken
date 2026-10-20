@@ -158,6 +158,8 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         fmt: str | None = None,
+        grouped_widths: tuple[int, ...] = (),
+        grouped_compat: bool = False,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
@@ -191,7 +193,19 @@ class CpuMoeExecutor:
         self.quant_format = fmt
         self.device = device
         self.max_tokens = int(max_tokens)
+        self.grouped_widths = tuple(sorted(set(grouped_widths)))
+        self.grouped_compat = grouped_compat
+        if grouped_compat and not hasattr(_cpu_moe.CpuMoeExecutor, "create_grouped_compat_task"):
+            raise RuntimeError("rebuild _cpu_moe for baseline-compatible grouped tasks")
+        if self.grouped_widths and (fmt != "bf16" or self.grouped_widths[0] < 1
+                                   or self.grouped_widths[-1] > self.max_tokens):
+            raise ValueError("grouped CPU MoE requires BF16 widths within max_tokens")
+        if self.grouped_widths and not hasattr(_cpu_moe.CpuMoeExecutor, "prepare_grouped"):
+            raise RuntimeError("rebuild _cpu_moe with `python setup.py build_ext --inplace` for grouped BF16")
+        self._poisoned = False
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        self.activation_signature = [activation, self.apply_router_weight_on_input, float(swiglu_alpha),
+                                     swiglu_limit]
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
@@ -217,6 +231,8 @@ class CpuMoeExecutor:
                     "the cudaLaunchHostFunc sync"
                 )
                 self._flag_sync = False
+        if self.grouped_widths and not self._flag_sync:
+            raise RuntimeError("speculative Hybrid requires CUDA Graph stream memops; callbacks are unsupported")
 
         nthreads, core_ids = resolve_threads_and_affinity(num_threads)
         coord_core = -1
@@ -244,6 +260,8 @@ class CpuMoeExecutor:
             **ptrs,
         )
         self.num_threads = nthreads
+        if self.grouped_widths:
+            self._ext.prepare_grouped(self.max_tokens)
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
 
@@ -272,7 +290,7 @@ class CpuMoeExecutor:
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
         self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
-        self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
+        self._flag_capacity = self.num_layers * (_FLAG_SLOTS_PER_LAYER + len(self.grouped_widths))
         if self._flag_sync:
             self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
             self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
@@ -299,6 +317,10 @@ class CpuMoeExecutor:
                 daemon=True,
             )
             self._watchdog.start()
+
+        for bs in self.grouped_widths:
+            for layer_id in range(self.num_layers):
+                self._task_for(layer_id, bs, grouped=True)
 
         # ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain
         # that the C++ side runs single-threaded on the CUDA host-callback thread --
@@ -336,6 +358,25 @@ class CpuMoeExecutor:
         self._banks.append(table)
         self._banks.extend(layers)
         return table
+
+    def validate_grouped_graph(self, stream):
+        if not self.grouped_widths or not self._flag_sync:
+            raise RuntimeError("grouped CPU MoE requires memop Graph support")
+        with torch.cuda.stream(stream):
+            for width in self.grouped_widths:
+                hidden = torch.zeros(width, self.H, device=self.device, dtype=torch.bfloat16)
+                ids = torch.full((width, self.top_k), -1, device=self.device, dtype=torch.int32)
+                weights = torch.zeros(width, self.top_k, device=self.device)
+                self.decode_sync(self.decode_submit(0, hidden, weights, ids, grouped=True))
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = self.decode_sync(self.decode_submit(0, hidden, weights, ids, grouped=True))
+                graph.replay()
+                stream.synchronize()
+                self.raise_if_unhealthy()
+                if bool(output.count_nonzero()):
+                    raise RuntimeError("grouped memop Graph handshake returned stale output")
 
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
         """Return (pointer kwargs for the C++ ctor, (H, I)) for the given format.
@@ -499,15 +540,24 @@ class CpuMoeExecutor:
                 "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
                 "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
             }
+            if self.grouped_compat or bs in self.grouped_widths:
+                io["gpu_out"] = torch.empty((bs, self.H), dtype=torch.bfloat16, device=self.device)
             self._io[bs] = io
         return io
 
-    def _task_for(self, layer_id: int, bs: int) -> int:
-        key = (layer_id, bs)
+    def _task_for(self, layer_id: int, bs: int, *, grouped: bool = False) -> int:
+        key = (layer_id, bs, "grouped") if grouped else (layer_id, bs)
         task = self._tasks.get(key)
         if task is None:
+            if grouped:
+                if bs not in self.grouped_widths or not 0 <= layer_id < self.num_layers:
+                    raise ValueError("unregistered grouped CPU MoE geometry")
+                if len(self._flag_slots) >= self._flag_capacity:
+                    raise RuntimeError("grouped CPU MoE flag capacity exhausted")
             io = self._io_for(bs)
-            task = self._ext.create_task(
+            create = (self._ext.create_grouped_compat_task if self.grouped_compat else
+                      self._ext.create_grouped_task) if grouped else self._ext.create_task
+            task = create(
                 layer_id,
                 bs,
                 io["x"].data_ptr(),
@@ -537,7 +587,8 @@ class CpuMoeExecutor:
         All ops go on the current CUDA stream so the whole thing is captured into
         the active CUDA graph (the two host nodes carry the data dependency on the
         pinned buffers, which hold this step's real routing on replay)."""
-        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
+        pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids,
+                                     grouped=self.grouped_compat)
         return self.decode_sync(pending)
 
     def decode_submit(
@@ -546,6 +597,8 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        grouped: bool = False,
     ) -> tuple:
         """Issue the D2H copies + the CPU-pool submit host node, then return without
         waiting. Lets a caller (the hybrid backend) enqueue GPU work between this and
@@ -557,7 +610,11 @@ class CpuMoeExecutor:
         distinct from the interleaved GPU work) across the overlap window."""
         if self._ext is None:
             raise RuntimeError("CPU MoE executor is closed")
+        if self._poisoned:
+            raise RuntimeError("CPU MoE executor is poisoned; rebuild the executor")
         bs = hidden_states.shape[0]
+        if grouped and (bs not in self.grouped_widths or (layer_id, bs, "grouped") not in self._flag_slots):
+            raise ValueError("grouped CPU MoE task must be registered before capture")
         io = self._io_for(bs)
 
         if self._gpu_prequant:
@@ -573,9 +630,13 @@ class CpuMoeExecutor:
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
-        task = self._task_for(layer_id, bs)
-        out = torch.empty_like(hidden_states)
-        slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
+        task = self._task_for(layer_id, bs, grouped=grouped)
+        if self.grouped_compat or grouped:
+            out = io["gpu_out"]
+        else:
+            out = torch.empty_like(hidden_states)
+        key = (layer_id, bs, "grouped") if grouped else (layer_id, bs)
+        slot = self._flag_slots.get(key) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's
             # doorbell). No kernel launched; no host-func round trip.
@@ -617,7 +678,13 @@ class CpuMoeExecutor:
         windows under heavy external load, but a coordinator that made progress in
         between is alive by definition. ``suspects`` maps slot -> (first_seen,
         served_at_first_sight) and persists across ticks."""
+        if self._poisoned:
+            self._done.fill_(1)
+            return
         stuck = (self._ready == 1) & (self._done == 0)
+        active = getattr(self._ext, "flag_active_slot", lambda: -1)()
+        if active >= 0 and self._done[active] == 0:
+            stuck[active] = True
         if not bool(stuck.any()):
             suspects.clear()
             return
@@ -643,6 +710,7 @@ class CpuMoeExecutor:
         )
         for i in dead:
             self._err[i] = 1
+        self._poisoned = True
         for i in dead:
             self._done[i] = 1  # after err: unblock the stream into a checked failure
             suspects.pop(i, None)
@@ -653,6 +721,7 @@ class CpuMoeExecutor:
         pinned read -- so a dead coordinator surfaces as a loud error on the next step
         instead of silently shipping stale expert outputs."""
         if self._err is not None and bool((self._err != 0).any()):
+            self._poisoned = True
             raise RuntimeError(
                 "CPU MoE flag-handshake watchdog fired: a decode step's doorbell was "
                 "never answered by the coordinator thread (its outputs cannot be "

@@ -43,6 +43,7 @@ prompt = tokenizer.apply_chat_template(
 engine = Engine(EngineConfig(
     model_path=model_path, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
     speculative_mtp_depth=3, max_running_req=1,
+    speculative_max_input_tokens=3840, speculative_max_output_tokens=256,
     attention_backend="triton", moe_strategy="offload",
     moe_cache_auto=True, kv_reserve_tokens=4096,
     gpu_memory_budget_bytes=16 << 30, max_seq_len_override=4096,
@@ -51,7 +52,7 @@ engine = Engine(EngineConfig(
 ))
 try:
     result = engine.generate_speculative(
-        prompt, max_tokens=256, eos_ids=(tokenizer.eos_token_id,), prompt_chunk_size=128,
+        prompt, max_tokens=256, eos_ids=(tokenizer.eos_token_id,), prompt_chunk_size=None,
     )
     print(tokenizer.decode(result.token_ids))
 finally:
@@ -69,12 +70,11 @@ ModelState and Reservation. Accepted draft count, committed input count and
 allocated length are separate. Every round processes the pending anchor plus
 accepted drafts; the newly emitted correction or bonus is the next pending
 anchor. Target and MTP share token locations and have distinct layer storage.
-Rejected whole pages are reclaimed after the last reader completes; a partially
-live page remains reserved. The private mapping's cleanup and next writer are
-queued on the reader's CUDA stream, so round-local reclamation does not require
-a host event wait. Other streams must observe the last-reader event before
-accessing that mapping. Mapping initialization writes only newly reserved or
-reopened tail slots. Terminal rounds commit Target state and skip next-round MTP
+Baseline SD retains rejected tail reservation until request cleanup. Acceptance
+advances logical frontiers; it does not compact KV or rewrite prefix mappings.
+Other streams must observe the last-reader event before accessing that mapping.
+Mapping initialization writes only newly reserved tail slots. Terminal rounds
+commit Target state and skip next-round MTP
 reconciliation. Completion, cancellation and rebuild drain the stream before
 returning request ownership or replacing storage.
 Slot 1 and request-map row 0 belong exclusively to this runner.
@@ -134,7 +134,51 @@ CPU tasks with no assigned routes clear their output and complete without
 waking the worker pool. This applies to both the mapped-flag and host-function
 handshakes. Input/result copies and completion notification remain present.
 Window-copy scratch is shared across layers and included in the MTP hybrid
-memory budget (624 bytes for top-8 widths 2..4).
+memory budget.
+
+Baseline Hybrid now defaults to `speculative_hybrid_window_policy="balanced"`
+and `speculative_hybrid_cpu_backend="grouped"`. The placement kernel counts
+effective routes per expert across the current window, protects active cache
+hits, and orders misses by count, previous recency, then expert ID. It evaluates
+hot-expert prefixes and minimizes `max(IO + GPU, CPU)`, with a calibrated
+contention correction when both branches access host memory. Ties fetch fewer
+experts. `moe_hybrid_max_fetch=-1` has no fixed fetch cap; a nonnegative value
+limits new loads to `window_rows * cap`, rather than requiring that many loads.
+CPU-assigned experts need no GPU slot, and zero-weight routes consume no load
+quota. Partitioning and copy plans remain on the GPU during decode.
+
+The baseline CPU grouped task shares expert-weight loads across token routes
+while preserving the ordinary CPU GEMV accumulator order, activation rounding,
+and original top-k reduction order. It uses separate tasks from the three-level
+GPU-rounding implementation. Legal widths and pinned buffers are prepared before
+capture, with a reusable GPU result per width. BF16 is required for this grouped
+backend. `speculative_hybrid_cpu_backend="legacy"` keeps ordinary CPU tasks;
+`speculative_hybrid_window_policy="legacy"` keeps the earlier cap/fraction
+placement. These two controls are independent. The benchmark exposes them as
+`--hybrid-cpu-backend` and `--hybrid-window-policy`.
+
+On a profile-cache miss, initialization calibrates the native weight-copy,
+CPU task, GPU expert kernel, and concurrent branches at each legal width.
+Timing samples rotate expert sets so a repeatedly reused CPU cache line is not
+treated as representative host-memory bandwidth.
+The profile stores raw samples, predicted/measured choices and their regret;
+it is a cost estimate, not a guarantee of an optimal split on every layer.
+Profiles are keyed by hardware, affinity, ISA, geometry, widths, CPU arithmetic,
+cache slots, eager/Graph mode and source/binary hashes. They live in
+`~/.cache/freetoken/baseline_hybrid`, overridable with
+`FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE`. An explicit
+`speculative_hybrid_profile` (`--hybrid-profile` in the benchmark) must exist
+and match the runtime; it is never silently replaced. With automatic memory
+planning, the minimum-cache probe uses automatic calibration first, and the
+explicit profile is validated against the final cache geometry. Calibration
+scratch is included in the startup peak; cache rebuild discards placement
+buffers and revalidates/recalibrates before recapture. Keep diagnostic profile
+caches separate when other CPU/GPU jobs are active.
+
+The compatibility and placement tests establish numerical/lifecycle behavior.
+Complete-request A/B performance on the intended checkpoint is still required
+before claiming a speedup. Changing the CPU/GPU placement can change floating
+point partial sums even when the CPU grouped task itself is bitwise compatible.
 
 GDN commit consumes the GPU count before the output readback. Output, EOS and
 cancellation decisions still drain once per round before MTP reconciliation;
@@ -148,20 +192,41 @@ Assess performance using complete requests, rather than acceptance rate alone.
 
 Graphs cover recursive MTP, Target verify, acceptance, GDN commit and MTP
 reconciliation, with verify/reconcile widths 1-4. Prompt prefill is eager. The
-result includes phase replay/fallback counts. Decode batches reuse width-specific
-request, input, FLA and attention metadata buffers; device operations update
-positions and KV indices without rebuilding CUDA tensors from host length lists.
+result includes phase replay/fallback counts. Baseline initialization captures
+all configured SD widths and skips ordinary AR graphs. EOS values update one
+resident mask without creating new graph variants. Decode batches reuse
+width-specific request, input and FLA buffers plus shared fixed attention indices;
+each round updates only the small input, position and output-location buffers.
 Rebuild rejects active requests,
 drains all readers, discards graphs and scratch tied to old pools, and recreates
 the runner. Over-budget rebuild is rejected before teardown.
 
 `gpu_memory_budget_bytes` sets an absolute GPU budget and the PyTorch allocator
-limit. Automatic cache planning charges resident Target/MTP weights, joint KV,
-persistent GDN, width-specific replay vectors/conv windows, graph/activation reserves and
-runtime margin before solving expert slots. AR and MTP can therefore have
+limit. Baseline SD requires explicit positive `speculative_max_input_tokens` and
+`speculative_max_output_tokens`. KV capacity is their sum rounded to pages, plus
+the separate padding page. `prompt_chunk_size=None` runs the full prompt in one
+outer pass; explicit positive chunk sizes change scheduling, not allocation.
+The existing GDN kernel's chunk size remains 64; the old outer 128-token default
+has been removed for baseline SD. Three-level scheduling retains its prior default.
+
+Automatic baseline planning starts with the minimum expert cache, measures all
+SD graph widths and maximum full-prompt activation shape, then assigns the
+remaining budget to expert slots. It rebuilds and recaptures once at the selected
+size and checks the maximum-shape peak again. An insufficient budget fails
+initialization rather than silently enabling outer chunking. This adds startup
+work; formal performance must report initialization separately. Persistent GDN
+and one maximum-width replay/conv workspace are charged along with weights,
+KV and runtime storage. Smaller widths share scratch storage; graphs execute
+serially on the request stream. AR and MTP can therefore have
 different expert cache sizes under the same cap. Validate actual process memory
 on the intended hardware; the benchmark records sampled NVML process memory
 and allocator allocated/reserved peaks.
+
+Baseline round metrics use version 2: `matched_drafts` is the raw matching prefix,
+`returned_drafts` counts drafts actually emitted after EOS/cap/cancellation,
+`committed_input_rows` counts Target state advances, and `returned_tokens` counts
+visible outputs from that round. The first prefill output is outside the rounds.
+Same-method audit equality and strict AR/MTP parity are separate checks.
 
 `benchmarks/audit_qwen_mtp.py` retains the earlier strict full-model gate. It tests forced
 acceptance 0-3 against sequential Target and reconciled MTP, position snapshots,
@@ -230,6 +295,8 @@ are rejected. Hybrid requires `FREETOKEN_HYBRID_WINDOW=1`, the default.
 config = SchedulerConfig(
     model_path=model_path, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
     speculative_mtp_depth=3, speculative_three_level=True,
+    speculative_max_input_tokens=3968, speculative_max_output_tokens=128,
+    speculative_expert_scheduler="gpu", speculative_execution_implementation="optimized",
     speculative_submit_tokens=0, speculative_max_loops=6, speculative_prefetch=True,
     speculative_prefetch_layer_experts=4, speculative_prefetch_gap_capacity=0,
     speculative_audit=False, max_running_req=1,
@@ -243,6 +310,31 @@ config = SchedulerConfig(
 Import `SchedulerConfig` from `freetoken.scheduler.config`. `speculative_submit_tokens`
 counts actual Target input rows, including the pending anchor; zero applies no
 additional row cap. `speculative_max_loops` defaults to six and must be positive.
+Both maximum token counts are required positive integers. Requests exceeding
+either bound fail before prefill. Target and MTP KV reserve the page-aligned sum;
+larger explicit page counts are preserved and charged. `prompt_chunk_size=None`
+runs one prefill; a positive chunk size changes execution shape without resizing
+KV or the expert cache. Only the final chunk computes Target/MTP heads, and the
+MTP seed retains one hidden row. Internal attention/GDN tiling is unchanged.
+
+Automatic cache sizing probes the minimum cache with the configured maximum
+prompt and decode widths, then rebuilds and checks the final peak. Only automatic
+startup sizing may shrink slots after that check; explicit slot counts fail if
+they exceed the budget. The original loop admission and expert protection rules
+still apply. A tiny cache can reject all inner loops and use single-row Target.
+Passing admission for a shorter loop is not a guarantee that every subsequent
+Target union fits while future-layer leases remain protected.
+
+Eager, reference Graph and full Graph share one GDN replay/conv workspace across
+widths and serial phases. Formal and private recurrent/conv state remain
+independent; the private copy occurs only when an inner loop actually starts.
+The single-request token domain retains its physical mapping and rejected tail
+reservation; logical valid lengths still govern committed KV. Attention indices
+use fixed row strides and only small position/length buffers change per step.
+Native SD engines skip ordinary AR graph capture. A `reference_ar` runner on
+that engine uses eager AR; independent AR engines keep their normal graph policy.
+Startup and cache rebuild prepare SD captures before request timing.
+
 A loop appends its accepted draft prefix and one correction/bonus to a provisional window, then continues
 from that window's private state. Sparse verification keeps the four largest
 router weights, with stable original-order ties, plus ready GPU-resident experts;

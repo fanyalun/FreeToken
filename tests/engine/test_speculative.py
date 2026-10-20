@@ -1,9 +1,60 @@
+import gc
+
 import pytest
 import torch
 
 from freetoken.engine.speculative import (
     Proposal, VerifyResult, SpeculativeFrontier, greedy_commit,
 )
+
+
+@pytest.fixture(autouse=True)
+def _collect_graph_test_objects():
+    # Cyclic test runners must release old Graphs outside the next test's capture.
+    gc.collect()
+    yield
+    gc.collect()
+
+
+def test_hybrid_small_verify_admission_keeps_loop_limit_without_all_route_residency():
+    from freetoken.engine.speculative_window import WindowBudget
+
+    conservative = WindowBudget.resolve(512, 40, 8, 256)
+    hybrid = WindowBudget.resolve(512, 40, 8, 256, cpu_fallback=True)
+    assert conservative.before_loop(0, 0, 4) == "cache_pressure"
+    assert hybrid.before_loop(0, 0, 4) is None
+    assert hybrid.before_loop(5, 10000, 4) is None
+    assert hybrid.before_loop(6, 0, 4) == "loop_limit"
+
+
+@pytest.mark.parametrize("phases", [("verify",), ("preverify", "verify"), ()])
+@pytest.mark.parametrize("graphs", ["reference", "full"])
+def test_gpu_hybrid_config_accepts_supported_phases(phases, graphs):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
+        speculative_mtp_depth=3, speculative_three_level=True, speculative_expert_scheduler="gpu",
+        speculative_max_input_tokens=128, speculative_max_output_tokens=32,
+        speculative_execution_implementation="optimized", speculative_graph_implementation=graphs,
+        moe_strategy="hybrid", speculative_hybrid_phases=phases, max_running_req=1,
+        attention_backend="triton", cuda_graph_max_bs=4)
+    assert config.speculative_hybrid_phases == phases
+
+
+@pytest.mark.parametrize("values", [dict(speculative_hybrid_phases=("bogus",)),
+    dict(speculative_hybrid_phases=("verify", "verify")), dict(speculative_hybrid_phases="verify"),
+    dict(speculative_graph_implementation="coarse"), dict(speculative_execution_implementation="reference")])
+def test_gpu_hybrid_config_rejects_unsupported_modes(values):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    args = dict(speculative_mtp_depth=3, speculative_three_level=True, speculative_expert_scheduler="gpu",
+        speculative_max_input_tokens=128, speculative_max_output_tokens=32,
+        speculative_execution_implementation="optimized", moe_strategy="hybrid")
+    args.update(values)
+    with pytest.raises(ValueError):
+        EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, **args)
 
 
 @pytest.mark.parametrize("slots", [5120, 512, 8])
@@ -17,6 +68,15 @@ def test_window_workspace_uses_loop_limit_and_counts_anchor(slots):
     assert WindowBudget.resolve(slots, 40, 8, 256, 1).submit_rows == 1
 
 
+@pytest.mark.parametrize("slots,expected", [(256, (0, 1)), (512, (1, 2)), (1280, (4, 8)), (1600, (4, 25))])
+def test_reachable_widths_respect_initial_and_following_admission(slots, expected):
+    from freetoken.engine.speculative_window import WindowBudget
+    budget = WindowBudget.resolve(slots, 40, 8, 256)
+    assert budget.reachable_widths(3) == expected
+    assert WindowBudget.resolve(slots, 40, 8, 256, 1).reachable_widths(3) == (0, 1)
+    assert WindowBudget.resolve(slots, 40, 8, 256, cpu_fallback=True).reachable_widths(3) == (4, 25)
+
+
 @pytest.mark.parametrize("depth", [1, 2, 3, 4, 8])
 def test_variable_draft_depth_configuration(depth):
     from freetoken.distributed import DistributedInfo
@@ -24,7 +84,8 @@ def test_variable_draft_depth_configuration(depth):
     from freetoken.engine.speculative_window import WindowBudget
 
     config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
-        speculative_mtp_depth=depth, speculative_three_level=True)
+        speculative_mtp_depth=depth, speculative_three_level=True,
+        speculative_max_input_tokens=128, speculative_max_output_tokens=32)
     assert config.speculative_mtp_depth == depth
     assert WindowBudget.resolve(4907, 40, 8, 256, depth=depth).submit_rows == 6 * (depth + 1) + 1
 
@@ -48,6 +109,7 @@ def test_coarse_graph_configuration_accepts_variable_depth(implementation):
     from freetoken.engine.config import EngineConfig
     config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
         speculative_mtp_depth=4, speculative_three_level=True, speculative_expert_scheduler="gpu",
+        speculative_max_input_tokens=128, speculative_max_output_tokens=32,
         speculative_execution_implementation="optimized", speculative_graph_implementation=implementation,
         attention_backend="triton", max_running_req=1, cuda_graph_max_bs=4)
     assert config.speculative_mtp_depth == 4
@@ -88,6 +150,31 @@ def test_coarse_metadata_replays_valid_rows_and_noncontiguous_pages(width):
             torch.testing.assert_close(inputs[:n], ids[:n])
             assert inputs[n:].eq(0).all() and positions[n:].eq(0).all()
             assert valid.item() == n
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fixed_speculative_metadata_preserves_indices_and_masks_empty_rows():
+    from freetoken.engine.qwen_speculative_graph import _metadata, _stage
+    device = torch.device("cuda")
+    width, stride = 4, 64
+    ids = torch.arange(width, dtype=torch.int32, device=device)
+    table = torch.arange(stride, dtype=torch.int32, device=device)
+    inputs, positions, locations, q_positions = (torch.empty_like(ids) for _ in range(4))
+    indptr = torch.arange(width + 1, dtype=torch.int32, device=device) * stride
+    indices = table.repeat(width)
+    original = indices.clone()
+    context = torch.zeros(7, dtype=torch.int32, device=device)
+    valid = torch.zeros(1, dtype=torch.int32, device=device)
+    for start, rows in ((0, 4), (20, 2), (60, 0), (60, 4)):
+        _stage[(1,)](context, start, rows, 0, 0, width, width, width)
+        _metadata[(1, width)](ids, table, inputs, positions, locations, indptr, indices, valid,
+                              context, width, -1, 256, True, q_positions)
+        torch.testing.assert_close(indices, original, atol=0, rtol=0)
+        assert indptr.tolist() == [0, 64, 128, 192, 256]
+        assert q_positions[:rows].tolist() == list(range(start, start + rows))
+        assert q_positions[rows:].eq(-1).all()
+        assert positions[rows:].eq(0).all()
+        assert valid.item() == rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -142,8 +229,9 @@ def test_masked_kv_store_never_writes_padding_slots():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("implementation", ["coarse", "full"])
+@pytest.mark.parametrize("verify_quota", [0, 2])
 @pytest.mark.parametrize("depth,limit", [(1, 0), (2, 0), (3, 0), (4, 0), (4, 1), (4, 3)])
-def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth, limit, implementation):
+def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth, limit, implementation, verify_quota):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from freetoken.engine.qwen_mtp import QwenMTPRunner
@@ -155,13 +243,13 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        sources = [torch.arange(16, dtype=torch.float32).reshape(16, 1).pin_memory()]
-        bank = torch.empty(32, 1, device=device)
+        sources = [torch.arange(16, dtype=torch.float32).reshape(16, 1).pin_memory() for _ in range(2)]
+        bank = torch.empty(64, 1, device=device)
         cache = SimpleNamespace(device=device, quant_format="bf16", decode_target="gpu",
-            cpu_layer_ids=set(), _unpinned_layers=set(), num_layers=1, num_experts=16, cache_size=32,
-            banks=[(sources, bank)], id_of_slot=torch.full((32,), -1, device=device, dtype=torch.int32),
-            slot_for_id=torch.full((1, 16), -1, device=device, dtype=torch.int32),
-            usage=torch.zeros(32, device=device, dtype=torch.int64),
+            cpu_layer_ids=set(), _unpinned_layers=set(), num_layers=2, num_experts=16, cache_size=64,
+            banks=[(sources, bank)], id_of_slot=torch.full((64,), -1, device=device, dtype=torch.int32),
+            slot_for_id=torch.full((2, 16), -1, device=device, dtype=torch.int32),
+            usage=torch.zeros(64, device=device, dtype=torch.int64),
             step=torch.zeros((), device=device, dtype=torch.int64),
             bank_views=lambda: (bank,), alphas_for_slots=lambda _: None)
         def reset():
@@ -185,9 +273,10 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 forward_host_ctx=lambda *a: nullcontext()))
         runner = object.__new__(QwenMTPRunner)
         runner.engine, runner._reserved_len, runner.graph_replays = engine, 0, {}
-        budget = WindowBudget.resolve(32, 1, 8, 16, limit, depth=depth)
+        budget = WindowBudget.resolve(64, 2, 8, 16, limit, depth=depth)
         experts = GPUExpertCache(cache, stream, max_loops=6, max_rows=budget.submit_rows,
-            inner_rows=depth + 1, layer_quota=1, gap_capacity=3, implementation="optimized", compact_control=True)
+            inner_rows=depth + 1, layer_quota=1, gap_capacity=3, implementation="optimized", compact_control=True,
+            verify_layer_quota=verify_quota)
         original_copy = experts._copy
         def delayed_copy(*a, **kw):
             if torch.cuda.current_stream() == experts.copy_stream:
@@ -195,7 +284,8 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             return original_copy(*a, **kw)
         monkeypatch.setattr(experts, "_copy", delayed_copy)
         coordinator = SimpleNamespace(runner=runner, engine=engine, experts=experts,
-                                       budget=budget, private_pool=private)
+                                       budget=budget, private_pool=private, inner_width=depth + 1,
+                                       outer_width=budget.submit_rows)
         class State:
             def __init__(self, pool, layers, width, slot, **kwargs):
                 self.pool, self.width, self.slot = pool, width, slot
@@ -204,12 +294,15 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         monkeypatch.setattr("freetoken.engine.qwen_speculative_graph.QwenGDNVerifyState", State)
         def gemm(cache, hidden, weights, slots, **kwargs):
             return hidden + (kwargs["views"][0][slots.long(), 0] * weights).sum(-1, keepdim=True) * 0
-        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
         def target(batch):
+            if not torch.cuda.is_current_stream_capturing():
+                assert ((batch.input_ids >= 0) & (batch.input_ids < 128)).all()
             ids = (batch.input_ids[:, None] + torch.arange(8, device=device)) % 16
             weights = torch.ones(ids.shape, device=device) / 8
             hidden = torch.zeros(batch.size, 2, device=device, dtype=torch.bfloat16)
-            return batch.input_ids + 1, experts.route(layer, hidden, weights, ids.int())
+            for li in range(2):
+                hidden = experts.route(SimpleNamespace(layer_id=li, _expert_gemm=gemm), hidden, weights, ids.int())
+            return batch.input_ids + 1, hidden
         runner._target = target
         def draft(batch, hidden, count=None):
             tokens = batch.input_ids + 1
@@ -218,6 +311,7 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             return tokens, hidden.clone()
         runner._draft = draft
         graphs = QwenSpeculativeGraphSet(coordinator)
+        experts.candidate_buffer.fill_(-1000000)
         graphs.prepare(())
         expected_graphs = 2 * (depth + 1 + budget.submit_rows) if implementation == "full" else 4
         assert graphs.ready and len(graphs.graphs) == graphs.captures == expected_graphs
@@ -283,6 +377,19 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         with pytest.raises(RuntimeError, match="configuration changed"):
             graphs.prepare(())
         graphs.close()
+        if implementation == "full" and depth == 1 and limit == 0 and verify_quota == 0:
+            config.speculative_mtp_depth = depth
+            experts.cpu_stream = torch.cuda.Stream()
+            def failed_target(batch):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("injected failure before CPU fork")
+                return target(batch)
+            runner._target = failed_target
+            failed_graphs = QwenSpeculativeGraphSet(coordinator)
+            with pytest.raises(RuntimeError, match="injected failure before CPU fork"):
+                failed_graphs.prepare(())
+            assert failed_graphs.closed
+            stream.synchronize()
         assert not graphs.ready and not graphs.graphs
 
 
@@ -321,6 +428,13 @@ def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
     {"speculative_prefetch_layer_quotas": [True]},
     {"speculative_prefetch_layer_quotas": [1]},
     {"speculative_prefetch_demand_fence": True},
+    {"speculative_verify_prefetch_layer_experts": -1},
+    {"speculative_verify_prefetch_layer_experts": True},
+    {"speculative_verify_prefetch_layer_experts": 1},
+    {"speculative_verify_prefetch_layer_quotas": []},
+    {"speculative_verify_prefetch_layer_quotas": [1, 2]},
+    {"speculative_verify_prefetch_layer_quotas": [0, True]},
+    {"speculative_verify_prefetch_layer_quotas": [0, -1]},
     {"speculative_expert_scheduler": "unknown"},
     {"speculative_expert_scheduler": "gpu"},
     {"speculative_expert_scheduler": "gpu", "speculative_three_level": True,
@@ -331,6 +445,27 @@ def test_three_level_configuration_rejects_invalid_combinations(values):
     from freetoken.engine.config import EngineConfig
     with pytest.raises(ValueError):
         EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16, **values)
+
+
+@pytest.mark.parametrize("prefetch,scalar,quotas", [(False, 2, None), (True, 2, [0, 0]), (True, 0, None)])
+def test_verify_prefetch_inactive_configuration_needs_no_gpu_scheduler(prefetch, scalar, quotas):
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
+        speculative_prefetch=prefetch, speculative_verify_prefetch_layer_experts=scalar,
+        speculative_verify_prefetch_layer_quotas=quotas)
+
+
+def test_reference_verify_prefetch_configuration_changes_require_rebuild():
+    from types import SimpleNamespace
+    from freetoken.engine.qwen_three_level import ThreeLevelCoordinator
+    control = object.__new__(ThreeLevelCoordinator)
+    control.engine = SimpleNamespace(config=SimpleNamespace(speculative_verify_prefetch_layer_experts=2))
+    control.experts = SimpleNamespace(verify_layer_quotas=(0, 2), verify_prefetch_enabled=True)
+    control.verify_prefetch_signature = control._verify_prefetch_signature()
+    control.engine.config.speculative_verify_prefetch_layer_experts = 1
+    with pytest.raises(RuntimeError, match="rebuild"):
+        control._forward(None, None, None)
 
 
 def test_route_metrics_align_consumed_input_rows_and_leave_final_correction_unknown():
@@ -379,6 +514,7 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
                                               conv_states=torch.zeros(1, 2, 24, 3, device=engine.device),
                                               local_index=lambda _: 0, num_slots=2)
     engine.config.speculative_mtp_depth = 3
+    engine.config.speculative_max_output_tokens = 32
     engine.config.speculative_submit_tokens = 0
     engine.config.speculative_max_loops = max_loops
     engine.config.speculative_prefetch = True
@@ -391,7 +527,7 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
     engine.moe_offload_cache = SimpleNamespace(cache_size=slots, num_experts=32)
 
     class State:
-        def __init__(self, pool, layers, width, slot):
+        def __init__(self, pool, layers, width, slot, workspace=None):
             self.pool, self.width, self.slot = pool, width, slot
         def commit(self, count):
             self.pool.recurrent_states[:, self.slot].add_(count)
@@ -425,6 +561,9 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
     runner.use_graph, runner.active = graph_mode, False
     runner.last_event, runner.frontier = None, None
+    runner.draft_width = 4
+    runner.reader_event = torch.cuda.Event()
+    runner.anchor_buffer = torch.empty(1, dtype=torch.int32, device=engine.device)
     runner._request_lock = threading.Lock()
     runner.model_state = _QwenState(runner)
     runner.coordinator = SpeculativeCoordinator(_QwenProposer(runner), runner.model_state, _QwenReservation(runner))
@@ -646,6 +785,171 @@ def _metadata_runner(monkeypatch, device):
     return runner
 
 
+@pytest.mark.parametrize("width", [1, 2, 4, 6])
+def test_baseline_fixed_mapping_updates_only_small_buffers(monkeypatch, width):
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.baseline, runner.draft_width, runner._shared_indices = True, 6, None
+    ids = torch.arange(width, dtype=torch.int32)
+    batch = runner._batch(ids, 0)
+    indices = batch.attn_metadata.indices.clone()
+    pointer = batch.attn_metadata.indices.data_ptr()
+    copies = []
+    original = torch.Tensor.copy_
+    def counted(dst, src, *args, **kwargs):
+        copies.append(dst.numel())
+        return original(dst, src, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "copy_", counted)
+    for start in (7, 64 - width, 1):
+        batch = runner._batch(ids, start)
+        assert batch.attn_metadata.indices.data_ptr() == pointer
+        assert torch.equal(batch.attn_metadata.indices, indices)
+        assert batch.attn_metadata.indptr.tolist() == [i * 64 for i in range(width + 1)]
+        assert batch.positions.tolist() == list(range(start, start + width))
+        assert batch.out_loc.tolist() == list(range(start, start + width))
+    assert max(copies) <= width
+    other = runner._batch(torch.zeros(1, dtype=torch.int32), 0)
+    assert other.attn_metadata.indices.data_ptr() == pointer
+
+
+def test_baseline_keeps_rejected_tail_reserved():
+    from types import SimpleNamespace
+    from freetoken.engine.speculative import SpeculativeCoordinator
+    reservation = SimpleNamespace(release=lambda *args: pytest.fail("released reusable mapping"))
+    coordinator = SpeculativeCoordinator(None, None, reservation)
+    frontier = SpeculativeFrontier(4, 8, 8, 8)
+    frontier.begin(12, 4)
+    coordinator.drain(frontier, 1, retain_reservation=True)
+    assert (frontier.target_valid_len, frontier.draft_valid_len, frontier.allocated_len) == (9, 9, 12)
+    assert frontier.reserve_end(3) == 12
+
+
+def test_baseline_diagnostic_width_preserves_production_metadata(monkeypatch):
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.baseline, runner.draft_width, runner._shared_indices = True, 4, None
+    production = runner._batch(torch.zeros(4, dtype=torch.int32), 0)
+    diagnostic = runner._batch(torch.zeros(6, dtype=torch.int32), 0)
+    assert diagnostic.attn_metadata.indices.numel() == 6 * 64
+    assert production.attn_metadata.indices.data_ptr() == runner._shared_indices.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("backend", ["fused", "offload", "hybrid"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_baseline_tiny_engine_lifecycle(backend, eager):
+    import subprocess
+    import sys
+    from pathlib import Path
+    # Isolate global context, distributed groups and CPU executor threads per engine.
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")), "--backend", backend]
+    if eager:
+        command.append("--eager")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"status": "passed"' in result.stdout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("options",
+    [["--backend", backend, "--phases", phases] + mode
+     for backend, phases in (("offload", "verify"), ("hybrid", "verify"), ("hybrid", "both"))
+     for mode in (["--eager"], ["--graph-implementation", "reference"], ["--graph-implementation", "full"])]
+    + [["--backend", "offload", "--layers", "10", "--slots", "16"] + mode
+       for mode in (["--eager"], ["--graph-implementation", "reference"], ["--graph-implementation", "full"])]
+    + [["--backend", backend, "--scheduler", "host"] + mode
+       for backend in ("offload", "hybrid") for mode in (["--eager"], [])]
+    + [["--backend", "offload", "--output-limit", str(limit), "--graph-implementation", mode]
+       for limit in (1, 2, 3) for mode in ("reference", "full")])
+def test_three_level_tiny_engine_lifecycle(options):
+    import subprocess
+    import sys
+    from pathlib import Path
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")), "--three-level", *options]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"status": "passed"' in result.stdout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("eager", [False, True])
+def test_baseline_hybrid_controls_and_cpu_compatibility(eager):
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    results = {}
+    for policy, cpu in (("balanced", "legacy"), ("legacy", "grouped"), ("legacy", "legacy")):
+        command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")),
+                   "--backend", "hybrid", "--hybrid-window-policy", policy, "--hybrid-cpu-backend", cpu]
+        if eager:
+            command.append("--eager")
+        result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+        assert result.returncode == 0, result.stdout + result.stderr
+        results[policy, cpu] = json.loads(next(line for line in result.stdout.splitlines() if line.startswith('{"status"')))
+    assert results["legacy", "grouped"]["request_outputs"] == results["legacy", "legacy"]["request_outputs"]
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")), "--backend", "hybrid"]
+    if eager:
+        command.append("--eager")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240,
+                            env={**os.environ, "FREETOKEN_HYBRID_WINDOW": "0"})
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("chunk", [None, 2, 4, 128])
+@pytest.mark.parametrize("baseline", [False, True])
+def test_baseline_prefill_only_final_heads_and_compact_seed(monkeypatch, chunk, baseline):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.baseline = baseline
+    runner.engine.model = SimpleNamespace(forward_host_ctx=lambda *args: nullcontext())
+    runner.seed_hidden = torch.empty(1, 2)
+    runner.seed_token = torch.empty(1, dtype=torch.int32)
+    heads, hidden_outputs = [], []
+    def target(batch, *, need_logits=True):
+        heads.append(("target", need_logits))
+        return batch.input_ids + 1 if need_logits else None, torch.ones(batch.input_ids.numel(), 2)
+    def draft(batch, hidden, *, need_logits=True):
+        heads.append(("draft", need_logits))
+        output = hidden + 1
+        hidden_outputs.append(output)
+        return batch.input_ids + 1 if need_logits else None, output
+    runner._target, runner._draft = target, draft
+    anchor = runner._prefill(torch.arange(9, dtype=torch.int32), chunk)
+    assert anchor.tolist() == [9] and runner.next_draft.tolist() == [10]
+    assert [head for head in heads if head[1]] == [("target", True), ("draft", True)]
+    if chunk is None:
+        assert len(heads) == 2
+    assert runner.last_draft_hidden.shape == (1, 2)
+    assert runner.last_draft_hidden.untyped_storage().nbytes() == 8
+    assert all(runner.last_draft_hidden.data_ptr() != output[-1:].data_ptr() for output in hidden_outputs)
+
+
+@pytest.mark.parametrize("eos_ids", [(), (10,), (11, 12)])
+def test_acceptance_mask_matches_tuple_and_distinguishes_truncation(eos_ids):
+    proposal = Proposal(torch.tensor([9]), torch.tensor([10, 11, 12]))
+    verified = VerifyResult(torch.tensor([10, 11, 12, 13]), torch.empty(4, 0))
+    mask = torch.zeros(32, dtype=torch.bool)
+    mask[list(eos_ids)] = True
+    for cap in (1, 2, 4):
+        expected = greedy_commit(proposal, verified, remaining=cap, eos_ids=eos_ids)
+        actual = greedy_commit(proposal, verified, remaining=cap, eos_mask=mask)
+        assert actual.accepted_drafts.item() == 3
+        assert actual.input_count.item() == expected.input_count.item()
+        assert actual.terminal.item() == expected.terminal.item()
+
+
+@pytest.mark.parametrize("limits", [(None, 8), (8, None), (0, 8), (True, 8)])
+@pytest.mark.parametrize("three_level", [False, True])
+def test_baseline_requires_explicit_positive_limits(limits, three_level):
+    from freetoken.engine.config import EngineConfig
+    from freetoken.distributed import DistributedInfo
+    with pytest.raises(ValueError, match="baseline SD requires"):
+        EngineConfig(model_path="unused", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+                     speculative_mtp_depth=3, speculative_max_input_tokens=limits[0],
+                     speculative_max_output_tokens=limits[1], speculative_three_level=three_level)
+
+
 @pytest.mark.parametrize("width", range(1, 5))
 def test_decode_metadata_matches_backend_without_host_staging(monkeypatch, width):
     from types import SimpleNamespace
@@ -844,14 +1148,15 @@ def test_terminal_commit_keeps_target_state_and_truthful_draft_frontier(terminal
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("optimized", [False, True, "fixed"])
 def test_decode_attention_graph_reuses_metadata_across_widths_and_requests(monkeypatch, optimized):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from torch.nn.functional import scaled_dot_product_attention
 
     runner = _metadata_runner(monkeypatch, torch.device("cuda:0"))
-    runner.metadata_optimized = optimized
+    runner.metadata_optimized = optimized is True
+    runner.baseline, runner.draft_width, runner._shared_indices = optimized == "fixed", 4, None
     backend = runner.engine.attn_backend
     torch.manual_seed(72)
     k = torch.randn(64, 1, 128, dtype=torch.bfloat16, device=runner.engine.device)
@@ -904,7 +1209,7 @@ def test_target_capture_exception_joins_copy_fork_before_context_exit(monkeypatc
     def retire():
         runner.engine.stream.wait_stream(copy_stream)
         retired.append(torch.cuda.is_current_stream_capturing())
-    controller = SimpleNamespace(cross_layer_prefetch=True, retire_layers=retire)
+    controller = SimpleNamespace(cross_layer_prefetch=True, retire_layers=retire, copy_stream=copy_stream)
     runner.engine.moe_offload_cache = SimpleNamespace(speculative_controller=controller)
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
     runner.use_graph = True
@@ -929,10 +1234,42 @@ def test_target_capture_exception_joins_copy_fork_before_context_exit(monkeypatc
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_target_capture_exception_does_not_join_idle_branches(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    runner = _metadata_runner(monkeypatch, torch.device("cuda"))
+    runner.engine.stream = torch.cuda.Stream()
+    runner.engine.stream.wait_stream(torch.cuda.current_stream())
+    runner.engine.linear_state_pool = None
+    runner.engine.model = SimpleNamespace(forward_host_ctx=lambda *args: nullcontext())
+    retired = []
+    controller = SimpleNamespace(cross_layer_prefetch=True, cpu_stream=torch.cuda.Stream(),
+        copy_stream=torch.cuda.Stream(), retire_layers=lambda: retired.append(True))
+    runner.engine.moe_offload_cache = SimpleNamespace(speculative_controller=controller)
+    runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
+    runner.use_graph = True
+    def target(batch):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("injected failure before branch fork")
+        return batch.input_ids, batch.input_ids.float()
+    runner._target = target
+    with torch.cuda.stream(runner.engine.stream):
+        batch = runner._batch(torch.ones(1, dtype=torch.int32, device="cuda"), 0)
+        with pytest.raises(RuntimeError, match="injected failure before branch fork"):
+            runner._execute("verify", batch)
+        assert not torch.cuda.is_current_stream_capturing()
+    runner.engine.stream.synchronize()
+    assert not retired and not runner.graphs
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("baseline", [False, True])
+@pytest.mark.parametrize("cancel_after_verify", [False, True])
 @pytest.mark.parametrize("cap,eos_ids,expected", [(2, (), [7, 8]), (5, (), [7, 8, 9, 10, 11]),
                                                     (8, (9,), [7, 8, 9]), (8, (12,), [7, 8, 9, 10, 11, 12])])
-def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_mode, cap, eos_ids, expected):
+def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_mode, baseline, cap, eos_ids, expected, cancel_after_verify):
     import threading
     from contextlib import nullcontext
     from types import SimpleNamespace
@@ -947,6 +1284,18 @@ def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_m
     runner.engine.linear_state_pool, runner.engine.cpu_moe_executor = None, None
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
     runner.use_graph, runner.active = graph_mode, False
+    runner.baseline, runner.draft_width, runner._shared_indices = baseline, 4, None
+    if baseline:
+        device = runner.engine.device
+        runner.engine.config.speculative_max_input_tokens = 32
+        runner.engine.config.speculative_max_output_tokens = 32
+        runner.proposal_buffer = torch.empty(3, dtype=torch.int32, device=device)
+        runner.verify_buffer = torch.empty(4, dtype=torch.int32, device=device)
+        runner.anchor_buffer = torch.empty(1, dtype=torch.int32, device=device)
+        runner.eos_mask = torch.zeros(128, dtype=torch.bool, device=device)
+        runner.drain_buffer = torch.empty(7, dtype=torch.int32, device=device)
+        runner.drain_host = torch.empty(7, dtype=torch.int32, pin_memory=True)
+        runner.result_event, runner.reader_event = torch.cuda.Event(), torch.cuda.Event()
     runner.last_event, runner.frontier = None, None
     runner._request_lock = threading.Lock()
     committed = torch.zeros((), dtype=torch.int32, device=runner.engine.device)
@@ -972,14 +1321,27 @@ def test_generate_skips_terminal_reconcile_and_drains_state(monkeypatch, graph_m
         calls.append(phase)
         return execute(phase, *args, **kwargs)
     runner._execute = measured
+    cancelled = threading.Event()
+    accept = runner._accept
+    def accept_then_cancel(*args, **kwargs):
+        result = accept(*args, **kwargs)
+        if cancel_after_verify:
+            cancelled.set()
+        return result
+    runner._accept = accept_then_cancel
     for _ in range(2):
         calls.clear()
+        cancelled.clear()
         with torch.cuda.stream(runner.engine.stream):
             committed.zero_()
-        result = runner.generate([1, 2, 3], max_tokens=cap, eos_ids=eos_ids)
-        assert result.token_ids == expected
-        assert calls.count("reconcile") == len(result.rounds) - 1
-        assert committed.item() == len(expected) - 1
+        result = runner.generate([1, 2, 3], max_tokens=cap, eos_ids=eos_ids, cancel=cancelled)
+        visible = expected[:1] if cancel_after_verify else expected
+        assert result.token_ids == visible
+        assert calls.count("reconcile") == (0 if cancel_after_verify else len(result.rounds) - 1)
+        assert committed.item() == (min(len(expected) - 1, 4) if cancel_after_verify else len(expected) - 1)
+        if baseline:
+            assert all(r["metrics_version"] == 2 for r in result.rounds)
+            assert sum(r["returned_tokens"] for r in result.rounds) == len(visible) - 1
         assert runner._reserved_len == 0 and not bool(runner.engine.page_table.any())
         assert runner.frontier is runner.last_event is runner.model_state.current is None
         assert not runner.active and not runner._request_lock.locked()

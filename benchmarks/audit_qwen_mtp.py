@@ -136,6 +136,7 @@ def main():
         moe_cache_auto=True, kv_reserve_tokens=4096, memory_ratio=0.9,
         max_seq_len_override=4096, gpu_memory_budget_bytes=16 << 30,
         speculative_mtp_depth=3, page_size=args.page_size,
+        speculative_max_input_tokens=3840, speculative_max_output_tokens=256,
         cuda_graph_max_bs=0 if args.eager else 4, cache_type="naive", max_extend_tokens=128,
         mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
     ))
@@ -170,7 +171,7 @@ def main():
         try:
             rejected = runner.generate(prompt, max_tokens=32)
             assert rejected.token_ids == baseline
-            assert all(r["accepted"] == 0 for r in rejected.rounds)
+            assert all(r.get("matched_drafts", r.get("accepted", 0)) == 0 for r in rejected.rounds)
             assert len(rejected.rounds) == 31
         finally:
             runner.coordinator.proposer.propose = propose

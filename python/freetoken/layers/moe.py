@@ -316,7 +316,8 @@ class OffloadMoELayer(MoELayer):
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
         """
         window = get_global_ctx().batch.rowwise_linear and hidden_states.shape[0] > 1
-        if window and (not _HYBRID_WINDOW or cache.cache_size < topk_ids.numel()):
+        balanced = getattr(cache, "baseline_hybrid", None) if _HYBRID_WINDOW else None
+        if window and (not _HYBRID_WINDOW or (balanced is None and cache.cache_size < topk_ids.numel())):
             # Preserve the per-token fetch cap and CPU/GPU partial-sum rounding of AR.
             return torch.cat([
                 self._decode_hybrid(cache, hidden_states[i:i + 1], topk_weights[i:i + 1], topk_ids[i:i + 1])
@@ -325,16 +326,22 @@ class OffloadMoELayer(MoELayer):
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
         raw = topk_ids.clone()  # raw expert ids for the CPU partial
-        if window:
+        if balanced is not None:
+            balanced.ensure(self.layer_id, topk_ids, topk_weights)
+        elif window:
             cache.ensure_experts_hybrid_window(self.layer_id, topk_ids)
         else:
             cache.ensure_experts_hybrid(self.layer_id, topk_ids)
-        if cache.collect_stats and not window:
+        if cache.collect_stats and not window and balanced is None:
             cache.record_decode_stats_hybrid(self.layer_id)
         on_gpu = topk_ids >= 0
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
-        pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        cpu_mask = on_gpu | (topk_weights == 0) if balanced is not None else on_gpu
+        cpu_ids = torch.where(cpu_mask, raw.new_full((), -1), raw).contiguous()
+        if getattr(executor, "grouped_compat", False):
+            pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids, grouped=True)
+        else:
+            pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.

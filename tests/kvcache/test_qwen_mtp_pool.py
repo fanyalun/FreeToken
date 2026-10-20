@@ -47,6 +47,14 @@ def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
     joint.rebuild_from_config(config, 12)
     assert joint._kv_buffer.shape[2] == 13
     assert joint.k_cache(1).data_ptr() != joint.k_cache(2).data_ptr()
+    config.speculative_mtp_depth = 3
+    config.speculative_max_output_tokens = 8
+    workspace = QwenGDNVerifyState(pool, [layer], 4, slot=1)
+    views = [QwenGDNVerifyState(pool, [layer], w, slot=1, workspace=workspace) for w in range(1, 4)]
+    storage = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+               for s in (workspace, *views) for t in (s.conv_windows, s.indices, s.cu_seqlens, *s.replay_inputs)}
+    assert sum(storage.values()) == workspace.bytes() + 3 * 12
+    assert joint.kv_cost(config)[1] == sum(storage.values()) + 9 * mc.num_experts_per_tok * 8 + 3 * 16
     config.model_config = replace(mc, num_experts=64)
     config.speculative_three_level = True
     config.speculative_submit_tokens = submit_limit
@@ -54,26 +62,29 @@ def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
     config.speculative_mtp_depth = 3
     from freetoken.engine.speculative_window import WindowBudget
     from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
-    maximum = WindowBudget.resolve(128, 2, 2, 64, submit_limit).submit_rows
-    wide = [QwenGDNVerifyState(pool, [layer], w, 1) for w in range(1, max(4, maximum) + 1)]
-    private = [QwenGDNVerifyState(pool, [layer], w, 0) for w in range(1, 5)]
+    maximum = min(8, WindowBudget.resolve(128, 2, 2, 64, submit_limit).submit_rows)
+    workspace = QwenGDNVerifyState(pool, [layer], maximum, 1)
+    wide = [QwenGDNVerifyState(pool, [layer], w, 1, workspace=workspace) for w in range(1, maximum + 1)]
+    private = [QwenGDNVerifyState(pool, [layer], w, 0, workspace=workspace) for w in range(1, min(4, maximum - 1) + 1)]
     hybrid_plan = 9 * mc.num_experts_per_tok * 8 + 3 * 16
-    expected = sum(s.bytes() for s in [*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16) + hybrid_plan
+    expected = QwenGDNVerifyState.workspace_bytes([*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16) + hybrid_plan
     assert QwenMTPKVCache.kv_cost(config)[1] == expected
     config.moe_strategy = "offload"
     for depth in (1, 2, 3, 4, 8):
         config.speculative_mtp_depth = depth
-        width = depth + 1
-        maximum = WindowBudget.resolve(128, 2, 2, 64, submit_limit, depth=depth).submit_rows
-        wide = [QwenGDNVerifyState(pool, [layer], w, 1) for w in range(1, max(width, maximum) + 1)]
-        private = [QwenGDNVerifyState(pool, [layer], w, 0) for w in range(1, width + 1)]
-        expected = sum(s.bytes() for s in [*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16)
+        width = min(8, depth + 1)
+        maximum = min(8, WindowBudget.resolve(128, 2, 2, 64, submit_limit, depth=depth).submit_rows)
+        inner = min(width, maximum - 1)
+        workspace = QwenGDNVerifyState(pool, [layer], maximum, 1)
+        wide = [QwenGDNVerifyState(pool, [layer], w, 1, workspace=workspace) for w in range(1, maximum + 1)]
+        private = [QwenGDNVerifyState(pool, [layer], w, 0, workspace=workspace) for w in range(1, inner + 1)]
+        expected = QwenGDNVerifyState.workspace_bytes([*wide, *private]) + linear_state_bytes_per_req(linear, 1, torch.bfloat16)
         assert QwenMTPKVCache.kv_cost(config)[1] == expected
         config.speculative_graph_implementation = "coarse"
-        workspace = QwenGDNVerifyState(pool, [layer], max(width, maximum), 1)
+        workspace = QwenGDNVerifyState(pool, [layer], maximum, 1)
         expected = workspace.bytes() + 12 + linear_state_bytes_per_req(linear, 1, torch.bfloat16)
         assert QwenMTPKVCache.kv_cost(config)[1] == expected
         config.speculative_graph_implementation = "full"
-        expected = workspace.bytes() + (width + maximum - 1) * 12 + linear_state_bytes_per_req(linear, 1, torch.bfloat16)
+        expected = workspace.bytes() + (max(1, inner) + maximum - 1) * 12 + linear_state_bytes_per_req(linear, 1, torch.bfloat16)
         assert QwenMTPKVCache.kv_cost(config)[1] == expected
         config.speculative_graph_implementation = "reference"

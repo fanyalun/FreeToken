@@ -47,7 +47,9 @@ def prepare_experiment(model, data, root, samples=16):
         "fingerprint_version": 1,
         "model": str(model), "data": str(data), "source_root": str(root),
         "source_sha256": source_fingerprint(root),
-        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+        "commit": (json.loads((root / "source_identity.json").read_text())["commit"]
+                   if (root / "source_identity.json").exists() else
+                   subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()),
         "model_config_sha256": digest(model / "config.json"),
         "weight_index_sha256": digest(index),
         "checkpoint_metadata_sha256": {str(p.relative_to(model)): digest(p) for p in sorted(metadata)},
@@ -67,10 +69,19 @@ def prepare_experiment(model, data, root, samples=16):
 
 def benchmark_config(args, experiment):
     return {
-        **vars(args), **experiment,
+        **{key: value for key, value in vars(args).items() if key != "moe_slots"}, **experiment,
+        "requested_moe_slots": getattr(args, "moe_slots", None),
         "max_active_requests": 1, "target_dtype": "bfloat16", "draft_dtype": "bfloat16",
         "depth": 3 if args.mode == "mtp" else 0,
-        "ignore_eos": True, "temperature": 0, "prompt_chunk_size": 128,
+        "ignore_eos": True, "temperature": 0, "prompt_chunk_size": getattr(args, "prompt_chunk_size", None),
+        "max_input_tokens": getattr(args, "max_input_tokens", 3840),
+        "max_output_tokens": args.tokens,
+        "hybrid_window_policy": getattr(args, "hybrid_window_policy", "balanced"),
+        "hybrid_cpu_backend": getattr(args, "hybrid_cpu_backend", "grouped"),
+        "hybrid_profile": getattr(args, "hybrid_profile", None),
+        "hybrid_profile_sha256": digest(args.hybrid_profile) if getattr(args, "hybrid_profile", None) else None,
+        "ar_implementation": "engine_graph_runner_and_sampler" if args.mode == "ar" else None,
+        "round_metrics_version": 2,
         "timing_scope": "complete programmatic single-request generation through resource drain",
         "ttft_scope": "generation start through first target token materialization",
         "warmups": 5,

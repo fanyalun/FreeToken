@@ -44,7 +44,8 @@ def profile_ranges():
     wrap(GPUExpertCache, "_allocate", lambda s, layer, *a, **k:
          f"ADMISSION/layer={layer}/prefetch={k.get('prefetch', False)}")
     wrap(GPUExpertCache, "_copy", lambda s, layer, *a, **k:
-         f"{'LAYER_PREFETCH' if torch.cuda.current_stream() == s.copy_stream else 'DEMAND_COPY'}/layer={layer}")
+         f"{('VERIFY_PREFETCH' if s.phase == 'verify' else 'LAYER_PREFETCH') if torch.cuda.current_stream() == s.copy_stream else 'DEMAND_COPY'}/layer={layer}")
+    wrap(GPUExpertCache, "join_verify", lambda s, layer: f"VERIFY_PREFETCH_JOIN/layer={layer}")
     wrap(GPUExpertCache, "wait_demand", lambda *a, **k: "DEMAND_FENCE")
     wrap(ThreeLevelCoordinator, "_candidate_tokens", lambda *a, **k: "CANDIDATE_STAGING")
     for name, label in [("finish_loop", "GAP_PREFETCH"), ("retire_layers", "PENDING_RETIREMENT/layer"),
@@ -69,6 +70,9 @@ def main():
     parser.add_argument("--selected-gap-capacity", type=int, choices=(6, 12), default=12)
     parser.add_argument("--layer-budget", type=Path)
     parser.add_argument("--median-layer-budget", type=Path)
+    parser.add_argument("--verify-layer-quota", type=int, default=0)
+    parser.add_argument("--verify-layer-budget", type=Path)
+    parser.add_argument("--round-index", type=int, default=0)
     args = parser.parse_args()
     variants = {"reference": (0, 4, 12), "admission": (1, 4, 12), "copy": (2, 4, 12),
                 "prefetch": (3, 4, 12), "optimized": (4, 4, 12)}
@@ -80,6 +84,13 @@ def main():
     variants.update(io_calibration=(4, 0, 0), demand_fenced=(4, args.selected_layer_quota, args.selected_gap_capacity),
                     layer_budget=(4, args.selected_layer_quota, args.selected_gap_capacity),
                     median_budget=(4, args.selected_layer_quota, args.selected_gap_capacity))
+    variants.update({f"verify_s{small}_q{quota}": (4, small, 12)
+                     for small in (2, 1, 0) for quota in (0, 1, 2)})
+    verify_budget = json.loads(args.verify_layer_budget.read_text()) if args.verify_layer_budget else None
+    if args.verify_layer_quota < 0:
+        parser.error("verify quota must be nonnegative")
+    if any(name.startswith("verify_") for name in args.methods) and len(args.methods) != 1:
+        parser.error("verify matrix cells require one fixed configuration per process")
     layer_budget = json.loads(args.layer_budget.read_text()) if args.layer_budget else None
     if "layer_budget" in args.methods and layer_budget is None:
         parser.error("layer_budget requires --layer-budget")
@@ -91,6 +102,14 @@ def main():
     unknown = set(args.methods) - set(variants) - {"sd", "sd_reference"}
     if unknown:
         parser.error(f"unknown methods: {unknown}")
+    cell = args.methods[0] if len(args.methods) == 1 else None
+    verify_quota = int(cell.rsplit("q", 1)[1]) if cell and cell.startswith("verify_") else args.verify_layer_quota
+    if cell and cell.startswith("verify_") and (verify_budget is not None
+            or args.verify_layer_quota not in (0, verify_quota)):
+        parser.error("fixed matrix method conflicts with custom verify budget")
+    if (verify_quota or verify_budget is not None) and (cell not in variants or variants[cell][0] != 4):
+        parser.error("verify prefetch requires a single optimized method")
+    small_quota = variants[cell][1] if cell in variants else 4
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     def write(name, value):
@@ -106,6 +125,8 @@ def main():
     config = dict(**identity, methods=args.methods, variants=variants, loops=6, slots=4907,
         kv_pages=4300, budget_gib=64, samples=args.samples, tokens=args.tokens, repeats=args.repeats,
         collect_signals=args.collect_signals,
+        verify_layer_quota=verify_quota, verify_layer_budget=verify_budget,
+        round_index=args.round_index,
         policies={name: dict(keep_hits=name != "top4_only", renormalize=name == "renormalized")
                   for name in args.methods if name not in ("sd", "sd_reference")},
         graph=True, ignore_eos=True, profile=args.profile, pid=os.getpid(),
@@ -132,9 +153,14 @@ def main():
         attention_backend="triton", moe_strategy="offload", moe_cache_auto=False, moe_cache_size=4907,
         kv_reserve_tokens=4096, max_seq_len_override=4096, gpu_memory_budget_bytes=64 << 30,
         num_page_override=4300, speculative_mtp_depth=3, speculative_three_level=True,
+        speculative_max_input_tokens=max(map(len, prompts)), speculative_max_output_tokens=args.tokens,
         speculative_max_loops=6, speculative_expert_scheduler="gpu", speculative_compact_control=True,
-        speculative_prefetch=True, speculative_prefetch_layer_experts=4, speculative_prefetch_gap_capacity=12,
-        cuda_graph_max_bs=4, cache_type="naive", max_extend_tokens=128,
+        speculative_execution_implementation="optimized" if verify_quota or verify_budget is not None
+            or (cell and cell.startswith("verify_")) else "reference",
+        speculative_prefetch=True, speculative_prefetch_layer_experts=small_quota, speculative_prefetch_gap_capacity=12,
+        speculative_verify_prefetch_layer_experts=verify_quota,
+        speculative_verify_prefetch_layer_quotas=verify_budget["layer_quotas"] if verify_budget else None,
+        cuda_graph_max_bs=4, cache_type="naive",
         mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio")))))
     runner, cache = engine.speculative_runner, engine.moe_offload_cache
     diagnostics = None
@@ -164,7 +190,9 @@ def main():
         expert.collect_signals = args.collect_signals
         controls[name] = control
     config.update(actual_slots=cache.cache_size, actual_kv_pages=engine.num_pages,
-                  gpu=torch.cuda.get_device_name(engine.device))
+                  gpu=torch.cuda.get_device_name(engine.device),
+                  effective_verify_layer_quotas={name: list(control.experts.verify_layer_quotas)
+                      for name, control in controls.items() if control is not None})
     assert cache.cache_size == 4907 and engine.num_pages == 4300
     write("config.json", config)
     stop = threading.Event()
