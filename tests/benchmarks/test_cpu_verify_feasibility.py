@@ -367,6 +367,9 @@ def test_cpu_window_epochs_follow_gpu_after_sizing(monkeypatch, auto_slots):
         def __init__(self):
             self.epochs = []
 
+        def require_drained(self):
+            pass
+
         def initialize(self, checkpoint, epoch):
             assert epoch == window.epoch
             assert not self.epochs or epoch > self.epochs[-1]
@@ -417,3 +420,78 @@ def test_feasibility_entrypoint_allows_runtime_inference_tensor_updates(tmp_path
     with pytest.raises(RuntimeError, match="inference scope verified"):
         benchmark.main()
     assert not torch.is_inference_mode_enabled()
+
+
+@pytest.mark.parametrize("mode", ["layerwise", "layerwise_barrier"])
+def test_streamed_window_binds_barrier_policy_before_candidates(monkeypatch, mode):
+    from types import SimpleNamespace
+    from freetoken.engine.prefix_transfer import PrefixTicket
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import bench_cpu_verify_feasibility as benchmark
+
+    ticket = PrefixTicket(1, 2, 3)
+    transfer = object()
+    calls = []
+
+    def initialize(prompt, *, chunk_size, prefix_transfer, prefix_mode):
+        assert prefix_transfer is transfer and prefix_mode == mode
+        return ticket
+
+    worker = SimpleNamespace(require_drained=lambda: None,
+        initialize_streamed=lambda value, **kw: calls.append((value, kw)),
+        poll=lambda: dict(kind="initialized", epoch=1))
+    window = SimpleNamespace(initialize=initialize)
+    assert benchmark.initialize_cpu_window(window, worker, [1, 2], None, transfer, mode) is ticket
+    assert calls == [(ticket, dict(wait_all=mode == "layerwise_barrier"))]
+
+
+def test_prefix_analysis_rejects_mixed_barrier_semantics(monkeypatch, tmp_path):
+    import json
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import analyze_prefix_transfer as analysis
+
+    for name, stage in (("legacy", None), ("new", "before_cpu_verify")):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "config.json").write_text(json.dumps(dict(budget_gib=24, prompt_chunk_size=512)))
+        row = dict(sample_id=0, prefix_transfer="layerwise_barrier")
+        if stage is not None:
+            row["prefix_barrier_stage"] = stage
+        (root / "measurements.jsonl").write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="cannot combine"):
+        analysis.summarize(tmp_path)
+
+
+def test_prefix_matrix_preserves_initialization_failure(monkeypatch, tmp_path):
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import run_prefix_transfer_matrix as matrix
+    import qwen_mtp_config
+
+    baseline = tmp_path / "baseline"
+    (baseline / "budget_24g_retained").mkdir(parents=True)
+    (baseline / "budget_24g_retained/config.json").write_text(json.dumps(dict(actual_slots=2428, actual_kv_pages=2176)))
+    command = [sys.executable, "benchmark.py", "--budget-gib", "24", "--auto-slots", "--formal-timing", "--output", "unused"]
+    (baseline / "retained_matrix_complete.json").write_text(json.dumps(dict(jobs=[dict(command=command)])))
+    output = tmp_path / "matrix"
+    monkeypatch.setattr(sys, "argv", ["matrix", "--baseline", str(baseline), "--output", str(output), "--phase", "audit"])
+    monkeypatch.setattr(qwen_mtp_config, "source_fingerprint", lambda _: {})
+
+    def fail(command, **kwargs):
+        directory = Path(command[command.index("--output") + 1])
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        (directory / "complete.json").write_text('{"status": "incomplete"}')
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(matrix.subprocess, "run", fail)
+    with pytest.raises(RuntimeError, match="gate failed"):
+        matrix.main()
+    result = json.loads((output / "manifest.json").read_text())
+    assert result["jobs"][0]["status"] == "incomplete_or_invalid"
+    assert result["jobs"][0]["returncode"] == 1

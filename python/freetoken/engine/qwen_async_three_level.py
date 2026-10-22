@@ -93,7 +93,11 @@ class QwenAsyncGpuWindow:
         self.epoch, self.active = 0, False
         self.canonical_length = 0
 
-    def initialize(self, input_ids, *, chunk_size=None):
+    def initialize(self, input_ids, *, chunk_size=None, prefix_transfer=None, prefix_mode="sync"):
+        if prefix_mode not in ("sync", "layerwise_barrier", "layerwise"):
+            raise ValueError("unknown prefix transfer mode")
+        if (prefix_transfer is None) != (prefix_mode == "sync"):
+            raise ValueError("streamed prefix mode requires a transfer")
         if self.active or self.runner.active:
             raise RuntimeError("GPU window already active")
         r, e = self.runner, self.engine
@@ -107,11 +111,17 @@ class QwenAsyncGpuWindow:
         if not r._request_lock.acquire(blocking=False):
             raise RuntimeError("GPU runner already owns a request")
         self.active, r.active = True, True
+        self.prefix_transfer = prefix_transfer
         prefill_started = time.perf_counter()
         try:
             with torch.cuda.stream(e.stream):
                 self._record_timing("prefill_start")
-                anchor = r._prefill(ids, chunk_size)
+                if prefix_transfer is None:
+                    anchor = r._prefill(ids, chunk_size)
+                else:
+                    prefix_transfer.begin(self.epoch + 1, ids.numel())
+                    anchor = r._prefill(ids, chunk_size, prefix_transfer=prefix_transfer)
+                    prefix_transfer.finish()
                 self._record_timing("prefill_end")
                 length = ids.numel()
                 self.output_end = length + e.config.speculative_max_output_tokens
@@ -123,12 +133,17 @@ class QwenAsyncGpuWindow:
                 self.private_pool.conv_states.copy_(pool.conv_states[:, 1:2])
                 attention = [i for i in range(e.config.model_config.num_layers)
                              if not e.config.model_config.is_linear_layer(i)]
-                keys = torch.stack([e.kv_cache.k_cache(i)[:length, 0] for i in attention]).cpu()
-                values = torch.stack([e.kv_cache.v_cache(i)[:length, 0] for i in attention]).cpu()
-                checkpoint = PrefixCheckpoint(length, int(anchor.item()), keys, values,
-                    pool.recurrent_states[:, 1].cpu(), pool.conv_states[:, 1].cpu())
+                if prefix_transfer is None:
+                    keys = torch.stack([e.kv_cache.k_cache(i)[:length, 0] for i in attention]).cpu()
+                    values = torch.stack([e.kv_cache.v_cache(i)[:length, 0] for i in attention]).cpu()
+                    checkpoint = PrefixCheckpoint(length, self.canonical_anchor, keys, values,
+                        pool.recurrent_states[:, 1].cpu(), pool.conv_states[:, 1].cpu())
+                else:
+                    from .prefix_transfer import PrefixTicket
+                    checkpoint = PrefixTicket(self.epoch + 1, length, self.canonical_anchor)
                 self.prefill_seconds = (self.timing_events["prefill_start"].elapsed_time(
-                    self.timing_events["prefill_end"]) / 1000 if self.instrument_components else None)
+                    self.timing_events["prefill_end"]) / 1000 if (
+                        self.instrument_components or getattr(self, "measure_prefill", False)) else None)
                 self.prefill_wall_seconds = time.perf_counter() - prefill_started
                 self.epoch += 1
                 self.experts.begin(self.epoch)
@@ -144,6 +159,8 @@ class QwenAsyncGpuWindow:
         return r._execute("cpu_async_lossy", batch, need_logits=need_logits)
 
     def audit_gpu_anchor(self, anchor):
+        if getattr(self, "prefix_transfer", None) is not None:
+            self.prefix_transfer.drain()
         r, e = self.runner, self.engine
         with torch.cuda.stream(e.stream):
             e.stream.synchronize()
@@ -207,7 +224,7 @@ class QwenAsyncGpuWindow:
             r.next_draft, r.last_draft_hidden = r.seed_token, r.seed_hidden
 
     def _record_timing(self, name):
-        if self.instrument_components:
+        if self.instrument_components or (name.startswith("prefill_") and getattr(self, "measure_prefill", False)):
             self.timing_events[name].record(self.engine.stream)
 
     def component_timings(self):
@@ -249,6 +266,8 @@ class QwenAsyncGpuWindow:
         return GpuCandidateBlock(start, anchor, tuple(candidates)), records
 
     def install(self, result):
+        if getattr(self, "prefix_transfer", None) is not None:
+            self.prefix_transfer.drain()
         if (not self.active or result.request_epoch != self.epoch
                 or result.start != self.canonical_length):
             raise ValueError("CPU result does not extend the confirmed GPU prefix")
@@ -377,6 +396,8 @@ class QwenAsyncGpuWindow:
             return
         r, e = self.runner, self.engine
         try:
+            if getattr(self, "prefix_transfer", None) is not None:
+                self.prefix_transfer.abort()
             with torch.cuda.stream(e.stream):
                 e.stream.synchronize()
                 if self.experts.active:

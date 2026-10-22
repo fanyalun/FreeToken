@@ -497,7 +497,7 @@ class QwenMTPRunner:
         self.graph_replays["accept"] = self.graph_replays.get("accept", 0) + 1
         return output
 
-    def _prefill(self, ids, chunk_size):
+    def _prefill(self, ids, chunk_size, *, prefix_transfer=None):
         chunk_size = ids.numel() if chunk_size is None else chunk_size
         anchor = None
         for start in range(0, ids.numel(), chunk_size):
@@ -505,6 +505,8 @@ class QwenMTPRunner:
             self._reserve((end + self.engine.config.page_size - 1) // self.engine.config.page_size * self.engine.config.page_size)
             batch = self._batch(ids[start:end], start, prefill=True)
             final = end == ids.numel()
+            if prefix_transfer is not None:
+                batch.prefix_export = (prefix_transfer, start, end, final)
             skip_head = self.mtp_enabled and not final
             with self.engine.model.forward_host_ctx(batch, False):
                 predicted, hidden = self._target(batch, need_logits=False) if skip_head else self._target(batch)

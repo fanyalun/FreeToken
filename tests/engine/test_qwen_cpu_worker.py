@@ -68,6 +68,7 @@ class Pipe:
 
 def worker():
     w = CpuVerifierWorker.__new__(CpuVerifierWorker)
+    w.prefix_receiver = None
     w.pipe = Pipe()
     w.closed, w.ready, w.initialized = False, True, True
     w.epoch = w.latest_epoch = 3
@@ -86,10 +87,39 @@ def publish(w, slot=0, block=0, epoch=3):
         tokens=(5, 6), terminal=False, width=2))
 
 
+@pytest.mark.parametrize("wait_all", [False, True])
+def test_streamed_initialization_sends_barrier_policy_without_waiting(wait_all):
+    from freetoken.engine.prefix_transfer import PrefixTicket
+
+    w = worker()
+    w.prefix_receiver = object()
+    w.initialize_streamed(PrefixTicket(4, 2, 3), wait_all=wait_all)
+    assert w.pipe.sent == [dict(kind="initialize_streamed",
+        ticket=dict(epoch=4, length=2, anchor=3), wait_all=wait_all)]
+    assert w.inflight == "initialize" and not w.initialized
+
+
+def test_cancel_during_streamed_initialization_waits_for_ack():
+    w = worker()
+    aborted = []
+    w.prefix_receiver = SimpleNamespace(abort=lambda: aborted.append(True))
+    w.inflight, w.initialized = "initialize", False
+    w.cancel(3)
+    assert aborted == [True]
+    w.pipe.messages.append(dict(kind="initialize_aborted", epoch=3))
+    w.pipe.messages.append(dict(kind="cancelled", epoch=3))
+    assert w.poll() is None
+    assert w.poll()["kind"] == "cancelled"
+    w.require_drained()
+    assert not w.initialized
+
+
 def test_slots_wait_for_last_reader_and_do_not_reuse_published_result():
     w = worker()
     job = VerifyJob(3, 0, 4, 2, (5,), 10)
     w.submit(job)
+    with pytest.raises(RuntimeError, match="drained"):
+        w.require_drained()
     with pytest.raises(RuntimeError, match="busy"):
         w.submit(job)
     publish(w)

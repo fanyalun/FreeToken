@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -55,6 +56,36 @@ def window(monkeypatch):
         return torch.full_like(ids, -100), hidden
     w._lossy = lossy
     return w, calls, keys, values
+
+
+@pytest.mark.parametrize("mode", ["layerwise", "layerwise_barrier"])
+def test_streamed_initialization_returns_with_d2h_pending(monkeypatch, mode):
+    w, calls, _, _ = window(monkeypatch)
+    w.active = w.runner.active = False
+    w.runner._request_lock = threading.Lock()
+    w.engine.max_seq_len = 64
+    w.engine.config.speculative_max_input_tokens = 32
+    w.engine.config.speculative_max_output_tokens = 16
+    w.instrument_components = False
+    w._record_timing = lambda _: None
+    w.experts.begin = lambda _: None
+    w.experts.set_phase = lambda *args: None
+    w.close_request = lambda: None
+
+    def drain():
+        pytest.fail("initialization must not wait for D2H before generating A")
+
+    transfer = SimpleNamespace(begin=lambda *args: calls.append(("begin", *args)),
+        finish=lambda: calls.append(("finish",)), drain=drain)
+
+    def prefill(ids, chunk_size, *, prefix_transfer):
+        assert prefix_transfer is transfer
+        return torch.tensor(20)
+
+    w.runner._prefill = prefill
+    ticket = w.initialize([1, 2], prefix_transfer=transfer, prefix_mode=mode)
+    assert (ticket.epoch, ticket.length, ticket.anchor) == (4, 2, 20)
+    assert calls == [("begin", 4, 2), ("finish",)]
 
 
 @pytest.mark.parametrize("rows", [1, 8, 9, 17])

@@ -13,6 +13,7 @@ from pathlib import Path
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -23,6 +24,7 @@ from freetoken.distributed import DistributedInfo
 from freetoken.engine import Engine
 from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, QwenAsyncGpuWindow, retained_tail
 from freetoken.engine.qwen_cpu_target import VerifyJob
+from freetoken.engine.qwen_cpu_target import bitwise_equal
 from frozen_cpu_runtime import create_cpu_worker
 from freetoken.mm.config import MultimodalConfig
 from freetoken.scheduler.config import SchedulerConfig
@@ -227,12 +229,69 @@ def prepare_auto_window(engine, prompt, chunk_size, instrument):
     raise RuntimeError("CPU async GPU memory sizing failed after three boundary warmups")
 
 
-def initialize_cpu_window(window, worker, prompt, chunk_size):
-    checkpoint = window.initialize(prompt, chunk_size=chunk_size)
+def initialize_cpu_window(window, worker, prompt, chunk_size, transfer=None, mode="sync"):
+    worker.require_drained()
+    checkpoint = (window.initialize(prompt, chunk_size=chunk_size) if transfer is None else
+                  window.initialize(prompt, chunk_size=chunk_size, prefix_transfer=transfer, prefix_mode=mode))
     # Memory sizing may already have advanced the GPU window's request epoch.
-    worker.initialize(checkpoint, window.epoch)
+    if transfer is None:
+        worker.initialize(checkpoint, window.epoch)
+    else:
+        worker.initialize_streamed(checkpoint, wait_all=mode == "layerwise_barrier")
     wait_for(worker, "initialized")
     return checkpoint
+
+
+def audit_streamed_prefixes(window, worker, prompts, chunk_size, transfer, audit_tokens, output):
+    reports = []
+    for sample, prompt in enumerate(prompts):
+        checkpoint = initialize_cpu_window(window, worker, prompt, chunk_size)
+        worker.audit(audit_tokens)
+        reference = wait_for(worker, "audit")
+        window.close_request()
+        ticket = initialize_cpu_window(window, worker, prompt, chunk_size, transfer, "layerwise")
+        transfer.drain()
+        checks = {"anchor": ticket.anchor == checkpoint.anchor}
+        for name, tensor in transfer.receiver.tensors.items():
+            actual = tensor[:, :ticket.length] if name in ("keys", "values") else tensor
+            checks[name] = bitwise_equal(actual, getattr(checkpoint, name))
+        worker.audit(audit_tokens)
+        streamed = wait_for(worker, "audit")
+        checks["serial_tensor_hashes"] = reference["serial_tensor_sha256"] == streamed["serial_tensor_sha256"]
+        checks["tokens"] = reference["tokens"] == streamed["tokens"]
+        checks["acceptance_boundaries"] = reference["checks"] == streamed["checks"]
+        report = dict(sample_id=sample, checks=checks, sync=reference, layerwise=streamed,
+                      d2h=transfer.records, exact=all(checks.values()))
+        reports.append(report)
+        (output / "prefix_parity.json").write_text(json.dumps(reports, indent=2) + "\n")
+        window.close_request()
+        if not report["exact"]:
+            raise RuntimeError(f"streamed prefix bitwise audit failed: {checks}")
+    return reports
+
+
+class StartupResourceMonitor:
+    def __init__(self, allowed_pids, previous):
+        self.allowed_pids, self.previous = allowed_pids, previous
+        self.samples = []
+        self.error = None
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="startup_resource_monitor", daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            while not self.stop.wait(0.5):
+                sample = resource_snapshot(0)
+                load = resource_interference(sample, self.allowed_pids, previous=self.previous)
+                self.samples.append(dict(resources=sample, interference=load))
+                self.previous = sample
+        except BaseException:
+            self.error = traceback.format_exc()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
 
 
 @torch.inference_mode()
@@ -257,6 +316,9 @@ def main():
     parser.add_argument("--kernel-profile", choices=("v1", "ggml_v2"), default="v1")
     parser.add_argument("--components", choices=("attention", "dense", "head", "experts", "gdn", "expert_reuse", "expert_numa"), nargs="+", default=None)
     parser.add_argument("--prompt-chunk-size", type=int, default=None)
+    parser.add_argument("--prefix-transfer", choices=("sync", "layerwise_barrier", "layerwise"), default="sync")
+    parser.add_argument("--startup-timing", action="store_true")
+    parser.add_argument("--prefix-audit-only", action="store_true")
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--max-output-tokens", type=int, default=2048)
     parser.add_argument("--profile", action="store_true")
@@ -272,6 +334,12 @@ def main():
     parser.add_argument("--frozen-cpu-root", type=Path)
     parser.add_argument("--prefix-length", type=int)
     args = parser.parse_args()
+    if args.prefix_transfer != "sync":
+        args.startup_timing = True
+    if args.startup_timing and args.frozen_cpu_root:
+        parser.error("startup timing requires the current streamed CPU Target implementation")
+    if args.prefix_audit_only and args.prefix_transfer == "sync":
+        parser.error("prefix audit requires a layerwise transfer")
     if args.recovery_mode == "recheck" and args.replay_policy != "retained":
         parser.error("candidate recheck cannot use forced diagnostic tails")
     if args.idle_seconds < 0 or args.idle_timeout <= args.idle_seconds:
@@ -321,6 +389,7 @@ def main():
         "command": [sys.executable, *sys.argv], "purpose": "formal" if args.formal_timing else "diagnostic", "sampling": "greedy",
         "gpu_slots": None if args.auto_slots else args.gpu_slots, "kv_pages": args.kv_pages, "budget_gib": args.budget_gib, "depth": 3, "page_size": 1,
         "target": "independent_complete_cpu", "gpu_init": "full_gpu_prefill",
+        "prefix_barrier_stage": "before_cpu_verify" if args.prefix_transfer == "layerwise_barrier" else None,
         "measurement_scope": "fixed-window feasibility, not complete-request throughput",
         "coverage_criterion": COVERAGE_CRITERION,
         "coverage_protocol": "generation_overlap_v2",
@@ -339,6 +408,7 @@ def main():
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target.h", Path(__file__).resolve(),
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target_v2.h",
+            repo / "python/freetoken/kernel/csrc/pinned_tensor.cpp",
             repo / "python/freetoken/kernel/csrc/cpu_moe/ggml_v2_sources.json",
             repo / "benchmarks/frozen_cpu_runtime.py",
             repo / "benchmarks/bench_qwen_mtp.py",
@@ -391,6 +461,7 @@ def main():
                 instrument_components=args.instrument_components or args.profile,
                 preverify_top_k=args.preverify_top_k)
         window.experts.preverify_top_k = args.preverify_top_k
+        window.measure_prefill = args.startup_timing
         config["gpu_initialization_seconds"] = time.perf_counter() - initialization_start
         config["gpu_components"] = dict(replay_target_head=False, final_only_mtp_head=True,
                                         shared_private_workspace=True)
@@ -405,12 +476,19 @@ def main():
         write("config.json", config)
         if (not args.auto_slots and engine.moe_offload_cache.cache_size != args.gpu_slots) or engine.num_pages != args.kv_pages:
             raise RuntimeError("actual slots/pages differ from the feasibility contract")
+        transfer = None
+        receiver = None
+        if args.prefix_transfer != "sync":
+            from freetoken.engine.prefix_transfer import PrefixReceiver, PrefixTransfer
+            receiver = PrefixReceiver(text_config, args.max_input_tokens, device=engine.device)
+            transfer = PrefixTransfer(receiver, engine, chunk_size=args.prompt_chunk_size)
         for threads in args.threads:
             worker = create_cpu_worker(args.model, text_config, core_sets[threads],
                 frozen_root=args.frozen_cpu_root,
                 max_rows=max(33, max(args.loops) * 4 + 1), grouped=not args.ungrouped, backend=args.backend,
                 kernel_profile=args.kernel_profile, components=args.components,
                 bind_openmp=args.bind_openmp,
+                prefix_receiver=receiver,
                 max_context=args.max_input_tokens + args.max_output_tokens)
             worker.wait_ready()
             print(json.dumps(dict(event="worker_ready", threads=threads, **worker.metadata)), flush=True)
@@ -435,6 +513,13 @@ def main():
             print(json.dumps(dict(event="cpu_correctness", threads=threads, checks=audit["checks"])), flush=True)
             window.warm_widths(checkpoint.anchor)
             window.close_request()
+            if args.prefix_audit_only:
+                reports = audit_streamed_prefixes(window, worker, prompts, args.prompt_chunk_size,
+                                                  transfer, args.audit_tokens, out)
+                write("complete.json", dict(status="prefix_parity_validated", measured_windows=0,
+                    formal_eligible=False, all_prefixes_exact=all(r["exact"] for r in reports),
+                    prompt_chunk_size=args.prompt_chunk_size, samples=len(reports)))
+                return
             if args.profile and not profiling:
                 torch.cuda.profiler.start()
                 profiling = True
@@ -443,14 +528,15 @@ def main():
                 for sample, prompt in enumerate(prompts):
                     for loops in order:
                         ahead_loops = args.ahead_loops if args.ahead_loops is not None else loops
-                        checkpoint = initialize_cpu_window(window, worker, prompt, args.prompt_chunk_size)
-                        if sample not in prefixes:
-                            prefixes[sample] = checkpoint.clone()
-                            torch.save(asdict(checkpoint), out / f"gpu_prefix_sample{sample}.pt")
-                        elif checkpoint.anchor != prefixes[sample].anchor or any(
-                            not torch.equal(getattr(checkpoint, key), getattr(prefixes[sample], key))
-                            for key in ("keys", "values", "recurrent", "conv")):
-                            raise RuntimeError("GPU prefill initialization drifted across curve cells")
+                        if not args.startup_timing:
+                            checkpoint = initialize_cpu_window(window, worker, prompt, args.prompt_chunk_size)
+                            if sample not in prefixes:
+                                prefixes[sample] = checkpoint.clone()
+                                torch.save(asdict(checkpoint), out / f"gpu_prefix_sample{sample}.pt")
+                            elif checkpoint.anchor != prefixes[sample].anchor or any(
+                                not torch.equal(getattr(checkpoint, key), getattr(prefixes[sample], key))
+                                for key in ("keys", "values", "recurrent", "conv")):
+                                raise RuntimeError("GPU prefill initialization drifted across curve cells")
                         if args.idle_seconds:
                             quiet_start = time.monotonic()
                             idle_deadline = quiet_start + args.idle_timeout
@@ -488,9 +574,16 @@ def main():
                                 cpu_worker_thread_affinity={p.name: sorted(os.sched_getaffinity(int(p.name)))
                                     for p in (worker_proc / "task").iterdir()},
                                 cpu_worker_status=(worker_proc / "status").read_text(), **resources)) + "\n")
-                        # Warm the actual row widths without adding a second request graph.
+                        startup_monitor = (StartupResourceMonitor({os.getpid(), worker.metadata["pid"]}, resources)
+                                           if args.startup_timing else None)
+                        startup_started = time.perf_counter()
+                        if args.startup_timing:
+                            checkpoint = initialize_cpu_window(window, worker, prompt, args.prompt_chunk_size,
+                                                               transfer, args.prefix_transfer)
+                        a_started = time.perf_counter()
                         a, a_loops = window.generate_block(checkpoint.anchor, loops)
                         engine.stream.synchronize()
+                        a_seconds = time.perf_counter() - a_started
                         a_counters = window.experts.counters.cpu().tolist()
                         submitted = time.perf_counter()
                         worker.submit(VerifyJob(window.epoch, 0, a.start, a.anchor, a.candidates, 128))
@@ -506,6 +599,7 @@ def main():
                             result, timing = wait_for(worker, "result") if missed else ready
                         waiting = time.perf_counter() - wait_start if missed else 0.0
                         observed_pub = time.perf_counter() - submitted
+                        startup_observed = time.perf_counter() - startup_started
                         b_counters = window.experts.counters.cpu().tolist()
                         replay_block, tail_retained = replay_block_for_result(result, b, args.replay_policy)
                         restore_start = time.perf_counter()
@@ -521,6 +615,8 @@ def main():
                                 window.replay(replay_block)
                             engine.stream.synchronize()
                         restore_seconds = time.perf_counter() - restore_start
+                        if startup_monitor is not None:
+                            startup_monitor.close()
                         if not torch.equal(engine.linear_state_pool.recurrent_states[:, 1].cpu(),
                                            result.checkpoint.recurrent):
                             raise RuntimeError("CPU canonical GDN installation mismatch")
@@ -550,13 +646,34 @@ def main():
                                 interference=interference_after, **resources_after)) + "\n")
                         row = dict(threads=threads, sample_id=sample, repeat=repeat, loops=loops,
                             ahead_loops=ahead_loops,
-                            formal_eligible=args.formal_timing and not (interference["detected"] or interference_after["detected"]),
+                            formal_eligible=args.formal_timing and not (interference["detected"] or interference_after["detected"]
+                                or (startup_monitor is not None and (startup_monitor.error is not None
+                                    or any(s["interference"]["detected"] for s in startup_monitor.samples)))),
                             resource_interference=dict(before=interference, after=interference_after),
                             candidate_count=len(a.candidates), forward_rows=len(a.candidates) + 1,
                             cpu_publish_seconds=timing["publish_seconds"],
                             cpu_compute_seconds=timing["compute_seconds"],
                             cpu_publication_seconds=timing["publish_seconds"] - timing["compute_seconds"],
                             cpu_observed_response_seconds=observed_pub,
+                            cpu_response_to_publication_seconds=timing["published_at"] - submitted,
+                            prefix_transfer=args.prefix_transfer,
+                            prefix_barrier_stage=config["prefix_barrier_stage"],
+                            prefix_barrier_seconds=timing["verify_phases"].get("prefix_barrier_seconds", 0.0),
+                            startup_timing=args.startup_timing,
+                            startup_to_cpu_publication_seconds=(timing["published_at"] - startup_started
+                                                                if args.startup_timing else None),
+                            startup_to_result_observed_seconds=startup_observed if args.startup_timing else None,
+                            gpu_first_block_seconds=a_seconds,
+                            prefix_layer_imports=timing["prefix_layers"],
+                            cpu_forward_seconds=timing["verify_phases"]["forward_seconds"],
+                            cpu_commit_seconds=timing["verify_phases"]["commit_seconds"],
+                            running_resources=startup_monitor.samples if startup_monitor else [],
+                            resource_monitor_error=startup_monitor.error if startup_monitor else None,
+                            prefix_d2h=list(transfer.records) if transfer else [],
+                            prefix_pinned_bytes=transfer.pinned_bytes if transfer else 0,
+                            cpu_forward_commit_excluding_prefix_seconds=timing["compute_seconds"]
+                                - timing["verify_phases"].get("prefix_barrier_seconds", 0.0) - sum(
+                                p["wait_seconds"] + p["import_seconds"] for p in timing["prefix_layers"]),
                             gpu_generation_seconds=gpu_seconds, install_replay_seconds=restore_seconds,
                             gpu_prefill_seconds=window.prefill_seconds,
                             prefix_preparation_wall_seconds=window.prefill_wall_seconds,
@@ -632,12 +749,16 @@ def main():
         write("failure.json", dict(traceback=traceback.format_exc()))
         raise
     finally:
+        if "startup_monitor" in locals() and startup_monitor is not None:
+            startup_monitor.close()
         if profiling:
             torch.cuda.profiler.stop()
         if worker is not None:
             worker.close()
         if window is not None:
             window.close_request()
+        if "transfer" in locals() and transfer is not None:
+            transfer.close()
         if engine is not None:
             engine.shutdown()
         memory_monitor.close()

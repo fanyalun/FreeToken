@@ -69,6 +69,10 @@ class Qwen3_5DecoderLayer(BaseOP):
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        prefix = getattr(get_global_ctx().batch, "prefix_export", None)
+        if prefix is not None:
+            transfer, start, end, final = prefix
+            transfer.enqueue_layer(self._layer_id, start, end, final)
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
         hidden = self.mlp.forward(hidden)
         return hidden, residual

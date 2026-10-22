@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 from freetoken.moe.cpu_target import CpuTargetExperts, pack_target_bank
+from .prefix_transfer import prefix_shapes, prefix_range
 
 
 @dataclass
@@ -157,6 +159,14 @@ class QwenCpuTarget:
         self.linear_layers = [i for i, t in enumerate(self.layer_types) if t == "linear_attention"]
         self.attention_layers = [i for i, t in enumerate(self.layer_types) if t == "full_attention"]
         self.state = None
+        self.prefix_receiver = None
+        self.prefix_imported = set()
+        self.prefix_timings = []
+        self.prefix_held = False
+        self.prefix_barrier_pending = False
+        self.prefix_storage = {name: torch.empty(shape, dtype=dtype)
+                               for name, (shape, dtype) in prefix_shapes(config, max_context).items()}
+        self.keys, self.values = self.prefix_storage["keys"], self.prefix_storage["values"]
         self.epoch = None
         self.next_block = 0
         if self.native is not None:
@@ -305,12 +315,70 @@ class QwenCpuTarget:
         if any(t.device.type != "cpu" for t in tensors) or checkpoint.recurrent.dtype != torch.float32 or (
                 any(t.dtype != torch.bfloat16 for t in (checkpoint.keys, checkpoint.values, checkpoint.conv))):
             raise ValueError("CPU checkpoint requires BF16 KV/conv and FP32 recurrent state")
-        self.state = checkpoint.clone()
-        shape = (len(self.attention_layers), self.max_context, c["num_key_value_heads"], c["head_dim"])
-        self.keys, self.values = torch.empty(shape, dtype=torch.bfloat16), torch.empty(shape, dtype=torch.bfloat16)
+        self.release_prefix()
+        self.prefix_receiver = None
+        self.prefix_timings = []
+        self.state = PrefixCheckpoint(checkpoint.length, checkpoint.anchor,
+            self.keys[:, :checkpoint.length], self.values[:, :checkpoint.length],
+            self.prefix_storage["recurrent"], self.prefix_storage["conv"])
+        self.state.recurrent.copy_(checkpoint.recurrent)
+        self.state.conv.copy_(checkpoint.conv)
         self.keys[:, :checkpoint.length].copy_(checkpoint.keys)
         self.values[:, :checkpoint.length].copy_(checkpoint.values)
         self.epoch, self.next_block = request_epoch, 0
+
+    def release_prefix(self):
+        if self.prefix_held:
+            self.prefix_receiver.release(self.epoch)
+            self.prefix_held = False
+        self.prefix_barrier_pending = False
+
+    def initialize_streamed(self, ticket, receiver, *, wait_all=False):
+        if not 0 < ticket.length <= self.max_context or receiver.kinds != self.layer_types:
+            raise ValueError("streamed prefix geometry mismatch")
+        for name, tensor in receiver.tensors.items():
+            expected = self.prefix_storage[name]
+            if tensor.dtype != expected.dtype or (name not in ("keys", "values") and tensor.shape != expected.shape):
+                raise ValueError("streamed prefix tensor mismatch")
+            if name in ("keys", "values") and (tensor.shape[0] != expected.shape[0]
+                    or tensor.shape[2:] != expected.shape[2:] or tensor.shape[1] < ticket.length):
+                raise ValueError("streamed prefix KV mismatch")
+        self.release_prefix()
+        receiver.acquire(ticket)
+        self.prefix_receiver, self.prefix_held = receiver, True
+        self.prefix_barrier_pending = wait_all
+        self.prefix_imported, self.prefix_timings = set(), []
+        self.epoch, self.next_block = ticket.epoch, 0
+        self.state = PrefixCheckpoint(ticket.length, ticket.anchor,
+            self.keys[:, :ticket.length], self.values[:, :ticket.length],
+            self.prefix_storage["recurrent"], self.prefix_storage["conv"])
+
+    def ensure_prefix_layer(self, layer):
+        import time
+
+        receiver = self.prefix_receiver
+        if receiver is None:
+            return
+        receiver.check(self.epoch)
+        if layer in self.prefix_imported:
+            return
+        started = time.perf_counter()
+        with prefix_range(f"CPU prefix wait layer {layer}"):
+            receiver.wait(self.epoch, layer)
+        ready = time.perf_counter()
+        index = receiver.indices[layer]
+        names = ("keys", "values") if self.layer_types[layer] == "full_attention" else ("recurrent", "conv")
+        with prefix_range(f"CPU prefix import layer {layer}"):
+            for name in names:
+                source, target = receiver.tensors[name][index], self.prefix_storage[name][index]
+                if name in ("keys", "values"):
+                    source, target = source[:self.state.length], target[:self.state.length]
+                target.copy_(source)
+        self.prefix_imported.add(layer)
+        self.prefix_timings.append(dict(layer=layer, wait_seconds=ready - started,
+                                       import_seconds=time.perf_counter() - ready))
+        if len(self.prefix_imported) == len(self.layer_types):
+            self.release_prefix()
 
     def _weight(self, layer, suffix):
         return self.weights[f"layers.{layer}.{suffix}"]
@@ -319,6 +387,8 @@ class QwenCpuTarget:
         s = self.state
         if s is None:
             raise RuntimeError("CPU Target is uninitialized")
+        for layer in range(len(self.layer_types)):
+            self.ensure_prefix_layer(layer)
         return PrefixCheckpoint(s.length, s.anchor, self.keys[:, :s.length].clone(),
                                 self.values[:, :s.length].clone(), s.recurrent.clone(), s.conv.clone())
 
@@ -455,6 +525,8 @@ class QwenCpuTarget:
 
     @torch.inference_mode()
     def verify(self, job):
+        verify_started = time.perf_counter()
+        imports_before = len(self.prefix_timings)
         if self.state is None or job.request_epoch != self.epoch or job.block_id != self.next_block:
             raise ValueError("uninitialized, stale epoch or out-of-order CPU verify job")
         state = self.state
@@ -462,11 +534,19 @@ class QwenCpuTarget:
         if job.start != state.length or job.anchor != state.anchor or job.remaining < 1 or (
                 width > self.max_rows or state.length + width > self.max_context):
             raise ValueError("CPU verify job does not start at the canonical pending anchor")
+        barrier_seconds = 0.0
+        if self.prefix_barrier_pending:
+            barrier_started = time.perf_counter()
+            with prefix_range("CPU prefix wait all layers"):
+                self.prefix_receiver.wait_all(self.epoch)
+            barrier_seconds = time.perf_counter() - barrier_started
+            self.prefix_barrier_pending = False
         ids = torch.tensor((job.anchor, *job.candidates), dtype=torch.long)
         x = F.embedding(ids, self.weights["embed_tokens.weight"]).to(torch.bfloat16)
         replay, windows = [], []
         li = ai = 0
         for layer, kind in enumerate(self.layer_types):
+            self.ensure_prefix_layer(layer)
             norm = self._norm(x, self._weight(layer, "input_layernorm.weight"), self.config["rms_norm_eps"])
             if kind == "linear_attention":
                 mixed, items, win = self._gdn(layer, norm, state.recurrent[li], state.conv[li])
@@ -494,6 +574,7 @@ class QwenCpuTarget:
                 count, terminal = row + 1, True
                 tokens = tokens[:count]
                 break
+        commit_started = time.perf_counter()
         for layer in range(len(self.linear_layers)):
             rec = state.recurrent[layer]
             if self.native:
@@ -515,8 +596,14 @@ class QwenCpuTarget:
             self.keys[:, old:state.length].clone(), self.values[:, old:state.length].clone(),
             state.recurrent.clone(), state.conv.clone())
         self.next_block += 1
+        self.verify_timings = dict(
+            prefix_barrier_seconds=barrier_seconds,
+            forward_seconds=commit_started - verify_started - barrier_seconds - sum(
+                item["wait_seconds"] + item["import_seconds"] for item in self.prefix_timings[imports_before:]),
+            commit_seconds=time.perf_counter() - commit_started)
         return CpuVerifyResult(job.request_epoch, job.block_id, old, accepted, count, tuple(tokens),
                                terminal, delta, hidden[:count].clone(), predictions)
 
     def close(self):
+        self.release_prefix()
         self.experts.close()

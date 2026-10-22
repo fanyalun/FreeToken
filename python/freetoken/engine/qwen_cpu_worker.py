@@ -13,10 +13,11 @@ import traceback
 import torch
 
 from .qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, bitwise_equal
+from .prefix_transfer import PrefixAborted, PrefixTicket
 
 
 def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, backend,
-              kernel_profile="v1", components=None, bind_openmp=False):
+              kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None):
     target = None
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -48,8 +49,19 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
             if kind == "close":
                 break
             if kind == "cancel":
+                if hasattr(target, "release_prefix"):
+                    target.release_prefix()
                 target.state = None
                 pipe.send({"kind": "cancelled", "epoch": command["epoch"]})
+                continue
+            if kind == "initialize_streamed":
+                try:
+                    target.initialize_streamed(PrefixTicket(**command["ticket"]), prefix_receiver,
+                                               wait_all=command["wait_all"])
+                except PrefixAborted:
+                    pipe.send(dict(kind="initialize_aborted", epoch=command["ticket"]["epoch"]))
+                    continue
+                pipe.send({"kind": "initialized", "epoch": command["ticket"]["epoch"]})
                 continue
             if kind == "audit":
                 report = audit_cpu_blocks(target, command["tokens"], slots[0]["audit_logits"])
@@ -67,8 +79,17 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
                 raise ValueError("unknown CPU command")
             started = time.perf_counter()
             annotate = torch.cuda.nvtx.range if os.getenv("FREETOKEN_CPU_VERIFY_NVTX") == "1" else lambda _: nullcontext()
-            with annotate("CPU Target complete forward and accepted state commit"):
-                result = target.verify(VerifyJob(**command["job"]))
+            prefix_records_start = len(getattr(target, "prefix_timings", ()))
+            try:
+                with annotate("CPU Target complete forward and accepted state commit"):
+                    result = target.verify(VerifyJob(**command["job"]))
+                if prefix_receiver is not None and target.prefix_receiver is not None:
+                    prefix_receiver.check(result.request_epoch)
+            except PrefixAborted:
+                target.release_prefix()
+                target.state = None
+                pipe.send(dict(kind="aborted", slot=command["slot"], epoch=command["job"]["request_epoch"]))
+                continue
             verified_at = time.perf_counter()
             n = result.input_count
             with annotate("CPU accepted state publication to shared slot"):
@@ -86,6 +107,10 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
                 "terminal": result.terminal, "width": result.predictions.numel(),
                 "compute_seconds": verified_at - started,
                 "publish_seconds": time.perf_counter() - started,
+                "published_at": time.perf_counter(),
+                "prefix_layers": getattr(target, "prefix_timings", [])[prefix_records_start:],
+                "verify_phases": getattr(target, "verify_timings", dict(
+                    forward_seconds=verified_at - started, commit_seconds=None)),
                 "rss_kib": _rss_kib()})
     except (EOFError, BrokenPipeError):
         pass
@@ -161,7 +186,8 @@ def audit_cpu_blocks(target, tokens, first_logits=None):
 
 class CpuVerifierWorker:
     def __init__(self, model, config, core_ids, *, max_context=4096, max_rows=33, grouped=True, backend="optimized",
-                 kernel_profile="v1", components=None, bind_openmp=False):
+                 kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None):
+        self.prefix_receiver = prefix_receiver
         if backend not in ("legacy", "optimized") or (backend == "optimized" and not grouped):
             raise ValueError("optimized backend requires grouped experts; ungrouped is legacy-only")
         if not core_ids or max_context < 1 or max_rows < 1:
@@ -194,7 +220,7 @@ class CpuVerifierWorker:
         self.pipe, child = context.Pipe()
         self.process = context.Process(target=_cpu_main,
             args=(child, self.slots, str(model), list(core_ids), max_context, max_rows, grouped, backend,
-                  kernel_profile, components, bind_openmp), daemon=True)
+                  kernel_profile, components, bind_openmp, prefix_receiver), daemon=True)
         saved_environment = {key: os.environ.get(key) for key in ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND")}
         saved_affinity = os.sched_getaffinity(0) if bind_openmp else None
         try:
@@ -257,6 +283,11 @@ class CpuVerifierWorker:
             if event is not None and event.query():
                 self.readers[slot], self.owners[slot] = None, None
 
+    def require_drained(self):
+        self._reap_readers()
+        if not self.ready or self.inflight is not None or any(owner is not None for owner in self.owners):
+            raise RuntimeError("prefill requires a drained CPU worker and result slots")
+
     def initialize(self, checkpoint, request_epoch):
         self._reap_readers()
         if not self.ready or self.inflight is not None or any(owner is not None for owner in self.owners):
@@ -274,6 +305,17 @@ class CpuVerifierWorker:
                             anchor=checkpoint.anchor, epoch=request_epoch))
         self.inflight = "initialize"
 
+    def initialize_streamed(self, ticket, *, wait_all=False):
+        self._reap_readers()
+        if (self.prefix_receiver is None or not self.ready or self.inflight is not None
+                or any(owner is not None for owner in self.owners)):
+            raise RuntimeError("streamed initialize requires a ready, drained worker")
+        if ticket.epoch <= self.latest_epoch:
+            raise ValueError("request epochs must increase across reinitialization")
+        self.latest_epoch, self.epoch, self.initialized = ticket.epoch, ticket.epoch, False
+        self.pipe.send(dict(kind="initialize_streamed", ticket=asdict(ticket), wait_all=wait_all))
+        self.inflight = "initialize"
+
     def submit(self, job):
         if not self.ready or not self.initialized or self.inflight is not None or job.request_epoch != self.epoch:
             raise RuntimeError("CPU worker busy, uninitialized or stale epoch")
@@ -289,6 +331,17 @@ class CpuVerifierWorker:
         if message is None:
             return None
         kind = message["kind"]
+        if kind == "initialize_aborted":
+            if self.inflight == "cancel":
+                return None
+            self.inflight, self.initialized = None, False
+            raise PrefixAborted("CPU prefix initialization aborted")
+        if kind == "aborted":
+            self.owners[message["slot"]] = None
+            if self.inflight != "cancel":
+                self.inflight, self.initialized = None, False
+                raise PrefixAborted("CPU prefix verification aborted")
+            return None
         if kind == "initialized":
             if message["epoch"] != self.epoch:
                 return None
@@ -335,6 +388,8 @@ class CpuVerifierWorker:
     def cancel(self, request_epoch):
         if request_epoch != self.epoch:
             return
+        if self.prefix_receiver is not None:
+            self.prefix_receiver.abort()
         self.epoch = None
         self.initialized = False
         self.pipe.send(dict(kind="cancel", epoch=request_epoch))
@@ -350,6 +405,8 @@ class CpuVerifierWorker:
         if self.closed:
             return
         self.closed = True
+        if self.prefix_receiver is not None:
+            self.prefix_receiver.abort()
         for event in self.readers:
             if event is not None:
                 event.synchronize()
