@@ -351,8 +351,12 @@ class Engine:
                 raise ValueError("native MTP requires text-only, max_running_req=1 and triton attention")
             if config.model_config.model_type not in ("qwen3_5_moe", "qwen3_5_moe_text"):
                 raise ValueError("native MTP requires Qwen3.5/3.6 MoE")
-            if config.speculative_three_level and (config.moe_strategy not in ("offload", "hybrid") or config.moe_cpu_layers):
-                raise ValueError("three-level decoding requires offload/hybrid with GPU-offload banks in every layer")
+            if config.speculative_three_level and (config.moe_strategy not in ("offload", "hybrid", "fused") or config.moe_cpu_layers):
+                raise ValueError("three-level decoding requires resident or GPU-offload experts in every layer")
+            if config.speculative_three_level:
+                from freetoken.moe.preverify_policy import PreverifyPolicy
+                PreverifyPolicy.from_config(config, layers=config.model_config.num_moe_layers,
+                                             model_path=config.model_path)
             self._pool_cls = QwenMTPKVCache
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)

@@ -72,7 +72,7 @@ def benchmark_config(args, experiment):
         **{key: value for key, value in vars(args).items() if key != "moe_slots"}, **experiment,
         "requested_moe_slots": getattr(args, "moe_slots", None),
         "max_active_requests": 1, "target_dtype": "bfloat16", "draft_dtype": "bfloat16",
-        "depth": 3 if args.mode == "mtp" else 0,
+        "depth": 3 if args.mode in ("mtp", "three_level") else 0,
         "ignore_eos": True, "temperature": 0, "prompt_chunk_size": getattr(args, "prompt_chunk_size", None),
         "max_input_tokens": getattr(args, "max_input_tokens", 3840),
         "max_output_tokens": args.tokens,

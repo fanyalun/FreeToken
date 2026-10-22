@@ -199,6 +199,8 @@ def fused_experts_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    *,
+    skip_invalid_routes: bool = False,
 ) -> torch.Tensor:
     """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
@@ -206,6 +208,15 @@ def fused_experts_impl(
     not shared; the resident bf16 path routes decode through here too."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
+
+    from freetoken.core import get_active_batch
+    if getattr(get_active_batch(), "speculative_reference_math", False) and hidden_states.shape[0] > 1:
+        # Use identical one-row GEMM geometry for the resident arithmetic control only.
+        for row in range(hidden_states.shape[0]):
+            fused_experts_impl(hidden_states[row:row+1], w1, w2, topk_weights[row:row+1],
+                topk_ids[row:row+1], activation, apply_router_weight_on_input, act_alpha, act_limit,
+                skip_invalid_routes=skip_invalid_routes)
+        return hidden_states
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -256,7 +267,10 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+    align = moe_align_block_size
+    if skip_invalid_routes:
+        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
+    sorted_token_ids, expert_ids, num_tokens_post_padded = align(
         curr_topk_ids, config["BLOCK_SIZE_M"], E
     )
 
@@ -275,6 +289,9 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
     gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+    if skip_invalid_routes:
+        # Invalid routes have no GEMM writer and must contribute zero to the final reduction.
+        intermediate_cache3.zero_()
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,

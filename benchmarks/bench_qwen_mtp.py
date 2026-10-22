@@ -18,6 +18,7 @@ from freetoken.engine import Engine
 from freetoken.engine.qwen_mtp import QwenMTPRunner
 from freetoken.mm.config import MultimodalConfig
 from freetoken.scheduler.config import SchedulerConfig
+from freetoken.moe.preverify_policy import add_policy_arguments, policy_config
 
 
 class ProcessMemoryMonitor:
@@ -79,12 +80,22 @@ class PhaseAudit:
             setattr(self.runner, method, original)
 
 
+@torch.inference_mode()
+def reset_request_counters(controller, stream):
+    with torch.cuda.stream(stream):
+        controller.request_counters.zero_()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--data", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--mode", choices=("ar", "mtp"), required=True)
+    parser.add_argument("--mode", choices=("ar", "mtp", "three_level"), required=True)
+    parser.add_argument("--max-loops", type=int, default=6)
+    parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prefetch-layer-experts", type=int, default=4)
+    add_policy_arguments(parser)
     parser.add_argument("--backend", choices=("fused", "offload", "hybrid"), required=True)
     parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
     parser.add_argument("--hybrid-window-policy", choices=("balanced", "legacy"), default="balanced")
@@ -111,6 +122,8 @@ def main():
     config = benchmark_config(args, experiment)
     config["driver_sha256"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                for name in ("bench_qwen_mtp.py", "qwen_mtp_config.py")}
+    config["modes_calibration_sha256"] = (hashlib.sha256(Path(args.modes_calibration).read_bytes()).hexdigest()
+                                            if args.modes_calibration else None)
     if any(len(prompt) > args.max_input_tokens for prompt in prompts):
         raise ValueError("tokenized prompt exceeds --max-input-tokens")
     (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -133,12 +146,17 @@ def main():
             moe_cache_size=args.moe_slots or 0, kv_reserve_tokens=args.max_input_tokens + args.tokens, memory_ratio=0.9,
             num_page_override=args.max_input_tokens + args.tokens,
             max_seq_len_override=args.max_input_tokens + args.tokens, gpu_memory_budget_bytes=args.budget_gib << 30,
-            speculative_mtp_depth=3 if args.mode == "mtp" else 0,
-            cuda_graph_max_bs=0 if args.eager else (4 if args.mode == "mtp" else 1),
-            cuda_graph_bs=[] if args.eager else ([1, 2, 3, 4] if args.mode == "mtp" else [1]),
+            speculative_mtp_depth=3 if args.mode in ("mtp", "three_level") else 0,
+            speculative_three_level=args.mode == "three_level", speculative_max_loops=args.max_loops,
+            speculative_prefetch=args.prefetch, speculative_prefetch_layer_experts=args.prefetch_layer_experts,
+            speculative_expert_scheduler="gpu" if args.mode == "three_level" else "host",
+            speculative_execution_implementation="optimized" if args.mode == "three_level" else "reference",
+            cuda_graph_max_bs=0 if args.eager else (4 if args.mode in ("mtp", "three_level") else 1),
+            cuda_graph_bs=[] if args.eager else ([1, 2, 3, 4] if args.mode in ("mtp", "three_level") else [1]),
             cache_type="naive", max_extend_tokens=128,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
             **limits,
+            **policy_config(args),
         ))
     except BaseException as exc:
         monitor.close()
@@ -146,8 +164,15 @@ def main():
             "error_type": type(exc).__name__, "error": str(exc), "matrix_complete": False}) + "\n")
         raise
     config["initialization_seconds"] = time.perf_counter() - initialized
+    executor = getattr(engine, "cpu_moe_executor", None)
+    config["cpu_affinity"] = sorted(os.sched_getaffinity(0))
+    config["cpu_executor"] = (dict(threads=executor.num_threads, cores=executor.core_ids,
+                                    coordinator=executor._coord_core) if executor is not None else None)
     runner = engine.speculative_runner or QwenMTPRunner(engine, reference_ar=True)
     cache = engine.moe_offload_cache
+    controller = getattr(getattr(runner, "three_level", None), "experts", None)
+    if controller is not None and not hasattr(controller, "request_counters"):
+        controller = None
     def generate(prompt, *, max_tokens):
         chunk = args.prompt_chunk_size
         if chunk is None and not limits:
@@ -176,12 +201,18 @@ def main():
         config["resident_mtp_bytes"] = sum(t.numel() * t.element_size() for t in engine.mtp.state_dict().values()) if engine.mtp else 0
         config["ssm_dtype"] = str(engine.linear_state_pool.recurrent_states.dtype)
         config["conv_dtype"] = str(engine.linear_state_pool.conv_states.dtype)
+        if controller is not None and controller.hybrid_profile is not None:
+            profile_path = out / "effective_hybrid_profile.json"
+            profile_path.write_text(json.dumps(controller.hybrid_profile, indent=2) + "\n")
+            config["effective_hybrid_profile_sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
         (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         if cache is not None:
             cache.reset()
         torch.cuda.synchronize(engine.device)
         with (out / "requests.jsonl").open("w") as f:
             for index, prompt in enumerate(prompts):
+                if controller is not None:
+                    reset_request_counters(controller, engine.stream)
                 started = time.perf_counter()
                 result = generate(prompt, max_tokens=args.tokens)
                 torch.cuda.synchronize(engine.device)
@@ -190,6 +221,24 @@ def main():
                     raise ValueError("incomplete returned-token request")
                 row = {"sample_id": index, **dataclasses.asdict(result), "complete_wall_seconds": wall,
                        "tpot_seconds": (wall - result.ttft_seconds) / (args.tokens - 1) if args.tokens > 1 else None}
+                if controller is not None:
+                    from freetoken.moe.speculative_gpu import STAT_NAMES
+                    stats = dict(zip(STAT_NAMES, controller.request_counters.cpu().tolist()))
+                    native = stats["preverify_native_routes"]
+                    stats["actual_skip_fraction"] = 1-stats["preverify_retained_routes"]/native if native else None
+                    stats["threshold_skip_fraction"] = 1-stats["preverify_threshold_retained_routes"]/native if native else None
+                    stats["logical_expert_bytes"] = sum(bank[0].numel()*bank.element_size() for _, bank in cache.banks)
+                    stats["logical_total_loads"] = stats["demand_loads"] + stats["prefetch_loads"]
+                    stats["logical_total_bytes"] = stats["logical_total_loads"] * stats["logical_expert_bytes"]
+                    intersection = stats["target_predicted_expert_intersection"]
+                    predicted = stats["preverify_predicted_unique_experts"]
+                    stats["predicted_expert_union_precision"] = intersection/predicted if predicted else None
+                    actual = stats["target_unique_experts"]
+                    stats["predicted_expert_union_recall"] = intersection/actual if actual else None
+                    if stats["preverify_threshold_retained_routes"] + stats["preverify_extra_hit_routes"] != stats["preverify_retained_routes"]:
+                        raise RuntimeError("Pre-Verify retained route counters do not reconcile")
+                    stats["scope"] = "all Pre-Verify and final Target windows; excludes prompt prefill"
+                    row["expert_stats"] = stats
                 f.write(json.dumps(row) + "\n")
                 f.flush()
                 rows.append(row)

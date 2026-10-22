@@ -59,14 +59,36 @@ subsequent results are rejected and the executor must be rebuilt.
 
 `speculative_hybrid_profile=None` calibrates once and caches the result under
 `~/.cache/freetoken/speculative_hybrid/`. `FREETOKEN_HYBRID_PROFILE_CACHE` overrides
-that directory. An explicit profile filename must exist and match the runtime;
-a mismatch is an error. The identity includes geometry, BF16 dtype, legal widths,
-GPU UUID, CPU model/ISA, worker and coordinator affinity, NUMA nodes, PyTorch/CUDA,
-extension and relevant kernel source hashes, activation parameters and slot count.
-Profile version 3 also identifies eager/reference/full execution, the GPU grouped
-kernel switch, CPU backend, Triton version and cache layout. Stale automatic
-profiles are recalibrated; explicit mismatches fail. An automatic capacity probe
-uses its own geometry's automatic profile. Explicit profiles are checked only
+that directory. Baseline SD Hybrid uses the same reuse rules under
+`~/.cache/freetoken/baseline_hybrid/`, overridden by
+`FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE`.
+
+Compatibility includes expert geometry/dtype, GPU UUID and PCIe topology, CPU
+model/ISA, worker/coordinator affinity, NUMA nodes, PyTorch/CUDA, native and kernel
+source hashes, activation parameters/backend, eager/reference/full execution,
+the GPU grouped switch, CPU backend, Triton and per-expert cache layout/strides.
+The total slot count and leading cache-bank dimension are recorded as provenance
+and coverage, not compatibility constraints. Changing only the memory budget,
+slot count, inputs, repeats or prefetch settings does not invalidate measurements
+when these execution conditions remain unchanged.
+
+Cache lookup searches compatible JSON profiles, including files with older
+identity-based filenames. A wider profile can serve a narrower legal width set;
+tables are reshaped to the requested route stride without overwriting the wider
+cached table. Only missing widths and IO fetch counts are measured on extension.
+Coverage records physically measured fetch limits, so zero-filled or extrapolated
+IO entries in older profiles are not treated as measurements. Increasing slots
+beyond a previously measured limit also refreshes affected width-dependent
+concurrency costs. New files are written atomically under a compatibility key,
+with a per-key lock preventing concurrent extensions from losing coverage.
+
+An explicit profile must exist and be execution-compatible. Compatible files
+can seed incremental calibration; the explicit source stays unchanged and the
+extended result is saved in the automatic cache. Incompatible explicit profiles
+fail; incompatible automatic candidates are ignored. Reuse metadata records the
+source path, SHA-256, source identity and newly calibrated widths. Source hash or
+backend changes still require new compatible measurements; an older file is not
+accepted merely because its hardware matches. Explicit profiles are checked only
 after the final cache geometry has passed the peak check.
 
 Calibration uses real expert banks, production weight copies, GPU expert kernels,

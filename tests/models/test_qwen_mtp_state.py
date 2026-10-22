@@ -10,6 +10,26 @@ from freetoken.kernel.causal_conv1d import causal_conv1d_decode
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_reference_gated_norm_is_exact_across_window_widths(monkeypatch):
+    from freetoken.kernel.fla.layernorm_gated import rms_norm_gated
+
+    monkeypatch.setattr("freetoken.core.get_active_batch",
+                        lambda: SimpleNamespace(speculative_reference_math=True))
+    monkeypatch.setattr("freetoken.kernel.fla.layernorm_gated._get_sm_count", lambda _: 108)
+    torch.manual_seed(0)
+    x = torch.randn(59 * 32, 128, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn_like(x)
+    weight = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+
+    def norm(a, b):
+        return rms_norm_gated(x=a, z=b, weight=weight, bias=None, is_rms_norm=True)
+
+    outer = norm(x, z)
+    inner = torch.cat([norm(a, b) for a, b in zip(x.split(128), z.split(128))])
+    torch.testing.assert_close(outer, inner, rtol=0, atol=0)
+
+
 def test_runner_import_does_not_initialize_cuda():
     subprocess.run(
         [sys.executable, "-c", "import torch; from freetoken.engine.qwen_mtp import QwenMTPRunner; assert not torch.cuda.is_initialized()"],

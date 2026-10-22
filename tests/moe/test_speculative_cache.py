@@ -126,6 +126,58 @@ def toy_layer(li):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph", [False, True])
+def test_modes_ready_hits_and_weighted_identity_before_gemm(graph):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+    from freetoken.moe.preverify_policy import PreverifyPolicy
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(device, layers=1, slots=16)
+        cache.slot_for_id[0, 6] = 0
+        cache.id_of_slot[0] = 6
+        cache.banks[0][1][0] = 6
+        cache.slot_for_id[0, 7] = 1
+        cache.id_of_slot[1] = 7
+        cache.banks[0][1][1] = 7
+        policy = PreverifyPolicy("modes", replacement="identity", importance=(1.,), tau=.125)
+        control = GPUExpertCache(cache, stream, max_loops=1, max_rows=1, prefetch=False,
+                                 preverify_policy=policy, compact_control=True, implementation="optimized")
+        weights = torch.tensor([[.25, .25, .125, .125, .0625, .0625, .0625, .0625]], device=device)
+        ids = torch.arange(8, dtype=torch.int32, device=device)[None]
+        hidden = torch.full((1, 1), 2., device=device)
+        def gemm(cache, hidden, weights, slots, **kwargs):
+            out = (kwargs["views"][0][slots.long(), 0] * weights).sum(-1, keepdim=True)
+            hidden.zero_()
+            return out
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        control.begin(0)
+        control.pending[1] = 1
+        control.set_phase("preverify", 0)
+        output = control.route(layer, hidden, weights, ids)
+        expected = .25 + 2 * .125 + 3 * .125 + 6 * .0625 + 2 * .1875
+        torch.testing.assert_close(output, torch.full_like(output, expected), rtol=0, atol=0)
+        assert int(control.error) == 0
+        if graph:
+            hidden.fill_(2.)
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture, stream=stream):
+                hidden.fill_(2.)
+                output = control.route(layer, hidden, weights, ids)
+            capture.replay()
+            torch.testing.assert_close(output, torch.full_like(output, expected), rtol=0, atol=0)
+        control.pending[1] = 0
+        control.set_phase("verify")
+        output = control.route(layer, hidden, weights, ids)
+        torch.testing.assert_close(output, torch.full_like(output, 2.25), rtol=0, atol=0)
+        assert control.counters[26:28].tolist() == [8, 8]
+        assert int(control.counters[24] + control.counters[25]) == int(control.counters[3])
+        control.close()
+    stream.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("slots,quotas", [(8, [0, 2, 0]), (9, [0, 2, 1]), (32, [0, 2, 2])])
 def test_verify_prefetch_preserves_demand_weights_and_joins_before_use(graph_mode, slots, quotas):

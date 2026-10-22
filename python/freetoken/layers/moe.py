@@ -143,6 +143,9 @@ class MoELayer(BaseOP):
             topk=self.top_k,
             renormalize=self.renormalize,
         )
+        controller = getattr(self, "preverify_controller", None)
+        if controller is not None and controller.active and controller.phase in ("preverify", "verify"):
+            return self._maybe_all_reduce(controller.route(self, hidden_states, topk_weights, topk_ids))
         return self._maybe_all_reduce(self._resident_gemm(hidden_states, topk_weights, topk_ids))
 
 

@@ -18,6 +18,8 @@ STAT_NAMES = (
     "hybrid_cpu_routes", "hybrid_cpu_unique_experts", "hybrid_gpu_routes",
     "hybrid_preverify_cpu_routes", "hybrid_verify_cpu_routes",
     "hybrid_preverify_cpu_unique_experts", "hybrid_verify_cpu_unique_experts",
+    "preverify_threshold_retained_routes", "preverify_extra_hit_routes",
+    "target_predicted_expert_intersection", "preverify_predicted_unique_experts",
 )
 
 
@@ -29,7 +31,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           N: tl.constexpr, E: tl.constexpr, error, CHECK_PENDING: tl.constexpr,
           weight_history, keep_history, KEEP_HITS: tl.constexpr, RENORMALIZE: tl.constexpr,
           COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None,
-          verify_prefetched=None):
+          verify_prefetched=None, POLICY: tl.constexpr = False, RETAIN_TOPK: tl.constexpr = 4,
+          importance=None, TAU: tl.constexpr = 0.0):
     k = tl.arange(0, N)
     rows = ROWS if valid_rows is None else tl.load(valid_rows)
     valid = k < rows * TOPK
@@ -39,7 +42,7 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
     owner = LAYER * EXPERTS + e
     slot = tl.load(mapping + owner, valid, -1)
     ready = valid & (slot >= 0) & (tl.load(pending + tl.maximum(slot, 0), valid, 0) == 0)
-    if CHECK_PENDING:
+    if CHECK_PENDING and not POLICY:
         if tl.sum((valid & (slot >= 0) & ~ready).to(tl.int32), 0) > 0:
             tl.store(error, 3)
     experts = tl.arange(0, E)
@@ -57,7 +60,13 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         same_row = k[:, None] // TOPK == k[None, :] // TOPK
         better = (w[None, :] > w[:, None]) | ((w[None, :] == w[:, None]) & (k[None, :] < k[:, None]))
         rank = tl.sum((same_row & better & valid[None, :]).to(tl.int32), 1)
-        keep = valid & ((ready & KEEP_HITS) | (rank < 4))
+        if POLICY:
+            threshold_keep = valid & (w.to(tl.float32) * tl.load(importance + LAYER) >= TAU)
+        else:
+            threshold_keep = valid & (rank < RETAIN_TOPK)
+        keep = valid & ((ready & KEEP_HITS) | threshold_keep)
+        tl.atomic_add(stats + 24, tl.sum(threshold_keep.to(tl.int32), 0))
+        tl.atomic_add(stats + 25, tl.sum((keep & ~threshold_keep).to(tl.int32), 0))
         if COLLECT_SIGNALS:
             tl.store(weight_history + base + k, w, k < INNER_ROWS * TOPK)
             tl.store(keep_history + base + k, keep, k < INNER_ROWS * TOPK)
@@ -65,9 +74,13 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
             mass = tl.sum(tl.where(same_row & keep[None, :], w[None, :], 0), 1)
             w = w / tl.where(mass > 0, mass, 1)
     else:
+        predicted_active = tl.load(refs + LAYER * EXPERTS + experts, experts < EXPERTS, 0) > 0
         tl.store(refs + LAYER * EXPERTS + experts, 0, experts < EXPERTS)
         tl.store(final_history + LAYER * MAX_ROWS * TOPK + k, e, valid)
         keep = valid
+    if CHECK_PENDING and POLICY:
+        if tl.sum((keep & (slot >= 0) & ~ready).to(tl.int32), 0) > 0:
+            tl.store(error, 3)
     count = tl.histogram(e, E, mask=keep)
     tl.store(demand + experts, count, experts < EXPERTS)
     # A 256-expert reduction avoids a wide final-window query-by-query matrix.
@@ -82,6 +95,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         tl.atomic_add(stats + 2, rows * TOPK)
         tl.atomic_add(stats + 3, tl.sum(keep.to(tl.int32), 0))
     else:
+        tl.atomic_add(stats + 26, tl.sum((actual & predicted_active).to(tl.int32), 0))
+        tl.atomic_add(stats + 27, tl.sum(predicted_active.to(tl.int32), 0))
         initial_hit = tl.load(initial + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
         was_prefetched = tl.load(prefetched + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
         local_slot = tl.load(mapping + LAYER * EXPERTS + experts, experts < EXPERTS, -1)
@@ -447,7 +462,15 @@ class GPUExpertCache:
                  implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
                  inner_rows=4, layer_quotas=None, demand_fence=False,
                  verify_layer_quota=0, verify_layer_quotas=None,
-                 hybrid_phases=(), hybrid_max_fetch=-1):
+                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_policy=None):
+        from .preverify_policy import PreverifyPolicy
+        self.preverify_policy = preverify_policy or PreverifyPolicy()
+        if self.preverify_policy.replacement == "identity" and renormalize:
+            raise ValueError("identity replacement requires original expert weights")
+        if self.preverify_policy.kind == "modes" and len(self.preverify_policy.importance) != cache.num_layers:
+            raise ValueError("MoDES layer coverage mismatch")
+        self.importance = torch.tensor(self.preverify_policy.importance or (1.0,) * cache.num_layers,
+                                       dtype=torch.float32, device=cache.device)
         if cache.device.type != "cuda" or cache.decode_target not in ("gpu", "hybrid") or cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
             raise ValueError("GPU speculative scheduling requires pinned BF16 GPU-offload experts")
         if min(max_loops, max_rows, top_k) < 1 or min(layer_quota, gap_capacity) < 0:
@@ -502,6 +525,7 @@ class GPUExpertCache:
         self.used_device = torch.zeros_like(self.initial)
         self.cursor = torch.zeros(1, dtype=torch.int32, device=cache.device)
         self.error = torch.zeros_like(self.cursor)
+        self.request_counters = torch.zeros(len(STAT_NAMES), dtype=torch.int64, device=cache.device)
         self.protected = torch.zeros(cache.num_layers, dtype=torch.int32, device=cache.device)
         self.control_device = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, device=cache.device)
         self.control_host = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, pin_memory=True)
@@ -682,7 +706,14 @@ class GPUExpertCache:
             triton.next_power_of_2(max(self.inner_rows * ids.shape[1], ids.numel())), triton.next_power_of_2(c.num_experts),
             self.error, self.cross_layer_prefetch, self.weight_history, self.keep_history,
             self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows,
-            self.verify_prefetched if self.phase == "verify" else None)
+            self.verify_prefetched if self.phase == "verify" else None,
+            self.preverify_policy.kind == "modes", self.preverify_policy.top_k,
+            self.importance, self.preverify_policy.tau)
+        identity = None
+        if self.phase == "preverify" and self.preverify_policy.replacement == "identity":
+            # Snapshot the contribution before Hybrid rewrites selected weights or GEMM overwrites hidden.
+            mass = (weights.float() - selected.float()).sum(-1, keepdim=True)
+            identity = hidden.float() * mass
         prior_prefetch = self.layer_quota if self.layer_quotas is None else any(self.layer_quotas[:li])
         if li > 0 and prior_prefetch:
             self.wait_demand()
@@ -763,7 +794,8 @@ class GPUExpertCache:
                 self.retire_layers()
             elif not self.cross_layer_prefetch:
                 self.stream.wait_stream(self.copy_stream)
-        return result
+        from .preverify_policy import merge_identity
+        return merge_identity(result, identity)
 
     def decide(self, loop, consumed):
         c = self.cache
@@ -868,6 +900,7 @@ class GPUExpertCache:
             self.join_gap()
             self.retire_layers()
         self.retire_verify()
+        self.request_counters.add_(self.counters)
         if self.compact_control and not self.audit:
             if abort:
                 self.stream.synchronize()

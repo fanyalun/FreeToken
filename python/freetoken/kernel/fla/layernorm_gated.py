@@ -191,6 +191,10 @@ def _layer_norm_fwd(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
     rows_per_block = calc_rows_per_block(M, x.device)
+    from freetoken.core import get_active_batch
+    # Calibration must use the same reduction layout for small and large windows.
+    if getattr(get_active_batch(), "speculative_reference_math", False):
+        rows_per_block = 1
     # Update grid to use rows_per_block
     grid = (triton.cdiv(M, rows_per_block), ngroups)
     with _device_context(x.device):

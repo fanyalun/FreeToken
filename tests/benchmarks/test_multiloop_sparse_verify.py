@@ -9,6 +9,45 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+
+@pytest.mark.parametrize("candidates,predictions,accepted", [
+    ([2, 3], [2, 3, 4], 2), ([2, 3], [2, 9, 4], 1),
+    ([2, 3], [8, 3, 4], 0), ([], [4], 0),
+])
+def test_modes_window_acceptance_distinguishes_anchor_and_bonus(candidates, predictions, accepted):
+    from bench_modes_window_comparison import acceptance
+    result = acceptance(candidates, predictions)
+    assert result["submitted_candidates"] == len(candidates)
+    assert result["submitted_rows"] == len(candidates) + 1
+    assert result["accepted_tokens"] == result["accepted_length"] == accepted
+    assert result["returned_length"] == accepted + 1
+
+
+def test_modes_window_summary_requires_complete_stable_paired_windows():
+    from bench_modes_window_comparison import CASES, summarize
+    rows = [dict(sample=sample, policy=policy, loops=loops, repeat=repeat, actual_loops=loops,
+        candidates_sha256=str(sample), predictions_sha256=str(sample),
+        small_window_seconds=.01 * loops, big_verify_seconds=.02,
+        submitted_candidates=10, submitted_rows=11, accepted_tokens=7, returned_length=8,
+        native_routes=320, retained_routes=160)
+        for sample in range(2) for policy, loops in CASES for repeat in range(2)]
+    result = summarize(rows, 2, 2)
+    assert len(result) == 8
+    for row in result:
+        assert row["mean_small_loop_wall_ms"] == pytest.approx(10)
+        assert row["total_submitted_candidates"] == 20
+        assert row["total_accepted_tokens"] == 14
+        assert row["actual_skip_fraction"] == .5
+    with pytest.raises(ValueError, match="coverage"):
+        summarize(rows[:-1], 2, 2)
+    rows[0]["actual_loops"] -= 1
+    with pytest.raises(ValueError, match="requested loops"):
+        summarize(rows, 2, 2)
+    rows[0]["actual_loops"] += 1
+    rows[0]["predictions_sha256"] = "drift"
+    with pytest.raises(ValueError, match="drift"):
+        summarize(rows, 2, 2)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 from bench_multiloop_sparse_verify import loop_candidates, widen_state
 from analyze_multiloop_sparse_verify import capacity_replay, next_transfer, retained_predictions

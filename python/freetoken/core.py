@@ -130,6 +130,7 @@ class Batch:
     gdn_verify_state: object | None = field(default=None, init=False)
     # Legacy name for Hybrid multi-token MoE windows; dense projections stay batched.
     rowwise_linear: bool = field(default=False, init=False)
+    speculative_reference_math: bool = field(default=False, init=False)
     speculative_valid_rows: torch.Tensor | None = field(default=None, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.

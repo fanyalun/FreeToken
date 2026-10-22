@@ -167,7 +167,9 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
+        # Fixed absolute KV tiles isolate calibration from prefix/extend split rounding.
+        reference_math = getattr(batch, "speculative_reference_math", False)
+        if not reference_math and metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
@@ -189,7 +191,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
             )
         if (
-            (not metadata.is_decode)
+            not reference_math
+            and (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
         ):

@@ -60,9 +60,20 @@ class ThreeLevelCoordinator:
         self.runner, self.engine = runner, runner.engine
         engine = self.engine
         cache = engine.moe_offload_cache
-        if cache is None or engine.mtp is None or runner.reference_ar:
+        resident = getattr(engine.config, "moe_strategy", "offload") == "fused"
+        if (cache is None and not resident) or engine.mtp is None or runner.reference_ar:
             raise ValueError("three-level decoding requires native MTP and an offload expert cache")
         mc = engine.config.model_config
+        from freetoken.moe.preverify_policy import PreverifyPolicy
+        policy = PreverifyPolicy.from_config(engine.config, layers=mc.num_moe_layers,
+                                             model_path=getattr(engine.config, "model_path", ""))
+        if resident:
+            if (runner.use_graph or engine.config.speculative_graph_implementation != "reference"
+                    or engine.config.speculative_prefetch):
+                raise ValueError("resident three-level experiments require eager execution without prefetch")
+            from freetoken.moe.speculative_resident import ResidentExpertController
+            cache = SimpleNamespace(cache_size=mc.num_moe_layers * mc.num_experts,
+                                    num_experts=mc.num_experts)
         hybrid = getattr(engine.config, "moe_strategy", "offload") == "hybrid" and engine.config.speculative_expert_scheduler == "gpu"
         hybrid_phases = tuple(engine.config.speculative_hybrid_phases) if hybrid else ()
         self.draft_width = runner.draft_width
@@ -72,7 +83,7 @@ class ThreeLevelCoordinator:
                                                engine.config.speculative_max_output_tokens,
                                                engine.config.speculative_max_output_tokens),
                                            engine.config.speculative_max_loops, engine.config.speculative_mtp_depth,
-                                           cpu_fallback="preverify" in hybrid_phases)
+                                           cpu_fallback=resident or "preverify" in hybrid_phases)
         self.inner_width, self.outer_width = self.budget.reachable_widths(engine.config.speculative_mtp_depth)
         if coarse and max(self.draft_width, self.budget.submit_rows) > engine.max_seq_len:
             raise ValueError("speculative graph width exceeds context capacity")
@@ -92,7 +103,13 @@ class ThreeLevelCoordinator:
                          top_k=mc.num_experts_per_tok,
                          compact_control=getattr(engine.config, "speculative_compact_control", True),
                          implementation=getattr(engine.config, "speculative_execution_implementation", "reference"))
-        self.experts = cache_type(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
+            extra["preverify_policy"] = policy
+        if resident:
+            self.experts = ResidentExpertController(engine, policy, audit=engine.config.speculative_audit)
+        else:
+            if cache_type is SpeculativeExpertCache and policy != PreverifyPolicy():
+                raise ValueError("custom Pre-Verify policy requires GPU expert scheduling")
+            self.experts = cache_type(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
                                                use_graph=runner.use_graph, audit=engine.config.speculative_audit,
                                                layer_quota=engine.config.speculative_prefetch_layer_experts,
                                                gap_capacity=engine.config.speculative_prefetch_gap_capacity, **extra)
@@ -167,7 +184,8 @@ class ThreeLevelCoordinator:
                 engine.stream.synchronize()
                 engine.linear_state_pool.recurrent_states.zero_()
                 engine.linear_state_pool.conv_states.zero_()
-                engine.moe_offload_cache.reset()
+                if engine.moe_offload_cache is not None:
+                    engine.moe_offload_cache.reset()
                 engine.stream.synchronize()
                 runner._reserved_len = 0
                 runner.next_draft = runner.last_draft_hidden = None

@@ -8,6 +8,162 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_request_counter_reset_handles_inference_tensor_on_runner_stream(monkeypatch):
+    from contextlib import contextmanager
+    import torch
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from bench_qwen_mtp import reset_request_counters
+
+    with torch.inference_mode():
+        counters = torch.full((3,), 7, dtype=torch.int64)
+    assert counters.is_inference()
+    with pytest.raises(RuntimeError, match="outside InferenceMode"):
+        counters.zero_()
+    with torch.inference_mode():
+        counters.fill_(7)
+    stream = object()
+    entered = []
+
+    @contextmanager
+    def runner_stream(actual):
+        assert actual is stream
+        assert torch.is_inference_mode_enabled()
+        entered.append(actual)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", runner_stream)
+    reset_request_counters(SimpleNamespace(request_counters=counters), stream)
+    assert counters.tolist() == [0, 0, 0]
+    assert entered == [stream]
+    assert not torch.is_inference_mode_enabled()
+
+
+@pytest.mark.parametrize("incomplete", [None, "pilot", "calibration", "development", "asset"])
+def test_modes_continuation_requires_completed_calibration(tmp_path, monkeypatch, incomplete):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from run_modes_adaptation import validate_calibration_inputs
+
+    asset = tmp_path / "asset.json"
+    asset.write_text(json.dumps(dict(status="incomplete" if incomplete == "asset" else "validated")))
+    for name, key, count in (("pilot", "measured_rows", 240), ("calibration", "samples", 64),
+                              ("development", "samples", 16)):
+        folder = tmp_path / name
+        folder.mkdir()
+        data = dict(status="incomplete" if incomplete == name else "complete", **{key: count})
+        if name == "calibration":
+            data["assets"] = {"0.25": str(asset), "0.5": str(asset)}
+        (folder / "result.json").write_text(json.dumps(data))
+    if incomplete is None:
+        validate_calibration_inputs(tmp_path)
+    else:
+        with pytest.raises(ValueError, match="performance continuation requires"):
+            validate_calibration_inputs(tmp_path)
+
+
+@pytest.fixture
+def modes_archive(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    archive = importlib.import_module("modes_result_archive")
+    runner = importlib.import_module("run_modes_adaptation")
+    root = tmp_path / "archive"
+    run = root / "speculative/modes_text_preverify_test/formal"
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    run.mkdir(parents=True)
+    (run / "gsm8k_train.jsonl").write_text('{}\n')
+    archive.write(run / "selection.json", dict(model=str(model),
+        model_config_sha256=archive.digest(model / "config.json"),
+        train_sha256=archive.digest(run / "gsm8k_train.jsonl"),
+        created_utc="2026-10-22T00:00:00+00:00", ids={"development": [1]}))
+    archive.write(run / "input_validation.json", dict(status="validated"))
+    archive.write(run / "runtime/source_manifest.json", {})
+    archive.write(run / "complete.json", dict(status="incomplete", stage="prepared"))
+    archive.write(root / "catalog.json", dict(updated_at="original",
+        runs=[dict(id="unrelated", validity="valid")],
+        artifacts=[dict(id="unrelated_artifact", run_id="unrelated")]))
+    monkeypatch.setattr(archive, "ROOT", root)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr("sys.argv", ["run_modes_adaptation.py", "--run", str(run),
+        "--model", str(model), "--prepare-only"])
+
+    def seed(validity):
+        catalog = archive.read(root / "catalog.json")
+        catalog["runs"].append(dict(id="modes_text_preverify_test_formal", validity=validity,
+            path=str(run.relative_to(root)), independent_audit="preserve this decision"))
+        archive.write(root / "catalog.json", catalog)
+        archive.write(run / ".archive/validation.json", dict(status="validated", validity=validity,
+            run_id="modes_text_preverify_test_formal", independent_audit="preserve this receipt"))
+
+    return SimpleNamespace(archive=archive, runner=runner, root=root, run=run, seed=seed)
+
+
+@pytest.mark.parametrize("validity", ["valid", "failed", "invalid", "incomplete", "unknown"])
+def test_modes_prepare_only_preserves_registered_validation(modes_archive, validity):
+    state = modes_archive
+    state.seed(validity)
+    if validity == "valid":
+        state.archive.write(state.run / "complete.json", dict(status="complete"))
+    paths = [state.root / "catalog.json", state.run / ".archive/validation.json",
+             state.run / "complete.json"]
+    before = {path: path.read_bytes() for path in paths}
+    for _ in range(2):
+        state.runner.main()
+        assert {path: path.read_bytes() for path in paths} == before
+
+
+@pytest.mark.parametrize("completion", ["incomplete", "complete"])
+def test_modes_prepare_only_registers_new_runs_without_assuming_validity(modes_archive, completion):
+    state = modes_archive
+    state.archive.write(state.run / "complete.json", dict(status=completion))
+    state.runner.main()
+    catalog = state.archive.read(state.root / "catalog.json")
+    registered = [row for row in catalog["runs"] if row["id"] == "modes_text_preverify_test_formal"]
+    assert len(registered) == 1
+    assert registered[0]["validity"] == "incomplete"
+    assert len(catalog["runs"]) == 2 and len(catalog["artifacts"]) == 4
+    assert state.archive.read(state.run / ".archive/validation.json")["validity"] == "incomplete"
+    assert state.archive.read(state.run / "complete.json")["status"] == completion
+    paths = [state.root / "catalog.json", state.run / ".archive/validation.json"]
+    before = {path: path.read_bytes() for path in paths}
+    state.runner.main()
+    assert {path: path.read_bytes() for path in paths} == before
+
+
+@pytest.mark.parametrize("validity", ["valid", "failed"])
+def test_modes_explicit_registration_updates_validation(modes_archive, validity):
+    state = modes_archive
+    state.seed("failed" if validity == "valid" else "valid")
+    state.archive.register(state.run, validity=validity)
+    catalog = state.archive.read(state.root / "catalog.json")
+    registered = [row for row in catalog["runs"] if row["id"] == "modes_text_preverify_test_formal"]
+    assert len(registered) == 1
+    assert registered[0]["validity"] == validity
+    assert len(catalog["runs"]) == 2 and len(catalog["artifacts"]) == 4
+    assert state.archive.read(state.run / ".archive/validation.json")["validity"] == validity
+
+
+def test_modes_environment_preserves_cpu_affinity_after_torch_import(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from run_modes_adaptation import environment
+
+    monkeypatch.setenv("OMP_PROC_BIND", "close")
+    monkeypatch.setenv("OMP_PLACES", "cores")
+    monkeypatch.setenv("GOMP_CPU_AFFINITY", "0")
+    env = environment(tmp_path / "runtime", 0)
+    assert env["OMP_PROC_BIND"] == "false"
+    assert "OMP_PLACES" not in env and "GOMP_CPU_AFFINITY" not in env
+    cores = sorted(os.sched_getaffinity(0))[:2]
+    output = subprocess.check_output(["taskset", "--cpu-list", ",".join(map(str, cores)),
+        sys.executable, "-c", "import os, torch, json; print(json.dumps(sorted(os.sched_getaffinity(0))))"],
+        env=env, text=True)
+    assert json.loads(output) == cores
+
+
 def test_graph_audit_semantics_ignore_global_epoch_and_wall_time(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from bench_speculative_graph import semantic_requests

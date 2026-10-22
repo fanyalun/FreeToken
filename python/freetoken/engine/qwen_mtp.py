@@ -280,6 +280,7 @@ class QwenMTPRunner:
             batch.out_loc.copy_(self.engine.page_table[0, start:start + n])
         batch.gdn_verify_state = state
         batch.rowwise_linear = self.mtp_enabled
+        batch.speculative_reference_math = getattr(self.engine.config, "speculative_reference_math", False)
         metadata = batch.attn_metadata
         if not optimized and not fixed_mapping:
             torch.add(batch.positions, 1, out=metadata.indptr[1:])

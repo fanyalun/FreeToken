@@ -49,7 +49,9 @@ def _reference_paged_attention(
     return torch.stack(outs, dim=0)
 
 
-def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
+@pytest.mark.parametrize("reference_math", [False, True])
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch, reference_math, is_decode):
     from freetoken.attention import AttentionSpec
     from freetoken.attention.triton import TritonAttentionBackend, TritonMetadata
 
@@ -92,13 +94,14 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
             indices=torch.tensor([0, 1], dtype=torch.int32),
             q_to_req=torch.tensor([0, 1], dtype=torch.int32),
             q_positions=torch.tensor([0, 0], dtype=torch.int64),
-            is_decode=False,
+            is_decode=is_decode,
             prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
             max_q_len=1,
         ),
         out_loc=torch.tensor([0, 1], dtype=torch.int32),
+        speculative_reference_math=reference_math,
     )
-    q = torch.randn(2, 2, 4)
+    q = torch.randn(2, 2, 4).to(torch.bfloat16 if reference_math else torch.float32)
     k = torch.randn(2, 4)
     v = torch.randn(2, 4)
     sinks = torch.tensor([0.25, -0.5])
@@ -107,6 +110,30 @@ def test_triton_backend_passes_attention_sinks_to_paged_kernel(monkeypatch):
 
     assert out.shape == q.shape
     assert captured["sinks"] is sinks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_reference_attention_is_exact_across_window_boundaries(head_dim):
+    from freetoken.kernel.triton.attention import paged_attention
+
+    torch.manual_seed(42)
+    q = torch.randn(55, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(112, 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    def run(offset, width):
+        end = 57 + offset + width
+        return paged_attention(q[offset:offset + width], k, v,
+            torch.tensor([0, end], device="cuda", dtype=torch.int32),
+            torch.arange(end, device="cuda", dtype=torch.int32),
+            torch.zeros(width, device="cuda", dtype=torch.int32),
+            torch.arange(57 + offset, end, device="cuda", dtype=torch.int64),
+            head_dim ** -0.5)
+
+    outer = run(0, 55)
+    for offset, width in ((0, 1), (0, 4), (2, 4), (47, 4)):
+        torch.testing.assert_close(run(offset, width), outer[offset:offset + width], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")

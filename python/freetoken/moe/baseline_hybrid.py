@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 import statistics
@@ -178,27 +177,22 @@ class BaselineHybridPlanner:
 
 
 def load_or_calibrate(cache, layer, executor, widths, *, eager, profile_path=None):
+    from .hybrid_profile import load_profile
+
     identity = profile_identity(cache, executor, widths, eager=eager)
-    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    path = Path(profile_path) if profile_path else Path(os.getenv("FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE",
-                 str(Path.home() / ".cache/freetoken/baseline_hybrid"))) / f"{key}.json"
-    if path.exists():
-        try:
-            return validate_profile(json.loads(path.read_text()), identity)
-        except (ValueError, TypeError):
-            if profile_path:
-                raise
-    elif profile_path:
-        raise ValueError(f"baseline Hybrid profile does not exist: {path}")
-    profile = validate_profile(calibrate(cache, layer, executor, identity), identity)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(profile, indent=2) + "\n")
-    temporary.replace(path)
-    return profile
+    def measure(current, previous):
+        if previous is None:
+            return calibrate(cache, layer, executor, current)
+        return calibrate(cache, layer, executor, current, previous=previous)
+    return load_profile(identity, os.getenv("FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE",
+                        str(Path.home() / ".cache/freetoken/baseline_hybrid")),
+                        profile_path, validate_profile, measure,
+                        ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "contention", "io"))
 
 
-def calibrate(cache, layer, executor, identity):
+def calibrate(cache, layer, executor, identity, previous=None):
+    from .hybrid_profile import coverage, finish_coverage, initialize_profile, missing_widths
+
     widths, top_k = identity["widths"], executor.top_k
     maximum, routes = max(widths), max(widths) * top_k
     profile = dict(identity=identity,
@@ -207,6 +201,9 @@ def calibrate(cache, layer, executor, identity):
         fixed=[0.] * (maximum + 1), dispatch=[0.] * (maximum + 1),
         gpu_fixed=[0.] * (maximum + 1), contention=[1.] * (maximum + 1),
         io=[0.] * (routes + 1), measurements=[], choice_audit=[], weight_sampling="rotating_expert_sets")
+    initialize_profile(profile, previous, ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "contention", "io"))
+    missing = missing_widths(previous, identity)
+    previous_io = coverage(previous)[1] if previous else -1
     stream = torch.cuda.current_stream(cache.device)
     plan = (torch.arange(routes, device=cache.device, dtype=torch.int32),
             torch.arange(routes, device=cache.device, dtype=torch.int32),
@@ -251,18 +248,19 @@ def calibrate(cache, layer, executor, identity):
 
     try:
         limit = min(routes, cache.num_experts, cache.cache_size)
-        copy_zero, _ = measure(cache.copy_missing)
+        if previous_io < limit:
+            copy_zero, _ = measure(cache.copy_missing)
         copy_sources = plan[1].clone()
-        for q in range(1, limit + 1):
+        for q in range(max(1, previous_io + 1), limit + 1):
             plan[2].fill_(q)
             def rotate_copy():
                 plan[1][:q].copy_((copy_sources[:q] + advance(q)) % cache.num_experts)
             elapsed, samples = measure(cache.copy_missing, rotate_copy)
             profile["io"][q] = max(0., elapsed - copy_zero)
             profile["measurements"].append(dict(kind="weight_copy", experts=q, us=elapsed, samples=samples))
-        for q in range(limit + 1, routes + 1):
+        for q in range(max(limit, previous_io) + 1, routes + 1):
             profile["io"][q] = profile["io"][limit] * q / limit
-        for width in widths:
+        for width in missing:
             x = torch.randn(width, executor.H, device=cache.device, dtype=torch.bfloat16)
             ids = torch.full((width, top_k), -1, device=cache.device, dtype=torch.int32)
             weights = torch.full((width, top_k), 1 / top_k, device=cache.device)
@@ -374,7 +372,7 @@ def calibrate(cache, layer, executor, identity):
                 profile["choice_audit"].append(dict(**trial, predicted_q=chosen, predicted_us=predicted,
                     measured_best_q=optimum, regret_ratio=trial["measured_us"][chosen] / trial["measured_us"][optimum] - 1))
             print(f"baseline Hybrid calibration: width={width}/{maximum}", flush=True)
-        return profile
+        return finish_coverage(profile)
     finally:
         stream.synchronize()
         cache._pending_copy_plan = None

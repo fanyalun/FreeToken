@@ -32,3 +32,20 @@ def test_bf16_verify_uses_one_batched_linear(width, monkeypatch):
         actual = TorchLinearKernel().apply(layer, x)
     assert calls == [x.shape]
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [4, 26])
+def test_explicit_reference_math_has_width_invariant_first_row(width, monkeypatch):
+    import freetoken.core as core
+    torch.manual_seed(28)
+    layer = SimpleNamespace(weight=torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16), bias=None)
+    x = torch.randn(width, 4096, device="cuda", dtype=torch.bfloat16)
+    ctx = Context(1)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+    batch = Batch([], "decode")
+    batch.speculative_reference_math = True
+    expected = torch.cat([F.linear(row, layer.weight) for row in x.split(1)])
+    with ctx.forward_batch(batch):
+        actual = TorchLinearKernel().apply(layer, x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

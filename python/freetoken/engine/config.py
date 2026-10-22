@@ -76,6 +76,11 @@ class EngineConfig:
     speculative_three_level: bool = False
     speculative_submit_tokens: int = 0
     speculative_max_loops: int = 6
+    speculative_preverify_policy: str = "fixed_topk"
+    speculative_preverify_top_k: int = 4
+    speculative_preverify_replacement: str = "zero"
+    speculative_modes_calibration: str | None = None
+    speculative_reference_math: bool = False
     speculative_prefetch: bool = True
     speculative_prefetch_layer_experts: int = 4
     speculative_prefetch_layer_quotas: List[int] | None = None
@@ -118,6 +123,21 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        from freetoken.moe.preverify_policy import PreverifyPolicy
+        if self.speculative_preverify_policy not in ("fixed_topk", "modes"):
+            raise ValueError("invalid Pre-Verify policy")
+        PreverifyPolicy(top_k=self.speculative_preverify_top_k,
+                        replacement=self.speculative_preverify_replacement)
+        if self.speculative_preverify_policy == "modes" and not self.speculative_modes_calibration:
+            raise ValueError("MoDES requires a calibration asset")
+        if self.speculative_preverify_policy != "modes" and self.speculative_modes_calibration:
+            raise ValueError("MoDES calibration requires the modes policy")
+        if self.speculative_reference_math and self.moe_strategy != "fused":
+            raise ValueError("reference arithmetic is restricted to resident fused experiments")
+        if self.speculative_three_level and self.moe_strategy == "fused" and (
+                self.speculative_prefetch or self.cuda_graph_max_bs not in (0, None)
+                or self.speculative_graph_implementation != "reference"):
+            raise ValueError("resident three-level experiments require eager execution without prefetch")
         if self.speculative_hybrid_window_policy not in ("balanced", "legacy"):
             raise ValueError("speculative_hybrid_window_policy must be balanced or legacy")
         if self.speculative_hybrid_cpu_backend not in ("grouped", "legacy"):
