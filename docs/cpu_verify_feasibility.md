@@ -90,6 +90,61 @@ It disables prefetch and accumulated route leases. Current demand allocation,
 pending-copy protection, and stream ordering still protect the current GEMM.
 Old hit experts can be evicted and are loaded on demand during replay.
 
+## Candidate recheck and two handoffs
+
+`QwenAsyncGpuWindow.recheck()` installs no canonical state. Call `install()`
+first, then pass a tail whose start and anchor match that CPU result. Recheck
+runs bounded eight-row Pre-Verify segments with logits, retains the matching
+candidate prefix, and replaces the first mismatch with the new prediction.
+Only consumed inputs are committed to private GDN/conv and MTP state; the
+last emitted prediction remains the pending anchor. Even an all-matching tail
+is consumed through its last input to obtain a fresh bonus. Segment-boundary
+predictions are compared to the next old candidate before proceeding.
+
+For confirmed bonus `104` and old candidates `[105,106,107]`, a refreshed
+prediction `104 -> 999` commits only input `104`, drops all three candidates,
+and refreshes MTP using `hidden(104)` with shifted token `999`. The next Draft
+starts from `999`. The corrected branch remains provisional until CPU Target
+verification. An approximate EOS pauses extension without completing the
+request on the GPU.
+
+Both generation and recheck retain top-4 or top-6 plus ready cache hits, with
+original weights and zero replacement. Missing mandatory experts still cause
+demand IO. The shared controller defaults to top-4, preserving other callers.
+Prefetch remains disabled in the CPU window primitive.
+
+`bench_cpu_recovery.py` compares fixed replay against recheck over two handoffs:
+CPU verifies A while GPU builds B; GPU installs A and repairs B into B-prime;
+only then is B-prime submitted while GPU builds C. The second CPU result is
+installed before recovering C. A rejected A or mismatched bonus discards B;
+the first handoff generates a fresh proposal, while the final handoff stops at
+the restored frontier. This avoids cancellation or rollback of an already
+submitted CPU job and does not enable a continuous request scheduler.
+
+The benchmark restores identical model and physical expert-cache snapshots
+for paired runs. Independent audits compare both CPU commits, valid hidden/KV,
+recurrent and conv state against serial CPU Target and check GPU installation.
+Timing excludes prefill, snapshot restoration, warmup and serial audits. It
+includes CPU wait, state installation, expert demand IO, candidate recovery,
+and next-block generation. Component events are collected only in independent
+audit runs. Fixed-window measurements ignore EOS to preserve their workload;
+EOS handling is tested separately. These results are not complete-request
+throughput or evidence of CPU/GPU arithmetic equivalence.
+
+```bash
+PYTHONPATH=python CUDA_VISIBLE_DEVICES=0 OMP_PROC_BIND=false \
+  /home/fanya/FreeToken/.venv/bin/python benchmarks/bench_cpu_recovery.py \
+  --output /absolute/new_run --parent /absolute/paired_gpu_development_run \
+  --samples 16 --repeats 3 --loops 6 12 --top-k 4 6
+```
+
+The entry point runs from an immutable source snapshot with
+`source_identity.json` and `source_manifest.json`. Its fixed contract is 24 GiB,
+2048 expert slots, 512 input tokens, 256 output tokens, 768 KV pages, native MTP
+depth 3, and a 23-core CPU Target with the `ggml_v2` Attention/GDN components.
+The existing feasibility harness also accepts `--recovery-mode recheck` and
+`--preverify-top-k 6`; its default remains fixed replay for historical callers.
+
 ## Build and verification
 
 Use an existing environment and a toolkit matching PyTorch's CUDA major. Obtain

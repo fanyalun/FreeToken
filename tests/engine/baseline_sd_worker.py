@@ -26,6 +26,9 @@ def main():
     parser.add_argument('--graph-implementation', choices=('reference', 'full'), default='reference')
     parser.add_argument('--scheduler', choices=('host', 'gpu'), default='gpu')
     parser.add_argument('--phases', choices=('verify', 'both'), default='verify')
+    parser.add_argument('--small-prefetch', type=int, default=4)
+    parser.add_argument('--verify-prefetch', type=int, default=0)
+    parser.add_argument('--prefetch-gap', type=int, default=0)
     parser.add_argument('--slots', type=int, default=0)
     parser.add_argument('--budget-gib', type=int)
     parser.add_argument('--output-limit', type=int, default=8)
@@ -80,6 +83,10 @@ def main():
             speculative_execution_implementation='optimized',
             speculative_graph_implementation=args.graph_implementation,
             speculative_hybrid_phases=('preverify', 'verify') if args.phases == 'both' else ('verify',),
+            speculative_prefetch=bool(args.small_prefetch or args.verify_prefetch),
+            speculative_prefetch_layer_experts=args.small_prefetch,
+            speculative_verify_prefetch_layer_experts=args.verify_prefetch,
+            speculative_prefetch_gap_capacity=args.prefetch_gap,
             cuda_graph_max_bs=0 if args.eager else 4, page_size=4, use_dummy_weight=True,
             mm=MultimodalConfig(disabled_encoders=frozenset(('vision', 'audio')))))
         try:

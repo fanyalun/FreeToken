@@ -196,10 +196,13 @@ class CpuVerifierWorker:
             args=(child, self.slots, str(model), list(core_ids), max_context, max_rows, grouped, backend,
                   kernel_profile, components, bind_openmp), daemon=True)
         saved_environment = {key: os.environ.get(key) for key in ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND")}
+        saved_affinity = os.sched_getaffinity(0) if bind_openmp else None
         try:
             if bind_openmp:
                 os.environ["GOMP_CPU_AFFINITY"] = " ".join(map(str, core_ids))
                 os.environ["OMP_PROC_BIND"] = "TRUE"
+                # Spawn imports thread libraries before _cpu_main can set worker affinity.
+                os.sched_setaffinity(0, core_ids)
             self.process.start()
         finally:
             for key, value in saved_environment.items():
@@ -207,6 +210,8 @@ class CpuVerifierWorker:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+            if saved_affinity is not None:
+                os.sched_setaffinity(0, saved_affinity)
         child.close()
         self.ready = False
         self.metadata = {}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import torch
 
 
@@ -18,15 +19,31 @@ def pack_target_bank(weight, *, gate_up):
 
 
 class CpuTargetExperts:
-    def __init__(self, gate_up, down, top_k, core_ids, max_rows, *, grouped=True, backend="optimized", packed=False):
+    def __init__(self, gate_up, down, top_k, core_ids, max_rows, *, grouped=True, backend="optimized", packed=False,
+                 schedule="tile"):
         from freetoken.kernel import _cpu_moe
 
         if backend not in ("legacy", "optimized") or (backend == "optimized" and not grouped):
             raise ValueError("optimized CPU experts require grouped execution; ungrouped is legacy-only")
         if packed and (backend != "optimized" or not grouped):
             raise ValueError("packed experts require optimized grouped execution")
+        if schedule not in ("tile", "expert", "expert_numa") or (schedule != "tile" and
+                (backend != "optimized" or not grouped or packed)):
+            raise ValueError("expert schedule requires unpacked optimized grouped execution")
+        self.worker_nodes = []
+        if schedule == "expert_numa":
+            for core in core_ids:
+                nodes = list(Path(f"/sys/devices/system/cpu/cpu{core}").glob("node[0-9]*"))
+                if len(nodes) != 1:
+                    raise ValueError("NUMA expert schedule requires identifiable CPU nodes")
+                self.worker_nodes.append(int(nodes[0].name[4:]))
+            half = len(core_ids) // 2
+            if not half or len(core_ids) % 2 or len(set(self.worker_nodes[:half])) != 1 or (
+                    len(set(self.worker_nodes[half:])) != 1 or self.worker_nodes[0] == self.worker_nodes[-1]):
+                raise ValueError("NUMA expert schedule requires two equally sized contiguous worker groups")
         self.backend = backend
         self.packed = packed
+        self.schedule = schedule
         self.banks = (gate_up, down)
         self.tables = [torch.tensor([t.data_ptr() for t in bank], dtype=torch.int64)
                        for bank in self.banks]
@@ -69,6 +86,10 @@ class CpuTargetExperts:
                 xx, ii, ww, yy = self.io[rows]
                 for layer in range(len(gate_up)):
                     create = self.ext.create_grouped_packed_task if packed else self.ext.create_grouped_compat_task
+                    if schedule == "expert":
+                        create = self.ext.create_grouped_reuse_task
+                    elif schedule == "expert_numa":
+                        create = self.ext.create_grouped_numa_task
                     self.tasks[layer, rows] = create(
                         layer, rows, xx.data_ptr(), ii.data_ptr(), ww.data_ptr(), yy.data_ptr())
 

@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <freetoken/hip_compat.h>
@@ -297,9 +298,9 @@ float dot_avx2(const bf16_t* w, const bf16_t* x, int n) {
 
 // Preserve the ordinary GEMV's four-accumulator reduction while sharing weight loads.
 #if CPU_MOE_X86
-template<int rows>
+template<int rows, typename Input = bf16_t>
 __attribute__((target("avx512f")))
-void tile_dot_compat_avx512f_impl(const bf16_t* w, const bf16_t* const* x, float* out, int n) {
+void tile_dot_compat_avx512f_impl(const bf16_t* w, const Input* const* x, float* out, int n) {
   __m512 acc[rows][4];
   for (int r = 0; r < rows; ++r)
     for (int j = 0; j < 4; ++j) acc[r][j] = _mm512_setzero_ps();
@@ -308,20 +309,38 @@ void tile_dot_compat_avx512f_impl(const bf16_t* w, const bf16_t* const* x, float
     _mm_prefetch(reinterpret_cast<const char*>(w + i) + PF_AHEAD, _MM_HINT_T0);
     for (int j = 0; j < 4; ++j) {
       const auto weight = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + j * 16))), 16));
-      for (int r = 0; r < rows; ++r)
-        acc[r][j] = _mm512_fmadd_ps(weight, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[r] + i + j * 16))), 16)), acc[r][j]);
+      for (int r = 0; r < rows; ++r) {
+        if constexpr (std::is_same_v<Input, float>)
+          acc[r][j] = _mm512_fmadd_ps(weight, _mm512_loadu_ps(x[r] + i + j * 16), acc[r][j]);
+        else
+          acc[r][j] = _mm512_fmadd_ps(weight, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[r] + i + j * 16))), 16)), acc[r][j]);
+      }
     }
   }
   for (; i + 16 <= n; i += 16) {
     const auto weight = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i))), 16));
-    for (int r = 0; r < rows; ++r)
-      acc[r][0] = _mm512_fmadd_ps(weight, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[r] + i))), 16)), acc[r][0]);
+    for (int r = 0; r < rows; ++r) {
+      if constexpr (std::is_same_v<Input, float>)
+        acc[r][0] = _mm512_fmadd_ps(weight, _mm512_loadu_ps(x[r] + i), acc[r][0]);
+      else
+        acc[r][0] = _mm512_fmadd_ps(weight, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[r] + i))), 16)), acc[r][0]);
+    }
   }
   for (int r = 0; r < rows; ++r) out[r] = _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(acc[r][0], acc[r][1]), _mm512_add_ps(acc[r][2], acc[r][3])));
   for (; i < n; ++i) {
     const float weight = bf16_to_f32(w[i]);
-    for (int r = 0; r < rows; ++r) out[r] += weight * bf16_to_f32(x[r][i]);
+    for (int r = 0; r < rows; ++r) {
+      if constexpr (std::is_same_v<Input, float>) out[r] += weight * x[r][i];
+      else out[r] += weight * bf16_to_f32(x[r][i]);
+    }
   }
+}
+
+__attribute__((target("avx512f")))
+void tile_dot_float_avx512f(const bf16_t* w, const float* const* x, float* out, int n, int rows) {
+  if (rows == 1) tile_dot_compat_avx512f_impl<1>(w, x, out, n);
+  else if (rows == 2) tile_dot_compat_avx512f_impl<2>(w, x, out, n);
+  else tile_dot_compat_avx512f_impl<4>(w, x, out, n);
 }
 template<int rows>
 __attribute__((target("avx2,fma")))
@@ -1284,6 +1303,8 @@ struct MoeTask {
   bool grouped = false;
   bool grouped_compat = false;
   bool grouped_packed = false;
+  bool grouped_reuse = false;
+  bool grouped_numa = false;
 };
 
 // Output-row tiling. Small enough to give every worker independent work even at
@@ -1484,7 +1505,12 @@ struct CpuMoeExecutor {
   std::vector<float> legacy_down;
   std::vector<int> group_counts, group_offsets, group_routes, group_cursor;
   std::vector<GroupTile> group_tasks;
+  struct alignas(64) GroupQueue {
+    std::atomic<int64_t> gate_next{0}, down_next{0};
+    int64_t gate_end = 0, down_end = 0;
+  } group_nodes[2];
   std::vector<float> route_output;
+  std::vector<float> group_input_float, group_intermediate_float;
   tile_dot_fn tile_dot = tile_dot_scalar;
   tile_dot_fn tile_dot_compat = tile_dot_scalar;
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
@@ -1836,6 +1862,10 @@ struct CpuMoeExecutor {
 #endif
     for (int e = 0; e < num_experts; ++e) {
       int begin = group_offsets[e], left = group_counts[e];
+      if (t->grouped_reuse && left) {
+        group_tasks[group_tiles++] = {e, begin, left};
+        continue;
+      }
       while (left) {
         const int chunk = std::min(left, max_rows);
         const int rows = chunk >= 8 ? 8 : chunk >= 4 ? 4 : chunk >= 2 ? 2 : 1;
@@ -1887,24 +1917,65 @@ struct CpuMoeExecutor {
   void grouped_pass(const MoeTask* t, int64_t p, bool down) {
     if (t->grouped_packed) { packed_grouped_pass(t, p, down); return; }
     const int blocks = down ? n_hblk : n_iblk;
-    const auto tile = group_tasks[p / blocks];
+    auto tile = group_tasks[p / blocks];
     const int block = static_cast<int>(p % blocks);
+    if (t->grouped_reuse) {
+      // Keep an expert's output tile local across all of its token microtiles.
+      int limit = 4;
+#if CPU_MOE_X86
+      if (dot == dot_avx2) limit = 2;
+#endif
+      int left = tile.rows;
+      while (left) {
+        const int chunk = std::min(left, limit);
+        tile.rows = chunk >= 4 ? 4 : chunk >= 2 ? 2 : 1;
+        grouped_tile_pass(t, tile, block, down);
+        tile.begin += tile.rows;
+        left -= tile.rows;
+      }
+      return;
+    }
+    grouped_tile_pass(t, tile, block, down);
+  }
+
+  bool expanded_group_inputs(const MoeTask* t) const {
+#if CPU_MOE_X86
+    return t->grouped_reuse && dot == dot_avx512f;
+#else
+    return false;
+#endif
+  }
+
+  void grouped_tile_pass(const MoeTask* t, const GroupTile& tile, int block, bool down) {
     const int first = block * (down ? HBLK : IBLK);
     const int last = std::min(down ? H : I, first + (down ? HBLK : IBLK));
     const auto bank = reinterpret_cast<const bf16_t*>(tbl_at(down ? down_tbl : gate_up_tbl, t->layer_id));
     const bf16_t* inputs[8];
+    const float* expanded[8];
+    const bool use_expanded = expanded_group_inputs(t);
     int routes[8];
     for (int r = 0; r < tile.rows; ++r) {
       routes[r] = group_routes[tile.begin + r];
       inputs[r] = down ? g_scratch.data() + static_cast<size_t>(routes[r]) * I
                        : t->x + static_cast<size_t>(routes[r] / top_k) * H;
+      if (use_expanded)
+        expanded[r] = down ? group_intermediate_float.data() + static_cast<size_t>(routes[r]) * I
+                           : group_input_float.data() + static_cast<size_t>(routes[r] / top_k) * H;
     }
     for (int out = first; out < last; ++out) {
       float a[8], b[8];
       const auto w = bank + (static_cast<size_t>(tile.expert) * (down ? H : 2 * I) + out) * (down ? I : H);
+#if CPU_MOE_X86
+      if (use_expanded) tile_dot_float_avx512f(w, expanded, a, down ? I : H, tile.rows);
+      else
+#endif
       if (tile.rows == 1) a[0] = dot(w, inputs[0], down ? I : H);
       else (t->grouped_compat ? tile_dot_compat : tile_dot)(w, inputs, a, down ? I : H, tile.rows);
       if (!down) {
+#if CPU_MOE_X86
+        if (use_expanded) tile_dot_float_avx512f(w + static_cast<size_t>(I) * H, expanded, b, H, tile.rows);
+        else
+#endif
         if (tile.rows == 1) b[0] = dot(w + static_cast<size_t>(I) * H, inputs[0], H);
         else (t->grouped_compat ? tile_dot_compat : tile_dot)(w + static_cast<size_t>(I) * H, inputs, b, H, tile.rows);
       }
@@ -1929,6 +2000,8 @@ struct CpuMoeExecutor {
           } else {
             g_scratch[route * I + out] = f32_to_bf16(act_apply(act, gate) * up);
           }
+          if (use_expanded)
+            group_intermediate_float[route * I + out] = bf16_to_f32(g_scratch[route * I + out]);
         }
       }
     }
@@ -2265,12 +2338,17 @@ struct CpuMoeExecutor {
     }
   }
 
-  void run_task_body(const MoeTask* t) {
+  void run_task_body(const MoeTask* t, int tid) {
     int local_sense = 0;
+    const int node = tid < num_threads / 2 ? 0 : 1;
+    auto& gate_next = t->grouped_numa ? group_nodes[node].gate_next : p1_next;
+    const auto gate_end = t->grouped_numa ? group_nodes[node].gate_end : p1_total;
+    auto& down_next = t->grouped_numa ? group_nodes[node].down_next : p2_next;
+    const auto down_end = t->grouped_numa ? group_nodes[node].down_end : p2_total;
     if (profile_workers) nvtxRangePushA("CPU/GateUp + Activation");
     for (;;) {
-      int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
-      if (p >= p1_total) break;
+      int64_t p = gate_next.fetch_add(1, std::memory_order_relaxed);
+      if (p >= gate_end) break;
       if (t->grouped) grouped_pass(t, p, false);
       else if (expert_grouped) legacy_pass(t, p, false);
       else do_pass1(t, p);
@@ -2294,8 +2372,8 @@ struct CpuMoeExecutor {
     }
     if (profile_workers) nvtxRangePushA("CPU/Down");
     for (;;) {
-      int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
-      if (p >= p2_total) break;
+      int64_t p = down_next.fetch_add(1, std::memory_order_relaxed);
+      if (p >= down_end) break;
       if (t->grouped) grouped_pass(t, p, true);
       else if (expert_grouped) legacy_pass(t, p, true);
       else do_pass2(t, p);
@@ -2330,7 +2408,7 @@ struct CpuMoeExecutor {
         my_gen = cur_gen;
         t = cur_task;
       }
-      run_task_body(t);
+      run_task_body(t, tid);
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
@@ -2343,6 +2421,13 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask* t) {
     if (t->grouped) build_groups(t);
+    if (expanded_group_inputs(t)) {
+      // Expand each BF16 input once; output channels retain the original dot reduction.
+      const size_t inputs = static_cast<size_t>(t->num_tokens) * H;
+      group_input_float.resize(inputs);
+      group_intermediate_float.resize(static_cast<size_t>(t->num_tokens) * top_k * I);
+      for (size_t i = 0; i < inputs; ++i) group_input_float[i] = bf16_to_f32(t->x[i]);
+    }
     bool active = false;
     for (int i = 0; i < t->num_tokens * top_k; ++i) {
       if (t->ids[i] >= 0 && t->ids[i] < num_experts && (!t->grouped || t->grouped_compat || t->w[i] != 0)) {
@@ -2369,6 +2454,19 @@ struct CpuMoeExecutor {
       p1_total = static_cast<int64_t>(group_tiles) * n_iblk;
       p2_total = static_cast<int64_t>(group_tiles) * n_hblk;
       prt_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+      if (t->grouped_numa) {
+        // Match expert halves to worker groups; the caller arranges first touch.
+        int split = 0;
+        while (split < group_tiles && group_tasks[split].expert < num_experts / 2) ++split;
+        group_nodes[0].gate_next.store(0, std::memory_order_relaxed);
+        group_nodes[0].down_next.store(0, std::memory_order_relaxed);
+        group_nodes[0].gate_end = static_cast<int64_t>(split) * n_iblk;
+        group_nodes[0].down_end = static_cast<int64_t>(split) * n_hblk;
+        group_nodes[1].gate_next.store(group_nodes[0].gate_end, std::memory_order_relaxed);
+        group_nodes[1].down_next.store(group_nodes[0].down_end, std::memory_order_relaxed);
+        group_nodes[1].gate_end = p1_total;
+        group_nodes[1].down_end = p2_total;
+      }
     }
     if (expert_grouped && !t->grouped) {
       legacy_routes.assign(num_experts, {});
@@ -2660,6 +2758,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             uintptr_t x, uintptr_t ids, uintptr_t w, uintptr_t y) {
         auto task = e.create_grouped_task(layer, rows, x, ids, w, y);
         reinterpret_cast<MoeTask*>(task)->grouped_compat = true;
+        return task;
+      })
+      .def("create_grouped_reuse_task", [](CpuMoeExecutor& e, int layer, int rows,
+            uintptr_t x, uintptr_t ids, uintptr_t w, uintptr_t y) {
+        auto task = e.create_grouped_task(layer, rows, x, ids, w, y);
+        reinterpret_cast<MoeTask*>(task)->grouped_compat = true;
+        reinterpret_cast<MoeTask*>(task)->grouped_reuse = true;
+        return task;
+      })
+      .def("create_grouped_numa_task", [](CpuMoeExecutor& e, int layer, int rows,
+            uintptr_t x, uintptr_t ids, uintptr_t w, uintptr_t y) {
+        TORCH_CHECK(e.num_threads >= 2 && e.num_threads % 2 == 0 && e.num_experts % 2 == 0,
+                    "NUMA expert schedule requires equal worker and expert halves");
+        auto task = e.create_grouped_task(layer, rows, x, ids, w, y);
+        reinterpret_cast<MoeTask*>(task)->grouped_compat = true;
+        reinterpret_cast<MoeTask*>(task)->grouped_reuse = true;
+        reinterpret_cast<MoeTask*>(task)->grouped_numa = true;
         return task;
       })
       .def("create_grouped_packed_task", [](CpuMoeExecutor& e, int layer, int rows,

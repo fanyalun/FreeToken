@@ -34,6 +34,7 @@ def window(monkeypatch):
     w.runner, w.engine, w.active = r, e, True
     w.instrument_components = True
     w.epoch, w.canonical_length = 3, 5
+    w.canonical_anchor = 20
     w.output_end = 64
     w.private_pool = SimpleNamespace(recurrent_states=torch.zeros(1, 1, 2, 4, 4),
                                      conv_states=torch.zeros(1, 1, 16, 3))
@@ -127,6 +128,88 @@ def test_output_capacity_fails_before_replay_or_install(monkeypatch):
     with pytest.raises(ValueError, match="output capacity"):
         w.install(SimpleNamespace(request_epoch=3, start=5, checkpoint=SimpleNamespace(length=65)))
     assert not calls and keys.eq(0).all()
+
+
+@pytest.mark.parametrize("rows", [1, 7, 8, 9, 15, 16, 17])
+@pytest.mark.parametrize("reject", [0, 1, 7, 8, None])
+def test_recheck_cuts_at_first_mismatch_and_refreshes_only_valid_rows(monkeypatch, rows, reject):
+    w, calls, _, _ = window(monkeypatch)
+    old = tuple(range(21, 21 + rows))
+    reject = min(reject, rows) if reject is not None else rows
+
+    def lossy(ids, start, *, need_logits=True):
+        assert need_logits
+        calls.append(("lossy", start, ids.clone(), need_logits))
+        predictions = ids + 1
+        absolute = start - 5
+        if absolute <= reject < absolute + len(ids):
+            predictions[reject - absolute] = 999
+        return predictions, ids.float().unsqueeze(1).repeat(1, 4)
+
+    w._lossy = lossy
+    canonical = w.engine.linear_state_pool.recurrent_states.clone()
+    result = w.recheck(GpuCandidateBlock(5, 20, old), 50)
+    expected = old[:reject] + (999,)
+    assert result.block.candidates == expected
+    assert result.matched_old_tokens == reject
+    assert result.dropped_old_tokens == rows - reject
+    assert result.stop_reason == ("mismatch" if reject < rows else "exhausted")
+    assert result.bonus_token == 999 and result.private_end == 5 + len(expected)
+    assert w.canonical_length == 5 and w.canonical_anchor == 20
+    assert torch.equal(canonical, w.engine.linear_state_pool.recurrent_states)
+    assert w.runner.frontier.target_valid_len == result.private_end
+    commits = [c for c in calls if c[0] == "commit"]
+    assert sum(c[2] for c in commits) == len(expected)
+    refreshes = [c for c in calls if c[0] == "cpu_async_recheck_mtp"]
+    assert tuple(torch.cat([c[2] for c in refreshes]).tolist()) == expected
+    assert torch.cat([c[3] for c in refreshes])[:, 0].tolist() == [20, *old[:reject]]
+    assert refreshes[-1][4:] == (True, True)
+    assert all(c[4:] == (False, False) for c in refreshes[:-1])
+    assert int(w.runner.next_draft[0]) == 1999
+    assert len([c for c in calls if c[0] == "lossy"]) == (reject + 1 + 7) // 8
+
+
+@pytest.mark.parametrize("remaining,expected,reason", [(1, (21,), "capacity"),
+    (2, (21, 22), "capacity"), (3, (21, 22, 23), "exhausted")])
+def test_recheck_respects_capacity_and_adds_bonus_after_full_acceptance(monkeypatch, remaining, expected, reason):
+    w, calls, _, _ = window(monkeypatch)
+    w._lossy = lambda ids, start: (ids + 1, ids.float().unsqueeze(1).repeat(1, 4))
+    result = w.recheck(GpuCandidateBlock(5, 20, (21, 22)), remaining)
+    assert result.block.candidates == expected and result.stop_reason == reason
+    assert result.matched_old_tokens == min(remaining, 2)
+    assert result.private_end <= 5 + remaining
+
+
+def test_recheck_eos_is_provisional_and_discards_following_candidates(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    w._lossy = lambda ids, start: (ids + 1, ids.float().unsqueeze(1).repeat(1, 4))
+    result = w.recheck(GpuCandidateBlock(5, 20, (21, 22, 23)), 50, eos_ids=(22,))
+    assert result.block.candidates == (21, 22)
+    assert result.stop_reason == "eos" and result.dropped_old_tokens == 1
+    assert w.canonical_length == 5 and w.active
+    assert ("commit", 4, 2) in calls
+
+
+def test_recheck_rejects_wrong_anchor_or_frontier_before_any_work(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    for block, remaining in [(GpuCandidateBlock(5, 999, (21,)), 10),
+                             (GpuCandidateBlock(4, 20, (21,)), 10),
+                             (GpuCandidateBlock(5, 20, (21,)), 0)]:
+        with pytest.raises(ValueError):
+            w.recheck(block, remaining)
+    assert not calls
+    result = w.recheck(GpuCandidateBlock(5, 20, ()), 10)
+    assert result.stop_reason == "empty" and result.bonus_token == 20
+    assert not calls
+
+
+def test_recheck_clips_physical_output_capacity(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    w.output_end = 7
+    w._lossy = lambda ids, start: (ids + 1, ids.float().unsqueeze(1).repeat(1, 4))
+    result = w.recheck(GpuCandidateBlock(5, 20, (21, 22, 23)), 50)
+    assert result.block.candidates == (21, 22) and result.stop_reason == "capacity"
+    assert all(c[1] <= 7 for c in calls if c[0] == "reserve")
 
 
 def test_common_execute_skips_target_head_and_projects_one_mtp_row():

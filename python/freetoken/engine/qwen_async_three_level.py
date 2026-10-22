@@ -15,7 +15,7 @@ import torch
 from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
 from freetoken.moe.speculative_gpu import GPUExpertCache
 from .qwen_cpu_target import PrefixCheckpoint
-from .speculative import SpeculativeFrontier, VerifyResult
+from .speculative import Proposal, SpeculativeFrontier, VerifyResult, greedy_commit
 
 
 REPLAY_ROWS = 8
@@ -26,6 +26,17 @@ class GpuCandidateBlock:
     start: int
     anchor: int
     candidates: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class GpuRecoveryResult:
+    block: GpuCandidateBlock
+    matched_old_tokens: int
+    dropped_old_tokens: int
+    bonus_token: int
+    private_end: int
+    stop_reason: str
+    segments: tuple[dict, ...]
 
 
 def retained_tail(result, block):
@@ -39,7 +50,7 @@ def retained_tail(result, block):
 
 
 class QwenAsyncGpuWindow:
-    def __init__(self, runner, *, instrument_components=True):
+    def __init__(self, runner, *, instrument_components=True, preverify_top_k=4):
         self.runner, self.engine = runner, runner.engine
         self.instrument_components = instrument_components
         e = self.engine
@@ -52,9 +63,12 @@ class QwenAsyncGpuWindow:
         mc = c.model_config
         if mc.num_layers != 40 or mc.hidden_size != 2048 or mc.num_experts_per_tok != 8:
             raise ValueError("CPU-verify prototype supports Qwen3.6-35B-A3B only")
+        if preverify_top_k not in (4, 6):
+            raise ValueError("CPU-verify prototype requires Pre-Verify top-4 or top-6")
         self.experts = GPUExpertCache(e.moe_offload_cache, e.stream,
             max_loops=1, max_rows=REPLAY_ROWS, inner_rows=REPLAY_ROWS, prefetch=False,
-            layer_quota=0, gap_capacity=0, compact_control=True, implementation="optimized")
+            layer_quota=0, gap_capacity=0, compact_control=True, implementation="optimized",
+            preverify_top_k=preverify_top_k)
         self.experts.retain_routes = False
         self.layers = [layer.linear_attn for layer in e.model.model.layers.op_list if layer._is_linear]
         pool = e.linear_state_pool
@@ -103,6 +117,7 @@ class QwenAsyncGpuWindow:
                 self.output_end = length + e.config.speculative_max_output_tokens
                 r.frontier = SpeculativeFrontier(1, length, length, r._reserved_len)
                 self.canonical_length = length
+                self.canonical_anchor = int(anchor.item())
                 pool = e.linear_state_pool
                 self.private_pool.recurrent_states.copy_(pool.recurrent_states[:, 1:2])
                 self.private_pool.conv_states.copy_(pool.conv_states[:, 1:2])
@@ -266,11 +281,67 @@ class QwenAsyncGpuWindow:
                     offset + count == result.input_count)
             self._record_timing("refresh")
             self.canonical_length = end
+            self.canonical_anchor = checkpoint.anchor
             r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
             event = self.reader_events[self.reader_generation % 2]
             self.reader_generation += 1
             event.record(e.stream)
             return event
+
+    def recheck(self, block, remaining, *, eos_ids=()):
+        r, e = self.runner, self.engine
+        if (not self.active or block.start != self.canonical_length
+                or block.start != r.frontier.target_valid_len
+                or block.anchor != self.canonical_anchor):
+            raise ValueError("candidate recheck must start at the confirmed CPU anchor")
+        capacity = min(remaining, self.output_end - block.start)
+        if capacity < 1:
+            raise ValueError("candidate recheck requires positive output capacity")
+        if not block.candidates:
+            return GpuRecoveryResult(block, 0, 0, block.anchor, block.start, "empty", ())
+        old, output, segments = block.candidates, [], []
+        matched, anchor = 0, block.anchor
+        with torch.cuda.stream(e.stream):
+            self._record_timing("replay_start")
+            while True:
+                start = block.start + len(output)
+                width = min(REPLAY_ROWS, len(old) - matched + 1, capacity - len(output))
+                inputs = (anchor, *old[matched:matched + width - 1])
+                r._reserve(start + width)
+                ids = self.token_buffer[:width]
+                ids.copy_(torch.as_tensor(inputs, dtype=torch.int32))
+                predicted, hidden = self._lossy(ids, start)
+                commit = greedy_commit(Proposal(ids[:1], ids[1:]), VerifyResult(predicted, hidden),
+                                       remaining=capacity - len(output), eos_ids=eos_ids)
+                drained = torch.cat((predicted, commit.input_count.reshape(1))).tolist()
+                count = drained[-1]
+                tokens = drained[:count]
+                local_match = 0
+                for token, candidate in zip(tokens, old[matched:]):
+                    if token != candidate:
+                        break
+                    local_match += 1
+                mismatch = local_match < min(count, len(old) - matched)
+                matched += local_match
+                output.extend(tokens)
+                reason = ("eos" if tokens[-1] in eos_ids else
+                          "mismatch" if mismatch else
+                          "exhausted" if matched == len(old) and local_match < count else
+                          "capacity" if len(output) == capacity else None)
+                self.states[width].commit(commit.input_count)
+                self._refresh("cpu_async_recheck_mtp", tokens, hidden[:count], start, reason is not None)
+                segments.append(dict(start=start, inputs=inputs, predictions=drained[:width],
+                                     input_count=count, matched=local_match))
+                if reason is not None:
+                    break
+                # The last prediction is the next old candidate at a segment boundary.
+                anchor = tokens[-1]
+            end = block.start + len(output)
+            r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
+            self.experts.check_error()
+            self._record_timing("replay_end")
+        return GpuRecoveryResult(GpuCandidateBlock(block.start, block.anchor, tuple(output)),
+            matched, len(old) - matched, output[-1], end, reason, tuple(segments))
 
     def replay(self, block):
         r, e = self.runner, self.engine

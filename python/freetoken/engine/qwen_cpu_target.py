@@ -101,8 +101,10 @@ def _kernel_components(backend, kernel_profile, components):
         raise ValueError("ggml_v2 requires optimized backend")
     selected = tuple(sorted(components if components is not None else
                             (("attention",) if kernel_profile == "ggml_v2" else ())))
-    if len(set(selected)) != len(selected) or any(c not in ("attention", "dense", "head", "experts", "gdn") for c in selected):
+    if len(set(selected)) != len(selected) or any(c not in ("attention", "dense", "head", "experts", "gdn", "expert_reuse", "expert_numa") for c in selected):
         raise ValueError("unknown or duplicate v2 component")
+    if sum(c in selected for c in ("experts", "expert_reuse", "expert_numa")) > 1:
+        raise ValueError("expert scheduling components are mutually exclusive")
     if kernel_profile == "v1" and selected:
         raise ValueError("v2 components require ggml_v2 profile")
     return selected
@@ -132,6 +134,10 @@ class QwenCpuTarget:
                 raise RuntimeError(f"rebuild extension for {component} v2")
         if "experts" in selected and not getattr(experts, "packed", False):
             raise ValueError("experts v2 requires packed expert banks")
+        if "expert_reuse" in selected and getattr(experts, "schedule", None) != "expert":
+            raise ValueError("expert_reuse requires expert task scheduling")
+        if "expert_numa" in selected and getattr(experts, "schedule", None) != "expert_numa":
+            raise ValueError("expert_numa requires NUMA task scheduling")
         packed = []
         for name in tuple(weights):
             weight = weights[name]
@@ -211,6 +217,8 @@ class QwenCpuTarget:
                     packed_projection_bytes=sum(w.data.numel() * w.data.element_size()
                         for w in self.weights.values() if isinstance(w, PackedProjection)),
                     packed_experts=bool(getattr(self.experts, "packed", False)),
+                    expert_schedule=getattr(self.experts, "schedule", "tile"),
+                    expert_worker_nodes=getattr(self.experts, "worker_nodes", []),
                     components=dict(dense=bool(self.native), gdn=bool(self.native),
                                     attention=bool(self.native), streaming_head=bool(self.native)))
 
@@ -276,7 +284,9 @@ class QwenCpuTarget:
                     else:
                         weights[key] = tensor.float().contiguous()
         experts = CpuTargetExperts(gate_up, down, 8, core_ids, max_rows, grouped=grouped, backend=backend,
-                                   packed=bool(components and "experts" in components))
+                                   packed=bool(components and "experts" in components),
+                                   schedule=("expert_numa" if components and "expert_numa" in components else
+                                             "expert" if components and "expert_reuse" in components else "tile"))
         return cls(config, weights, experts, max_context=max_context, max_rows=max_rows, backend=backend,
                    kernel_profile=kernel_profile, components=components)
 

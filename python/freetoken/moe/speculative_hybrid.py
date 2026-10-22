@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 import platform
@@ -111,7 +110,9 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
 
 
 def profile_identity(cache, executor, widths, *, execution="graph"):
+    from .hybrid_profile import pcie_identity
     from freetoken.kernel import _cpu_moe
+    from freetoken.kernel.backend import is_flashinfer_installed
     from freetoken.kernel.triton import decode_moe
 
     props = torch.cuda.get_device_properties(cache.device)
@@ -131,7 +132,8 @@ def profile_identity(cache, executor, widths, *, execution="graph"):
                               for name, bank in cache.bank_caches.items()],
                 geometry=[cache.num_layers, cache.num_experts, executor.H, executor.I,
                 executor.top_k], dtype="bf16", widths=list(widths), gpu=props.name,
-                gpu_uuid=str(getattr(props, "uuid", "")), cpu=platform.processor(),
+                gpu_uuid=str(getattr(props, "uuid", "")), pcie=pcie_identity(str(getattr(props, "uuid", ""))),
+                activation_backend="flashinfer" if is_flashinfer_installed() else "triton", cpu=platform.processor(),
                 cpuinfo=[line for line in Path("/proc/cpuinfo").read_text().split("\n\n")[0].splitlines()
                          if line.startswith(("model name", "flags", "vendor_id", "cpu family", "model\t"))],
                 threads=executor.num_threads, cores=executor.core_ids, coordinator=executor._coord_core,
@@ -190,34 +192,27 @@ def calibration_routes(width, top_k, experts, distribution):
 
 
 def load_or_calibrate(controller, layer, executor, profile_path=None):
+    from .hybrid_profile import load_profile
+
     widths = tuple(range(1, max(controller.max_rows, controller.inner_rows) + 1))
     identity = profile_identity(controller.cache, executor, widths,
                                 execution=getattr(controller, "execution_mode", "graph" if controller.use_graph else "eager"))
-    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    path = Path(profile_path) if profile_path else Path(os.getenv("FREETOKEN_HYBRID_PROFILE_CACHE",
-                 str(Path.home() / ".cache/freetoken/speculative_hybrid"))) / f"{key}.json"
-    profile = None
-    if path.exists():
-        try:
-            profile = validate_profile(json.loads(path.read_text()), identity)
-        except (ValueError, TypeError):
-            if profile_path:
-                raise
-    elif profile_path:
-        raise ValueError(f"speculative Hybrid profile does not exist: {path}")
-    if profile is None:
-        profile = calibrate(controller, layer, executor, identity)
-        validate_profile(profile, identity)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(f".{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(profile, indent=2) + "\n")
-        temporary.replace(path)
+    def measure(current, previous):
+        if previous is None:
+            return calibrate(controller, layer, executor, current)
+        return calibrate(controller, layer, executor, current, previous=previous)
+    profile = load_profile(identity, os.getenv("FREETOKEN_HYBRID_PROFILE_CACHE",
+                           str(Path.home() / ".cache/freetoken/speculative_hybrid")),
+                           profile_path, validate_profile, measure,
+                           ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io"))
     device = controller.cache.device
     return profile, {name: torch.tensor(profile[name], device=device, dtype=torch.float32)
                      for name in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io")}
 
 
-def calibrate(controller, layer, executor, identity):
+def calibrate(controller, layer, executor, identity, previous=None):
+    from .hybrid_profile import coverage, finish_coverage, initialize_profile, missing_widths
+
     cache, stream = controller.cache, controller.stream
     widths = identity["widths"]
     maximum, top_k = max(widths), executor.top_k
@@ -226,6 +221,9 @@ def calibrate(controller, layer, executor, identity):
         gpu=[[0.] * (routes + 1) for _ in range(maximum + 1)], fixed=[0.] * (maximum + 1),
         dispatch=[0.] * (maximum + 1), gpu_fixed=[0.] * (maximum + 1), dram=[0.] * (maximum + 1),
         io=[0.] * (routes + 1), measurements=[], choice_audit=[], raw_samples=[])
+    initialize_profile(profile, previous, ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io"))
+    missing = missing_widths(previous, identity)
+    previous_io = coverage(previous)[1] if previous else -1
     cpu_stream = controller.cpu_stream
     plan = controller.plans[0]
 
@@ -272,8 +270,15 @@ def calibrate(controller, layer, executor, identity):
 
     try:
         controller.phase = "verify"
-        copy_times = []
-        for q in range(min(cache.cache_size, cache.num_experts, routes) + 1):
+        copy_zero = profile.get("copy_zero_us")
+        if copy_zero is None and previous:
+            copy_zero = next((m["us"] for m in previous.get("measurements", [])
+                              if m.get("kind") == "weight_copy" and m.get("experts") == 0), None)
+        limit = min(cache.cache_size, cache.num_experts, routes)
+        copy_counts = list(range(previous_io + 1, limit + 1))
+        if copy_zero is None and 0 not in copy_counts:
+            copy_counts.insert(0, 0)
+        for q in copy_counts:
             plan[1][:q].copy_(torch.arange(q, device=cache.device, dtype=torch.int32))
             plan[3].fill_(q)
             def setup_copy(rotation):
@@ -281,12 +286,14 @@ def calibrate(controller, layer, executor, identity):
                 plan[0][:q].copy_(owners + layer.layer_id * cache.num_experts)
                 plan[2][:q].copy_(owners)
             elapsed = measure(lambda: controller._copy(layer.layer_id, plan), setup=setup_copy)
-            copy_times.append(elapsed)
+            if q == 0:
+                copy_zero = elapsed
+            else:
+                profile["io"][q] = max(0., elapsed - copy_zero)
             profile["measurements"].append(dict(kind="weight_copy", experts=q, us=elapsed,
                                                 samples_us=profile["raw_samples"][-1]))
-        for q, elapsed in enumerate(copy_times):
-            profile["io"][q] = max(0., elapsed - copy_times[0])
-        for width in widths:
+        profile["copy_zero_us"] = copy_zero
+        for width in missing:
             x = torch.randn(width, executor.H, device=cache.device, dtype=torch.bfloat16)
             ids = torch.full((width, top_k), -1, device=cache.device, dtype=torch.int32)
             weights = torch.ones(width, top_k, device=cache.device) / top_k
@@ -298,7 +305,7 @@ def calibrate(controller, layer, executor, identity):
             empty = measure(lambda: cpu_join(cpu_submit(x, weights, ids)))
             gpu_empty = measure(gpu_compute)
             profile["fixed"][width] = empty
-            profile["gpu_fixed"][width] = gpu_empty + copy_times[0]
+            profile["gpu_fixed"][width] = gpu_empty + copy_zero
             samples = range(1, width + 1)
             observed_cpu, observed_gpu = {0: 0.}, {0: 0.}
             for n in samples:
@@ -397,7 +404,7 @@ def calibrate(controller, layer, executor, identity):
                 profile["choice_audit"].append(dict(**trial, predicted_q=chosen, predicted_us=estimates,
                     measured_best_q=optimum, regret_ratio=times[chosen] / times[optimum] - 1))
             print(f"speculative Hybrid calibration: width={width}/{maximum}", flush=True)
-        return profile
+        return finish_coverage(profile)
     finally:
         stream.wait_stream(cpu_stream)
         stream.synchronize()

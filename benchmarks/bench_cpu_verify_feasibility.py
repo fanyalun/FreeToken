@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+import gc
 import hashlib
 import json
 import os
@@ -25,6 +26,17 @@ from freetoken.engine.qwen_cpu_target import VerifyJob
 from frozen_cpu_runtime import create_cpu_worker
 from freetoken.mm.config import MultimodalConfig
 from freetoken.scheduler.config import SchedulerConfig
+
+COVERAGE_CRITERION = "cpu_publish_seconds <= gpu_generation_seconds"
+GPU_WORK_CRITERION = "cpu_publish_seconds <= gpu_generation_seconds + install_replay_seconds"
+
+
+def replay_block_for_result(result, block, policy="retained"):
+    tail = retained_tail(result, block)
+    if tail is not None:
+        return tail, True
+    candidates = block.candidates if policy == "forced_diagnostic" else ()
+    return GpuCandidateBlock(result.checkpoint.length, result.tokens[-1], candidates), False
 
 
 @dataclass(frozen=True)
@@ -60,15 +72,50 @@ def choose_cores(threads):
     return cores
 
 
-def resource_snapshot():
+def process_cpu_counters():
+    values = {}
+    for path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            text = path.read_text()
+            fields = text.rsplit(")", 1)[1].split()
+            values[path.parent.name] = dict(ppid=int(fields[1]),
+                ticks=int(fields[11]) + int(fields[12]), start_ticks=int(fields[19]),
+                command=text[text.index("(") + 1:text.rindex(")")])
+        except (OSError, ValueError, IndexError):
+            continue
+    return dict(monotonic=time.monotonic(), ticks_per_second=os.sysconf("SC_CLK_TCK"), processes=values)
+
+
+def process_cpu_interval(before, after):
+    elapsed = after["monotonic"] - before["monotonic"]
+    if elapsed <= 0 or before["ticks_per_second"] != after["ticks_per_second"]:
+        raise ValueError("CPU usage interval requires advancing time and a stable clock rate")
+    values = []
+    for pid, current in after["processes"].items():
+        previous = before["processes"].get(pid)
+        initial = previous["ticks"] if previous and previous["start_ticks"] == current["start_ticks"] else 0
+        values.append(dict(pid=int(pid), ppid=current["ppid"], command=current["command"],
+            cpu_percent=100 * max(0, current["ticks"] - initial) / after["ticks_per_second"] / elapsed))
+    return dict(elapsed_seconds=elapsed, processes=values)
+
+
+def resource_snapshot(sample_seconds=0.2):
+    before = process_cpu_counters()
+    if sample_seconds:
+        time.sleep(sample_seconds)
+        after = process_cpu_counters()
+    else:
+        after = before
     return dict(wall_time=time.time(), cpu_stat=Path("/proc/stat").read_text(),
+        process_cpu_counters=after,
+        process_cpu_interval=process_cpu_interval(before, after) if sample_seconds else None,
         memory=Path("/proc/meminfo").read_text(),
         gpu_processes=subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory",
                                                 "--format=csv"], text=True),
         processes=subprocess.check_output(["ps", "-eo", "pid,ppid,psr,pcpu,comm", "--sort=-pcpu"], text=True))
 
 
-def resource_interference(snapshot, allowed_pids):
+def resource_interference(snapshot, allowed_pids, previous=None):
     processes = [line.split() for line in snapshot["processes"].splitlines()[1:]]
     processes = [fields for fields in processes if len(fields) >= 5]
     allowed_pids = set(allowed_pids)
@@ -82,24 +129,42 @@ def resource_interference(snapshot, allowed_pids):
         pid = line.split(",")[0].strip()
         if pid.isdigit() and int(pid) not in allowed_pids:
             gpu.append(int(pid))
-    cpu = []
-    for fields in processes:
-        if int(fields[0]) not in allowed_pids and float(fields[3]) >= 50:
-            cpu.append(dict(pid=int(fields[0]),cpu_percent=float(fields[3]),command=fields[4]))
-    return dict(external_gpu_pids=gpu, external_cpu_processes=cpu, detected=bool(gpu or cpu))
+    interval = (process_cpu_interval(previous["process_cpu_counters"], snapshot["process_cpu_counters"])
+                if previous is not None else snapshot.get("process_cpu_interval"))
+    if interval is not None:
+        cpu = [row for row in interval["processes"] if row["pid"] not in allowed_pids and row["cpu_percent"] >= 50]
+    else:
+        cpu = [dict(pid=int(f[0]), cpu_percent=float(f[3]), command=f[4])
+               for f in processes if int(f[0]) not in allowed_pids and float(f[3]) >= 50]
+    return dict(external_gpu_pids=gpu, external_cpu_processes=cpu, detected=bool(gpu or cpu),
+        cpu_usage_basis="proc_stat_interval" if interval is not None else "legacy_ps_lifetime_average",
+        cpu_interval_seconds=interval["elapsed_seconds"] if interval is not None else None)
 
 
 def summarize(rows):
     summary = []
-    for threads, loops in sorted({(r["threads"], r["loops"]) for r in rows}):
-        cells = [r for r in rows if r["threads"] == threads and r["loops"] == loops]
+    for threads, loops, ahead in sorted({(r["threads"], r["loops"], r.get("ahead_loops", r["loops"])) for r in rows}):
+        cells = [r for r in rows if r["threads"] == threads and r["loops"] == loops
+                 and r.get("ahead_loops", r["loops"]) == ahead]
         cpu = statistics.median(r["cpu_publish_seconds"] for r in cells)
         generation = statistics.median(r["gpu_generation_seconds"] for r in cells)
         replay = statistics.median(r["install_replay_seconds"] for r in cells)
-        summary.append(dict(threads=threads, loops=loops, measurements=len(cells),
+        margins = [r["gpu_generation_seconds"] - r["cpu_publish_seconds"] for r in cells]
+        summary.append(dict(threads=threads, loops=loops, ahead_loops=ahead, measurements=len(cells),
+            coverage_margin_seconds=statistics.median(margins),
+            coverage_feasible=all(margin >= 0 for margin in margins),
+            coverage_deadline_misses=sum(margin < 0 for margin in margins),
             candidate_lengths=[r["candidate_count"] for r in cells],
             cpu_publish_seconds=cpu, gpu_generation_seconds=generation,
             install_replay_seconds=replay,
+            coverage_criterion=COVERAGE_CRITERION,
+            generation_plus_replay_margin_seconds=statistics.median(
+                r["gpu_generation_seconds"] + r["install_replay_seconds"] - r["cpu_publish_seconds"] for r in cells),
+            generation_plus_replay_feasible=all(r["cpu_publish_seconds"] <=
+                r["gpu_generation_seconds"] + r["install_replay_seconds"] for r in cells),
+            generation_plus_replay_criterion=GPU_WORK_CRITERION,
+            window_estimate_seconds=statistics.median(max(r["cpu_publish_seconds"],
+                r["gpu_generation_seconds"]) + r["install_replay_seconds"] for r in cells),
             cycle_estimate_seconds=statistics.median(max(r["cpu_publish_seconds"],
                 r["gpu_generation_seconds"] + r["install_replay_seconds"]) for r in cells),
             cycle_deadline_misses=sum(r["cpu_publish_seconds"] > r["gpu_generation_seconds"]
@@ -111,6 +176,66 @@ def summarize(rows):
     return summary
 
 
+def plan_cpu_window_memory(native_plan, measured_peak, slots, minimum, maximum):
+    from freetoken.engine.baseline_sd import plan_measured_memory
+
+    # Private replay buffers are created after the native SD startup planner.
+    return plan_measured_memory(
+        capacity_tokens=native_plan.capacity_tokens, kv_pages=native_plan.kv_pages,
+        budget_bytes=native_plan.budget_bytes,
+        measured_peak_bytes=max(measured_peak,
+            native_plan.non_expert_peak_bytes + slots * native_plan.expert_slot_bytes),
+        initial_slots=slots, expert_slot_bytes=native_plan.expert_slot_bytes,
+        minimum_slots=minimum, maximum_slots=maximum, automatic=True,
+        routing_reserve_bytes=64 << 20)
+
+
+def prepare_auto_window(engine, prompt, chunk_size, instrument):
+    cache = engine.moe_offload_cache
+    native_plan = engine.baseline_sd_memory_plan
+    minimum = engine.config.model_config.num_experts * (2 if engine.config.moe_prefill_overlap else 1)
+    maximum = min(cache.num_layers * cache.num_experts,
+                  cache.max_slots or cache.num_layers * cache.num_experts)
+    sizing = []
+    for attempt in range(3):
+        window = QwenAsyncGpuWindow(engine.speculative_runner, instrument_components=instrument)
+        error = None
+        try:
+            checkpoint = window.initialize(prompt, chunk_size=chunk_size)
+            window.audit_gpu_anchor(checkpoint.anchor)
+            window.warm_widths(checkpoint.anchor)
+        except ValueError as exc:
+            if not str(exc).startswith("CPU async GPU peak "):
+                raise
+            error = str(exc)
+        finally:
+            window.close_request()
+        allocated = torch.cuda.memory_allocated(engine.device) - engine._baseline_allocated
+        external = max(0, engine._physical_baseline_free - torch.cuda.mem_get_info(engine.device)[0] - allocated)
+        peak = torch.cuda.max_memory_allocated(engine.device) - engine._baseline_allocated + external
+        sizing.append(dict(slots=cache.cache_size, measured_peak_bytes=peak, budget_error=error))
+        if attempt and error is None:
+            return window, sizing
+        plan = plan_cpu_window_memory(native_plan, peak, cache.cache_size, minimum, maximum)
+        if attempt and plan.final_slots >= cache.cache_size:
+            raise RuntimeError("CPU async memory sizing did not reduce the overflowing cache")
+        del window
+        gc.collect()
+        torch.cuda.empty_cache()
+        engine.baseline_sd_memory_plan = plan
+        engine.rebuild_runtime_cache(moe_cache_size=plan.final_slots)
+    raise RuntimeError("CPU async GPU memory sizing failed after three boundary warmups")
+
+
+def initialize_cpu_window(window, worker, prompt, chunk_size):
+    checkpoint = window.initialize(prompt, chunk_size=chunk_size)
+    # Memory sizing may already have advanced the GPU window's request epoch.
+    worker.initialize(checkpoint, window.epoch)
+    wait_for(worker, "initialized")
+    return checkpoint
+
+
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -120,32 +245,49 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--audit-tokens", type=int, default=16)
     parser.add_argument("--loops", type=int, nargs="+", default=[1, 2, 3, 4, 6, 8])
+    parser.add_argument("--ahead-loops", type=int,
+                        help="GPU coverage window; defaults to the CPU verification loop count")
     parser.add_argument("--threads", type=int, nargs="+", default=[23, 46])
     parser.add_argument("--gpu-slots", type=int, default=4907)
+    parser.add_argument("--auto-slots", action="store_true")
+    parser.add_argument("--kv-pages", type=int, default=4300)
     parser.add_argument("--budget-gib", type=int, default=64)
     parser.add_argument("--ungrouped", action="store_true")
     parser.add_argument("--backend", choices=("legacy", "optimized"), default="optimized")
     parser.add_argument("--kernel-profile", choices=("v1", "ggml_v2"), default="v1")
-    parser.add_argument("--components", choices=("attention", "dense", "head", "experts", "gdn"), nargs="+", default=None)
+    parser.add_argument("--components", choices=("attention", "dense", "head", "experts", "gdn", "expert_reuse", "expert_numa"), nargs="+", default=None)
     parser.add_argument("--prompt-chunk-size", type=int, default=None)
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--max-output-tokens", type=int, default=2048)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--instrument-components", action="store_true")
     parser.add_argument("--formal-timing", action="store_true")
+    parser.add_argument("--replay-policy", choices=("retained", "forced_diagnostic"), default="retained")
+    parser.add_argument("--recovery-mode", choices=("fixed_replay", "recheck"), default="fixed_replay")
+    parser.add_argument("--preverify-top-k", type=int, choices=(4, 6), default=4)
+    parser.add_argument("--idle-seconds", type=float, default=0)
+    parser.add_argument("--idle-timeout", type=float, default=600)
     parser.add_argument("--bind-openmp", action="store_true")
     parser.add_argument("--frozen-prompts", type=Path)
     parser.add_argument("--frozen-cpu-root", type=Path)
     parser.add_argument("--prefix-length", type=int)
     args = parser.parse_args()
+    if args.recovery_mode == "recheck" and args.replay_policy != "retained":
+        parser.error("candidate recheck cannot use forced diagnostic tails")
+    if args.idle_seconds < 0 or args.idle_timeout <= args.idle_seconds:
+        parser.error("idle-seconds must be nonnegative and smaller than idle-timeout")
     if args.gpu_slots < 1 or args.budget_gib < 1:
         parser.error("gpu-slots and budget-gib must be positive integers")
+    if args.ahead_loops is not None and args.ahead_loops < 1:
+        parser.error("ahead-loops must be positive")
     if args.ungrouped and args.backend != "legacy":
         parser.error("--ungrouped is only valid with --backend legacy")
     if args.backend == "legacy" and args.kernel_profile != "v1":
         parser.error("ggml_v2 requires optimized backend")
     if args.components and args.kernel_profile != "ggml_v2":
         parser.error("components require ggml_v2")
+    if args.components and "expert_numa" in args.components and args.threads != [46]:
+        parser.error("expert_numa requires the two-node 46-thread protocol")
     if args.frozen_cpu_root and (args.backend != "optimized" or args.kernel_profile != "v1" or args.components):
         parser.error("frozen CPU runtime requires optimized v1 without v2 components")
     if args.formal_timing and (args.profile or args.instrument_components):
@@ -153,8 +295,8 @@ def main():
     if args.prefix_length is not None and not 1 <= args.prefix_length <= args.max_input_tokens:
         parser.error("prefix length must fit the input capacity")
     if min(args.max_input_tokens, args.max_output_tokens) < 1 or (
-            args.max_input_tokens + args.max_output_tokens > 4300):
-        parser.error("positive input/output capacities with sum <= 4300 required")
+            args.max_input_tokens + args.max_output_tokens > args.kv_pages):
+        parser.error("positive input/output capacities must fit kv-pages")
     if args.prompt_chunk_size is not None and args.prompt_chunk_size < 1:
         parser.error("prompt chunk size must be a positive integer")
     if min(args.samples, args.repeats, *args.loops) < 1 or not 2 <= args.audit_tokens <= 33:
@@ -177,10 +319,15 @@ def main():
     identity["prompt_sha256"] = hashlib.sha256(json.dumps(prompts).encode()).hexdigest()
     config = {**identity, **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "command": [sys.executable, *sys.argv], "purpose": "formal" if args.formal_timing else "diagnostic", "sampling": "greedy",
-        "gpu_slots": args.gpu_slots, "kv_pages": 4300, "budget_gib": args.budget_gib, "depth": 3, "page_size": 1,
+        "gpu_slots": None if args.auto_slots else args.gpu_slots, "kv_pages": args.kv_pages, "budget_gib": args.budget_gib, "depth": 3, "page_size": 1,
         "target": "independent_complete_cpu", "gpu_init": "full_gpu_prefill",
         "measurement_scope": "fixed-window feasibility, not complete-request throughput",
-        "replay_scope": "install CPU accepted state, refresh MTP, replay fixed B from corrected anchor",
+        "coverage_criterion": COVERAGE_CRITERION,
+        "coverage_protocol": "generation_overlap_v2",
+        "generation_plus_replay_criterion": GPU_WORK_CRITERION,
+        "install_replay_device": "GPU execution and host orchestration, reported separately",
+        "legacy_cycle_fields": "historical aliases; feasibility matches the generation-plus-replay criterion",
+        "replay_scope": "install accepted CPU state, refresh MTP, replay only retained B unless forced_diagnostic",
         "replay_rows": 8, "graph": False, "prefetch": False, "retain_prior_routes": False}
     write("config.json", config)
     write("prompts.json", prompts)
@@ -217,34 +364,46 @@ def main():
     memory_monitor.start()
     rows, audits = [], []
     prefixes = {}
-    epoch = 0
     profiling = False
     try:
         initialization_start = time.perf_counter()
+        text_config = json.loads((Path(args.model) / "config.json").read_text())["text_config"]
+        initial_slots = 2 * text_config["num_experts"] if args.auto_slots else args.gpu_slots
         engine = Engine(BenchmarkConfig(
             rendezvous_file=str((out / "rendezvous").resolve()),
             model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
             max_running_req=1, attention_backend="triton", moe_strategy="offload",
-            moe_cache_size=args.gpu_slots, moe_cache_auto=False, num_page_override=4300,
+            moe_cache_size=initial_slots, moe_cache_auto=False, num_page_override=args.kv_pages,
             max_seq_len_override=args.max_input_tokens + args.max_output_tokens, gpu_memory_budget_bytes=args.budget_gib << 30,
             speculative_max_input_tokens=args.max_input_tokens, speculative_max_output_tokens=args.max_output_tokens,
             speculative_mtp_depth=3, cuda_graph_max_bs=0, cache_type="naive",
+            speculative_prefetch=False, speculative_prefetch_layer_experts=0,
+            speculative_prefetch_gap_capacity=0, speculative_verify_prefetch_layer_experts=0,
             max_extend_tokens=args.prompt_chunk_size or args.max_input_tokens,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
         ))
-        window = QwenAsyncGpuWindow(engine.speculative_runner,
-                                   instrument_components=args.instrument_components or args.profile)
+        if args.auto_slots:
+            window, sizing = prepare_auto_window(engine, max(prompts, key=len),
+                args.prompt_chunk_size, args.instrument_components or args.profile)
+            config["cpu_async_memory_sizing"] = sizing
+        else:
+            window = QwenAsyncGpuWindow(engine.speculative_runner,
+                instrument_components=args.instrument_components or args.profile,
+                preverify_top_k=args.preverify_top_k)
+        window.experts.preverify_top_k = args.preverify_top_k
         config["gpu_initialization_seconds"] = time.perf_counter() - initialization_start
         config["gpu_components"] = dict(replay_target_head=False, final_only_mtp_head=True,
                                         shared_private_workspace=True)
-        text_config = json.loads((Path(args.model) / "config.json").read_text())["text_config"]
+        config["preverify_topk"] = args.preverify_top_k
+        config["gpu_components"]["replay_target_head"] = args.recovery_mode == "recheck"
+        config["preverify_keep_cache_hits"] = window.experts.keep_hits
         config.update(gpu=torch.cuda.get_device_name(engine.device), actual_slots=engine.moe_offload_cache.cache_size,
             actual_kv_pages=engine.num_pages,
             actual_strategy=engine.config.moe_strategy,
             baseline_sd_memory_plan=engine.baseline_sd_memory_plan.as_dict(),
             memory_ratio=engine.config.memory_ratio)
         write("config.json", config)
-        if engine.moe_offload_cache.cache_size != args.gpu_slots or engine.num_pages != 4300:
+        if (not args.auto_slots and engine.moe_offload_cache.cache_size != args.gpu_slots) or engine.num_pages != args.kv_pages:
             raise RuntimeError("actual slots/pages differ from the feasibility contract")
         for threads in args.threads:
             worker = create_cpu_worker(args.model, text_config, core_sets[threads],
@@ -257,10 +416,7 @@ def main():
             print(json.dumps(dict(event="worker_ready", threads=threads, **worker.metadata)), flush=True)
             config.setdefault("cpu_runtime", {})[str(threads)] = worker.metadata
             write("config.json", config)
-            checkpoint = window.initialize(prompts[0], chunk_size=args.prompt_chunk_size)
-            epoch += 1
-            worker.initialize(checkpoint, epoch)
-            wait_for(worker, "initialized")
+            checkpoint = initialize_cpu_window(window, worker, prompts[0], args.prompt_chunk_size)
             worker.audit(args.audit_tokens)
             audit = wait_for(worker, "audit")
             write(f"cpu_correctness_threads{threads}.json", audit)
@@ -286,7 +442,8 @@ def main():
                 order = args.loops if repeat % 2 == 0 else list(reversed(args.loops))
                 for sample, prompt in enumerate(prompts):
                     for loops in order:
-                        checkpoint = window.initialize(prompt, chunk_size=args.prompt_chunk_size)
+                        ahead_loops = args.ahead_loops if args.ahead_loops is not None else loops
+                        checkpoint = initialize_cpu_window(window, worker, prompt, args.prompt_chunk_size)
                         if sample not in prefixes:
                             prefixes[sample] = checkpoint.clone()
                             torch.save(asdict(checkpoint), out / f"gpu_prefix_sample{sample}.pt")
@@ -294,11 +451,31 @@ def main():
                             not torch.equal(getattr(checkpoint, key), getattr(prefixes[sample], key))
                             for key in ("keys", "values", "recurrent", "conv")):
                             raise RuntimeError("GPU prefill initialization drifted across curve cells")
-                        epoch += 1
-                        worker.initialize(checkpoint, epoch)
-                        wait_for(worker, "initialized")
+                        if args.idle_seconds:
+                            quiet_start = time.monotonic()
+                            idle_deadline = quiet_start + args.idle_timeout
+                            while time.monotonic() - quiet_start < args.idle_seconds:
+                                idle = resource_snapshot(1)
+                                load = resource_interference(idle, {os.getpid(), worker.metadata["pid"]})
+                                with (out / "idle_resources.jsonl").open("a") as stream:
+                                    stream.write(json.dumps(dict(sample_id=sample, loops=loops,
+                                        repeat=repeat, resources=idle, interference=load)) + "\n")
+                                if load["detected"]:
+                                    quiet_start = time.monotonic()
+                                if time.monotonic() >= idle_deadline:
+                                    raise TimeoutError("external activity prevented quiet CPU/GPU timing")
                         resources = resource_snapshot()
                         interference = resource_interference(resources, {os.getpid(), worker.metadata["pid"]})
+                        while args.idle_seconds and interference["detected"]:
+                            with (out / "idle_resources.jsonl").open("a") as stream:
+                                stream.write(json.dumps(dict(sample_id=sample, loops=loops,
+                                    repeat=repeat, resources=resources, interference=interference,
+                                    phase="final_pre_window_check")) + "\n")
+                            if time.monotonic() >= idle_deadline:
+                                raise TimeoutError("external activity persisted at the final timing check")
+                            time.sleep(0.2)
+                            resources = resource_snapshot()
+                            interference = resource_interference(resources, {os.getpid(), worker.metadata["pid"]})
                         worker_proc = Path(f"/proc/{worker.metadata['pid']}")
                         with (out / "resources.jsonl").open("a") as resource_file:
                             resource_file.write(json.dumps(dict(threads=threads, repeat=repeat,
@@ -316,10 +493,10 @@ def main():
                         engine.stream.synchronize()
                         a_counters = window.experts.counters.cpu().tolist()
                         submitted = time.perf_counter()
-                        worker.submit(VerifyJob(epoch, 0, a.start, a.anchor, a.candidates, 128))
+                        worker.submit(VerifyJob(window.epoch, 0, a.start, a.anchor, a.candidates, 128))
                         gpu_start = time.perf_counter()
                         with annotate("GPU ahead block generation"):
-                            b, b_loops = window.generate_block(a.candidates[-1], loops)
+                            b, b_loops = window.generate_block(a.candidates[-1], ahead_loops)
                             engine.stream.synchronize()
                         gpu_seconds = time.perf_counter() - gpu_start
                         ready = worker.poll()
@@ -330,17 +507,18 @@ def main():
                         waiting = time.perf_counter() - wait_start if missed else 0.0
                         observed_pub = time.perf_counter() - submitted
                         b_counters = window.experts.counters.cpu().tolist()
-                        tail = retained_tail(result, b)
-                        # A forced fixed-token tail measures replay even on rejection; it is
-                        # never output or presented as a retained, valid future block.
-                        replay_block = tail or GpuCandidateBlock(result.checkpoint.length,
-                            result.tokens[-1], b.candidates)
+                        replay_block, tail_retained = replay_block_for_result(result, b, args.replay_policy)
                         restore_start = time.perf_counter()
                         with annotate("Install CPU state and refresh confirmed MTP"):
                             reader = window.install(result)
                             worker.release(result, reader)
                         with annotate("GPU fixed token private tail replay"):
-                            window.replay(replay_block)
+                            recovery = None
+                            if args.recovery_mode == "recheck" and not result.terminal:
+                                recovery = window.recheck(replay_block,
+                                    window.output_end - result.checkpoint.length)
+                            else:
+                                window.replay(replay_block)
                             engine.stream.synchronize()
                         restore_seconds = time.perf_counter() - restore_start
                         if not torch.equal(engine.linear_state_pool.recurrent_states[:, 1].cpu(),
@@ -356,7 +534,8 @@ def main():
                         replay_counters = window.experts.counters.cpu().tolist()
                         expert_bytes = sum(bank[0].numel() * bank.element_size() for _, bank in window.experts.cache.banks)
                         resources_after = resource_snapshot()
-                        interference_after = resource_interference(resources_after, {os.getpid(), worker.metadata["pid"]})
+                        interference_after = resource_interference(resources_after, {os.getpid(), worker.metadata["pid"]},
+                                                                   previous=resources)
                         with (out / "resources.jsonl").open("a") as resource_file:
                             resource_file.write(json.dumps(dict(threads=threads, repeat=repeat,
                                 sample_id=sample, loops=loops, phase="after_window",
@@ -370,6 +549,7 @@ def main():
                                 cpu_worker_status=(worker_proc / "status").read_text(),
                                 interference=interference_after, **resources_after)) + "\n")
                         row = dict(threads=threads, sample_id=sample, repeat=repeat, loops=loops,
+                            ahead_loops=ahead_loops,
                             formal_eligible=args.formal_timing and not (interference["detected"] or interference_after["detected"]),
                             resource_interference=dict(before=interference, after=interference_after),
                             candidate_count=len(a.candidates), forward_rows=len(a.candidates) + 1,
@@ -382,7 +562,10 @@ def main():
                             prefix_preparation_wall_seconds=window.prefill_wall_seconds,
                             deadline_miss=missed, gpu_wait_seconds=waiting,
                             accepted=result.accepted, input_count=result.input_count,
-                            original_b_retained=tail is not None, replay_rows=len(replay_block.candidates),
+                            original_b_retained=tail_retained, replay_rows=len(replay_block.candidates),
+                            replay_policy=args.replay_policy,
+                            recovery_mode=args.recovery_mode,
+                            recheck=asdict(recovery) if recovery is not None else None,
                             cpu_rss_kib=timing["rss_kib"], gpu_loops=a_loops, gpu_ahead_loops=b_loops,
                             recurrent_transfer_bytes=result.checkpoint.recurrent.numel() * 4,
                             state_transfer_bytes=sum(t.numel() * t.element_size() for t in (
@@ -395,6 +578,11 @@ def main():
                             raise RuntimeError("observed process memory exceeds absolute GPU budget")
                         row["cycle_margin_seconds"] = gpu_seconds + restore_seconds - timing["publish_seconds"]
                         row["cycle_feasible"] = row["cycle_margin_seconds"] >= 0
+                        row["generation_plus_replay_margin_seconds"] = row["cycle_margin_seconds"]
+                        row["generation_plus_replay_feasible"] = row["cycle_feasible"]
+                        row["coverage_margin_seconds"] = gpu_seconds - timing["publish_seconds"]
+                        row["coverage_feasible"] = row["coverage_margin_seconds"] >= 0
+                        row["candidate_acceptance_rate"] = result.accepted / len(a.candidates)
                         row.update(window.component_timings())
                         row.update(gpu_a_demand_experts=a_counters[0],
                             gpu_b_demand_experts=b_counters[0] - a_counters[0],
@@ -413,13 +601,27 @@ def main():
             worker.close()
             worker = None
         summary = summarize(rows)
-        any_feasible = any(row["cycle_estimate_feasible"] for row in summary)
-        complete_curve = (set(args.loops) == {1, 2, 3, 4, 6, 8} and set(args.threads) == {23, 46}
+        any_feasible = any(row["coverage_feasible"] for row in rows)
+        complete_curve = (args.ahead_loops is None and set(args.loops) == {1, 2, 3, 4, 6, 8} and set(args.threads) == {23, 46}
                           and args.samples == 4 and args.repeats == 3 and not args.profile)
+        expected_windows = len(args.threads) * len(args.loops) * args.samples * args.repeats
         write("complete.json", dict(status="feasibility_measured" if any_feasible else "feasibility_gate_failed",
             milestone_complete=complete_curve and not args.ungrouped, curves_complete=complete_curve,
             cpu_serial_block_parity=True, gpu_install_checked=True,
-            cycle_estimate_feasible=any_feasible, pipeline_complete=False,
+            cycle_estimate_feasible=any(row["cycle_estimate_feasible"] for row in summary), pipeline_complete=False,
+            coverage_feasible=all(row["coverage_feasible"] for row in rows),
+            coverage_feasible_windows=sum(row["coverage_feasible"] for row in rows),
+            coverage_criterion=COVERAGE_CRITERION,
+            coverage_protocol="generation_overlap_v2",
+            generation_plus_replay_criterion=GPU_WORK_CRITERION,
+            generation_plus_replay_feasible=all(row["generation_plus_replay_feasible"] for row in rows),
+            generation_plus_replay_feasible_windows=sum(row["generation_plus_replay_feasible"] for row in rows),
+            generation_only_no_wait=all(not row["deadline_miss"] for row in rows),
+            observed_deadline_misses=sum(row["deadline_miss"] for row in rows),
+            requested_windows=expected_windows,
+            requested_windows_complete=len(rows) == expected_windows,
+            coverage_formal_timing_complete=args.formal_timing and len(rows) == expected_windows
+                and all(row["formal_eligible"] for row in rows),
             every_window_feasible=all(row["cycle_feasible"] for row in rows),
             feasible_windows=sum(row["cycle_feasible"] for row in rows), measured_windows=len(rows),
             formal_timing_complete=args.formal_timing and complete_curve and all(row["formal_eligible"] for row in rows),

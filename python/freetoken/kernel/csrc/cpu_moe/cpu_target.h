@@ -23,9 +23,10 @@ inline void project_scalar(const float* w, const bf16_t* x, float* out, int k, i
 }
 
 #if CPU_MOE_X86
+template<int rows>
 __attribute__((target("avx512f")))
-inline void project_512(const float* w, const bf16_t* x, float* out, int k, int rows) {
-  __m512 sums[4];
+inline void project_512_rows(const float* w, const bf16_t* x, float* out, int k) {
+  __m512 sums[rows];
   for (int r = 0; r < rows; ++r) sums[r] = _mm512_setzero_ps();
   int j = 0;
   for (; j + 16 <= k; j += 16) {
@@ -39,6 +40,20 @@ inline void project_512(const float* w, const bf16_t* x, float* out, int k, int 
   for (int r = 0; r < rows; ++r) out[r] = _mm512_reduce_add_ps(sums[r]);
   for (; j < k; ++j)
     for (int r = 0; r < rows; ++r) out[r] = std::fma(w[j], bf16_to_f32(x[r * k + j]), out[r]);
+}
+
+__attribute__((target("avx512f")))
+inline void project_512(const float* w, const bf16_t* x, float* out, int k, int rows) {
+  switch (rows) {
+    case 1: project_512_rows<1>(w, x, out, k); break;
+    case 2: project_512_rows<2>(w, x, out, k); break;
+    case 3: project_512_rows<3>(w, x, out, k); break;
+    case 4: project_512_rows<4>(w, x, out, k); break;
+    case 5: project_512_rows<5>(w, x, out, k); break;
+    case 6: project_512_rows<6>(w, x, out, k); break;
+    case 7: project_512_rows<7>(w, x, out, k); break;
+    case 8: project_512_rows<8>(w, x, out, k); break;
+  }
 }
 
 __attribute__((target("avx2,fma")))
@@ -71,7 +86,7 @@ struct Projection {
   std::string isa = "scalar";
   Projection() {
 #if CPU_MOE_X86
-    if (__builtin_cpu_supports("avx512f")) { fn = project_512; rows = 4; isa = "avx512f"; }
+    if (__builtin_cpu_supports("avx512f")) { fn = project_512; rows = 8; isa = "avx512f"; }
     else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
       fn = project_256; rows = 2; isa = "avx2_fma";
     }
@@ -83,32 +98,41 @@ inline torch::Tensor linear(torch::Tensor x, torch::Tensor weight, bool argmax) 
   check(x, at::kBFloat16); check(weight, at::kFloat);
   TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1)
               && x.size(0) > 0 && weight.size(0) > 0 && x.size(1) > 0, "projection geometry");
-  const int rows = x.size(0), n = weight.size(0), k = x.size(1), block = 256;
+  const int rows = x.size(0), n = weight.size(0), k = x.size(1);
+  // Keep each weight tile in private cache and expose small projections to all threads.
+  const int cache_block = std::max(1, 65536 / k);
+  const int thread_block = std::max(1, (n + 4 * at::get_num_threads() - 1) / (4 * at::get_num_threads()));
+  const int block = std::min({32, cache_block, thread_block});
   const int blocks = (n + block - 1) / block;
   auto output = torch::empty(argmax ? std::vector<int64_t>{rows} : std::vector<int64_t>{rows, n},
                              x.options().dtype(argmax ? at::kLong : at::kBFloat16));
-  auto maxima = torch::empty({blocks, rows}, weight.options());
-  auto indices = torch::empty({blocks, rows}, x.options().dtype(at::kLong));
+  auto maxima = argmax ? torch::empty({blocks, rows}, weight.options()) : torch::Tensor();
+  auto indices = argmax ? torch::empty({blocks, rows}, x.options().dtype(at::kLong)) : torch::Tensor();
   auto* xp = reinterpret_cast<const bf16_t*>(x.data_ptr());
   auto* wp = weight.data_ptr<float>();
   auto* yp = argmax ? nullptr : reinterpret_cast<bf16_t*>(output.data_ptr());
-  auto* mp = maxima.data_ptr<float>(); auto* ip = indices.data_ptr<int64_t>();
+  auto* mp = argmax ? maxima.data_ptr<float>() : nullptr;
+  auto* ip = argmax ? indices.data_ptr<int64_t>() : nullptr;
   const Projection dispatch;
   at::parallel_for(0, blocks, 1, [&](int64_t begin, int64_t end) {
     for (int b = begin; b < end; ++b) {
-      for (int r = 0; r < rows; ++r) { mp[b * rows + r] = -INFINITY; ip[b * rows + r] = b * block; }
+      if (argmax)
+        for (int r = 0; r < rows; ++r) { mp[b * rows + r] = -INFINITY; ip[b * rows + r] = b * block; }
       for (int r = 0; r < rows; r += dispatch.rows) {
         int nr = std::min(dispatch.rows, rows - r);
         for (int o = b * block; o < std::min(n, (b + 1) * block); ++o) {
-          float values[4];
+          float values[8];
           dispatch.fn(wp + o * k, xp + r * k, values, k, nr);
           for (int t = 0; t < nr; ++t) {
             const auto rounded = f32_to_bf16(values[t]);
-            if (yp) yp[(r + t) * n + o] = rounded;
-            const float v = bf16_to_f32(rounded);
-            const int index = b * rows + r + t;
-            if (v > mp[index] || (std::isnan(v) && !std::isnan(mp[index]))) {
-              mp[index] = v; ip[index] = o;
+            if (yp) {
+              yp[(r + t) * n + o] = rounded;
+            } else {
+              const float v = bf16_to_f32(rounded);
+              const int index = b * rows + r + t;
+              if (v > mp[index] || (std::isnan(v) && !std::isnan(mp[index]))) {
+                mp[index] = v; ip[index] = o;
+              }
             }
           }
         }

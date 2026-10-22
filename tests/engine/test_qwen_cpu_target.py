@@ -223,6 +223,7 @@ def test_bitwise_audit_distinguishes_signed_zero():
 @pytest.mark.parametrize("kwargs", [dict(backend="legacy", kernel_profile="ggml_v2"),
     dict(kernel_profile="unknown"), dict(components=("attention",)),
     dict(kernel_profile="ggml_v2", components=("unknown",)),
+    dict(kernel_profile="ggml_v2", components=("experts", "expert_reuse")),
     dict(kernel_profile="ggml_v2", components=("attention", "attention"))])
 def test_invalid_kernel_profiles_fail_before_model_allocation(kwargs):
     with pytest.raises(ValueError):

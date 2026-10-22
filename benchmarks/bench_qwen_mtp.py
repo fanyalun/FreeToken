@@ -79,6 +79,27 @@ class PhaseAudit:
             setattr(self.runner, method, original)
 
 
+def snapshot_hybrid_profiles(engine, runner, output):
+    cache = engine.moe_offload_cache
+    baseline = getattr(cache, "baseline_hybrid", None)
+    controller = getattr(getattr(runner, "three_level", None), "experts", None)
+    profiles = {
+        "baseline": getattr(baseline, "profile", None),
+        "three_level": getattr(controller, "hybrid_profile", None),
+    }
+    records = {}
+    for name, profile in profiles.items():
+        if profile is None:
+            continue
+        # Snapshot the loaded tables, not a global cache file that can be replaced.
+        data = (json.dumps(profile, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+        filename = f"hybrid_profile_{name}.json"
+        (output / filename).write_bytes(data)
+        records[name] = dict(path=filename, sha256=hashlib.sha256(data).hexdigest(),
+                             identity=profile["identity"], origin="loaded_runtime_profile")
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -109,8 +130,8 @@ def main():
     parser.add_argument("--purpose", choices=("smoke", "formal", "diagnostic"), default="formal")
     parser.add_argument("--audit", action="store_true")
     args = parser.parse_args()
-    if args.mode == "three_level" and args.backend != "offload":
-        parser.error("this comparison uses GPU offload for three-level execution")
+    if args.mode == "three_level" and args.backend not in ("offload", "hybrid"):
+        parser.error("three-level execution requires offload or hybrid")
     if min(args.cpu_threads, args.max_loops) < 1 or min(args.small_prefetch, args.verify_prefetch) < 0:
         parser.error("positive threads/loops and nonnegative prefetch quotas required")
     out = Path(args.output)
@@ -206,6 +227,9 @@ def main():
             raise ValueError("actual KV pages differ from the fixed-page contract")
         config["hybrid_max_fetch_effective"] = cache.hybrid_max_fetch if cache is not None else None
         config["hybrid_fetch_fraction"] = cache.hybrid_fetch_fraction if cache is not None else None
+        config["hybrid_phases"] = list(engine.config.speculative_hybrid_phases) if args.mode == "three_level" and args.backend == "hybrid" else []
+        config["prefetch_gap_capacity"] = engine.config.speculative_prefetch_gap_capacity
+        config["hybrid_profiles"] = snapshot_hybrid_profiles(engine, runner, out)
         config["kv_pages"] = engine.num_pages
         storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
                     for s in runner.states.values()

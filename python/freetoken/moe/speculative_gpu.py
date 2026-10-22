@@ -29,7 +29,7 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           N: tl.constexpr, E: tl.constexpr, error, CHECK_PENDING: tl.constexpr,
           weight_history, keep_history, KEEP_HITS: tl.constexpr, RENORMALIZE: tl.constexpr,
           COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None,
-          verify_prefetched=None, RETAIN_ROUTES: tl.constexpr = True):
+          verify_prefetched=None, RETAIN_ROUTES: tl.constexpr = True, RETAIN_TOPK: tl.constexpr = 4):
     k = tl.arange(0, N)
     rows = ROWS if valid_rows is None else tl.load(valid_rows)
     valid = k < rows * TOPK
@@ -58,7 +58,7 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         same_row = k[:, None] // TOPK == k[None, :] // TOPK
         better = (w[None, :] > w[:, None]) | ((w[None, :] == w[:, None]) & (k[None, :] < k[:, None]))
         rank = tl.sum((same_row & better & valid[None, :]).to(tl.int32), 1)
-        keep = valid & ((ready & KEEP_HITS) | (rank < 4))
+        keep = valid & ((ready & KEEP_HITS) | (rank < RETAIN_TOPK))
         if COLLECT_SIGNALS:
             tl.store(weight_history + base + k, w, k < INNER_ROWS * TOPK)
             tl.store(keep_history + base + k, keep, k < INNER_ROWS * TOPK)
@@ -448,11 +448,14 @@ class GPUExpertCache:
                  implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
                  inner_rows=4, layer_quotas=None, demand_fence=False,
                  verify_layer_quota=0, verify_layer_quotas=None,
-                 hybrid_phases=(), hybrid_max_fetch=-1):
+                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_top_k=4):
         if cache.device.type != "cuda" or cache.decode_target not in ("gpu", "hybrid") or cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
             raise ValueError("GPU speculative scheduling requires pinned BF16 GPU-offload experts")
         if min(max_loops, max_rows, top_k) < 1 or min(layer_quota, gap_capacity) < 0:
             raise ValueError("invalid GPU speculative cache geometry")
+        if type(preverify_top_k) is not int or not 1 <= preverify_top_k <= top_k:
+            raise ValueError("Pre-Verify top-k must fit the native routing width")
+        self.preverify_top_k = preverify_top_k
         self.cache, self.stream = cache, stream
         self.prefetch, self.use_graph, self.audit = prefetch, use_graph, audit
         self.compact_control = compact_control
@@ -684,7 +687,7 @@ class GPUExpertCache:
             triton.next_power_of_2(max(self.inner_rows * ids.shape[1], ids.numel())), triton.next_power_of_2(c.num_experts),
             self.error, self.cross_layer_prefetch, self.weight_history, self.keep_history,
             self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows,
-            self.verify_prefetched if self.phase == "verify" else None, self.retain_routes)
+            self.verify_prefetched if self.phase == "verify" else None, self.retain_routes, self.preverify_top_k)
         prior_prefetch = self.layer_quota if self.layer_quotas is None else any(self.layer_quotas[:li])
         if li > 0 and prior_prefetch:
             self.wait_demand()

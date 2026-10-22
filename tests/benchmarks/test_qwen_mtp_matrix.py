@@ -334,3 +334,55 @@ def test_matrix_validates_new_child_results_against_starting_identity(benchmark,
     with pytest.raises(ValueError, match="source_sha256"):
         _invoke(state)
     assert not (state.output / "matrix_complete.json").exists()
+
+
+def test_three_level_hybrid_prefetch_reaches_experiment_setup(tmp_path, monkeypatch):
+    import sys
+    from pathlib import Path
+    import pytest
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import bench_qwen_mtp as module
+
+    monkeypatch.setattr(sys, "argv", ["bench_qwen_mtp.py", "--model", "unused",
+        "--data", "unused", "--output", str(tmp_path/"run"), "--mode", "three_level",
+        "--backend", "hybrid", "--budget-gib", "40", "--graph-implementation", "full",
+        "--small-prefetch", "1", "--verify-prefetch", "2", "--samples", "2"])
+    def stop_before_model(*args, **kwargs):
+        raise RuntimeError("experiment setup reached")
+    monkeypatch.setattr(module, "prepare_experiment", stop_before_model)
+    with pytest.raises(RuntimeError, match="experiment setup reached"):
+        module.main()
+
+
+@pytest.mark.parametrize("kind", ["baseline", "three_level"])
+def test_hybrid_profile_snapshot_uses_loaded_tables(tmp_path, monkeypatch, kind):
+    import hashlib
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import bench_qwen_mtp as module
+
+    profile = {"identity": {"threads": 23, "widths": [1, 2, 3, 4]}, "cpu": [[1., 2.]]}
+    cache = SimpleNamespace(baseline_hybrid=None)
+    runner = SimpleNamespace(three_level=None)
+    if kind == "baseline":
+        cache.baseline_hybrid = SimpleNamespace(profile=profile, profile_path="/unused/global/cache.json")
+    else:
+        runner.three_level = SimpleNamespace(experts=SimpleNamespace(hybrid_profile=profile))
+    result = module.snapshot_hybrid_profiles(SimpleNamespace(moe_offload_cache=cache), runner, tmp_path)
+    record = result[kind]
+    data = (tmp_path / record["path"]).read_bytes()
+    assert json.loads(data) == profile
+    assert hashlib.sha256(data).hexdigest() == record["sha256"]
+    assert record["identity"] == profile["identity"]
+    profile["cpu"][0][0] = 999.
+    assert json.loads(data)["cpu"][0][0] == 1.
+
+
+def test_offload_profile_snapshot_has_no_hybrid_tables(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    import bench_qwen_mtp as module
+
+    assert module.snapshot_hybrid_profiles(SimpleNamespace(moe_offload_cache=None),
+                                          SimpleNamespace(three_level=None), tmp_path) == {}
+    assert not list(tmp_path.iterdir())

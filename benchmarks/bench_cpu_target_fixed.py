@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import resource
 import sys
+import tarfile
 import time
 
 _initial_affinity = os.sched_getaffinity(0)
@@ -121,10 +122,18 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--backend", choices=("legacy", "optimized"), nargs="+", default=["legacy", "optimized"])
     parser.add_argument("--kernel-profile", choices=("v1", "ggml_v2"), nargs="+", default=["v1"])
-    parser.add_argument("--components", nargs="+", choices=("attention", "dense", "head", "experts", "gdn"), default=None)
+    parser.add_argument("--components", nargs="+", choices=("attention", "dense", "head", "experts", "gdn", "expert_reuse", "expert_numa"), default=None)
     parser.add_argument("--instrument-components", action="store_true")
     parser.add_argument("--formal-timing", action="store_true")
     parser.add_argument("--threads", type=int, default=23)
+    parser.add_argument("--candidate-threads", type=int,
+                        help="reuse frozen candidates from this thread-count cell")
+    parser.add_argument("--sample-ids", type=int, nargs="+", help="measure only these frozen sample IDs")
+    parser.add_argument("--loops", type=int, nargs="+", help="measure only these frozen loop cells")
+    parser.add_argument("--snapshot-format", choices=("tree", "tar"), default="tree")
+    parser.add_argument("--idle-seconds", type=float, default=0,
+                        help="require this continuous quiet interval before each timing cell")
+    parser.add_argument("--idle-timeout", type=float, default=600)
     parser.add_argument("--audit-tokens", type=int, default=16)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--audit-only", action="store_true")
@@ -134,15 +143,24 @@ def main():
         parser.error("legacy cannot be combined with ggml_v2")
     if args.components and "ggml_v2" not in args.kernel_profile:
         parser.error("components require ggml_v2")
+    if args.components and "expert_numa" in args.components and args.threads != 46:
+        parser.error("expert_numa requires the two-node 46-thread protocol")
     if args.formal_timing and args.instrument_components:
         parser.error("formal timing excludes component instrumentation")
     if args.frozen_v1_root and (args.backend != ["optimized"] or args.kernel_profile != ["v1"]):
         parser.error("frozen runtime requires optimized v1 only")
     if not 2 <= args.audit_tokens <= 33 or args.repeats < 1:
         parser.error("audit-tokens must be 2..33 and repeats positive")
+    if args.idle_seconds < 0 or args.idle_timeout <= args.idle_seconds:
+        parser.error("idle timeout must exceed the nonnegative quiet interval")
     args.output.mkdir(parents=True, exist_ok=False)
     write(args.output / "complete.json", dict(validity="incomplete", pipeline_complete=False))
     config = json.loads((args.prefix_run / "config.json").read_text())
+    samples = args.sample_ids if args.sample_ids is not None else list(range(config["samples"]))
+    if not samples or len(set(samples)) != len(samples) or any(s < 0 or s >= config["samples"] for s in samples):
+        parser.error("sample IDs must be unique and present in the frozen run")
+    if args.loops and (min(args.loops) < 1 or len(set(args.loops)) != len(args.loops)):
+        parser.error("loop filters must be unique positive values")
     model = Path(config["model"])
     if digest(model / "config.json") != config["model_config_sha256"]:
         raise ValueError("checkpoint config changed from frozen prefix experiment")
@@ -170,15 +188,27 @@ def main():
         copy = args.output / "harness" / path.relative_to(harness_root)
         copy.parent.mkdir(parents=True, exist_ok=True)
         copy.write_bytes(path.read_bytes())
-    for path in source_paths:
-        if path.is_file():
-            copy = args.output / "source" / path.relative_to(source)
-            copy.parent.mkdir(parents=True, exist_ok=True)
-            copy.write_bytes(path.read_bytes())
+    if args.snapshot_format == "tar":
+        with tarfile.open(args.output / "source.tar", "w") as archive:
+            for path in source_paths:
+                if path.is_file():
+                    archive.add(path, arcname=str(path.relative_to(source)), recursive=False)
+    else:
+        for path in source_paths:
+            if path.is_file():
+                copy = args.output / "source" / path.relative_to(source)
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                copy.write_bytes(path.read_bytes())
     manifest = dict(purpose="formal" if args.formal_timing else "diagnostic", validity="incomplete", model=config["model"],
-        command=[sys.executable, *sys.argv],
-        thread_environment={k: os.environ.get(k) for k in ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND", "OMP_WAIT_POLICY")},
+        command=[sys.executable, *sys.argv], sample_ids=samples, selected_loops=args.loops,
+        resource_cpu_protocol="proc_stat_interval_before_and_during_each_measurement",
+        snapshot_format=args.snapshot_format,
+        source_archive_sha256=digest(args.output / "source.tar") if args.snapshot_format == "tar" else None,
+        idle_seconds=args.idle_seconds, idle_timeout=args.idle_timeout,
+        thread_environment={k: os.environ.get(k) for k in
+            ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT")},
         prefix_run=str(args.prefix_run), prefix_config_sha256=digest(args.prefix_run / "config.json"),
+        candidate_threads=args.candidate_threads if args.candidate_threads is not None else args.threads,
         runtime_source_root=str(source), frozen_v1_runtime=bool(args.frozen_v1_root),
         runtime_modules={name: sys.modules[name].__file__ for name in (
             "freetoken.engine.qwen_cpu_target", "freetoken.moe.cpu_target", "freetoken.kernel._cpu_moe")},
@@ -211,7 +241,7 @@ def main():
         write(args.output / "manifest.json", manifest)
         meter = None
         try:
-            for sample in range(config["samples"]):
+            for sample in samples:
                 path = args.prefix_run / f"gpu_prefix_sample{sample}.pt"
                 checkpoint = PrefixCheckpoint(**torch.load(path, map_location="cpu", weights_only=True))
                 manifest.setdefault("prefix_sha256", {})[str(sample)] = digest(path)
@@ -229,10 +259,32 @@ def main():
                     target.enable_attention_diagnostics()
                     meter = Components(target)
                 selected = [r for r in frozen if r["sample_id"] == sample and r["repeat"] == 0
-                            and r["threads"] == args.threads]
+                            and r["threads"] == manifest["candidate_threads"]
+                            and (args.loops is None or r["loops"] in args.loops)]
                 if not selected or len({r["loops"] for r in selected}) != len(selected):
                     raise ValueError("frozen candidates must contain unique loop cells for every input")
+                if args.loops and {r["loops"] for r in selected} != set(args.loops):
+                    raise ValueError("requested loop filter is absent from frozen input")
                 for cell in selected:
+                    if args.idle_seconds:
+                        wait_started = time.monotonic()
+                        quiet_since = wait_started
+                        while True:
+                            idle_resources = resource_snapshot(sample_seconds=1)
+                            idle_interference = resource_interference(idle_resources, {os.getpid()})
+                            now = time.monotonic()
+                            if idle_interference["detected"]:
+                                quiet_since = now
+                            with (args.output / "idle_resources.jsonl").open("a") as stream:
+                                stream.write(json.dumps(dict(sample=sample, loops=cell["loops"],
+                                    resources=idle_resources, interference=idle_interference)) + "\n")
+                            print(json.dumps(dict(event="waiting_for_idle", sample=sample, loops=cell["loops"],
+                                waited_seconds=now-wait_started, quiet_seconds=now-quiet_since,
+                                interference=idle_interference)), flush=True)
+                            if now - quiet_since >= args.idle_seconds:
+                                break
+                            if now - wait_started >= args.idle_timeout:
+                                raise TimeoutError("no continuous idle interval before timing cell")
                     resources = resource_snapshot()
                     interference = resource_interference(resources, {os.getpid()})
                     with (args.output / "resources.jsonl").open("a") as stream:
@@ -252,6 +304,7 @@ def main():
                             meter.seconds.clear()
                             if getattr(target, "attention_diagnostics", None) is not None:
                                 target.attention_diagnostics.clear()
+                        window_before = resource_snapshot() if repeat >= 0 else None
                         before_usage = resource.getrusage(resource.RUSAGE_SELF)
                         started = time.perf_counter()
                         result = target.verify(job)
@@ -259,6 +312,15 @@ def main():
                         assert result.input_count == 1
                         if repeat < 0:
                             continue
+                        window_after = resource_snapshot(sample_seconds=0)
+                        before_interference = resource_interference(window_before, {os.getpid()})
+                        during_interference = resource_interference(window_after, {os.getpid()}, previous=window_before)
+                        interference = dict(before=before_interference, during=during_interference,
+                            detected=before_interference["detected"] or during_interference["detected"])
+                        with (args.output / "resources.jsonl").open("a") as stream:
+                            stream.write(json.dumps(dict(backend=backend, sample=sample, loops=cell["loops"],
+                                repeat=repeat, phase="measured_window", before=window_before,
+                                after=window_after, interference=interference)) + "\n")
                         usage = resource.getrusage(resource.RUSAGE_SELF)
                         row = dict(backend=backend, sample_id=sample, loops=cell["loops"],
                             formal_eligible=args.formal_timing and not interference["detected"],

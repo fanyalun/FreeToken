@@ -96,10 +96,12 @@ def test_baseline_profile_cache_hit_and_explicit_mismatch(tmp_path, monkeypatch)
         return profile
     monkeypatch.setattr(module, "calibrate", calibrate)
     assert module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True) == profile
-    assert module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True) == profile
+    loaded = module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True)
+    assert all(loaded[name] == value for name, value in profile.items())
     assert len(calls) == 1
     path = next(tmp_path.glob("*.json"))
-    assert module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True, profile_path=path) == profile
+    loaded = module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True, profile_path=path)
+    assert all(loaded[name] == value for name, value in profile.items())
     path.write_text(json.dumps({**profile, "identity": {}}))
     with pytest.raises(ValueError, match="identity"):
         module.load_or_calibrate(None, None, None, [1, 2, 3, 4], eager=True, profile_path=path)
@@ -221,6 +223,190 @@ def test_three_level_profile_cache_recalibrates_automatic_but_rejects_explicit(t
     assert len(calls) == 8
 
 
+@pytest.fixture(params=["baseline", "three_level"])
+def reusable_profiles(request, tmp_path, monkeypatch):
+    from copy import deepcopy
+    from freetoken.moe import baseline_hybrid, speculative_hybrid
+    from freetoken.moe.hybrid_profile import coverage, finish_coverage, initialize_profile, missing_widths
+
+    baseline = request.param == "baseline"
+    module = baseline_hybrid if baseline else speculative_hybrid
+    identity = dict(widths=[1, 2], geometry=[2, 8, 64, 32, 2], cache_slots=4096,
+        cache_layout=[["gate_up", [4096, 64, 64], [4096, 64, 1], "torch.bfloat16"]],
+        execution="graph", threads=23, cores=[0, 1], numa={"0": ["node0"]},
+        kernels={"native": "v1"}, gpu_uuid="gpu1", pcie={"path": "pcie0", "max_link_width": "16"})
+    fields = ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "io", "contention" if baseline else "dram")
+    calls = []
+    def calibrate(*args, previous=None):
+        current = deepcopy(args[-1])
+        width = max(current["widths"])
+        result = baseline_profile(width) if baseline else profile_tables(width, top_k=2)
+        result["identity"] = current
+        initialize_profile(result, previous, fields)
+        missing = missing_widths(previous, current)
+        io_max = coverage(previous)[1] if previous else -1
+        end = min(width * 2, current["geometry"][1], current["cache_slots"])
+        calls.append((missing, list(range(io_max + 1, end + 1))))
+        for w in missing:
+            result["cpu"][w] = [0.] + [float(w * 100 + n) for n in range(1, width * 2 + 1)]
+        for q in range(io_max + 1, end + 1):
+            result["io"][q] = float(q * 7)
+        return finish_coverage(result)
+    monkeypatch.setattr(module, "profile_identity", lambda *args, **kwargs: deepcopy(identity))
+    monkeypatch.setattr(module, "calibrate", calibrate)
+    monkeypatch.setenv("FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE" if baseline else "FREETOKEN_HYBRID_PROFILE_CACHE", str(tmp_path))
+    def load(path=None):
+        if baseline:
+            return module.load_or_calibrate(None, None, None, identity["widths"], eager=False, profile_path=path)
+        control = SimpleNamespace(cache=SimpleNamespace(device="cpu"), max_rows=max(identity["widths"]),
+                                  inner_rows=1, use_graph=True)
+        return module.load_or_calibrate(control, None, None, path)[0]
+    return SimpleNamespace(identity=identity, calls=calls, load=load, directory=tmp_path,
+                           validate=module.validate_profile, predict=module.predict_prefix)
+
+
+def test_profile_reuse_across_slot_counts_preserves_measurements(reusable_profiles):
+    state = reusable_profiles
+    original = state.load()
+    state.identity["cache_slots"] = 2048
+    state.identity["cache_layout"][0][1][0] = 2048
+    loaded = state.load()
+    assert len(state.calls) == 1
+    assert loaded["identity"]["cache_slots"] == 2048
+    assert loaded["cpu"] == original["cpu"] and loaded["io"] == original["io"]
+    assert loaded["reuse"]["source_identity"]["cache_slots"] == 4096
+    assert loaded["reuse"]["calibrated_widths"] == []
+
+
+def test_profile_superset_reuse_reshapes_tables_without_shrinking_cache(reusable_profiles):
+    state = reusable_profiles
+    state.identity["widths"] = [1, 2, 3, 4]
+    wide = state.load()
+    path = next(state.directory.glob("*.json"))
+    saved = path.read_bytes()
+    state.identity["widths"] = [1, 2]
+    narrow = state.load()
+    assert len(state.calls) == 1 and path.read_bytes() == saved
+    assert len(narrow["cpu"]) == 3 and len(narrow["cpu"][1]) == 5
+    assert narrow["cpu"][2] == wide["cpu"][2][:5]
+    assert narrow["io"] == wide["io"][:5]
+    assert state.predict(narrow, 2, [1, 1, 2, 0, 0, 0, 0, 0]) == state.predict(wide, 2, [1, 1, 2, 0, 0, 0, 0, 0])
+
+
+def test_profile_extension_measures_only_missing_widths_and_io(reusable_profiles):
+    import json
+    state = reusable_profiles
+    original = state.load()
+    state.identity["widths"] = [1, 2, 3, 4]
+    expanded = state.load()
+    assert state.calls == [([1, 2], [0, 1, 2, 3, 4]), ([3, 4], [5, 6, 7, 8])]
+    assert expanded["cpu"][1][:5] == original["cpu"][1]
+    assert expanded["cpu"][2][:5] == original["cpu"][2]
+    assert expanded["io"][:5] == original["io"]
+    state.identity["widths"] = [1, 2]
+    state.load()
+    assert len(state.calls) == 2
+    cached = json.loads(next(state.directory.glob("*.json")).read_text())
+    assert cached["identity"]["widths"] == [1, 2, 3, 4]
+
+
+def test_profile_reuse_does_not_trust_unmeasured_fetches(reusable_profiles):
+    state = reusable_profiles
+    state.identity["cache_slots"] = 2
+    state.identity["cache_layout"][0][1][0] = 2
+    state.load()
+    state.identity["cache_slots"] = 8
+    state.identity["cache_layout"][0][1][0] = 8
+    state.load()
+    assert state.calls == [([1, 2], [0, 1, 2]), ([2], [3, 4])]
+
+
+def test_profile_extension_at_lower_budget_preserves_wider_measured_coverage(reusable_profiles):
+    state = reusable_profiles
+    state.identity["widths"] = [1, 2, 3, 4]
+    original = state.load()
+    state.identity["cache_slots"] = 2
+    state.identity["cache_layout"][0][1][0] = 2
+    state.identity["widths"] = [1, 2, 3, 4, 5]
+    state.load()
+    assert state.calls[-1] == ([5], [])
+    state.identity["cache_slots"] = 4096
+    state.identity["cache_layout"][0][1][0] = 4096
+    state.identity["widths"] = [1, 2, 3, 4]
+    loaded = state.load()
+    assert len(state.calls) == 2
+    assert loaded["io"] == original["io"]
+    assert loaded["cpu"][4] == original["cpu"][4]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("threads", 46), ("cores", [2, 3]), ("numa", {"0": ["node1"]}),
+    ("gpu_uuid", "gpu2"), ("pcie", {"path": "pcie1", "max_link_width": "8"}),
+    ("kernels", {"native": "v2"}), ("execution", "eager"),
+    ("cache_layout", [["gate_up", [4096, 128, 64], [8192, 64, 1], "torch.bfloat16"]]),
+])
+def test_profile_reuse_rejects_incompatible_execution(reusable_profiles, key, value):
+    state = reusable_profiles
+    state.load()
+    path = next(state.directory.glob("*.json"))
+    state.identity[key] = value
+    with pytest.raises(ValueError, match="identity mismatch"):
+        state.load(path)
+    state.load()
+    assert len(state.calls) == 2
+
+
+def test_explicit_legacy_profile_reuse_and_extension_keep_source_unchanged(reusable_profiles):
+    import json
+    state = reusable_profiles
+    original = state.load()
+    original.pop("calibration_coverage")
+    path = state.directory / "legacy.json"
+    path.write_text(json.dumps(original))
+    source = path.read_bytes()
+    state.identity["cache_slots"] = 2048
+    state.identity["cache_layout"][0][1][0] = 2048
+    state.load(path)
+    assert len(state.calls) == 1 and path.read_bytes() == source
+    state.identity["widths"] = [1, 2, 3, 4]
+    state.load(path)
+    assert state.calls[-1] == ([3, 4], [5, 6, 7, 8]) and path.read_bytes() == source
+
+
+def test_automatic_profile_search_ignores_corrupt_candidates(reusable_profiles):
+    state = reusable_profiles
+    state.load()
+    next(state.directory.glob("*.json")).rename(state.directory / "old_identity_hash.json")
+    (state.directory / "corrupt.json").write_text('{"identity":')
+    (state.directory / "invalid_identity.json").write_text('{"identity": null}')
+    state.load()
+    assert len(state.calls) == 1
+
+
+def test_explicit_canonical_profile_is_not_overwritten_on_extension(reusable_profiles):
+    state = reusable_profiles
+    state.load()
+    path = next(state.directory.glob("*.json"))
+    source = path.read_bytes()
+    state.identity["widths"] = [1, 2, 3, 4]
+    state.load(path)
+    assert path.read_bytes() == source
+    assert len(list(state.directory.glob("*.json"))) == 2
+    state.load(path)
+    assert len(state.calls) == 2
+
+
+def test_profile_rejects_false_coverage_claims(reusable_profiles):
+    import json
+    state = reusable_profiles
+    profile = state.load()
+    profile["calibration_coverage"]["io_max"] = 1000
+    path = state.directory / "bad_coverage.json"
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="invalid measurements"):
+        state.load(path)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("slots,width", [(3669, 2), (3669, 4), (3669, 25), (4096, 25)])
 @pytest.mark.parametrize("cap", [-1, 0, 1])
@@ -257,7 +443,7 @@ def test_partition_qwen_geometry_without_host_route_readback(slots, width, cap):
         assert plan[0][:fetched].tolist() == list(range(li * 256, li * 256 + fetched))
 
 
-def make_cache(stream, *, layers=2, slots=8, hidden=64, intermediate=32, num_threads=4):
+def make_cache(stream, *, layers=2, slots=8, hidden=64, intermediate=32, num_threads=4, grouped_compat=False):
     from freetoken.kernel.pinned import alloc_pinned_tensor
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
@@ -280,7 +466,8 @@ def make_cache(stream, *, layers=2, slots=8, hidden=64, intermediate=32, num_thr
         step=torch.zeros((), device="cuda", dtype=torch.int64),
         bank_views=lambda: tuple(bank for _, bank in banks), alphas_for_slots=lambda _: None)
     cache.cpu_executor = CpuMoeExecutor(cache, top_k=8, activation="silu", apply_router_weight_on_input=False,
-        num_threads=num_threads, max_tokens=25, device=cache.device, grouped_widths=tuple(range(1, 26)))
+        num_threads=num_threads, max_tokens=25, device=cache.device, grouped_widths=tuple(range(1, 26)),
+        grouped_compat=grouped_compat)
     return cache
 
 
@@ -566,16 +753,63 @@ def test_calibration_uses_real_graph_branches_and_checks_profile_identity(tmp_pa
         control = GPUExpertCache(cache, stream, max_loops=1, max_rows=2, inner_rows=2,
             compact_control=True, implementation="optimized", prefetch=False, hybrid_phases=("verify",), use_graph=use_graph)
         try:
+            control.max_rows = control.inner_rows = 1
             control.prepare_hybrid(layer)
+            first_cpu = list(control.hybrid_profile["cpu"][1])
+            first_io = list(control.hybrid_profile["io"])
+            assert len(control.hybrid_profile["choice_audit"]) == 3
+            control.max_rows = control.inner_rows = 2
+            control.prepare_hybrid(layer)
+            assert control.hybrid_profile["cpu"][1][:len(first_cpu)] == first_cpu
+            assert control.hybrid_profile["io"][:len(first_io)] == first_io
+            assert control.hybrid_profile["reuse"]["calibrated_widths"] == [2]
             assert len(list(tmp_path.glob("*.json"))) == 1
             assert len(control.hybrid_profile["choice_audit"]) == 6
             assert control.hybrid_profile["identity"]["execution"] == ("graph" if use_graph else "eager")
             assert all(trial["regret_ratio"] >= 0 for trial in control.hybrid_profile["choice_audit"])
             assert cache.slot_for_id.eq(-1).all()
             loaded, _ = load_or_calibrate(control, layer, cache.cpu_executor)
-            assert loaded == control.hybrid_profile
+            assert all(loaded[name] == value for name, value in control.hybrid_profile.items() if name != "reuse")
             with pytest.raises(ValueError, match="does not exist"):
                 load_or_calibrate(control, layer, cache.cpu_executor, str(tmp_path / "missing.json"))
+        finally:
+            stream.synchronize()
+            cache.cpu_executor.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("use_graph", [False, True])
+def test_baseline_calibration_incrementally_extends_real_measurements(tmp_path, monkeypatch, use_graph):
+    from freetoken.moe.baseline_hybrid import load_or_calibrate
+    from freetoken.moe.fused import fused_experts_decode_impl
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    monkeypatch.setenv("FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE", str(tmp_path))
+    with torch.cuda.stream(stream):
+        cache = make_cache(stream, grouped_compat=True)
+        cache.bank_caches = {str(i): bank for i, (_, bank) in enumerate(cache.banks)}
+        cache._copy_fused_ok = False
+        cache.copy_missing = lambda: OffloadMoeCache.copy_missing(cache)
+        cache.reset = lambda: None
+        cache.reset_stats = lambda: None
+        def gemm(cache, x, weights, slots, **kwargs):
+            return fused_experts_decode_impl(x, *cache.bank_views(), weights, slots, "silu", False)
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        try:
+            first = load_or_calibrate(cache, layer, cache.cpu_executor, [1], eager=not use_graph)
+            cache.cache_size = 2
+            extended = load_or_calibrate(cache, layer, cache.cpu_executor, [1, 2], eager=not use_graph)
+            assert extended["reuse"]["calibrated_widths"] == [2]
+            assert extended["cpu"][1][:len(first["cpu"][1])] == first["cpu"][1]
+            assert extended["io"][:len(first["io"])] == first["io"]
+            single = [m for m in extended["measurements"] if m["kind"] == "single_expert"]
+            assert [m["width"] for m in single] == [1, 2, 2]
+            cache.cache_size = 8
+            reloaded = load_or_calibrate(cache, layer, cache.cpu_executor, [1], eager=not use_graph)
+            assert reloaded["reuse"]["calibrated_widths"] == []
+            assert reloaded["cpu"] == first["cpu"]
         finally:
             stream.synchronize()
             cache.cpu_executor.close()

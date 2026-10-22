@@ -482,7 +482,8 @@ def test_gpu_padding_preserves_admission_lru_and_variable_history(depth, phase):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("keep_hits,renormalize", [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize("phase", ["preverify", "verify"])
-def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, phase):
+@pytest.mark.parametrize("preverify_top_k", [4, 6])
+def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, phase, preverify_top_k):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     device = torch.device("cuda:0")
@@ -495,7 +496,8 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
             cache.id_of_slot[slot] = expert
             cache.banks[0][1][slot, 0] = expert
         control = GPUExpertCache(cache, stream, max_loops=6, max_rows=25, prefetch=False,
-            keep_hits=keep_hits, renormalize=renormalize, collect_signals=True)
+            keep_hits=keep_hits, renormalize=renormalize, collect_signals=True,
+            preverify_top_k=preverify_top_k)
         control.begin(1)
         control.set_phase(phase)
         ids = torch.arange(8, device=device, dtype=torch.int32).reshape(1, 8)
@@ -503,7 +505,7 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
         result = control.route(toy_layer(0), torch.zeros(1, 1, device=device), weights, ids)
         selected = weights.clone()
         if phase == "preverify":
-            selected[:, 4:] = 0
+            selected[:, preverify_top_k:] = 0
             if keep_hits:
                 selected[:, [5, 7]] = weights[:, [5, 7]]
             if renormalize:
@@ -513,7 +515,7 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
         torch.testing.assert_close(result, (ids.float() * selected).sum(-1, keepdim=True))
         torch.testing.assert_close(control.outputs[0, 1][1], selected)
         control.close()
-        expected_loads = 4 if phase == "preverify" else 6
+        expected_loads = preverify_top_k - int(preverify_top_k == 6) if phase == "preverify" else 6
         assert control.stats["demand_loads"] == expected_loads
         assert control.stats[phase + "_demand_loads"] == expected_loads
 

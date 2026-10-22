@@ -1,4 +1,5 @@
 from collections import deque
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,49 @@ import torch
 
 from freetoken.engine.qwen_cpu_target import VerifyJob
 from freetoken.engine.qwen_cpu_worker import CpuVerifierWorker
+from freetoken.engine import qwen_cpu_worker
+
+
+@pytest.mark.parametrize("bind_openmp", [False, True])
+@pytest.mark.parametrize("start_fails", [False, True])
+def test_spawn_inherits_worker_affinity_and_restores_parent(monkeypatch, bind_openmp, start_fails):
+    parent_cores, worker_cores = {0, 24}, [1, 2, 25, 26]
+    affinity = set(parent_cores)
+
+    def set_affinity(pid, cores):
+        nonlocal affinity
+        assert pid == 0
+        affinity = set(cores)
+
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(affinity))
+    monkeypatch.setattr(os, "sched_setaffinity", set_affinity)
+    monkeypatch.setenv("GOMP_CPU_AFFINITY", "0 24")
+    monkeypatch.delenv("OMP_PROC_BIND", raising=False)
+    monkeypatch.setattr(torch.Tensor, "share_memory_", lambda tensor: tensor)
+
+    def start():
+        assert affinity == (set(worker_cores) if bind_openmp else parent_cores)
+        assert os.environ["GOMP_CPU_AFFINITY"] == ("1 2 25 26" if bind_openmp else "0 24")
+        assert os.environ.get("OMP_PROC_BIND") == ("TRUE" if bind_openmp else None)
+        if start_fails:
+            raise RuntimeError("spawn failed")
+
+    context = SimpleNamespace(Pipe=lambda: (Pipe(), SimpleNamespace(close=lambda: None)),
+        Process=lambda **kwargs: SimpleNamespace(start=start))
+    monkeypatch.setattr(qwen_cpu_worker.mp, "get_context", lambda method: context)
+    config = dict(layer_types=["linear_attention", "full_attention"], linear_num_value_heads=1,
+        linear_key_head_dim=2, linear_value_head_dim=2, linear_num_key_heads=1,
+        num_key_value_heads=1, head_dim=2, linear_conv_kernel_dim=2, hidden_size=4, vocab_size=8)
+    if start_fails:
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            CpuVerifierWorker("unused", config, worker_cores, max_context=4, max_rows=2,
+                bind_openmp=bind_openmp)
+    else:
+        CpuVerifierWorker("unused", config, worker_cores, max_context=4, max_rows=2,
+            bind_openmp=bind_openmp)
+    assert affinity == parent_cores
+    assert os.environ["GOMP_CPU_AFFINITY"] == "0 24"
+    assert "OMP_PROC_BIND" not in os.environ
 
 
 class Pipe:
