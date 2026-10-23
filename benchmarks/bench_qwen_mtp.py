@@ -86,6 +86,39 @@ def reset_request_counters(controller, stream):
         controller.request_counters.zero_()
 
 
+def snapshot_hybrid_profiles(engine, runner, output):
+    cache = engine.moe_offload_cache
+    baseline = getattr(cache, "baseline_hybrid", None)
+    controller = getattr(getattr(runner, "three_level", None), "experts", None)
+    profiles = {
+        "baseline": getattr(baseline, "profile", None),
+        "three_level": getattr(controller, "hybrid_profile", None),
+    }
+    records = {}
+    for name, profile in profiles.items():
+        if profile is None:
+            continue
+        # Snapshot the loaded tables, not a global cache file that can be replaced.
+        data = (json.dumps(profile, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+        filename = f"hybrid_profile_{name}.json"
+        (output / filename).write_bytes(data)
+        records[name] = dict(path=filename, sha256=hashlib.sha256(data).hexdigest(),
+                             identity=profile["identity"], origin="loaded_runtime_profile")
+    return records
+
+
+def prefetch_config(args):
+    phases = args.small_prefetch is not None or args.verify_prefetch is not None
+    small = (args.small_prefetch or 0) if phases else args.prefetch_layer_experts
+    verify = args.verify_prefetch or 0
+    if min(small, verify) < 0:
+        raise ValueError("prefetch quotas must be nonnegative")
+    return dict(speculative_prefetch=bool(small or verify) if phases else args.prefetch,
+                speculative_prefetch_layer_experts=small,
+                speculative_prefetch_gap_capacity=12 if phases and small else 0,
+                speculative_verify_prefetch_layer_experts=verify)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -105,21 +138,50 @@ def main():
     parser.add_argument("--max-input-tokens", type=int, default=3840)
     parser.add_argument("--prompt-chunk-size", type=int, default=None)
     parser.add_argument("--moe-slots", type=int, default=None)
+    parser.add_argument("--kv-pages", type=int, default=None)
+    parser.add_argument("--cpu-threads", type=int, default=23)
+    parser.add_argument("--frozen-prompts", default=None)
+    parser.add_argument("--prefix-length", type=int, default=None)
+    parser.add_argument("--graph-implementation", choices=("reference", "full"), default="reference")
+    parser.add_argument("--small-prefetch", type=int, default=None,
+                        help="Explicit phase quotas override --prefetch and --prefetch-layer-experts")
+    parser.add_argument("--verify-prefetch", type=int, default=None)
     parser.add_argument("--samples", type=int, default=16)
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--purpose", choices=("smoke", "formal", "diagnostic"), default="formal")
     parser.add_argument("--audit", action="store_true")
     args = parser.parse_args()
+    if min(args.cpu_threads, args.max_loops) < 1:
+        parser.error("positive threads and loops required")
+    try:
+        prefetch = prefetch_config(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
     (out / "complete.json").write_text(json.dumps({"status": "incomplete", "matrix_complete": False}) + "\n")
-    if args.samples < 1 or args.tokens < 1:
+    if args.samples < 1 or args.tokens < 1 or args.repeats < 1:
         raise ValueError("samples and tokens must be positive")
     import freetoken
     root = Path(freetoken.__file__).resolve().parents[2]
     prompts, experiment = prepare_experiment(args.model, args.data, root, args.samples)
+    if args.frozen_prompts:
+        source = Path(args.frozen_prompts)
+        prompts = json.loads(source.read_text())
+        if len(prompts) != args.samples or any(not p or any(type(t) is not int or t < 0 for t in p) for p in prompts):
+            raise ValueError("frozen prompts must match samples and contain nonempty token lists")
+        experiment["frozen_prompts_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    if args.prefix_length is not None:
+        if not 1 <= args.prefix_length <= args.max_input_tokens:
+            raise ValueError("prefix length must fit input capacity")
+        prompts = [(p*((args.prefix_length+len(p)-1)//len(p)))[:args.prefix_length] for p in prompts]
+        experiment["input_purpose"] = "deterministic repeated-token length diagnostic, not natural long-document quality"
+    experiment["prompt_sha256"] = hashlib.sha256(json.dumps(prompts).encode()).hexdigest()
+    (out / "prompts.json").write_text(json.dumps(prompts)+"\n")
     config = benchmark_config(args, experiment)
+    config["effective_prefetch_config"] = prefetch
     config["driver_sha256"] = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                                for name in ("bench_qwen_mtp.py", "qwen_mtp_config.py")}
     config["modes_calibration_sha256"] = (hashlib.sha256(Path(args.modes_calibration).read_bytes()).hexdigest()
@@ -138,22 +200,24 @@ def main():
         engine = Engine(SchedulerConfig(
             model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
             max_running_req=1, attention_backend="triton", moe_strategy=args.backend,
+            moe_cpu_threads=args.cpu_threads,
             moe_hybrid_max_fetch=args.hybrid_max_fetch,
             speculative_hybrid_window_policy=args.hybrid_window_policy,
             speculative_hybrid_cpu_backend=args.hybrid_cpu_backend,
             speculative_hybrid_profile=args.hybrid_profile,
             moe_cache_auto=args.moe_slots is None and args.backend != "fused",
             moe_cache_size=args.moe_slots or 0, kv_reserve_tokens=args.max_input_tokens + args.tokens, memory_ratio=0.9,
-            num_page_override=args.max_input_tokens + args.tokens,
+            num_page_override=args.kv_pages or args.max_input_tokens + args.tokens,
             max_seq_len_override=args.max_input_tokens + args.tokens, gpu_memory_budget_bytes=args.budget_gib << 30,
             speculative_mtp_depth=3 if args.mode in ("mtp", "three_level") else 0,
             speculative_three_level=args.mode == "three_level", speculative_max_loops=args.max_loops,
-            speculative_prefetch=args.prefetch, speculative_prefetch_layer_experts=args.prefetch_layer_experts,
+            **prefetch,
             speculative_expert_scheduler="gpu" if args.mode == "three_level" else "host",
             speculative_execution_implementation="optimized" if args.mode == "three_level" else "reference",
+            speculative_graph_implementation=args.graph_implementation,
             cuda_graph_max_bs=0 if args.eager else (4 if args.mode in ("mtp", "three_level") else 1),
             cuda_graph_bs=[] if args.eager else ([1, 2, 3, 4] if args.mode in ("mtp", "three_level") else [1]),
-            cache_type="naive", max_extend_tokens=128,
+            cache_type="naive", page_size=1, max_extend_tokens=args.prompt_chunk_size or args.max_input_tokens,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
             **limits,
             **policy_config(args),
@@ -188,8 +252,15 @@ def main():
         torch.cuda.synchronize(engine.device)
         torch.cuda.reset_peak_memory_stats(engine.device)
         config["moe_slots"] = cache.cache_size if cache is not None else 0
+        if args.moe_slots is not None and config["moe_slots"] != args.moe_slots:
+            raise ValueError("actual expert slots differ from the fixed-slot contract")
+        if args.kv_pages is not None and engine.num_pages != args.kv_pages:
+            raise ValueError("actual KV pages differ from the fixed-page contract")
         config["hybrid_max_fetch_effective"] = cache.hybrid_max_fetch if cache is not None else None
         config["hybrid_fetch_fraction"] = cache.hybrid_fetch_fraction if cache is not None else None
+        config["hybrid_phases"] = list(engine.config.speculative_hybrid_phases) if args.mode == "three_level" and args.backend == "hybrid" else []
+        config["prefetch_gap_capacity"] = engine.config.speculative_prefetch_gap_capacity
+        config["hybrid_profiles"] = snapshot_hybrid_profiles(engine, runner, out)
         config["kv_pages"] = engine.num_pages
         storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
                     for s in runner.states.values()
@@ -210,7 +281,10 @@ def main():
             cache.reset()
         torch.cuda.synchronize(engine.device)
         with (out / "requests.jsonl").open("w") as f:
-            for index, prompt in enumerate(prompts):
+            for repeat, index, prompt in ((r, i, p) for r in range(args.repeats) for i, p in enumerate(prompts)):
+                if index == 0 and cache is not None:
+                    cache.reset()
+                    torch.cuda.synchronize(engine.device)
                 if controller is not None:
                     reset_request_counters(controller, engine.stream)
                 started = time.perf_counter()
@@ -219,7 +293,7 @@ def main():
                 wall = time.perf_counter() - started
                 if len(result.token_ids) != args.tokens:
                     raise ValueError("incomplete returned-token request")
-                row = {"sample_id": index, **dataclasses.asdict(result), "complete_wall_seconds": wall,
+                row = {"sample_id": index, "repeat": repeat, **dataclasses.asdict(result), "complete_wall_seconds": wall,
                        "tpot_seconds": (wall - result.ttft_seconds) / (args.tokens - 1) if args.tokens > 1 else None}
                 if controller is not None:
                     from freetoken.moe.speculative_gpu import STAT_NAMES
@@ -242,6 +316,8 @@ def main():
                 f.write(json.dumps(row) + "\n")
                 f.flush()
                 rows.append(row)
+                if repeat and row["token_ids"] != rows[index]["token_ids"]:
+                    raise ValueError(f"timing repeat token mismatch at repeat {repeat}, sample {index}")
                 print(json.dumps({"sample_id": index, "returned": args.tokens, "wall": wall}), flush=True)
         summary = {
             "requests": len(rows), "returned_tokens": sum(len(r["token_ids"]) for r in rows),
@@ -279,6 +355,11 @@ def main():
                 audit.close()
             summary["independent_audit_complete"] = True
             (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        summary["peak_process_bytes_nvml"] = monitor.peak
+        summary["nvml_samples"] = monitor.samples
+        if monitor.peak > args.budget_gib << 30:
+            raise ValueError("audit process memory exceeds absolute budget")
+        (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         (out / "complete.json").write_text(json.dumps({"status": "cell_completed", "matrix_complete": False}) + "\n")
     finally:
         monitor.close()

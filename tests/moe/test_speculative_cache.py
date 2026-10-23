@@ -125,6 +125,79 @@ def toy_layer(li):
     return SimpleNamespace(layer_id=li, _expert_gemm=gemm)
 
 
+@pytest.mark.parametrize("source", ["default", "keyword", "policy", "both"])
+def test_gpu_policy_and_cpu_top_k_share_constructor_default(monkeypatch, source):
+    from freetoken.moe import speculative_gpu
+    from freetoken.moe.preverify_policy import PreverifyPolicy
+
+    class AllocationReached(Exception):
+        pass
+
+    def stop_allocation(*args, **kwargs):
+        raise AllocationReached
+
+    options = {}
+    if source in ("keyword", "both"):
+        options["preverify_top_k"] = 6
+    if source in ("policy", "both"):
+        options["preverify_policy"] = PreverifyPolicy(top_k=6)
+    control = object.__new__(speculative_gpu.GPUExpertCache)
+    monkeypatch.setattr(speculative_gpu.torch, "tensor", stop_allocation)
+    with pytest.raises(AllocationReached):
+        control.__init__(SimpleNamespace(num_layers=1, device="cpu"), None,
+            max_loops=1, max_rows=1, **options)
+    expected = 4 if source == "default" else 6
+    assert control.preverify_top_k == control.preverify_policy.top_k == expected
+
+
+def test_cpu_recheck_routes_use_dynamic_top_k_without_prediction_leases(monkeypatch):
+    from freetoken.moe import speculative_gpu
+    from freetoken.moe.preverify_policy import PreverifyPolicy
+
+    class PlanningReached(Exception):
+        pass
+
+    calls = []
+    names = speculative_gpu._plan.arg_names
+
+    class PlanProbe:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append(dict(zip(names, args)) | kwargs)
+                raise PlanningReached
+            return launch
+
+    control = object.__new__(speculative_gpu.GPUExpertCache)
+    for name in ("pending", "refs", "history", "ready_history", "widths", "final_history",
+                 "queue", "demand", "cursor", "counters", "initial", "prefetched_device",
+                 "used_device", "error", "weight_history", "keep_history", "valid_rows", "importance"):
+        setattr(control, name, None)
+    control.cache = SimpleNamespace(num_layers=1, num_experts=8, slot_for_id=None)
+    control.phase, control.max_rows, control.inner_rows, control.top_k = "preverify", 1, 1, 8
+    control.cross_layer_prefetch, control.retain_routes = True, False
+    control.renormalize, control.collect_signals = False, False
+    control.preverify_policy = PreverifyPolicy(top_k=6)
+    control.outputs = {}
+    monkeypatch.setattr(speculative_gpu, "_plan", PlanProbe())
+    for top_k, keep_hits in ((6, False), (4, True)):
+        control.preverify_top_k, control.keep_hits = top_k, keep_hits
+        with pytest.raises(PlanningReached):
+            control.route(SimpleNamespace(layer_id=0), torch.zeros(1, 1),
+                torch.ones(1, 8), torch.arange(8).reshape(1, 8))
+    assert [call["RETAIN_TOPK"] for call in calls] == [6, 4]
+    assert [call["KEEP_HITS"] for call in calls] == [False, True]
+    assert all(call["RETAIN_ROUTES"] is False for call in calls)
+
+
+def test_gpu_cache_rejects_conflicting_policy_and_cpu_top_k():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+    from freetoken.moe.preverify_policy import PreverifyPolicy
+
+    with pytest.raises(ValueError, match="conflicts with policy"):
+        GPUExpertCache(SimpleNamespace(), None, max_loops=1, max_rows=1,
+            preverify_policy=PreverifyPolicy(top_k=4), preverify_top_k=6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph", [False, True])
 def test_modes_ready_hits_and_weighted_identity_before_gemm(graph):
@@ -175,6 +248,37 @@ def test_modes_ready_hits_and_weighted_identity_before_gemm(graph):
         assert int(control.counters[24] + control.counters[25]) == int(control.counters[3])
         control.close()
     stream.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_demand_only_windows_do_not_pin_routes_and_replay_after_eviction():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        cache = toy_cache(device, layers=2, experts=16, slots=8)
+        control = GPUExpertCache(cache, stream, max_loops=1, max_rows=8, inner_rows=8,
+            top_k=8, prefetch=False, layer_quota=0, gap_capacity=0, compact_control=True,
+            implementation="optimized")
+        control.retain_routes = False
+        control.begin(1)
+        control.set_phase("preverify", 0)
+        ids = torch.arange(8, dtype=torch.int32, device=device).reshape(1, 8)
+        weights = torch.arange(8, 0, -1, dtype=torch.float32, device=device).reshape(1, 8) / 36
+        hidden = torch.zeros(1, 1, device=device)
+        first = control.route(toy_layer(0), hidden, weights, ids).clone()
+        assert not control.refs.any()
+        control.route(toy_layer(1), hidden, weights, ids)
+        control.route(toy_layer(0), hidden, weights, ids + 8)
+        assert (cache.slot_for_id[0, :4] < 0).all()
+        replayed = control.route(toy_layer(0), hidden, weights, ids)
+        assert torch.equal(first, replayed)
+        assert not control.refs.any()
+        assert not control.pending.any()
+        assert not control.prefetched_device.any()
+        control.check_error()
+        control.close(abort=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -503,7 +607,8 @@ def test_gpu_padding_preserves_admission_lru_and_variable_history(depth, phase):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("keep_hits,renormalize", [(True, False), (False, False), (True, True)])
 @pytest.mark.parametrize("phase", ["preverify", "verify"])
-def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, phase):
+@pytest.mark.parametrize("preverify_top_k", [4, 6])
+def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, phase, preverify_top_k):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     device = torch.device("cuda:0")
@@ -516,7 +621,8 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
             cache.id_of_slot[slot] = expert
             cache.banks[0][1][slot, 0] = expert
         control = GPUExpertCache(cache, stream, max_loops=6, max_rows=25, prefetch=False,
-            keep_hits=keep_hits, renormalize=renormalize, collect_signals=True)
+            keep_hits=keep_hits, renormalize=renormalize, collect_signals=True,
+            preverify_top_k=preverify_top_k)
         control.begin(1)
         control.set_phase(phase)
         ids = torch.arange(8, device=device, dtype=torch.int32).reshape(1, 8)
@@ -524,7 +630,7 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
         result = control.route(toy_layer(0), torch.zeros(1, 1, device=device), weights, ids)
         selected = weights.clone()
         if phase == "preverify":
-            selected[:, 4:] = 0
+            selected[:, preverify_top_k:] = 0
             if keep_hits:
                 selected[:, [5, 7]] = weights[:, [5, 7]]
             if renormalize:
@@ -534,7 +640,7 @@ def test_gpu_sparse_policy_keeps_native_exact_weights(keep_hits, renormalize, ph
         torch.testing.assert_close(result, (ids.float() * selected).sum(-1, keepdim=True))
         torch.testing.assert_close(control.outputs[0, 1][1], selected)
         control.close()
-        expected_loads = 4 if phase == "preverify" else 6
+        expected_loads = preverify_top_k - int(preverify_top_k == 6) if phase == "preverify" else 6
         assert control.stats["demand_loads"] == expected_loads
         assert control.stats[phase + "_demand_loads"] == expected_loads
 

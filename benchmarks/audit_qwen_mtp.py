@@ -121,6 +121,8 @@ def main():
     parser.add_argument("--backend", choices=("offload", "hybrid"), default="offload")
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--page-size", type=int, default=4)
+    parser.add_argument("--budget-gib", type=int, default=16)
+    parser.add_argument("--slots", type=int, default=0)
     args = parser.parse_args()
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
@@ -132,8 +134,8 @@ def main():
     engine = Engine(SchedulerConfig(
         model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
         max_running_req=1, attention_backend="triton", moe_strategy=args.backend,
-        moe_cache_auto=True, kv_reserve_tokens=4096, memory_ratio=0.9,
-        max_seq_len_override=4096, gpu_memory_budget_bytes=16 << 30,
+        moe_cache_auto=args.slots == 0, moe_cache_size=args.slots, kv_reserve_tokens=4096, memory_ratio=0.9,
+        max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
         speculative_mtp_depth=3, page_size=args.page_size,
         speculative_max_input_tokens=3840, speculative_max_output_tokens=256,
         cuda_graph_max_bs=0 if args.eager else 4, cache_type="naive", max_extend_tokens=128,

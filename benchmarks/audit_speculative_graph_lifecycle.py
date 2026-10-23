@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--graph-implementation", choices=("coarse", "full"), default="coarse")
     parser.add_argument("--budget-gib", type=int, default=64)
+    parser.add_argument("--slots", type=int, default=4907)
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -34,7 +35,7 @@ def main():
         "/home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl", root, 1)
     identity["source_sha256"][str(Path(__file__).relative_to(root))] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     write("config.json", dict(**identity, purpose="diagnostic", tokens=32, depth=3,
-        slots=4907, kv_pages=4300, budget_gib=args.budget_gib, graph_implementation=args.graph_implementation,
+        slots=args.slots, kv_pages=4300, budget_gib=args.budget_gib, graph_implementation=args.graph_implementation,
         layer_quota=2, gap_capacity=12))
     for name in identity["source_sha256"]:
         if name.endswith(".py"):
@@ -43,7 +44,7 @@ def main():
             target.write_bytes((root / name).read_bytes())
     engine = Engine(BenchmarkConfig(rendezvous_file=str(out / "rendezvous"), model_path=identity["model"],
         tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16, max_running_req=1,
-        attention_backend="triton", moe_strategy="offload", moe_cache_auto=False, moe_cache_size=4907,
+        attention_backend="triton", moe_strategy="offload", moe_cache_auto=False, moe_cache_size=args.slots,
         num_page_override=4300, max_seq_len_override=4096, gpu_memory_budget_bytes=args.budget_gib << 30,
         speculative_mtp_depth=3, speculative_three_level=True, speculative_max_loops=6,
         speculative_max_input_tokens=max(map(len, prompts)), speculative_max_output_tokens=32,

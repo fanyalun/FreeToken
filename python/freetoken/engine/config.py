@@ -81,6 +81,7 @@ class EngineConfig:
     speculative_preverify_replacement: str = "zero"
     speculative_modes_calibration: str | None = None
     speculative_reference_math: bool = False
+    speculative_overlap_loops: int = 3
     speculative_prefetch: bool = True
     speculative_prefetch_layer_experts: int = 4
     speculative_prefetch_layer_quotas: List[int] | None = None
@@ -157,6 +158,8 @@ class EngineConfig:
             raise ValueError("speculative_submit_tokens must be nonnegative (0 uses the loop limit)")
         if self.speculative_max_loops < 1:
             raise ValueError("speculative_max_loops must be positive")
+        if type(self.speculative_overlap_loops) is not int or self.speculative_overlap_loops < 1:
+            raise ValueError("speculative_overlap_loops must be a positive integer")
         if self.speculative_expert_scheduler not in ("host", "gpu"):
             raise ValueError("speculative_expert_scheduler must be host or gpu")
         if self.speculative_execution_implementation not in ("reference", "optimized"):

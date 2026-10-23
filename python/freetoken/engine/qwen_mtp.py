@@ -232,6 +232,18 @@ class QwenMTPRunner:
         self.engine.attn_backend.prepare_metadata(batch)
         return batch
 
+    def reserve_eager_width(self, width):
+        if self.use_graph or self.active or self.graphs or not self.native_sd:
+            raise RuntimeError("extra decode width must be reserved on an idle eager native SD runner")
+        if type(width) is not int or width < self.draft_width:
+            raise ValueError("extra decode width must cover the draft width")
+        self.max_verify_width = width
+        self._shared_indices = torch.arange(self.engine.max_seq_len, dtype=torch.int32,
+                                             device=self.engine.device).repeat(width)
+        for n, (batch, _) in self._decode_batches.items():
+            if n <= width:
+                batch.attn_metadata.indices = self._shared_indices[:n * self.engine.max_seq_len]
+
     def _decode_batch(self, ids, start, state):
         n = ids.numel()
         fixed_mapping = getattr(self, "native_sd", getattr(self, "baseline", False))
@@ -335,24 +347,38 @@ class QwenMTPRunner:
             tokens = self.engine.model.lm_head.forward(hidden).argmax(-1).to(torch.int32) if need_logits else None
         return tokens, hidden
 
-    def _draft(self, batch, hidden, count=None, *, need_logits=True):
+    def _draft(self, batch, hidden, count=None, *, need_logits=True, last_only=False):
         with self.engine.ctx.forward_batch(batch):
             output = self.engine.mtp.forward(batch.input_ids, hidden)
             if count is not None:
                 output = output.index_select(0, (count - 1).reshape(1).long())
+            elif last_only:
+                output = output[-1:]
             tokens = self.engine.mtp.logits(output).argmax(-1).to(torch.int32) if need_logits else None
         return tokens, output
 
-    def _execute(self, phase, batch, hidden=None, *, count=None):
+    def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False):
+        if last_only and (hidden is None or count is not None):
+            raise ValueError("last_only requires MTP hidden and no dynamic count")
         if self.reference_ar:
+            if not need_logits or last_only:
+                raise ValueError("reference AR does not support hidden-only replay")
             return self._target(batch)
         key = (phase, batch.input_ids.numel())
+        if not need_logits or last_only:
+            key += (need_logits, last_only)
+        def forward(current, source, selected):
+            if source is None:
+                return self._target(current) if need_logits else self._target(current, need_logits=False)
+            if need_logits and not last_only:
+                return self._draft(current, source, selected)
+            return self._draft(current, source, selected, need_logits=need_logits, last_only=last_only)
         graph_ok = self.use_graph and batch.is_decode and 1 <= batch.size <= getattr(self, "max_verify_width", getattr(self, "draft_width", 4))
         if not graph_ok:
             self.graph_fallbacks[phase] = self.graph_fallbacks.get(phase, 0) + 1
             with self.engine.model.forward_host_ctx(batch, False):
                 try:
-                    return self._target(batch) if hidden is None else self._draft(batch, hidden, count)
+                    return forward(batch, hidden, count)
                 except BaseException:
                     if hidden is None:
                         cache = getattr(self.engine, "moe_offload_cache", None)
@@ -369,7 +395,7 @@ class QwenMTPRunner:
                         and controller.phase == "verify"):
                     controller.copy_stream.wait_stream(self.engine.stream)
                 try:
-                    return self._target(static) if fixed_hidden is None else self._draft(static, fixed_hidden, fixed_count)
+                    return forward(static, fixed_hidden, fixed_count)
                 except BaseException:
                     if fixed_hidden is None:
                         _drain_failed_cpu_branch(self.engine.stream, controller)
@@ -472,7 +498,7 @@ class QwenMTPRunner:
         self.graph_replays["accept"] = self.graph_replays.get("accept", 0) + 1
         return output
 
-    def _prefill(self, ids, chunk_size):
+    def _prefill(self, ids, chunk_size, *, prefix_transfer=None):
         chunk_size = ids.numel() if chunk_size is None else chunk_size
         anchor = None
         for start in range(0, ids.numel(), chunk_size):
@@ -480,6 +506,8 @@ class QwenMTPRunner:
             self._reserve((end + self.engine.config.page_size - 1) // self.engine.config.page_size * self.engine.config.page_size)
             batch = self._batch(ids[start:end], start, prefill=True)
             final = end == ids.numel()
+            if prefix_transfer is not None:
+                batch.prefix_export = (prefix_transfer, start, end, final)
             skip_head = self.mtp_enabled and not final
             with self.engine.model.forward_host_ctx(batch, False):
                 predicted, hidden = self._target(batch, need_logits=False) if skip_head else self._target(batch)

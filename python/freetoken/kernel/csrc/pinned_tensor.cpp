@@ -102,6 +102,12 @@ void host_register(int64_t addr, int64_t nbytes) {
               "cudaHostRegister failed: ", cudaGetErrorString(err));
 }
 
+void host_unregister(int64_t addr) {
+  const cudaError_t err = cudaHostUnregister(reinterpret_cast<void *>(addr));
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaHostUnregister failed: ", cudaGetErrorString(err));
+}
+
 int64_t driver_cuda_version() {
   int version = 0;  // stays 0 when no driver is installed
   const cudaError_t err = cudaDriverGetVersion(&version);
@@ -123,6 +129,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Device-visible alias of a pinned+mapped host address");
   m.def("host_register", &host_register,
         "cudaHostRegister an existing host range as portable+mapped");
+  m.def("host_unregister", &host_unregister,
+        "cudaHostUnregister an existing host range after its GPU users drain");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }

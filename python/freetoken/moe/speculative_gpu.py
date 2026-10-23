@@ -41,7 +41,7 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           weight_history, keep_history, KEEP_HITS: tl.constexpr, RENORMALIZE: tl.constexpr,
           COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None,
           verify_prefetched=None, POLICY: tl.constexpr = False, RETAIN_TOPK: tl.constexpr = 4,
-          importance=None, TAU: tl.constexpr = 0.0):
+          importance=None, TAU: tl.constexpr = 0.0, RETAIN_ROUTES: tl.constexpr = True):
     k = tl.arange(0, N)
     rows = ROWS if valid_rows is None else tl.load(valid_rows)
     valid = k < rows * TOPK
@@ -62,7 +62,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         old_count = tl.histogram(old, E, mask=old >= 0)
         new_count = tl.histogram(e, E, mask=valid)
         value = tl.load(refs + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
-        tl.store(refs + LAYER * EXPERTS + experts, value + new_count - old_count, experts < EXPERTS)
+        tl.store(refs + LAYER * EXPERTS + experts,
+                 value + new_count - old_count if RETAIN_ROUTES else 0, experts < EXPERTS)
         tl.store(history + base + k, tl.where(valid, e, -1), k < INNER_ROWS * TOPK)
         tl.store(ready_history + base + k, ready, k < INNER_ROWS * TOPK)
         tl.store(widths + loop * LAYERS + LAYER, rows)
@@ -492,9 +493,16 @@ class GPUExpertCache:
                  implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
                  inner_rows=4, layer_quotas=None, demand_fence=False,
                  verify_layer_quota=0, verify_layer_quotas=None,
-                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_policy=None):
+                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_policy=None, preverify_top_k=None):
         from .preverify_policy import PreverifyPolicy
-        self.preverify_policy = preverify_policy or PreverifyPolicy()
+        if preverify_top_k is not None:
+            if type(preverify_top_k) is not int or not 1 <= preverify_top_k <= top_k:
+                raise ValueError("Pre-Verify top-k must fit the native routing width")
+            if preverify_policy is not None and preverify_policy.top_k != preverify_top_k:
+                raise ValueError("Pre-Verify top-k conflicts with policy")
+        self.preverify_policy = preverify_policy or PreverifyPolicy(
+            top_k=4 if preverify_top_k is None else preverify_top_k)
+        self.preverify_top_k = self.preverify_policy.top_k
         if self.preverify_policy.replacement == "identity" and renormalize:
             raise ValueError("identity replacement requires original expert weights")
         if self.preverify_policy.kind == "modes" and len(self.preverify_policy.importance) != cache.num_layers:
@@ -524,6 +532,7 @@ class GPUExpertCache:
         self.hybrid_outputs = {}
         self.profile_hybrid = False
         self.keep_hits, self.renormalize, self.collect_signals = keep_hits, renormalize, collect_signals
+        self.retain_routes = True
         optimized = implementation == "optimized"
         self.optimize_admission = self.optimize_copy = self.cross_layer_prefetch = self.stage_candidates = optimized
         self.layer_quota, self.gap_capacity = layer_quota, gap_capacity
@@ -745,8 +754,8 @@ class GPUExpertCache:
             self.error, self.cross_layer_prefetch, self.weight_history, self.keep_history,
             self.keep_hits, self.renormalize, self.collect_signals, self.inner_rows, self.valid_rows,
             self.verify_prefetched if self.phase == "verify" else None,
-            self.preverify_policy.kind == "modes", self.preverify_policy.top_k,
-            self.importance, self.preverify_policy.tau)
+            self.preverify_policy.kind == "modes", self.preverify_top_k,
+            self.importance, self.preverify_policy.tau, RETAIN_ROUTES=self.retain_routes)
         identity = None
         if self.phase == "preverify" and self.preverify_policy.replacement == "identity":
             # Snapshot the contribution before Hybrid rewrites selected weights or GEMM overwrites hidden.

@@ -30,6 +30,12 @@ python benchmarks/bench_offload_cache_copy.py
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
+`bench_qwen_mtp.py` retains the SD defaults for `--prefetch` and
+`--prefetch-layer-experts`. Supplying either `--small-prefetch` or
+`--verify-prefetch` selects explicit phase quotas instead: the omitted quota is
+zero, and two zero quotas disable prefetch. These phase quotas override the
+legacy flags; `effective_prefetch_config` records the settings passed to the engine.
+
 **`bench_draft_expert_motivation.py`** runs a standalone resident fused diagnostic:
 native MTP and autoregressive shared-weight self-drafts retaining top-h=2/4/6/8
 routed experts, each at draft lengths 1..32. Every cell completes the same first
