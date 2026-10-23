@@ -60,6 +60,10 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
   void *data_ptr = nullptr;
   const cudaError_t alloc_err = cudaHostAlloc(
       &data_ptr, alloc_nbytes, cudaHostAllocPortable | cudaHostAllocMapped);
+  if (alloc_err != cudaSuccess) {
+    // callers may catch the refusal and go on: leave no error for the next launch
+    (void)cudaGetLastError();
+  }
   TORCH_CHECK(alloc_err == cudaSuccess,
               "cudaHostAlloc failed: ", cudaGetErrorString(alloc_err));
 
@@ -98,6 +102,10 @@ void host_register(int64_t addr, int64_t nbytes) {
   const cudaError_t err =
       cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
                        cudaHostRegisterPortable | cudaHostRegisterMapped);
+  if (err != cudaSuccess) {
+    // a refused pin is expected (the pin probe), so clear it before a later launch check reports it
+    (void)cudaGetLastError();
+  }
   TORCH_CHECK(err == cudaSuccess,
               "cudaHostRegister failed: ", cudaGetErrorString(err));
 }

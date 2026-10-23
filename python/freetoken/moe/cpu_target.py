@@ -62,10 +62,10 @@ class CpuTargetExperts:
                 ) or any(t.shape != down_shape for t in down):
             raise ValueError("inconsistent CPU expert geometry")
         self.hidden, self.top_k, self.max_rows = hidden, top_k, max_rows
-        self.ext = _cpu_moe.CpuMoeExecutor(
+        self.ext = _cpu_moe.SpeculativeBf16Executor(
             len(core_ids), len(gate_up), experts, top_k, hidden, inter, max_rows,
-            0, 0, 0, self.tables[0].data_ptr(), self.tables[1].data_ptr(),
-            0, 0, 0, 0, 0, 0, 1.0, float("inf"), core_ids)
+            0, 0, self.tables[0].data_ptr(), self.tables[1].data_ptr(),
+            1.0, float("inf"), core_ids)
         if backend == "optimized":
             if not hasattr(self.ext, "create_grouped_compat_task"):
                 raise RuntimeError("rebuild _cpu_moe for compatible multi-row CPU experts")

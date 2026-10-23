@@ -101,7 +101,9 @@ class ExpertLeases:
 class SpeculativeExpertCache:
     def __init__(self, cache, stream, *, prefetch=True, use_graph=False, audit=False,
                  layer_quota=4, gap_capacity=0):
-        if cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
+        if (cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers
+                or len(getattr(cache, "pool_sizes", (cache.cache_size,))) != 1
+                or getattr(cache, "_raw_banks", False)):
             raise ValueError("three-level decoding requires BF16 experts with pinned GPU-offload banks")
         from freetoken.layers.moe import _HYBRID_OVERLAP, _HYBRID_WINDOW
         if cache.decode_target == "hybrid" and not _HYBRID_WINDOW:
@@ -297,7 +299,8 @@ class SpeculativeExpertCache:
             from .offload_kernels import _HYBRID_FETCH_BY_RECENCY
             missing = sorted((owner for owner in demanded if owner not in ledger.slots),
                              key=lambda owner: (-self.recency[owner], owner) if _HYBRID_FETCH_BY_RECENCY else (0, owner))
-            fraction = min(65536, max(0, round(cache.hybrid_fetch_fraction * 65536)))
+            fraction = cache.hybrid_fetch_fraction[li] if cache.hybrid_fetch_fraction is not None else 0.0
+            fraction = min(65536, max(0, round(fraction * 65536)))
             fetch = cache.hybrid_max_fetch * hidden.shape[0]
             if fraction:
                 lo = len(missing) * fraction // 65536

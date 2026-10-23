@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Mapping
 
 import torch
 from freetoken.distributed import DistributedInfo
@@ -23,6 +23,8 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
+    hf_overrides: Mapping[str, Any] = field(default_factory=dict)
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
@@ -32,6 +34,9 @@ class EngineConfig:
     quant_backend: str | None = None
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
+    # DeepSeek-V4.1 Decoder SWA Bounded Replay: "bounded" (default) runs the decoder layers on each
+    # prompt's last window; "exact" runs them on every token.
+    swa_decoder_replay: str = "bounded"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -40,12 +45,19 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
+    # --moe-cache-mem: slot-cache budget in bytes, turned into a slot count once the expert banks are loaded
+    moe_cache_mem: int | None = None
+    # --moe-cache-scope: unified (one LRU pool per expert quant) or per-layer (one pool per layer)
+    moe_cache_scope: str = "unified"
+    # --moe-cache-split: how pools share the slots; equal or profile:<path> (by expert use from a profile file)
+    moe_cache_split: str = "equal"
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
-    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
-    # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
+    # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 13.0
+    # (cudaMemcpyBatchAsync) or HIP (hipMemcpyBatchAsync);
+    # no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
     # CPU MoE backend (--moe-strategy cpu): number of CPU worker threads computing
@@ -65,6 +77,13 @@ class EngineConfig:
     # Baseline SD balanced policy instead minimizes calibrated IO+GPU vs CPU time;
     # nonnegative values remain a per-row upper bound, and -1 imposes no cap.
     moe_hybrid_max_fetch: int = -1
+    # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
+    # slots of its own pools and fetches this share of each decode step's misses through pinned staging; the rest
+    # are computed on the CPU. -1 (default) = auto: per layer from its `ft bench bw` row (bench_profile.locked_fetch_fraction),
+    # a fixed cap of 1 without one. 0 = locked layers decode on the CPU only. moe_locked_max_fetch caps the fetches per
+    # (layer, step) and sizes the staging (that many rows of the widest expert, per bank).
+    moe_locked_fetch: float = -1.0
+    moe_locked_max_fetch: int = 8
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -217,6 +236,13 @@ class EngineConfig:
                 raise ValueError("coarse/full graphs require CUDA Graph enabled")
         if self.speculative_submit_tokens and not self.speculative_three_level:
             raise ValueError("speculative_submit_tokens requires three-level decoding")
+        if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
+            raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
+        if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:
+            # the ensure kernel takes the share in Q16: this one rounds to 0 and the layers would never fetch
+            raise ValueError(f"moe_locked_fetch {self.moe_locked_fetch} rounds to 0 in Q16; pass 0 to keep locked layers CPU-only")
+        if self.moe_locked_max_fetch < 1:
+            raise ValueError(f"moe_locked_max_fetch must be at least 1, got {self.moe_locked_max_fetch}")
         if self.moe_backend is None:
             return
         if self.moe_strategy != "auto":
@@ -227,7 +253,7 @@ class EngineConfig:
 
     @cached_property
     def hf_config(self):
-        return cached_load_hf_config(self.model_path)
+        return cached_load_hf_config(self.model_path, self.hf_overrides)
 
     @cached_property
     def model_spec(self) -> ModelSpec:
@@ -254,7 +280,7 @@ class EngineConfig:
         hf_config = copy.copy(self.hf_config)
         built = {e.config_key for e in self.active_encoders}
         for key in set(ENCODER_SECTIONS) | {e.config_key for e in self.model_spec.encoders}:
-            if key not in built:
+            if key not in built and getattr(hf_config, key, None) is not None:
                 setattr(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
@@ -266,7 +292,7 @@ class EngineConfig:
     def max_seq_len(self) -> int:
         if self.max_seq_len_override is not None:
             return self.max_seq_len_override
-        return self.model_config.rotary_config.max_position
+        return self.model_config.rotary_config.table_positions
 
     @property
     def max_forward_len(self) -> int:

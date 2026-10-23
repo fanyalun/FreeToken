@@ -708,7 +708,7 @@ def test_hybrid_without_gpu_routes_skips_the_gpu_expert_reader(graph_mode):
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
         cache = toy_cache(device, slots=32)
-        cache.decode_target, cache.hybrid_max_fetch, cache.hybrid_fetch_fraction = "hybrid", 0, 0
+        cache.decode_target, cache.hybrid_max_fetch, cache.hybrid_fetch_fraction = "hybrid", 0, [0] * cache.num_layers
         cache.banks[0][1].fill_(float("nan"))
         cache.cpu_executor = SimpleNamespace(
             decode_submit=lambda li, hidden, weights, ids: (weights, ids),
@@ -749,7 +749,7 @@ def test_hybrid_window_fetch_budget_and_cpu_gpu_partition(
     with torch.cuda.stream(stream):
         cache = toy_cache(device, layers=1, experts=128)
         cache.decode_target = "hybrid"
-        cache.hybrid_max_fetch, cache.hybrid_fetch_fraction = max_fetch, fraction
+        cache.hybrid_max_fetch, cache.hybrid_fetch_fraction = max_fetch, [fraction] * cache.num_layers
         cpu_routes = []
         def submit(li, hidden, weights, ids):
             cpu_routes.append(ids.clone())

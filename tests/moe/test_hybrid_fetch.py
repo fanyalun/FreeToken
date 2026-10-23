@@ -1,8 +1,7 @@
 """Hybrid decode's bandwidth-matched fetch split.
 
-Covers the two halves of --moe-hybrid-max-fetch auto: the profile reader that turns
-`ft bench bw` kernel bandwidths into a fetch fraction, and the ensure kernel's
-per-step integer split (GPU kernel vs CPU reference mirror, and the balance rule).
+Covers the profile reader of --moe-hybrid-max-fetch auto, which turns the `ft bench bw`
+row of each MoE layer kind into a fetch fraction.
 """
 
 import json
@@ -11,10 +10,62 @@ import os
 import pytest
 import torch
 
-from freetoken.moe.bench_profile import default_profile_path, load_backend_recommendation, load_hybrid_fetch_fraction
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 Q = 1 << 16
+
+from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, fetch_fraction, layer_kind_key, load_layer_kinds, locked_fetch_fraction
+
+
+def test_layer_kind_rows_give_fetch_fractions(tmp_path):
+    bf16 = layer_kind_key("bf16", {}, 2048, 768, 8, 12)
+    gguf = layer_kind_key("gguf", {"gate_up_type": 12, "down_type": 14}, 2048, 768, 8, 12)
+    assert gguf == "gguf[down_type=14,gate_up_type=12]:2048x768:top8:t12"
+    prof = {
+        "version": PROFILE_VERSION,
+        "gpu": {"name": "FAKE GPU"},
+        "layer_kinds": {
+            bf16: {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
+            # overlapped (contended) pair wins over the standalone numbers when present
+            gguf: {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0, "cpu_moe_overlap_gbs": 90.0, "pcie_gather_overlap_gbs": 30.0},
+        },
+    }
+    path = tmp_path / "benchbw.json"
+    path.write_text(json.dumps(prof))
+    rows = load_layer_kinds(path=str(path))
+    # standalone fallback: full-contention assumption -> pcie / cpu
+    assert fetch_fraction(rows[bf16]) == pytest.approx(0.4)
+    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov)
+    assert fetch_fraction(rows[gguf]) == pytest.approx(0.25)
+    # a locked layer's fetch adds a memcpy at the CPU MoE rate before the gather: p / (2p + c), from the same pair
+    assert locked_fetch_fraction(rows[bf16]) == pytest.approx(40 / 180)
+    assert locked_fetch_fraction(rows[gguf]) == pytest.approx(30 / 150)
+    # another thread count is another kind
+    assert layer_kind_key("bf16", {}, 2048, 768, 8, 6) not in rows
+    # a profile from different hardware is ignored
+    assert load_layer_kinds(gpu_name="OTHER", path=str(path)) is None
+    # so is one of another version
+    path.write_text(json.dumps({**prof, "version": PROFILE_VERSION - 1}))
+    assert load_layer_kinds(path=str(path)) is None
+
+
+def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("FREETOKEN_BENCHBW_PATH", raising=False)
+    uuid = "GPU-2f3a9b1c-0000-1111-2222-333344445555"
+
+    def write(path, name, row):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"version": PROFILE_VERSION, "gpu": {"name": name}, "layer_kinds": {"k": row}}, f)
+
+    # legacy single file only: used when the name matches, ignored otherwise
+    write(default_profile_path(), "FAKE GPU", "legacy")
+    assert load_layer_kinds(gpu_name="FAKE GPU", gpu_uuid=uuid) == {"k": "legacy"}
+    assert load_layer_kinds(gpu_name="OTHER", gpu_uuid=uuid) is None
+    # this card's own file wins over the legacy one
+    write(default_profile_path(uuid), "FAKE GPU", "card")
+    assert load_layer_kinds(gpu_name="FAKE GPU", gpu_uuid=uuid) == {"k": "card"}
 
 
 def test_verify_small_cache_falls_back_to_per_token_fetch_cap(monkeypatch):
@@ -30,29 +81,38 @@ def test_verify_small_cache_falls_back_to_per_token_fetch_cap(monkeypatch):
             cpu_routes.append(ids.clone())
             return torch.zeros_like(hidden)
 
-        def decode_sync(self, pending):
-            return pending
+        def decode_sync(self, pending, add_to=None):
+            return pending if add_to is None else pending + add_to
 
     class Cache:
         cpu_executor = Executor()
         collect_stats = False
         cache_size = 8
+        locked_hybrid = frozenset()
 
-        def ensure_experts_hybrid(self, layer_id, ids):
+        def pool_slots(self, layer_id):
+            return self.cache_size
+
+        def ensure_experts_hybrid(self, layer_id, ids, weights, clamp=False):
+            from freetoken.moe.offload_kernels import HybridRoutes
+            raw = ids.clone()
             fetched.append(ids[0, 0].item())
             ids[:, 0] = 0
             ids[:, 1:] = -1
+            on_gpu = ids >= 0
+            return HybridRoutes(ids, torch.where(on_gpu, weights, 0), torch.where(on_gpu, -1, raw))
 
         def copy_missing(self):
             pass
 
-        def bank_views(self):
+        def pool_bank_views(self, layer_id):
             return ()
 
         def alphas_for_slots(self, layer_id):
             return None
 
-    layer = SimpleNamespace(layer_id=0, _expert_gemm=lambda cache, hidden, *args, **kwargs: hidden)
+    layer = SimpleNamespace(layer_id=0, skips_inactive_slots=True,
+                            _expert_gemm=lambda cache, hidden, *args, **kwargs: hidden)
     layer._decode_hybrid = lambda *args: OffloadMoELayer._decode_hybrid(layer, *args)
     ctx = Context(1)
     monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
@@ -90,51 +150,6 @@ def test_balanced_fetch_tracks_fraction():
     assert _balanced_fetch(4, round(0.415 * Q)) == 2
 
 
-def test_load_hybrid_fetch_fraction(tmp_path):
-    prof = {
-        "gpu": {"name": "FAKE GPU"},
-        "dtype_kernels": {
-            "bf16": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0},
-            # overlapped (contended) pair wins over the standalone numbers when present
-            "nvfp4_x": {"cpu_moe_gbs": 100.0, "pcie_gather_gbs": 40.0,
-                        "cpu_moe_overlap_gbs": 90.0, "pcie_gather_overlap_gbs": 30.0},
-        },
-        "workloads": {
-            "m": {"kernels": {"ds_fp4": {"cpu_moe_gbs": 80.0, "pcie_gather_gbs": 50.0}}}
-        },
-    }
-    path = tmp_path / "benchbw.json"
-    path.write_text(json.dumps(prof))
-    # standalone fallback: full-contention assumption -> pcie / cpu
-    assert load_hybrid_fetch_fraction("bf16", path=str(path)) == pytest.approx(0.4)
-    # overlapped pair preferred: pcie_ov / (pcie_ov + cpu_ov)
-    assert load_hybrid_fetch_fraction("nvfp4_x", path=str(path)) == pytest.approx(0.25)
-    # per-model fallback when there is no per-dtype entry for the format
-    assert load_hybrid_fetch_fraction("ds_fp4", path=str(path)) == pytest.approx(0.625)
-    assert load_hybrid_fetch_fraction("nvfp4", path=str(path)) is None
-    # a profile from different hardware is ignored
-    assert load_hybrid_fetch_fraction("bf16", gpu_name="OTHER", path=str(path)) is None
-
-
-def test_profile_lookup_prefers_the_gpu_uuid_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    monkeypatch.delenv("FREETOKEN_BENCHBW_PATH", raising=False)
-    uuid = "GPU-2f3a9b1c-0000-1111-2222-333344445555"
-
-    def write(path, name, verdict):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump({"gpu": {"name": name}, "dtypes": {"bf16": verdict}}, f)
-
-    # legacy single file only: used when the name matches, ignored otherwise
-    write(default_profile_path(), "FAKE GPU", "hybrid")
-    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "hybrid"
-    assert load_backend_recommendation("bf16", gpu_name="OTHER", gpu_uuid=uuid) is None
-    # this card's own file wins over the legacy one
-    write(default_profile_path(uuid), "FAKE GPU", "offload")
-    assert load_backend_recommendation("bf16", gpu_name="FAKE GPU", gpu_uuid=uuid) == "offload"
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_hybrid_fraction_gpu_matches_cpu_reference():
     torch.manual_seed(0)
@@ -152,8 +167,8 @@ def test_hybrid_fraction_gpu_matches_cpu_reference():
     for step in range(64):
         ids = torch.randperm(num_experts)[:top_k].to(torch.int32)
         g, c = ids.clone().cuda(), ids.clone()  # a CPU ids tensor drives the reference path
-        gpu.ensure_experts_hybrid(0, g)
-        ref.ensure_experts_hybrid(0, c)
+        gpu.ensure_experts_hybrid(0, g, torch.ones_like(g, dtype=torch.float32))
+        ref.ensure_experts_hybrid(0, c, torch.ones_like(c, dtype=torch.float32))
         missing = int(gpu.num_missing_full.item())
         fetched = int(gpu.num_indices.item())
         assert missing == int(ref.num_missing_full.item())
@@ -173,7 +188,7 @@ def test_hybrid_fixed_cap_unchanged():
         quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=1,
     )
     ids = torch.arange(8, dtype=torch.int32).cuda()
-    cache.ensure_experts_hybrid(0, ids)
+    cache.ensure_experts_hybrid(0, ids, torch.ones_like(ids, dtype=torch.float32))
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
 
@@ -182,7 +197,8 @@ def test_hybrid_fixed_cap_unchanged():
 @pytest.mark.parametrize("frac", [0.0, 0.415, 1.0])
 @pytest.mark.parametrize("cache_size", [32, 64, 4961])
 @pytest.mark.parametrize("rows", [2, 3, 4])
-def test_window_plan_matches_union_reference_and_weight_bytes(frac, cache_size, rows):
+@pytest.mark.parametrize("pools", [1, 2])
+def test_window_plan_matches_union_reference_and_weight_bytes(frac, cache_size, rows, pools):
     from freetoken.kernel.pinned import alloc_pinned_tensor
 
     torch.manual_seed(13)
@@ -190,9 +206,10 @@ def test_window_plan_matches_union_reference_and_weight_bytes(frac, cache_size, 
     sources = {name: [alloc_pinned_tensor(experts, 64, dtype=torch.bfloat16).copy_(
         torch.randn(experts, 64)) for _ in range(2)] for name in ("gate_up", "down")}
     def make():
-        cache = OffloadMoeCache(2, experts, cache_size, torch.device("cuda"),
+        cache = OffloadMoeCache(2, experts, cache_size * pools, torch.device("cuda"),
                                 decode_target="hybrid", hybrid_max_fetch=1,
-                                hybrid_fetch_fraction=frac)
+                                hybrid_fetch_fraction=frac,
+                                pool_of_layer=[0, pools - 1], pool_sizes=[cache_size] * pools)
         cache.set_bank_sources(sources)
         cache.collect_stats = True
         cache.collect_decode_freq = True
@@ -204,13 +221,12 @@ def test_window_plan_matches_union_reference_and_weight_bytes(frac, cache_size, 
         ids = torch.stack([torch.randperm(experts)[:top_k] for _ in range(rows)]).int().cuda()
         expected = ids.clone()
         plans = []
-        sequential.ensure_experts_hybrid(layer, expected.view(-1))
-        sequential.record_decode_stats_hybrid(layer)
+        sequential.ensure_experts_hybrid(layer, expected.view(-1), torch.ones_like(expected.view(-1), dtype=torch.float32))
         count = sequential.num_indices.item()
         plans.append((sequential.evict_slots[:count].clone(), sequential.src_indices[:count].clone()))
         sequential.copy_missing()
         actual = ids.clone()
-        window.ensure_experts_hybrid_window(layer, actual)
+        window.ensure_experts_hybrid_window(layer, actual, torch.ones_like(actual, dtype=torch.float32))
         window.copy_missing()
         torch.cuda.synchronize()
         assert torch.equal(actual, expected)
@@ -227,7 +243,7 @@ def test_window_plan_matches_union_reference_and_weight_bytes(frac, cache_size, 
             assert torch.equal(window.bank_caches[name], sequential.bank_caches[name])
         for row, raw in zip(actual, ids):
             live = row >= 0
-            assert torch.equal(window.id_of_slot[row[live].long()], layer * experts + raw[live])
+            assert torch.equal(window.pool_state(layer)[0][row[live].long()], layer * experts + raw[live])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -241,12 +257,12 @@ def test_window_plan_graph_replay_tracks_new_routes():
     with torch.cuda.stream(stream):
         ids = torch.empty(4, 8, dtype=torch.int32, device="cuda")
         ids.copy_(torch.arange(32, device="cuda").reshape(4, 8))
-        cache.ensure_experts_hybrid_window(0, ids)
+        cache.ensure_experts_hybrid_window(0, ids, torch.ones_like(ids, dtype=torch.float32))
         cache.copy_missing()
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            cache.ensure_experts_hybrid_window(0, ids)
+            cache.ensure_experts_hybrid_window(0, ids, torch.ones_like(ids, dtype=torch.float32))
             cache.copy_missing()
         for seed in range(8):
             torch.manual_seed(seed)
@@ -265,9 +281,9 @@ def test_window_scratch_is_shared_across_layers_and_matches_budget():
     cache = OffloadMoeCache(2, 32, 32, torch.device("cuda"), decode_target="hybrid", hybrid_max_fetch=1)
     for width in (2, 3, 4):
         ids = torch.arange(width * 8, dtype=torch.int32, device="cuda").reshape(width, 8)
-        cache.ensure_experts_hybrid_window(0, ids.clone())
+        cache.ensure_experts_hybrid_window(0, ids.clone(), torch.ones_like(ids, dtype=torch.float32))
         pointers = tuple(t.data_ptr() for t in cache._hybrid_window_plans[(width, 8)])
-        cache.ensure_experts_hybrid_window(1, ids.clone())
+        cache.ensure_experts_hybrid_window(1, ids.clone(), torch.ones_like(ids, dtype=torch.float32))
         assert pointers == tuple(t.data_ptr() for t in cache._hybrid_window_plans[(width, 8)])
     assert sum(t.numel() * t.element_size() for plan in cache._hybrid_window_plans.values() for t in plan) == 624
 
@@ -321,7 +337,7 @@ def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped, balanc
     batch.rowwise_linear = True
     def gemm(cache, hidden, weights, ids, **kwargs):
         return fused_experts_decode_impl(hidden, *kwargs["views"], weights, ids)
-    layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+    layer = SimpleNamespace(layer_id=0, skips_inactive_slots=False, _expert_gemm=gemm)
     layer._decode_hybrid = lambda *args: moe.OffloadMoELayer._decode_hybrid(layer, *args)
     caches[0].hybrid_max_fetch *= rows
     try:
@@ -346,7 +362,7 @@ def test_hybrid_window_matches_union_partials(monkeypatch, rows, grouped, balanc
                     continue
                 reference = caches[0]
                 slots = ids.clone()
-                reference.ensure_experts_hybrid(0, slots.view(-1))
+                reference.ensure_experts_hybrid(0, slots.view(-1), weights.view(-1))
                 on_gpu = slots >= 0
                 cpu_ids = torch.where(on_gpu, -1, ids).contiguous()
                 cpu = reference.cpu_executor.decode(0, hidden, weights, cpu_ids)

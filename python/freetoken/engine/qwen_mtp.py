@@ -45,7 +45,7 @@ def _drain_failed_cpu_branch(stream, controller):
         pending.add(executor._ext.flag_active_slot())
         for slot in sorted(pending):
             if slot >= 0:
-                executor._cpu_moe.memop_sync(branch.cuda_stream, executor._done.data_ptr(), slot)
+                executor._cpu_moe.speculative_memop_sync(branch.cuda_stream, executor._done.data_ptr(), slot)
         branch.synchronize()
         executor.raise_if_unhealthy()
     stream.wait_stream(branch)

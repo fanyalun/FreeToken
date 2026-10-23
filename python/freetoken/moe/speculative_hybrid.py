@@ -125,9 +125,11 @@ def profile_identity(cache, executor, widths, *, execution="graph"):
     kernel_root = Path(_cpu_moe.__file__).parent
     files = (Path(__file__), Path(_cpu_moe.__file__), Path(decode_moe.__file__),
              Path(__file__).with_name("cpu_executor.py"), Path(__file__).with_name("speculative_gpu.py"),
+             Path(__file__).with_name("speculative_cpu.py"),
              kernel_root / "fast_index_copy.py", kernel_root / "csrc/jit/fast_index_copy.cuh",
              Path(__file__).parents[1] / "layers/moe.py", Path(__file__).with_name("fused.py"),
-             kernel_root / "moe_impl.py", kernel_root / "csrc/cpu_moe/cpu_moe_ext.cpp")
+             kernel_root / "moe_impl.py", kernel_root / "csrc/cpu_moe/cpu_moe_ext.cpp",
+             kernel_root / "csrc/cpu_moe/speculative_bf16.cpp")
     numa = {}
     for core in (*executor.core_ids, executor._coord_core):
         numa[str(core)] = [p.name for p in Path(f"/sys/devices/system/cpu/cpu{core}").glob("node*")]

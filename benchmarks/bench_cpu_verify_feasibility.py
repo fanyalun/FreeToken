@@ -406,6 +406,7 @@ def main():
     source_hashes = {}
     for path in sorted((repo / "python/freetoken").rglob("*.py")) + [
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+            repo / "python/freetoken/kernel/csrc/cpu_moe/speculative_bf16.cpp",
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target.h", Path(__file__).resolve(),
             repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target_v2.h",
             repo / "python/freetoken/kernel/csrc/pinned_tensor.cpp",

@@ -7,6 +7,35 @@ a programmatic engine API. HTTP serving, scheduler streaming, continuous
 batching, cross-request prefix reuse, quantized checkpoints and other proposers
 require additional adapters and integration.
 
+## Upstream integration
+
+The `sd_cpu_upstream` branch combines the GPU three-level and CPU async branches
+from `be176884968b5b5ddbb04c19e8bc180087c22ece` with official FreeToken
+`0c50eb9d829e0189264f22ae3f501c7c30c01659`. Use the dependencies in this branch's
+`pyproject.toml`, including Torch 2.14 and Flashlib 0.4, and rebuild the native
+extensions with `python setup.py build_ext --inplace`. An extension compiled for
+the earlier Torch environment must not be copied into this runtime.
+
+The upstream cache supports multiple expert slot pools. Native MTP and the
+three-level controllers currently require one BF16 pool; ordinary upstream
+offload and Hybrid retain their multiple-pool support. The measured-peak SD
+budget planner and idle-only cache rebuild operate on that single pool.
+
+Qwen and MTP normalization now keep the checkpoint's raw zero-centered weights
+and add one in FP32 at execution time. MTP resident expert weights are attached
+through the upstream expert-bank interface, independently of the Target's KV
+layer numbering. Earlier FTW files with pre-folded norm weights require
+reconversion according to the upstream checkpoint rules. Historical token
+comparisons and timing results below do not certify this new runtime.
+
+Ordinary CPU MoE uses the upstream multi-format executor. Explicit grouped
+speculative Hybrid tasks use the separate `SpeculativeBf16Executor` binding in
+the same native extension, preserving their task slots and ordered arithmetic.
+The independent CPU Target keeps the install-only fixed recovery contract:
+`fixed_replay` installs CPU state without executing the old speculative B tail;
+`recheck` remains provisional until CPU verification. Profiles include the new
+Python and native executor sources in their compatibility fingerprints.
+
 The earlier rowwise dense path passed offload complete request token comparisons.
 Production now uses batched dense linear for multi-token windows; BF16 rounding
 can differ from one-row AR calls, so those earlier exact comparisons do not

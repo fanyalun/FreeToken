@@ -5,6 +5,8 @@ zero-copy case), across banks of differing per-row sizes.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 import torch
 
@@ -86,3 +88,34 @@ def test_offload_window_copy_plan_deduplicates_experts():
     assert torch.unique(ids).numel() == 2
     for row in ids:
         assert set(row.tolist()) == set(ids[0].tolist())
+
+
+@CUDA
+def test_fused_copy_identity_rows_and_wait_flag():
+    # without src_indices row i copies source row i; with wait_flag the copy holds until the flag is set (the locked-layer staging)
+    from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+    from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
+
+    dev = torch.device("cuda")
+    feats = [512, 256]
+    src = [alloc_pinned_tensor(4 * f, dtype=torch.uint8) for f in feats]
+    for t in src:
+        t.random_(0, 256)
+    dst = [torch.zeros(16 * f, dtype=torch.uint8, device=dev) for f in feats]
+    dst_ptrs = torch.tensor([t.data_ptr() for t in dst], dtype=torch.int64, device=dev)
+    src_ptrs = torch.tensor([device_ptr(t) for t in src], dtype=torch.int64, device=dev)
+    feat_bytes = torch.tensor(feats, dtype=torch.int64, device=dev)
+    slots = torch.tensor([5, 2, 9, 0], dtype=torch.int32, device=dev)
+    num = torch.tensor([3], dtype=torch.int64, device=dev)
+    flag = alloc_pinned_tensor(1, dtype=torch.int64)
+    flag.fill_(0)
+
+    fast_index_copy_multi_jit(dst_ptrs, src_ptrs, feat_bytes, slots, None, num, wait_flag=device_ptr(flag))
+    time.sleep(0.2)
+    assert not torch.cuda.current_stream().query(), "the copy ran before its flag was set"
+    flag.fill_(1)
+    torch.cuda.synchronize()
+    for d, s, f in zip(dst, src, feats):
+        for i, slot in enumerate([5, 2, 9]):
+            assert torch.equal(d[slot * f:(slot + 1) * f].cpu(), s[i * f:(i + 1) * f])
+        assert not d[0:f].any(), "num_indices bounds the rows"

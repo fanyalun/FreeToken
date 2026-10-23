@@ -66,7 +66,8 @@ class ResidentExpertController:
             return layer._resident_gemm(hidden, weights, ids)
         selected = torch.where(keep, weights, 0).contiguous()
         compute_ids = torch.where(keep, ids, -1).contiguous()
-        result = fused_experts_impl(hidden, layer.gate_up_proj, layer.down_proj, selected, compute_ids,
+        banks = layer.quant_method.resident_view(layer).tensors
+        result = fused_experts_impl(hidden, banks["gate_up"], banks["down"], selected, compute_ids,
             layer.activation, layer.apply_router_weight_on_input, float(layer.alpha),
             float("inf") if layer.limit is None else layer.limit,
             skip_invalid_routes=True)

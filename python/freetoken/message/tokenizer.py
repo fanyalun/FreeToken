@@ -73,6 +73,7 @@ class TokenizeMsg(BaseTokenizerMsg):
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
     images: List[bytes] | None = None
+    inline_system_policy: str | None = None
 
 
 @dataclass
@@ -100,6 +101,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    error: str | None = None
+
+
+@dataclass
+class FlushCacheMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
+    request_id: str
+    timeout: float = 0.0
+
+
+@dataclass
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to FlushCacheReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported"
     error: str | None = None
 
 

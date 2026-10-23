@@ -1,8 +1,8 @@
 import os
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Iterator, Tuple
 
 import torch
-from freetoken.core import get_global_ctx
+from freetoken.core import get_active_batch, get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
@@ -82,16 +82,12 @@ class MoELayer(BaseOP):
         self.strategy = strategy
         self.decode_target = decode_target
         self.prefix = prefix
-        # offload layers without a quant config stay on the format-tag banks (GGUF q4_0)
-        self.quant_method = None
-        if quant_config is not None or allocate_experts:
-            self.quant_method = quant_method_for(quant_config, self, prefix)
-            if allocate_experts:
-                self.quant_method.create_weights(self)
+        self.quant_method = quant_method_for(quant_config, self, prefix)
+        if allocate_experts:
+            self.quant_method.create_weights(self)
 
     def finalize(self) -> None:
-        if self.quant_method is not None:
-            self.quant_method.finalize(self)
+        self.quant_method.finalize(self)
 
     def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
@@ -104,7 +100,6 @@ class MoELayer(BaseOP):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        assert self.quant_method is not None
         return self.quant_method.apply(
             hidden_states, topk_weights, topk_ids, self.quant_method.resident_view(self),
             layer=self, is_prefill=get_global_ctx().batch.is_prefill,
@@ -192,6 +187,10 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+
+    @property
+    def skips_inactive_slots(self) -> bool:
+        return self.quant_method.kernel.supports_inactive_slots
 
     def forward(
         self,
@@ -296,7 +295,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -314,13 +313,15 @@ class OffloadMoELayer(MoELayer):
 
         The CPU pool is kicked off (``decode_submit``) before the GPU PCIe fetch + GEMM so
         the CPU overflow GEMV runs concurrently with the GPU work. Capture-safe: the
-        routing split is device-side elementwise and the CPU submit/sync are host nodes.
-        Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
-        routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+        routing split runs inside the hybrid ensure kernel and the CPU submit/sync are host nodes.
+        Each route is computed exactly once -- CPU-assigned routes reach the GPU as slot -1 with
+        weight 0 (a kernel with ``supports_inactive_slots`` skips them without a read; any other reads
+        slot 0, whose storage is a payload or the bank's zero fill) and the CPU ids are -1 for
+        GPU-assigned routes (the C++ kernel skips id<0).
         """
-        window = get_global_ctx().batch.rowwise_linear and hidden_states.shape[0] > 1
+        window = getattr(get_active_batch(), "rowwise_linear", False) and hidden_states.shape[0] > 1
         balanced = getattr(cache, "baseline_hybrid", None) if _HYBRID_WINDOW else None
-        if window and (not _HYBRID_WINDOW or (balanced is None and cache.cache_size < topk_ids.numel())):
+        if window and (not _HYBRID_WINDOW or (balanced is None and cache.pool_slots(self.layer_id) < topk_ids.numel()) or self.layer_id in cache.locked_hybrid):
             # Preserve the per-token fetch cap and CPU/GPU partial-sum rounding of AR.
             return torch.cat([
                 self._decode_hybrid(cache, hidden_states[i:i + 1], topk_weights[i:i + 1], topk_ids[i:i + 1])
@@ -328,19 +329,20 @@ class OffloadMoELayer(MoELayer):
             ], dim=0)
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        raw = topk_ids.clone()  # raw expert ids for the CPU partial
+        clamp = not self.skips_inactive_slots
         if balanced is not None:
+            raw = topk_ids.clone()
             balanced.ensure(self.layer_id, topk_ids, topk_weights)
+            on_gpu = topk_ids >= 0
+            cpu_ids = torch.where(on_gpu | (topk_weights == 0), -1, raw).contiguous()
+            gpu_w = torch.where(on_gpu, topk_weights, 0).contiguous()
+            gpu_slots = topk_ids.clamp_min(0) if clamp else topk_ids
         elif window:
-            cache.ensure_experts_hybrid_window(self.layer_id, topk_ids)
+            gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid_window(
+                self.layer_id, topk_ids, topk_weights, clamp=clamp)
         else:
-            cache.ensure_experts_hybrid(self.layer_id, topk_ids)
-        if cache.collect_stats and not window and balanced is None:
-            cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
-
-        cpu_mask = on_gpu | (topk_weights == 0) if balanced is not None else on_gpu
-        cpu_ids = torch.where(cpu_mask, raw.new_full((), -1), raw).contiguous()
+            gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(
+                self.layer_id, topk_ids, topk_weights, clamp=clamp)
         if getattr(executor, "grouped_compat", False):
             pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids, grouped=True)
         else:
@@ -353,20 +355,19 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
-        cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        if not _HYBRID_OVERLAP:
+            return gpu_routed + cpu_routed_early
+        return executor.decode_sync(pending, add_to=gpu_routed)
 
     def _prefill_routed(
         self,
@@ -396,16 +397,18 @@ class OffloadMoELayer(MoELayer):
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.stage_views(self.layer_id, 0),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        cache.release_prefill_layer(self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
@@ -421,7 +424,6 @@ class OffloadMoELayer(MoELayer):
 
     # ------------------------------------------------------------------
     # Kernel dispatch: ``views`` are the bank tensors the movement step produced (in bank registration order) and ``topk_ids`` already index their rows.
-    # GGUF q4_0 experts still dispatch on the cache's format tag until they get a method.
     # ------------------------------------------------------------------
 
     def _expert_gemm(
@@ -436,27 +438,28 @@ class OffloadMoELayer(MoELayer):
         alphas: tuple[torch.Tensor, torch.Tensor] | None,
         is_prefill: bool,
     ) -> torch.Tensor:
-        if self.quant_method is not None:
-            from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
+        from freetoken.moe.legacy_format import canonical_role  # legacy_format imports this package
 
-            view = ExpertView(
-                {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
-                slots=None if n is not None else topk_ids, n=n, alphas=alphas,
-            )
-            return self.quant_method.apply(
-                hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
-            )
-        fmt = cache.quant_format
-        if fmt == "q4_0":
-            # Native GGUF Q4_0 experts: dequant-in-kernel grouped GEMV (MMVQ) over the
-            # streamed packed banks; topk_ids already index the cache slots / layer.
-            from freetoken.moe.fused_q4_0 import fused_experts_gguf_q4_0
+        view = ExpertView(
+            {canonical_role(name): t for name, t in zip(cache.bank_schema, views)},
+            slots=None if n is not None else topk_ids, n=n, alphas=alphas,
+        )
+        return self.quant_method.apply(
+            hidden_states, topk_weights, topk_ids, view, layer=self, is_prefill=is_prefill
+        )
 
-            gate_up, down = views
-            return fused_experts_gguf_q4_0(
-                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
-            )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+
+def iter_moe_layers(model) -> Iterator[MoELayer]:
+    if isinstance(model, MoELayer):
+        yield model
+    if not isinstance(model, BaseOP):
+        return
+    for value in model.__dict__.values():
+        if isinstance(value, BaseOP):
+            yield from iter_moe_layers(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from iter_moe_layers(item)
 
 
 def make_moe_layer(
@@ -507,10 +510,10 @@ def make_moe_layer(
         has_bias=has_bias,
         quant_config=quant_config,
         prefix=prefix,
+        layer_id=layer_id,
     )
     if offload:
         assert layer_id is not None, "offload MoE backends need the layer_id"
-        kwargs["layer_id"] = layer_id
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
     return layer_cls(**kwargs)

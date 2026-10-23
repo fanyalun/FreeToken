@@ -301,7 +301,7 @@ def main():
                     native = stats["preverify_native_routes"]
                     stats["actual_skip_fraction"] = 1-stats["preverify_retained_routes"]/native if native else None
                     stats["threshold_skip_fraction"] = 1-stats["preverify_threshold_retained_routes"]/native if native else None
-                    stats["logical_expert_bytes"] = sum(bank[0].numel()*bank.element_size() for _, bank in cache.banks)
+                    stats["logical_expert_bytes"] = sum(bank[0].numel()*bank.element_size() for bank in cache.bank_views())
                     stats["logical_total_loads"] = stats["demand_loads"] + stats["prefetch_loads"]
                     stats["logical_total_bytes"] = stats["logical_total_loads"] * stats["logical_expert_bytes"]
                     intersection = stats["target_predicted_expert_intersection"]

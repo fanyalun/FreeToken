@@ -64,7 +64,12 @@ def main():
                 return 'file://' + str(root / 'rendezvous')
 
         def load_dummy(self, model_path, config, device):
+            from freetoken.moe.expert_banks import attach_resident_banks, build_expert_banks
+
             self.load_state_dict(_make_dummy_weight_state_dict(self.state_dict(), device=device))
+            experts = self.layers.op_list[0].mlp.experts
+            banks = build_expert_banks(experts.quant_method, 1, (), device=device, dummy=True, resident=True)
+            attach_resident_banks([experts], banks)
 
         QwenNativeMTP.load_checkpoint = load_dummy
         engine = Engine(Config(

@@ -54,3 +54,27 @@ def test_deadline_queue_and_prefetch_pollution():
     assert baseline["demand_misses"] == 0
     assert predicted["demand_misses"] == 2
     assert predicted["unused_prefetches"] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_snapshot_restores_expert_bytes_after_layer_eviction():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(num_layers=2, num_experts=8, cache_size=8,
+                            device=torch.device("cuda"), quant_format="bf16")
+    sources = {name: [torch.full((8, width), layer + bank + 1, dtype=torch.bfloat16).pin_memory()
+                      for layer in range(2)]
+               for bank, (name, width) in enumerate((("gate_up", 128), ("down", 64)))}
+    cache.set_bank_sources(sources)
+    cache.materialize_layer(0)
+    cache.copy_missing()
+    snapshot = load().CacheSnapshot(cache)
+    expected = [bank.clone() for bank in cache.bank_views()]
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    assert not torch.equal(cache.bank_views()[0], expected[0])
+    snapshot.restore(cache)
+    for actual, original in zip(cache.bank_views(), expected):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
+    for name, original in snapshot.values.items():
+        torch.testing.assert_close(getattr(cache, name), original, rtol=0, atol=0)

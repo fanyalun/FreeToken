@@ -67,6 +67,11 @@ class CacheManager:
     prefill_chunk_budget = None  # generic shared page pool: no per-model prefill chunk cap
 
     @property
+    def prefix_replay_tokens(self) -> int:
+        """Prompt-tail tokens a prefix hit must leave to the prefill (a pool whose model recomputes them)."""
+        return getattr(self.swa_pool, "prefix_replay_tokens", 0) if self.swa_pool is not None else 0
+
+    @property
     def prefill_chunk_align(self) -> int:
         """Granularity a non-final prefill chunk should end on. A hybrid snapshot is donated only
         at a page-aligned boundary, so at page_size>1 one unaligned chunk end costs every reuse
@@ -90,10 +95,10 @@ class CacheManager:
             return SWARadixCache(device, page_size, self.sliding_window_size)
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
-    def match_req(self, req: PendingReq) -> MatchResult:
+    def match_req(self, req: PendingReq, max_len: int | None = None) -> MatchResult:
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
-        ids = req.input_ids[: input_len - 1]
+        ids = req.input_ids[: input_len - 1 if max_len is None else max(0, min(input_len - 1, max_len))]
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -583,22 +588,31 @@ class CacheManager:
             del self._free
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
+    def flush(self) -> int:
+        """Evict every unlocked prefix-cache entry and return the number of tokens freed."""
+        evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)
+                     else self.prefix_cache.size_info.evictable_size)
+        evicted = self._evict(evictable)
+        self._free(evicted)
+        return len(evicted)
+
+    def _evict(self, need: int) -> torch.Tensor:
+        if self.is_swa:
+            # Evicting KV leaf nodes drops their swa slots too -> return both pools.
+            ev = self.prefix_cache.evict_full(need)
+            self._free_swa(ev.swa_indices)
+            return ev.kv_indices
+        if self.is_hybrid:
+            # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
+            er = self.prefix_cache.evict_full(need)
+            if er.mamba_slots:
+                self.linear_state_pool.free(er.mamba_slots)
+            return er.kv_indices
+        return self.prefix_cache.evict(need)
+
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
-            need = (needed_pages - free_pages) * self.page_size
-            if self.is_swa:
-                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
-                ev = self.prefix_cache.evict_full(need)
-                evicted = ev.kv_indices
-                self._free_swa(ev.swa_indices)
-            elif self.is_hybrid:
-                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
-                er = self.prefix_cache.evict_full(need)
-                evicted = er.kv_indices
-                if er.mamba_slots:
-                    self.linear_state_pool.free(er.mamba_slots)
-            else:
-                evicted = self.prefix_cache.evict(need)
+            evicted = self._evict((needed_pages - free_pages) * self.page_size)
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]

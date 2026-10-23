@@ -46,6 +46,8 @@ class CacheSnapshot:
     names = ("slot_for_id", "id_of_slot", "usage", "step", "expert_recency")
 
     def __init__(self, cache):
+        if len(cache.pool_sizes) != 1 or cache.quant_format != "bf16":
+            raise ValueError("sparse verify snapshots require one BF16 expert slot pool")
         self.values = {name: getattr(cache, name).clone() for name in self.names}
 
     def restore(self, cache):
@@ -64,7 +66,8 @@ class CacheSnapshot:
             src = torch.tensor([row[1] for row in rows], dtype=torch.int32, device=cache.device)
             count = torch.tensor([len(rows)], dtype=torch.int64, device=cache.device)
             fast_index_copy_multi_jit(
-                cache._copy_dst_ptrs, cache._copy_src_ptrs[layer], cache._copy_feat_bytes,
+                cache._copy_dst_ptrs_pool[cache.pool_of_layer[layer]],
+                cache._copy_src_ptrs[layer], cache._copy_feat_bytes[cache.layer_layout[layer]],
                 dst, src, count,
             )
         for name, value in self.values.items():

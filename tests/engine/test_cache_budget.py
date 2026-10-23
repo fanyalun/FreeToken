@@ -95,11 +95,15 @@ def test_baseline_rebuild_accounts_for_previously_expanded_state_pool(monkeypatc
 
     engine = object.__new__(Engine)
     engine.config = SimpleNamespace(speculative_max_input_tokens=7, speculative_max_output_tokens=3, page_size=1)
-    engine.moe_offload_cache = SimpleNamespace(validate_rebuild=lambda slots: None)
+    engine.moe_offload_cache = SimpleNamespace(
+        decode_target="hybrid", validate_rebuild=lambda slots, pools: None)
+    from freetoken.moe.pool_policy import PoolSpec
+    engine._moe_pools = lambda batch: [PoolSpec((0,), 1, 2)]
+    engine._moe_expert_counts = None
     engine.linear_state_pool = SimpleNamespace(num_slots=4)
     engine.num_pages = 10
     engine._pool_cls = SimpleNamespace(kv_cost=lambda config: (10, 0, 1, 0))
-    engine._target_moe_and_expert_bytes = lambda slots: (slots, 100)
+    engine._target_moe_and_expert_bytes = lambda slots, pools: (slots, 100)
     engine._baseline_sd_initial_state_bytes = 200
     engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 10, 500, 200, 100, 2, 2, 400, 0)
     monkeypatch.setattr("freetoken.engine.engine.state_pool_bytes", lambda config, slots: slots * 100)
@@ -314,7 +318,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
-        attention_backend = "fi"
+        attention_backend = "triton" if torch.version.hip is not None else "fi"
         num_page_override = None
         num_token_override = 5000
 
@@ -451,7 +455,7 @@ def _offload_engine_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
+        attention_backend="triton" if torch.version.hip is not None else "fi",
         **overrides,
     )
     object.__setattr__(
@@ -464,7 +468,7 @@ def _offload_engine_config(**overrides):
             num_layers=10,
             num_moe_layers=10,
             num_experts=8,
-            expert_quant="nvfp4",  # quantized experts -> must resolve to an offload backend
+            expert_quant="nvfp4",
             moe_strategy="auto",
         ),
     )
@@ -486,7 +490,7 @@ def test_guard_raises_actionable_error_when_too_small():
     assert "128" in msg and "moe-cache" in msg
 
 
-def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend():
+def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend(monkeypatch):
     """Bare `ft serve <FTW MoE checkpoint>`: no --moe-backend, no --moe-cache-* flags at all.
 
     args.py's parse-time default only fires when the backend is *already*
@@ -497,15 +501,16 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     moe_cache_auto=True, so _init_offload_moe_cache's _require_offload_cache_size guard is never
     reached with moe_cache_size still 0.
     """
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
     from freetoken.moe import is_offload_moe_strategy
 
+    # a unified-memory host (GB10) resolves auto to fused instead
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
     config = _offload_engine_config()
     _adjust_config(config)
 
-    # Which member of the family gets picked is not this test's claim, and is not ours to
-    # decide: a bare "auto" consults ~/.cache/freetoken/benchbw.json, so a box that has run
-    # `ft bench bw` resolves nvfp4 experts to hybrid instead. Assert the family, not the member.
+    # Which member of the family gets picked is not this test's claim. Assert the family, not the member.
     assert is_offload_moe_strategy(config.moe_strategy)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
@@ -527,13 +532,17 @@ def test_page_table_width_covers_whole_trailing_pages():
             assert w > last_col and w % 32 == 0
 
 
-def _generic_rotary_cfg(max_position, override):
+def _generic_rotary_cfg(max_position, override, scaling=None):
     from types import SimpleNamespace
+
+    from freetoken.models.config import RotaryConfig
 
     model_config = SimpleNamespace(
         single_stream_only=False, is_moe=False, expert_quant="none",
         has_swa_attention=False, has_linear_attention=False,
-        rotary_config=SimpleNamespace(max_position=max_position),
+        rotary_config=RotaryConfig(
+            head_dim=128, rotary_dim=128, max_position=max_position, base=1e4, scaling=scaling
+        ),
     )
 
     class Cfg:
@@ -573,6 +582,19 @@ def test_adjust_config_allows_override_at_rope_table_boundary():
     _adjust_config(_generic_rotary_cfg(max_position=1024, override=1024))  # must not raise
 
 
+YARN_4X = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 1024}
+
+
+def test_adjust_config_allows_override_to_the_yarn_extended_table():
+    # A YaRN override that leaves max_position_embeddings at the trained length (Qwen3.8's 1M
+    # recipe) serves original * factor positions; the gate must follow the table, not the config.
+    from freetoken.engine.engine import _adjust_config
+
+    _adjust_config(_generic_rotary_cfg(max_position=1024, override=4096, scaling=YARN_4X))
+    with pytest.raises(ValueError, match=r"rope table \(4096 positions\)"):
+        _adjust_config(_generic_rotary_cfg(max_position=1024, override=4097, scaling=YARN_4X))
+
+
 def test_adjust_config_rope_gate_exempts_dsv4():
     # DSV4 sizes its own rope table from the resolved max_seq_len (_adjust_dsv4_config),
     # so the generic gate must not fire even when the override dwarfs max_position.
@@ -600,3 +622,55 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_moe_slot_pool_split(tmp_path):
+    import json
+
+    from freetoken.moe.pool_policy import group_layers, load_profile, make_pools, split_slots
+
+    pools = make_pools(group_layers("per-layer", [0] * 4, [1] * 4), num_experts=16, min_num_slots=8, slot_limit=None)
+    assert split_slots(41, pools) == [11, 10, 10, 10]
+    with pytest.raises(ValueError, match="need"):
+        split_slots(31, pools)
+    with pytest.raises(ValueError, match="hold"):
+        split_slots(65, pools)
+    # one pool takes the whole cache, as before pools existed
+    assert split_slots(100, make_pools(group_layers("unified", [0] * 4, [1] * 4), 16, 8, None)) == [100]
+    # unified pools one bank layout each, widest slots first
+    assert group_layers("unified", ["a", "b", "a", "b"], [1, 3, 1, 3]) == [[1, 3], [0, 2]]
+
+    # layer 0 uses two experts, layer 1 has a hot half and a cold half, layers 2 and 3 use all 16 evenly
+    counts = [[5] * 2 + [0] * 14, [3] * 8 + [1] * 8, [1] * 16, [1] * 16]
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({"model": "toy", "expert_counts": counts}))
+    assert split_slots(48, pools, load_profile(path, 4, 16)) == [8, 8, 16, 16]
+    with pytest.raises(ValueError, match="needs"):
+        load_profile(path, 4, 32)
+
+
+
+def test_moe_pool_flags_and_decode_batch_clamp():
+    from unittest.mock import patch
+
+    from freetoken.engine.engine import _clamp_decode_batch_to_pools
+    from freetoken.server.args import parse_args
+
+    hf = SimpleNamespace(to_dict=lambda: {"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: hf):
+        args, _ = parse_args([
+            "--model", "/models/anon", "--moe-cache-mem", "1.5GiB",
+            "--moe-cache-scope", "per-layer", "--moe-cache-split", "profile:/p.json",
+        ])
+        assert (args.moe_cache_mem, args.moe_cache_scope, args.moe_cache_split) == (3 << 29, "per-layer", "profile:/p.json")
+        for bad in (["--moe-cache-mem", "12"], ["--moe-cache-mem", "1GiB", "--moe-cache-size", "512"]):
+            with pytest.raises(SystemExit):
+                parse_args(["--model", "/models/anon", *bad])
+
+    # GPU decode needs batch * top_k distinct experts to fit the smallest pool below num_experts
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(num_experts=16, num_experts_per_tok=4),
+        max_running_req=4, cuda_graph_max_bs=None, cuda_graph_bs=[1, 2, 4],
+    )
+    _clamp_decode_batch_to_pools(config, [12, 16, 9])
+    assert (config.max_running_req, config.cuda_graph_max_bs, config.cuda_graph_bs) == (2, 2, [1, 2])

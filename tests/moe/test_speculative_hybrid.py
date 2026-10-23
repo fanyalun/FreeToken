@@ -33,7 +33,7 @@ def test_baseline_profile_identity_and_zero_costs():
 def test_baseline_balancing_protects_hits_and_matches_reference(cap, width):
     from freetoken.moe.baseline_hybrid import BaselineHybridPlanner, predict_prefix
     device = torch.device("cuda")
-    cache = SimpleNamespace(device=device, num_experts=8, cache_size=4, collect_stats=False,
+    cache = SimpleNamespace(device=device, num_experts=8, cache_size=4, collect_stats=False, quant_format="bf16",
         slot_for_id=torch.full((2, 8), -1, device=device, dtype=torch.int32),
         id_of_slot=torch.tensor([0, 9, 10, 11], device=device, dtype=torch.int32),
         usage=torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int64),
@@ -118,7 +118,7 @@ def test_baseline_profile_cache_hit_and_explicit_mismatch(tmp_path, monkeypatch)
 def test_baseline_balancer_real_cache_geometry(slots, cap):
     from freetoken.moe.baseline_hybrid import BaselineHybridPlanner, predict_prefix
     device = torch.device("cuda")
-    cache = SimpleNamespace(device=device, num_experts=256, cache_size=slots, collect_stats=False,
+    cache = SimpleNamespace(device=device, num_experts=256, cache_size=slots, collect_stats=False, quant_format="bf16",
         slot_for_id=torch.full((40, 256), -1, device=device, dtype=torch.int32),
         id_of_slot=torch.full((slots,), -1, device=device, dtype=torch.int32),
         usage=torch.zeros(slots, device=device, dtype=torch.int64),
@@ -464,7 +464,8 @@ def make_cache(stream, *, layers=2, slots=8, hidden=64, intermediate=32, num_thr
         slot_for_id=torch.full((layers, experts), -1, device="cuda", dtype=torch.int32),
         usage=torch.zeros(slots, device="cuda", dtype=torch.int64),
         step=torch.zeros((), device="cuda", dtype=torch.int64),
-        bank_views=lambda: tuple(bank for _, bank in banks), alphas_for_slots=lambda _: None)
+        bank_views=lambda: tuple(bank for _, bank in banks),
+        pool_bank_views=lambda _: tuple(bank for _, bank in banks), alphas_for_slots=lambda _: None)
     cache.cpu_executor = CpuMoeExecutor(cache, top_k=8, activation="silu", apply_router_weight_on_input=False,
         num_threads=num_threads, max_tokens=25, device=cache.device, grouped_widths=tuple(range(1, 26)),
         grouped_compat=grouped_compat)
@@ -709,15 +710,15 @@ def test_eager_failure_after_cpu_submit_drains_native_task_before_reuse(use_grap
 
 
 def test_watchdog_detects_task_after_coordinator_consumes_ready(monkeypatch):
-    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.speculative_cpu import SpeculativeBf16Executor
 
-    executor = object.__new__(CpuMoeExecutor)
+    executor = object.__new__(SpeculativeBf16Executor)
     executor._poisoned = False
     executor._ready = torch.zeros(1, dtype=torch.int64)
     executor._done = torch.zeros(1, dtype=torch.int64)
     executor._err = torch.zeros(1, dtype=torch.int64)
     executor._ext = SimpleNamespace(flag_active_slot=lambda: 0, flag_served_count=lambda _: 0)
-    monkeypatch.setattr("freetoken.moe.cpu_executor.time.monotonic", lambda: 20.)
+    monkeypatch.setattr("freetoken.moe.speculative_cpu.time.monotonic", lambda: 20.)
     executor._watchdog_tick({0: (0., 0)})
     assert executor._poisoned and executor._err[0] and executor._done[0]
     with pytest.raises(RuntimeError, match="watchdog"):

@@ -142,6 +142,9 @@ def profile_identity(cache, executor, widths, *, eager):
 
 class BaselineHybridPlanner:
     def __init__(self, cache, profile, cap):
+        if (len(getattr(cache, "pool_sizes", (cache.cache_size,))) != 1
+                or cache.quant_format != "bf16" or getattr(cache, "_raw_banks", False)):
+            raise ValueError("baseline Hybrid windows require one BF16 expert slot pool")
         self.cache, self.profile, self.cap = cache, profile, cap
         self.profile_path = None
         self.widths = tuple(profile["identity"]["widths"])
@@ -267,7 +270,9 @@ def calibrate(cache, layer, executor, identity, previous=None):
             slots, gpu_weights = torch.zeros_like(ids), torch.zeros_like(weights)
 
             def submit():
-                return executor.decode_submit(layer.layer_id, x, weights, ids, grouped=executor.grouped_compat)
+                if executor.grouped_compat:
+                    return executor.decode_submit(layer.layer_id, x, weights, ids, grouped=True)
+                return executor.decode_submit(layer.layer_id, x, weights, ids)
 
             def cpu_compute():
                 return executor.decode_sync(submit())

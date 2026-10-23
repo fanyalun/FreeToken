@@ -509,7 +509,10 @@ class GPUExpertCache:
             raise ValueError("MoDES layer coverage mismatch")
         self.importance = torch.tensor(self.preverify_policy.importance or (1.0,) * cache.num_layers,
                                        dtype=torch.float32, device=cache.device)
-        if cache.device.type != "cuda" or cache.decode_target not in ("gpu", "hybrid") or cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers:
+        if (cache.device.type != "cuda" or cache.decode_target not in ("gpu", "hybrid")
+                or cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers
+                or len(getattr(cache, "pool_sizes", (cache.cache_size,))) != 1
+                or getattr(cache, "_raw_banks", False)):
             raise ValueError("GPU speculative scheduling requires pinned BF16 GPU-offload experts")
         if min(max_loops, max_rows, top_k) < 1 or min(layer_quota, gap_capacity) < 0:
             raise ValueError("invalid GPU speculative cache geometry")
@@ -692,7 +695,8 @@ class GPUExpertCache:
         owners, slots, src, count = plan
         if getattr(c, "_copy_fused_ok", False):
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
-            fast_index_copy_multi_jit(c._copy_dst_ptrs, c._copy_src_ptrs[layer], c._copy_feat_bytes, slots, src, count)
+            fast_index_copy_multi_jit(c._copy_dst_ptrs_pool[c.pool_of_layer[layer]], c._copy_src_ptrs[layer],
+                                      c._copy_feat_bytes[c.layer_layout[layer]], slots, src, count)
         else:
             _copy_global[(8, len(c.banks))](self.src_ptrs, self.dst_ptrs, self.feature_bytes,
                 owners, slots, count, c.num_experts, len(c.banks), 256)

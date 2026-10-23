@@ -55,7 +55,10 @@ def main():
     repo = Path(__file__).resolve().parents[1]
     files = [Path(__file__), repo / "python/freetoken/moe/cpu_target.py",
         repo / "python/freetoken/engine/qwen_cpu_target.py",
-        repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp"]
+        repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp",
+        repo / "python/freetoken/kernel/csrc/cpu_moe/speculative_bf16.cpp",
+        repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target.h",
+        repo / "python/freetoken/kernel/csrc/cpu_moe/cpu_target_v2.h"]
     for path in files:
         dst = args.output / "source" / path.relative_to(repo)
         dst.parent.mkdir(parents=True, exist_ok=True)

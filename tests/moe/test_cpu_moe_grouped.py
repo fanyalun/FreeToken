@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from freetoken.moe.cpu_executor import CpuMoeExecutor
+from freetoken.moe.speculative_cpu import SpeculativeBf16Executor
 
 
 @pytest.mark.parametrize("shape", [(47, 19), (256, 128), (263, 131)])
@@ -75,7 +76,7 @@ def test_grouped_bf16_preserves_gpu_rounding_boundaries(top_k, tail, weight, exp
     down[0, :, 0] = 1
     cache = SimpleNamespace(num_layers=1, num_experts=1, quant_format="bf16",
                             bank_sources={"gate_up": [gate_up], "down": [down]})
-    executor = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+    executor = SpeculativeBf16Executor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
         num_threads=2, max_tokens=1, device=torch.device("cpu"))
     try:
         executor._ext.prepare_grouped(1)
@@ -101,7 +102,7 @@ def test_grouped_bf16_matches_ordered_gpu_boundaries_with_tails(width, apply_inp
     cache = SimpleNamespace(num_layers=1, num_experts=experts, quant_format="bf16",
         bank_sources={"gate_up": [torch.randn(experts, 2 * intermediate, hidden_size).bfloat16() * 0.1],
                       "down": [torch.randn(experts, hidden_size, intermediate).bfloat16() * 0.1]})
-    executor = CpuMoeExecutor(cache, top_k=top_k, activation="silu",
+    executor = SpeculativeBf16Executor(cache, top_k=top_k, activation="silu",
         apply_router_weight_on_input=apply_input, num_threads=4, max_tokens=25,
         device=torch.device("cpu"))
     try:
