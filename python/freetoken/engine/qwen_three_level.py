@@ -83,7 +83,10 @@ class ThreeLevelCoordinator:
                                                engine.config.speculative_max_output_tokens,
                                                engine.config.speculative_max_output_tokens),
                                            engine.config.speculative_max_loops, engine.config.speculative_mtp_depth,
-                                           cpu_fallback=resident or "preverify" in hybrid_phases)
+                                           cpu_fallback=resident or "preverify" in hybrid_phases,
+                                           runtime_admission=(not resident
+                                               and getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu"
+                                               and getattr(engine.config, "speculative_execution_implementation", "reference") == "optimized"))
         self.inner_width, self.outer_width = self.budget.reachable_widths(engine.config.speculative_mtp_depth)
         if coarse and max(self.draft_width, self.budget.submit_rows) > engine.max_seq_len:
             raise ValueError("speculative graph width exceeds context capacity")
@@ -113,6 +116,8 @@ class ThreeLevelCoordinator:
                                                use_graph=runner.use_graph, audit=engine.config.speculative_audit,
                                                layer_quota=engine.config.speculative_prefetch_layer_experts,
                                                gap_capacity=engine.config.speculative_prefetch_gap_capacity, **extra)
+        if getattr(self.experts, "optimize_admission", False):
+            self.experts.eos_mask = runner.eos_mask
         if hybrid_phases:
             self.experts.execution_mode = (engine.config.speculative_graph_implementation
                                            if runner.use_graph else "eager")
@@ -265,6 +270,7 @@ class ThreeLevelCoordinator:
         completed = False
         graph_start = self.experts.graph_replays
         flush_reason = "output_or_submit_limit"
+        cache_conflict = False
         width = window.next_width(engine.config.speculative_mtp_depth, remaining)
         capacity = (dict(protected_experts=0, blocked_slots=0, available_slots=self.budget.cache_slots)
                     if self.compact_control else self.experts.ledger.capacity())
@@ -322,7 +328,8 @@ class ThreeLevelCoordinator:
                     width = control[5]
                     capacity = dict(protected_experts=control[6], blocked_slots=control[7],
                                     available_slots=self.budget.cache_slots - control[6] - control[7])
-                    stop_reason = (None, "loop_limit", "cache_pressure")[control[4]]
+                    stop_reason = (None, "loop_limit", "cache_pressure", "cache_conflict")[control[4]]
+                    cache_conflict |= stop_reason == "cache_conflict"
                 else:
                     width = window.next_width(engine.config.speculative_mtp_depth, remaining)
                     capacity = self.experts.ledger.capacity()
@@ -410,6 +417,7 @@ class ThreeLevelCoordinator:
                    "max_loops": self.budget.max_loops, "cache_slots": self.budget.cache_slots,
                    "target_reserve_slots": 0, "initial_admission": initial_admission,
                    "loop_count": len(window.loops),
+                   "cache_conflict": cache_conflict,
                    "loops": window.survival(min(accepted, count)), "epoch": self.epoch,
                    "flush_reason": "provisional_eos" if window.candidates and window.candidates[-1] in eos_ids else
                                    "single_row_submit" if not window.candidate_limit else flush_reason}

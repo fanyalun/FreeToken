@@ -579,7 +579,7 @@ def test_hybrid_graph_partitions_routes_and_falls_back_under_slot_pressure(phase
                 counts = torch.bincount(ids[selected != 0].long(), minlength=16).tolist()
                 missing = sorted((e for e, n in enumerate(counts) if n and not (cache_state == "hits" and e < 8)),
                                  key=lambda e: (-counts[e], e))
-                expected_loads = 0 if cap == 0 or not prefer_gpu or cache_state != "empty" else min(8, len(missing))
+                expected_loads = 0 if cap == 0 or not prefer_gpu or cache_state == "hits" else min(8, len(missing))
                 assert control.plans[0][3].item() == expected_loads
                 assert control.plans[0][0][:expected_loads].tolist() == missing[:expected_loads]
                 assert not control.error.item()

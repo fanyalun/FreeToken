@@ -13,7 +13,8 @@ from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
 
 
 @pytest.mark.parametrize("submit_limit", [0, 1, 9])
-def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
+@pytest.mark.parametrize("runtime_admission", [False, True])
+def test_joint_pool_cost_and_contents_match_allocation(submit_limit, runtime_admission):
     if try_get_tp_info() is None:
         set_tp_info(rank=0, size=1)
     rotary = RotaryConfig(32, 32, 128, 10000, None)
@@ -61,6 +62,10 @@ def test_joint_pool_cost_and_contents_match_allocation(submit_limit):
     config.speculative_max_loops = 6
     config.speculative_mtp_depth = 3
     from freetoken.engine.speculative_window import WindowBudget
+    if runtime_admission:
+        config.speculative_expert_scheduler = "gpu"
+        config.speculative_execution_implementation = "optimized"
+        config.moe_cache_size = 1
     from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
     maximum = min(8, WindowBudget.resolve(128, 2, 2, 64, submit_limit).submit_rows)
     workspace = QwenGDNVerifyState(pool, [layer], maximum, 1)

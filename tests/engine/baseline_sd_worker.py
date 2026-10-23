@@ -82,6 +82,14 @@ def main():
             mm=MultimodalConfig(disabled_encoders=frozenset(('vision', 'audio')))))
         try:
             runner = engine.speculative_runner
+            control_reads = [0]
+            if args.three_level and args.scheduler == 'gpu':
+                experts = runner.three_level.experts
+                original_drain = experts.drain_control
+                def drain(rows):
+                    control_reads[0] += 1
+                    return original_drain(rows)
+                experts.drain_control = drain
             graphs = set(runner.graphs)
             if args.backend == 'hybrid' and not args.three_level:
                 from freetoken.layers.moe import _HYBRID_WINDOW
@@ -221,12 +229,21 @@ def main():
             for length in (1, 63, 64, 65, 127, 128, 129):
                 prompt = list(range(length))
                 reset()
+                control_reads[0] = 0
                 a = engine.generate_speculative(prompt, max_tokens=args.output_limit)
+                if args.three_level and args.scheduler == 'gpu':
+                    assert control_reads[0] == sum(row['loop_count'] + 1 for row in a.rounds)
                 state = snapshot()
                 # Compare scheduling with identical residency and recency, hence placement.
                 reset()
                 b = engine.generate_speculative(prompt, max_tokens=args.output_limit, prompt_chunk_size=length)
                 assert a.token_ids == b.token_ids, (length, a.token_ids, b.token_ids)
+                if args.three_level:
+                    def trajectory(result):
+                        return [(row['accepted'], row['returned'], row['submit_rows'],
+                                 [(loop['accepted'], loop['returned']) for loop in row['loops']])
+                                for row in result.rounds]
+                    assert trajectory(a) == trajectory(b)
                 for before_state, after_state in zip(state, snapshot()):
                     torch.testing.assert_close(before_state, after_state, atol=0, rtol=0)
                 request_outputs.append(a.token_ids)
@@ -237,6 +254,13 @@ def main():
                 if args.three_level and runner.three_level.inner_width == 0:
                     assert all(row['loop_count'] == 0 for row in a.rounds)
                     assert not runner.three_level.private_pool.recurrent_states.any()
+                if args.three_level and args.scheduler == 'gpu' and args.slots == 16 and args.layers == 10:
+                    conflicts = [row for row in a.rounds if row['cache_conflict']]
+                    assert conflicts and all(row['loop_count'] == 1 for row in conflicts)
+                    assert all(row['loops'][-1]['stop_after_loop'] == 'cache_conflict' for row in conflicts)
+                    experts = runner.three_level.experts
+                    assert not experts.cache_conflict.any() and not experts.pending.any()
+                    assert not experts.gap_planned and not experts.gap_active
                 assert not runner.active and runner.frontier is None
             for prompt, limit in ((list(range(130)), 1), ([1], args.output_limit + 1)):
                 try:

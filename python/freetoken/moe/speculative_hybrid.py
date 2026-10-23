@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .speculative_gpu import _prediction_victim
+
 
 @triton.jit(do_not_specialize=["LAYER", "ROWS"])
 def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
@@ -18,7 +20,7 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
                LAYER, EXPERTS: tl.constexpr, SLOTS: tl.constexpr,
                ROWS, TOPK: tl.constexpr, MAX_ROUTES: tl.constexpr,
                FETCH_CAP: tl.constexpr, E: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
-               Q: tl.constexpr, PREVERIFY: tl.constexpr, valid_rows=None):
+               Q: tl.constexpr, PREVERIFY: tl.constexpr, valid_rows=None, cache_conflict=None):
     e = tl.arange(0, E)
     r = tl.arange(0, R)
     width = ROWS if valid_rows is None else tl.load(valid_rows)
@@ -54,7 +56,7 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     local = cached - LAYER * EXPERTS
     active = (local >= 0) & (local < EXPERTS)
     active &= tl.load(demand + tl.minimum(tl.maximum(local, 0), EXPERTS - 1), c < SLOTS, 0) > 0
-    available = (c < SLOTS) & ~protected & ~busy & ~active
+    available = (c < SLOTS) & ~busy & ~active
     limit = tl.minimum(tl.sum(available.to(tl.int32), 0), tl.sum(missing.to(tl.int32), 0))
     if FETCH_CAP >= 0:
         limit = tl.minimum(limit, width * FETCH_CAP)
@@ -73,9 +75,13 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     clock = tl.load(clock_ptr)
     for i in range(chosen):
         expert = tl.sum(tl.where(index == i, ordered_ids, 0), 0)
-        oldest = tl.min(tl.where(available, age, 9223372036854775807), 0)
-        slot = tl.min(tl.where(available & (age == oldest), c, 2147483647), 0)
+        slot = _prediction_victim(available, protected, age, c)
         if slot != 2147483647:
+            if PREVERIFY and cache_conflict is not None:
+                reclaimed = tl.sum(((c == slot) & protected).to(tl.int32), 0)
+                if reclaimed:
+                    tl.store(cache_conflict, 1)
+                    tl.atomic_add(stats + 28, 1)
             owner = LAYER * EXPERTS + expert
             previous = tl.sum(tl.where(c == slot, cached, 0), 0)
             if previous >= 0:

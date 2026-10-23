@@ -1090,7 +1090,7 @@ def test_compact_close_orders_cleanup_without_normal_host_drain(abort):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("prefetch,gap,quota", [(False, False, 0), (True, False, 4), (True, True, 11)])
-def test_optimized_admission_matches_reference_including_failed_prefix(prefetch, gap, quota):
+def test_optimized_admission_matches_reference_without_predictions_including_failed_prefix(prefetch, gap, quota):
     import triton
     from freetoken.moe.speculative_gpu import _admit, _admit_optimized
 
@@ -1123,6 +1123,9 @@ def test_optimized_admission_matches_reference_including_failed_prefix(prefetch,
             if trial == 3:
                 mapping[experts + 7] = -1
                 owners[7] = 0
+        refs.zero_()
+        if prefetch:
+            demand.zero_()
         inputs = [mapping, owners, usage, torch.tensor(100, dtype=torch.int64), refs, pending,
                   demand, queue, *(torch.full((experts * layers,), -99, dtype=torch.int32) for _ in range(3)),
                   torch.zeros(1, dtype=torch.int64), torch.zeros(1, dtype=torch.int32),
@@ -1134,6 +1137,154 @@ def test_optimized_admission_matches_reference_including_failed_prefix(prefetch,
                 triton.next_power_of_2(experts * layers if gap else experts))
         for expected, actual in zip(*runs):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source", ["demand", "layer", "gap", "verify"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), slots=6)
+        control = GPUExpertCache(cache, stream, max_loops=8, max_rows=33, top_k=2,
+            compact_control=True, implementation="optimized", prefetch=False)
+        control.begin(1)
+        control.set_phase("verify" if source == "verify" else "preverify")
+        owners = torch.tensor([0, 1, 16, 17, 18, 19], device="cuda", dtype=torch.int32)
+        def reset():
+            cache.slot_for_id.fill_(-1)
+            cache.slot_for_id.view(-1)[owners.long()] = torch.arange(6, device="cuda", dtype=torch.int32)
+            cache.id_of_slot.copy_(owners)
+            cache.usage.copy_(torch.tensor([0, 0, 0, 100, 1, 1], device="cuda"))
+            control.pending.zero_()
+            control.pending[2] = 1
+            if source == "gap":
+                control.pending[:2] = 1
+            control.refs.zero_()
+            control.refs[1, 2:4] = 2
+            control.demand.zero_()
+            control.demand[:2] = 1
+            control.queue.fill_(2147483647)
+            control.queue[0, 2:5] = torch.arange(3, device="cuda", dtype=torch.int32)
+            if source in ("demand", "verify"):
+                control.demand[2:5] = 1
+            control.counters.zero_()
+            control.cache_conflict.zero_()
+        reset()
+        def allocate():
+            control._allocate(-1 if source == "gap" else 0, control.plans[0],
+                prefetch=source in ("layer", "gap"), gap=source == "gap", quota=3)
+        if graph:
+            allocate()
+            reset()
+            stream.synchronize()
+            capture = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(capture, stream=stream):
+                allocate()
+            reset()
+            capture.replay()
+        else:
+            allocate()
+        stream.synchronize()
+        assert control.plans[0][1][:3].tolist() == [3, 4, 5]
+        assert cache.id_of_slot[:3].tolist() == [0, 1, 16]
+        assert cache.slot_for_id[1, 1:4].tolist() == [-1, -1, -1]
+        assert control.refs[1, 2:4].tolist() == [2, 2]
+        assert control.cache_conflict.item() == (source != "verify")
+        assert control.counters[28:30].tolist() == ([2, 0] if source == "demand" else
+                                                   [0, 2] if source in ("layer", "gap") else [0, 0])
+        # Finish every planned copy before closing this synthetic admission.
+        control._copy(0, control.plans[0])
+        control.pending.zero_()
+        control.close(abort=True)
+        assert not control.cache_conflict.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("source", ["demand", "layer", "gap"])
+@pytest.mark.parametrize("abort", [False, True])
+def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=1, slots=4)
+        control = GPUExpertCache(cache, stream, max_loops=8, max_rows=9, top_k=2,
+            compact_control=True, implementation="optimized", layer_quota=1, gap_capacity=2)
+        control.begin(1)
+        cache.id_of_slot.copy_(torch.arange(4, device="cuda", dtype=torch.int32))
+        cache.slot_for_id[0, :4] = torch.arange(4, device="cuda", dtype=torch.int32)
+        control.refs[0, :4] = 1
+        control.refs[0, 4] = 1
+        control.queue[0, 4] = 0
+        control.demand[:2] = 1
+        if source != "gap":
+            if source == "demand":
+                control.demand[4] = 1
+            control._allocate(0, control.plans[0], prefetch=source == "layer", quota=1)
+            control._copy(0, control.plans[0])
+        tokens = torch.tensor([11, 12], device="cuda", dtype=torch.int32)
+        commit = SimpleNamespace(input_count=torch.tensor(1, device="cuda"),
+            accepted_drafts=torch.tensor(0, device="cuda"), terminal=torch.tensor(False, device="cuda"))
+        # Two observed rows share an expert that can already have been evicted.
+        control.history[0, 0, :2] = torch.tensor([[2, 3], [2, 3]], device="cuda")
+        control.widths[0, 0] = 2
+        control.refs[0, 2:4] += 1
+        status = control.read_control(tokens, commit, loop=0, candidate_limit=8, remaining=16)
+        assert status[4] == 3 and status[0] == 1
+        assert len(status) == tokens.numel() + 8
+        assert control.candidate_buffer[0].item() == 11
+        assert control.refs[0, 2:4].tolist() == [1, 1]
+        if source == "gap":
+            assert control.gap_plan[3].item() == 1 and control.pending.any()
+        # Freeing all predictions cannot revoke an earlier conflict, even at loop limit/EOS.
+        control.refs.zero_()
+        if abort:
+            control.close(abort=True)
+        else:
+            control.finish_loop(False)
+            control.join_gap()
+            commit.terminal.fill_(True)
+            status = control.read_control(tokens, commit, loop=7, candidate_limit=8, remaining=16)
+            assert status[4] == 3 and status[2] == 1
+            control.finish_loop(False)
+            control.close()
+        assert cache.banks[0][1][cache.slot_for_id[0, 4], 0].item() == 4
+        assert not control.pending.any() and not control.refs.any()
+        assert not control.cache_conflict.any() and not control.gap_planned and not control.gap_active
+        assert not control.gap_plan[3].any()
+        assert control.request_counters[30].item() == 1
+        control.begin(2)
+        assert not control.cache_conflict.any() and not control.pending.any()
+        control.close()
+        assert control.request_counters[30].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prediction_reclaim_cannot_override_pending_or_demand():
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=1, slots=2)
+        control = GPUExpertCache(cache, stream, max_loops=8, max_rows=9, top_k=2,
+            compact_control=True, implementation="optimized", prefetch=False)
+        control.begin(1)
+        cache.id_of_slot.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
+        cache.slot_for_id[0, :2] = torch.arange(2, device="cuda", dtype=torch.int32)
+        control.pending[1] = 1
+        control.refs.fill_(1)
+        control.demand[[0, 2]] = 1
+        control._allocate(0, control.plans[0])
+        assert control.error.item() == 1 and not control.cache_conflict.any()
+        assert cache.id_of_slot.tolist() == [0, 1] and control.plans[0][3].item() == 0
+        control.pending.zero_()
+        control.close(abort=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

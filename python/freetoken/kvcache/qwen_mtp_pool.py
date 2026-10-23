@@ -52,7 +52,9 @@ class QwenMTPKVCache(MHAKVCache):
                         and "preverify" in getattr(config, "speculative_hybrid_phases", ()))
             budget = WindowBudget.resolve(slots or mc.num_moe_layers * mc.num_experts,
                 mc.num_moe_layers, mc.num_experts_per_tok, mc.num_experts,
-                upper, config.speculative_max_loops, config.speculative_mtp_depth, cpu_fallback=fallback)
+                upper, config.speculative_max_loops, config.speculative_mtp_depth, cpu_fallback=fallback,
+                runtime_admission=(getattr(config, "speculative_expert_scheduler", "host") == "gpu"
+                                   and getattr(config, "speculative_execution_implementation", "reference") == "optimized"))
             inner, upper = budget.reachable_widths(config.speculative_mtp_depth)
             widths = [upper]
             # Shared scratch retains small per-width index and sequence-length views.

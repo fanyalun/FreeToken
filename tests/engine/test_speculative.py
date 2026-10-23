@@ -27,6 +27,19 @@ def test_hybrid_small_verify_admission_keeps_loop_limit_without_all_route_reside
     assert hybrid.before_loop(6, 0, 4) == "loop_limit"
 
 
+@pytest.mark.parametrize("slots", [1, 512, 1280, 4907])
+def test_runtime_admission_preserves_lengths_and_default_loop_limit(slots):
+    from freetoken.engine.speculative_window import WindowBudget
+
+    budget = WindowBudget.resolve(slots, 40, 8, 256, runtime_admission=True)
+    assert budget.reachable_widths(3) == (4, 25)
+    assert budget.before_loop(0, 10000, 4, blocked_slots=10000) is None
+    assert budget.before_loop(5, 10000, 4) is None
+    assert budget.before_loop(6, 0, 4) == "loop_limit"
+    assert WindowBudget.resolve(slots, 40, 8, 256, 3, runtime_admission=True).reachable_widths(3) == (2, 3)
+    assert WindowBudget.resolve(slots, 40, 8, 256, 1, runtime_admission=True).reachable_widths(3) == (0, 1)
+
+
 @pytest.mark.parametrize("phases", [("verify",), ("preverify", "verify"), ()])
 @pytest.mark.parametrize("graphs", ["reference", "full"])
 def test_gpu_hybrid_config_accepts_supported_phases(phases, graphs):
@@ -230,8 +243,9 @@ def test_masked_kv_store_never_writes_padding_slots():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("implementation", ["coarse", "full"])
 @pytest.mark.parametrize("verify_quota", [0, 2])
-@pytest.mark.parametrize("depth,limit", [(1, 0), (2, 0), (3, 0), (4, 0), (4, 1), (4, 3)])
-def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth, limit, implementation, verify_quota):
+@pytest.mark.parametrize("depth,limit,cache_slots", [(1, 0, 64), (2, 0, 64), (3, 0, 64),
+    (4, 0, 64), (4, 1, 64), (4, 3, 64), (1, 0, 24)])
+def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth, limit, cache_slots, implementation, verify_quota):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from freetoken.engine.qwen_mtp import QwenMTPRunner
@@ -244,12 +258,12 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         sources = [torch.arange(16, dtype=torch.float32).reshape(16, 1).pin_memory() for _ in range(2)]
-        bank = torch.empty(64, 1, device=device)
+        bank = torch.empty(cache_slots, 1, device=device)
         cache = SimpleNamespace(device=device, quant_format="bf16", decode_target="gpu",
-            cpu_layer_ids=set(), _unpinned_layers=set(), num_layers=2, num_experts=16, cache_size=64,
-            banks=[(sources, bank)], id_of_slot=torch.full((64,), -1, device=device, dtype=torch.int32),
+            cpu_layer_ids=set(), _unpinned_layers=set(), num_layers=2, num_experts=16, cache_size=cache_slots,
+            banks=[(sources, bank)], id_of_slot=torch.full((cache_slots,), -1, device=device, dtype=torch.int32),
             slot_for_id=torch.full((2, 16), -1, device=device, dtype=torch.int32),
-            usage=torch.zeros(64, device=device, dtype=torch.int64),
+            usage=torch.zeros(cache_slots, device=device, dtype=torch.int64),
             step=torch.zeros((), device=device, dtype=torch.int64),
             bank_views=lambda: (bank,), alphas_for_slots=lambda _: None)
         def reset():
@@ -276,9 +290,10 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         runner.states, runner.graphs, runner._decode_batches = {}, {}, {}
         runner.active, runner.coarse_graphs = False, None
         runner.model_state = SimpleNamespace(current=None)
-        budget = WindowBudget.resolve(64, 2, 8, 16, limit, depth=depth)
+        budget = WindowBudget.resolve(cache_slots, 2, 8, 16, limit, depth=depth, runtime_admission=True)
         experts = GPUExpertCache(cache, stream, max_loops=6, max_rows=budget.submit_rows,
             inner_rows=depth + 1, layer_quota=1, gap_capacity=3, implementation="optimized", compact_control=True,
+            layer_quotas=(0, 0) if cache_slots == 24 else None,
             verify_layer_quota=verify_quota)
         original_copy = experts._copy
         def delayed_copy(*a, **kw):
@@ -363,6 +378,34 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         assert control[:3] == [1, eos_rows - 1, 1]
         graphs.tail(True, False)
         experts.close(abort=True)
+        if cache_slots == 24:
+            graphs.prepare(())
+            experts.begin(3)
+            experts.set_phase("preverify")
+            cache.reset()
+            owners = torch.arange(24, device=device, dtype=torch.int32)
+            cache.id_of_slot.copy_(owners)
+            cache.slot_for_id.view(-1)[:24].copy_(owners)
+            bank[:, 0].copy_((owners % 16).float())
+            experts.refs.fill_(1)
+            experts.queue[1, 8] = 0
+            graphs.seed.fill_(1)
+            anchor.zero_()
+            _, _, _, control = graphs.body(anchor, inner=True, start=2, rows=1,
+                limit=budget.submit_rows - 1, remaining=32)
+            assert control[4] == 3 and experts.counters[28].item() == 0
+            assert experts.counters[29].item() == 1
+            assert experts.gap_plan[3].item() == 1
+            before = private.recurrent_states.clone()
+            graphs.tail(True, False)
+            assert private.recurrent_states.item() == before.item() + 1
+            experts.set_phase("verify")
+            _, _, _, control = graphs.body(anchor, inner=False, start=2, rows=1, remaining=1)
+            assert control[:3] == [1, 0, 1] and control[4] == 0
+            graphs.tail(False, False)
+            experts.close(abort=True)
+            assert not experts.pending.any() and not experts.refs.any()
+            assert not experts.cache_conflict.any() and not experts.gap_plan[3].any()
         experts.begin(3)
         experts.set_phase("preverify")
         before = private.recurrent_states.clone()

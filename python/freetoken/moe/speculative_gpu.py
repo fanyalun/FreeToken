@@ -20,7 +20,16 @@ STAT_NAMES = (
     "hybrid_preverify_cpu_unique_experts", "hybrid_verify_cpu_unique_experts",
     "preverify_threshold_retained_routes", "preverify_extra_hit_routes",
     "target_predicted_expert_intersection", "preverify_predicted_unique_experts",
+    "demand_prediction_reclaims", "prefetch_prediction_reclaims", "cache_conflict_windows",
 )
+
+
+@triton.jit
+def _prediction_victim(available, protected, usage, slots):
+    ordinary = available & ~protected
+    eligible = tl.where(tl.sum(ordinary.to(tl.int32), 0) > 0, ordinary, available)
+    oldest = tl.min(tl.where(eligible, usage, 9223372036854775807), 0)
+    return tl.min(tl.where(eligible & (usage == oldest), slots, 2147483647), 0)
 
 
 @triton.jit
@@ -200,7 +209,11 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
            PREFETCH: tl.constexpr, QUOTA: tl.constexpr, GAP: tl.constexpr,
            C: tl.constexpr, E: tl.constexpr, PREVERIFY: tl.constexpr = False,
            VERIFY_PREFETCH: tl.constexpr = False, CURRENT_LAYER: tl.constexpr = -1,
-           verify_prefetched=None):
+           verify_prefetched=None, cache_conflict=None, control=None):
+    if control is not None:
+        if (tl.load(control + 3) != 0) | (tl.load(control + 4) != 0) | (tl.load(control + 5) == 0) | (tl.load(control + 2) != 0):
+            tl.store(plan_count, 0)
+            return
     e = tl.arange(0, E)
     base = 0 if GAP else LAYER * EXPERTS
     limit: tl.constexpr = TOTAL if GAP else EXPERTS
@@ -234,7 +247,7 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
         protected = tl.load(refs + tl.maximum(cached, 0), (c < SLOTS) & (cached >= 0), 0) > 0
         pending = tl.load(pending_ptr + c, c < SLOTS, 1) != 0
         active = tl.full((C,), False, tl.int1)
-        if VERIFY_PREFETCH:
+        if PREFETCH and not GAP:
             local = cached - CURRENT_LAYER * EXPERTS
             active = (local >= 0) & (local < EXPERTS)
             active &= tl.load(demand + tl.minimum(tl.maximum(local, 0), EXPERTS - 1), c < SLOTS, 0) > 0
@@ -248,15 +261,19 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
             priority = tl.min(tl.where(desired, order, 2147483647), 0)
             expert = tl.min(tl.where(desired & (order == priority), e, 2147483647), 0)
             rank = tl.sum(tl.where(e == expert, ranks, 0), 0)
-            eligible = (c < SLOTS) & ~protected & ~pending & ~active
-            best = tl.min(tl.where(eligible, usage, 9223372036854775807), 0)
-            slot = tl.min(tl.where(eligible & (usage == best), c, 2147483647), 0)
+            eligible = (c < SLOTS) & ~pending & ~active
+            slot = _prediction_victim(eligible, protected, usage, c)
             if slot == 2147483647:
                 if not PREFETCH:
                     tl.store(error, 1)
                     successful = rank - 1
                 running = False
             else:
+                if PREVERIFY and cache_conflict is not None:
+                    reclaimed = tl.sum(((c == slot) & protected).to(tl.int32), 0)
+                    if reclaimed:
+                        tl.store(cache_conflict, 1)
+                        tl.atomic_add(stats + (29 if PREFETCH else 28), 1)
                 owner = base + expert
                 previous = tl.sum(tl.where(c == slot, cached, 0), 0)
                 if previous >= 0:
@@ -418,13 +435,19 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
              ROWS: tl.constexpr, LAYERS: tl.constexpr, SLOTS: tl.constexpr,
              ROUTES: tl.constexpr, DEPTH: tl.constexpr, MAX_LOOPS: tl.constexpr,
              INNER: tl.constexpr, AUDIT: tl.constexpr, STAGE_CANDIDATES: tl.constexpr,
-             context=None, CPU_FALLBACK: tl.constexpr = False):
+             context=None, CPU_FALLBACK: tl.constexpr = False,
+             cache_conflict=None, RUNTIME_ADMISSION: tl.constexpr = False, eos_mask=None):
     if context is not None:
         completed = tl.load(context + 2) + 1
         candidates = tl.load(context + 3)
         candidate_limit = tl.load(context + 4)
         remaining = tl.load(context + 5)
     count = tl.load(consumed)
+    finished = tl.load(terminal)
+    if INNER and RUNTIME_ADMISSION and eos_mask is not None:
+        # Inner acceptance is capped by its width, so terminal alone does not mean EOS.
+        token = tl.load(tokens + tl.maximum(count - 1, 0))
+        finished = tl.load(eos_mask + token)
     failure = tl.load(error)
     total, blocked, width, stop = 0, 0, 0, 0
     if INNER:
@@ -437,11 +460,13 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
             blocked = tl.sum((tl.load(pending + slots, slots < SLOTS, 0) != 0).to(tl.int32), 0)
             # The target's last-layer join must retire all prefetch copies before admission.
             failure = tl.where(blocked != 0, 2, failure)
-        pressure = (total + width * ROUTES > SLOTS) & (not CPU_FALLBACK)
+        pressure = (total + width * ROUTES > SLOTS) & (not CPU_FALLBACK) & (not RUNTIME_ADMISSION)
         stop = tl.where(completed >= MAX_LOOPS, 1, tl.where(pressure, 2, 0))
+        if RUNTIME_ADMISSION:
+            stop = tl.where(tl.load(cache_conflict) != 0, 3, stop)
     tl.store(output + 0, count)
     tl.store(output + 1, tl.load(accepted))
-    tl.store(output + 2, tl.load(terminal))
+    tl.store(output + 2, finished)
     tl.store(output + 3, failure)
     tl.store(output + 4, stop)
     tl.store(output + 5, width)
@@ -452,6 +477,11 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
     tl.store(output + 8 + rows, values, rows < ROWS)
     if INNER and STAGE_CANDIDATES:
         tl.store(candidate_buffer + candidates + rows, values, (rows < count) & (failure == 0))
+
+
+@triton.jit
+def _gap_control(cache_conflict, output):
+    tl.store(output + 4, tl.where(tl.load(cache_conflict) != 0, 3, tl.load(output + 4)))
 
 
 class GPUExpertCache:
@@ -515,6 +545,7 @@ class GPUExpertCache:
         self.demand_fence = demand_fence
         self.max_loops, self.max_rows, self.top_k = max_loops, max_rows, top_k
         self.inner_rows, self.valid_rows = inner_rows, None
+        self.eos_mask = None
         self.plan_capacity = max(cache.num_experts, min(max(0, gap_capacity - 1), cache.num_layers * cache.num_experts))
         self.copy_stream = torch.cuda.Stream(device=cache.device)
         self.refs = torch.zeros_like(cache.slot_for_id, dtype=torch.int32)
@@ -525,6 +556,7 @@ class GPUExpertCache:
         self.used_device = torch.zeros_like(self.initial)
         self.cursor = torch.zeros(1, dtype=torch.int32, device=cache.device)
         self.error = torch.zeros_like(self.cursor)
+        self.cache_conflict = torch.zeros_like(self.cursor)
         self.request_counters = torch.zeros(len(STAT_NAMES), dtype=torch.int64, device=cache.device)
         self.protected = torch.zeros(cache.num_layers, dtype=torch.int32, device=cache.device)
         self.control_device = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, device=cache.device)
@@ -553,6 +585,7 @@ class GPUExpertCache:
             self.verify_plans = [self._new_plan() for _ in range(cache.num_layers)]
             self.verify_prefetched = torch.zeros_like(self.initial)
         self.gap_active = False
+        self.gap_planned = False
         self.demand = torch.zeros(cache.num_experts, dtype=torch.int32, device=cache.device)
         self.outputs, self.graphs = {}, {}
         self.graph_replays, self.input_offset, self.profiler = 0, 0, None
@@ -607,6 +640,7 @@ class GPUExpertCache:
             self.verify_inflight = False
         self.gap_plan[3].zero_()
         self.gap_active = False
+        self.gap_planned = False
         self.queue.fill_(2147483647)
         self.history.fill_(-1)
         self.widths.zero_()
@@ -616,6 +650,7 @@ class GPUExpertCache:
         self.used_device.zero_()
         self.counters.zero_()
         self.error.zero_()
+        self.cache_conflict.zero_()
         self.epoch, self.phase, self.loop = epoch, "preverify", 0
         self.records, self.stats, self.prefetched, self.used_prefetch = [], {}, set(), set()
         self.cache.speculative_controller = self
@@ -627,11 +662,14 @@ class GPUExpertCache:
         self.phase, self.loop = phase, loop
         self.cursor.fill_(loop)
 
-    def _allocate(self, layer, plan, *, prefetch=False, gap=False, quota=0, verify_prefetch=False):
+    def _allocate(self, layer, plan, *, prefetch=False, gap=False, quota=0, verify_prefetch=False,
+                  control=None):
         c = self.cache
         kernel = _admit_optimized if self.optimize_admission else _admit
-        extra = dict(VERIFY_PREFETCH=True, CURRENT_LAYER=layer - 1,
-                     verify_prefetched=self.verify_prefetched) if verify_prefetch else {}
+        extra = dict(VERIFY_PREFETCH=verify_prefetch,
+                     CURRENT_LAYER=layer - 1 if verify_prefetch else layer,
+                     verify_prefetched=self.verify_prefetched, cache_conflict=self.cache_conflict,
+                     control=control) if self.optimize_admission else {}
         kernel[(1,)](c.slot_for_id, c.id_of_slot, c.usage, c.step, self.refs, self.pending,
             self.demand, self.queue, *plan, self.error, self.counters, self.prefetched_device,
             layer, c.num_experts, c.cache_size, c.num_experts * c.num_layers,
@@ -735,7 +773,8 @@ class GPUExpertCache:
                 max(self.max_rows, self.inner_rows) * self.top_k, self.hybrid_max_fetch,
                 triton.next_power_of_2(c.num_experts), triton.next_power_of_2(c.cache_size),
                 triton.next_power_of_2(max(self.max_rows, self.inner_rows) * self.top_k), triton.next_power_of_2(c.num_experts + 1),
-                self.phase == "preverify", self.valid_rows, num_warps=8 if c.cache_size >= 2048 else 4)
+                self.phase == "preverify", self.valid_rows, cache_conflict=self.cache_conflict,
+                num_warps=8 if c.cache_size >= 2048 else 4)
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("HYBRID/CPU_D2H_READY")
@@ -811,19 +850,29 @@ class GPUExpertCache:
         return self.drain_control(tokens.numel())
 
     def write_control(self, tokens, commit, *, inner, loop=None, candidates=0, candidate_limit=0,
-                      remaining=0, depth=3, context=None):
+                      remaining=0, depth=3, context=None, eos_mask=None):
         c = self.cache
         if inner:
             _decide[(c.num_layers,)](self.refs, self.history, self.widths, self.queue, commit.input_count,
                 0 if loop is None else loop, c.num_layers, c.num_experts, self.top_k,
                 triton.next_power_of_2(c.num_experts), self.protected, self.error, True,
-                self.inner_rows, context, mapping=c.slot_for_id if "preverify" in self.hybrid_phases else None)
+                self.inner_rows, context,
+                mapping=c.slot_for_id if self.optimize_admission or "preverify" in self.hybrid_phases else None)
         _control[(1,)](tokens, commit.input_count, commit.accepted_drafts, commit.terminal,
             self.error, self.protected, self.pending, self.control_device,
             self.candidate_buffer, candidates, candidate_limit, remaining, 0 if loop is None else loop + 1,
             tokens.numel(), c.num_layers, c.cache_size, c.num_layers * self.top_k,
             depth, self.max_loops, inner, self.audit or context is not None, self.stage_candidates,
-            context, CPU_FALLBACK="preverify" in self.hybrid_phases)
+            context, CPU_FALLBACK="preverify" in self.hybrid_phases,
+            cache_conflict=self.cache_conflict, RUNTIME_ADMISSION=self.optimize_admission,
+            eos_mask=self.eos_mask if eos_mask is None else eos_mask)
+        if inner and self.optimize_admission and self.prefetch and self.gap_capacity > 1:
+            # Pending checks above describe the completed forward, before this new plan.
+            self.stream.wait_stream(self.copy_stream)
+            self._allocate(-1, self.gap_plan, prefetch=True, gap=True,
+                           quota=self.gap_capacity - 1, control=self.control_device)
+            _gap_control[(1,)](self.cache_conflict, self.control_device)
+            self.gap_planned = True
 
     def drain_control(self, rows):
         size = rows + 8
@@ -842,10 +891,12 @@ class GPUExpertCache:
         return values
 
     def finish_loop(self, continuing):
-        if continuing and self.prefetch and self.gap_capacity > 1:
+        if self.gap_planned or (continuing and self.prefetch and self.gap_capacity > 1
+                                and not self.optimize_admission):
             plan = self.gap_plan if self.cross_layer_prefetch else self.plans[1]
-            self.stream.wait_stream(self.copy_stream)
-            self._allocate(-1, plan, prefetch=True, gap=True, quota=self.gap_capacity - 1)
+            if not self.gap_planned:
+                self.stream.wait_stream(self.copy_stream)
+                self._allocate(-1, plan, prefetch=True, gap=True, quota=self.gap_capacity - 1)
             self.copy_stream.wait_stream(self.stream)
             with torch.cuda.stream(self.copy_stream):
                 kernel = _copy_global_vectorized if self.optimize_copy and self.vector_copy_aligned else _copy_global
@@ -855,6 +906,7 @@ class GPUExpertCache:
                 if not self.cross_layer_prefetch:
                     _ready[(1,)](self.pending, plan[1], plan[3], triton.next_power_of_2(self.plan_capacity))
             self.gap_active = self.cross_layer_prefetch
+            self.gap_planned = False
         self.queue.fill_(2147483647)
 
     def check_error(self):
@@ -893,6 +945,8 @@ class GPUExpertCache:
     def close(self, *, abort=False):
         if not self.active:
             return
+        if self.gap_planned:
+            self.finish_loop(False)
         self.stream.wait_stream(self.copy_stream)
         if self.cpu_stream is not None:
             self.stream.wait_stream(self.cpu_stream)
@@ -900,7 +954,11 @@ class GPUExpertCache:
             self.join_gap()
             self.retire_layers()
         self.retire_verify()
+        self.counters[30].add_(self.cache_conflict[0])
         self.request_counters.add_(self.counters)
+        self.cache_conflict.zero_()
+        self.gap_plan[3].zero_()
+        self.layer_plan_counts.zero_()
         if self.compact_control and not self.audit:
             if abort:
                 self.stream.synchronize()

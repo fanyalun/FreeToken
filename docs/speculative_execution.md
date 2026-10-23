@@ -7,15 +7,25 @@ The optimized implementation requires compact control.
 
 Set `speculative_execution_implementation="optimized"` explicitly to enable the
 GPU admission, gap copy, cross-layer prefetch, candidate staging, and decode
-metadata changes. Host and hybrid expert schedulers retain their own admission
-and prefetch implementations. The fused decode metadata preparation can also be
+metadata changes. Host/reference scheduling retains its admission and prefetch
+rules. Optimized GPU Hybrid uses the same slot reclamation as GPU offload; its
+cost model and CPU/GPU partition remain unchanged. Fused decode metadata can also be
 used by native two-level SD for a matched comparison.
 
-The six-loop limit, ready-or-top-4 selection, capacity formula, stop priority,
-and complete top-8 final verification are unchanged. MTP reconcile still executes
-the full batch width and writes the valid KV prefix using the existing semantics;
-only its selected hidden row reaches the LM head. No early submission, delayed
-trial or larger cache is included in those execution stages. The separate coarse
+The default six-loop limit, ready-or-top-4 selection, submission/output limits,
+and complete top-8 final verification are unchanged. Optimized GPU scheduling
+admits loops at runtime instead of reserving their worst-case expert union.
+It first selects safe slots without prediction references, then safe slots with
+prediction references, ordered by `(usage, slot_id)` within each tier. Pending
+copies and current demand/GEMM slots are always excluded. Reclaiming a prediction
+slot sets a sticky device `cache_conflict` flag and preserves the evicted expert's
+references for rejection accounting and final-verify prefetch. The current loop
+finishes and commits its accepted private state before full Target verification;
+it does not begin another loop. `cache_conflict` takes priority over `loop_limit`,
+and the window records the conflict independently of EOS/output termination.
+Final Target verification may reclaim predictions without another submission.
+MTP reconcile still executes the full batch width and writes the valid KV prefix;
+only its selected hidden row reaches the LM head. The separate coarse
 graph implementation below changes the graph pools and workspace layout.
 
 ## Graphs for a fixed run configuration
@@ -107,16 +117,23 @@ and copies weights; the compute stream owns mapping, usage, references, and
 pending state. Each prefetch fork retains its producer dependency.
 
 Layer prefetch loads experts from the layer that just ran. All original top-8
-routes have leases before admission, including routes omitted from lossy
-computation. These leases and pending flags prevent their eviction while later
-layers execute. A GPU invariant check reports an error through the existing
-control readback if a layer encounters a pending resident expert.
+routes have prediction references before admission, including routes omitted
+from lossy computation. Explicit current-demand exclusion protects the concurrent
+GEMM; pending flags protect copies. Predictions alone can be reclaimed. A GPU
+invariant check reports an error through the existing control readback if a layer
+encounters a pending resident expert.
 
 The final layer joins every layer-prefetch fork and retires pending flags in one
-kernel before the forward graph exits. Gap copies overlap MTP and are joined and
-retired at the next target-forward entry. Close also joins and retires copies,
-including partial-forward cancellation or exceptions; abort drains the stream
-before returning ownership. Thus loop admission still sees pending=0.
+kernel before the forward graph exits. Acceptance releases rejected references,
+then the GPU computes the continuation condition and plans gap slots before the
+single control readback. A gap reclamation updates the same conflict flag and
+stop reason before that readback. The host issues the planned copies even when
+they caused submission; they join before full Verify without another loop.
+Continuing gap copies overlap MTP and retire at the next target-forward entry.
+Capture and warmup also finish and join each gap plan before another body can
+overwrite it. Close joins and retires copies, including partial-forward
+cancellation or exceptions; abort drains the stream
+before returning ownership. The pending invariant is checked before new gap planning.
 If target execution raises during graph capture, it joins all copy forks before
 leaving the capture context, then the outer cleanup drains and releases ownership.
 
@@ -131,6 +148,11 @@ prefix sum. Only missing experts enter the victim-selection loop. Hits are
 excluded from eviction, so their usage writes can wait until the successful
 prefix is known. Capacity failure preserves the original partial allocation,
 timestamps, clock, and error. Empty queues and all-hit demand avoid slot scans.
+
+Window records include a `cache_conflict` boolean. Three appended counters,
+`demand_prediction_reclaims`, `prefetch_prediction_reclaims`, and
+`cache_conflict_windows`, count only Pre-Verify and gap reclamations. Existing
+counter indices are unchanged; final Verify does not increment these counters.
 
 Gap copy uses explicit 16-byte PTX loads and stores, eight CTAs per bank, and four
 warps per CTA. Unaligned source/destination addresses or expert strides use the

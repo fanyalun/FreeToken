@@ -40,14 +40,16 @@ additional per-layer Python route readback or host synchronization. CPU latency
 can still stall the GPU at the join. The existing loop/window control readback
 checks executor health before state commit.
 
-Small verify with Hybrid bypasses the conservative requirement that all next
-top-8 routes fit the GPU cache. Logical references remain intact; only resident
-referenced slots consume GPU capacity. The device allocator protects hits,
-references and pending copies. Optional fetches that cannot fit stay on CPU.
-Without small-verify Hybrid the original admission rule remains in effect.
-At budgets below that rule's minimum, a conservative configuration can still
-complete a request through single-row Target windows with zero inner loops.
-Report actual loop counts when comparing it with the CPU fallback.
+Optimized GPU scheduling admits each loop at runtime for both phase selections.
+The allocator excludes current demand hits and pending copies, then selects
+unreferenced slots before prediction-referenced slots in deterministic LRU order.
+Logical prediction references remain intact after eviction. Reclaiming a
+prediction during Pre-Verify or gap planning finishes the current loop and
+submits full Target Verify; reclamation during final Verify does not submit again.
+Optional Hybrid fetches that cannot fit stay on CPU. The cost model and route
+partition algorithm are unchanged. See [execution and conflict control](speculative_execution.md)
+for the single control readback and gap-copy ordering. Report actual loop counts
+and conflict counters when comparing configurations.
 
 Failed captures join only branches participating in capture. If an eager forward
 fails after a CPU doorbell but before its completion wait, error cleanup drains

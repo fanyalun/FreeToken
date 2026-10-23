@@ -217,7 +217,7 @@ class QwenSpeculativeGraphSet:
             lane.commit.input_count, lane.commit.terminal, self.eos, self.context,
             lane.width, triton.next_power_of_2(lane.width))
         self.experts.write_control(lane.tokens, lane.commit, inner=inner, context=self.context,
-                                   depth=self.engine.config.speculative_mtp_depth)
+                                   depth=self.engine.config.speculative_mtp_depth, eos_mask=self.eos)
 
     def _tail(self, inner):
         lane = self.inner if inner else self.outer
@@ -266,12 +266,17 @@ class QwenSpeculativeGraphSet:
                 rows = min(lane.width, self.outer_width) if inner else lane.width
                 self.stage(0, rows, 0, 0, self.outer_width - 1, self.outer_width, rows)
                 for suffix, fn in (("body", self._body), ("tail", self._tail)):
-                    if inner and suffix == "tail":
-                        experts.finish_loop(True)
-                        self.gap_ready.record(experts.copy_stream)
                     fn(inner)
+                    if inner and suffix == "body":
+                        experts.finish_loop(False)
+                        self.gap_ready.record(experts.copy_stream)
                     experts.join_gap()
                     engine.stream.synchronize()
+                    if inner and suffix == "body":
+                        # Acceptance retired rejected refs; capture starts a fresh window.
+                        experts.close(abort=True)
+                        experts.begin(0)
+                        experts.set_phase("preverify")
                     graph = torch.cuda.CUDAGraph()
                     try:
                         with torch.cuda.graph(graph, pool=self.pool, stream=engine.stream):
@@ -294,6 +299,10 @@ class QwenSpeculativeGraphSet:
                     except BaseException:
                         experts.close(abort=True)
                         raise
+                    if inner and suffix == "body":
+                        experts.finish_loop(False)
+                        self.gap_ready.record(experts.copy_stream)
+                        experts.join_gap()
                     if self.pool is None:
                         self.pool = graph.pool()
                     self.graphs[self._key(inner, suffix, lane.width)] = graph
@@ -338,22 +347,21 @@ class QwenSpeculativeGraphSet:
         self.stage(start, rows, loop, candidates, limit, remaining, rows if inner else remaining)
         self.experts.valid_rows = lane.batch.speculative_valid_rows
         self._replay(inner, "body", lane.width)
-        control = self.experts.drain_control(lane.width)
         self.experts.gap_active = False
+        self.experts.gap_planned = inner and self.experts.prefetch and self.experts.gap_capacity > 1
+        control = self.experts.drain_control(lane.width)
         return lane.tokens, lane.hidden, lane.commit, control
 
     def tail(self, inner, continuing):
         lane = self.active_lanes.pop(inner)
+        if inner:
+            self.experts.finish_loop(continuing)
+            self.gap_ready.record(self.experts.copy_stream)
         if continuing:
-            if inner:
-                self.experts.finish_loop(True)
-                self.gap_ready.record(self.experts.copy_stream)
             self._replay(inner, "tail", lane.width)
             self.runner.next_draft, self.runner.last_draft_hidden = self.seed, self.seed_hidden
         else:
             lane.state.commit(lane.commit.input_count)
-            if inner:
-                self.experts.finish_loop(False)
 
     def _key(self, inner, suffix, width):
         return (inner, suffix, width) if self.exact else (inner, suffix)
