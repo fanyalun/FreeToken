@@ -30,6 +30,63 @@ python benchmarks/bench_offload_cache_copy.py
 For host RAM vs PCIe bandwidth and the offload/hybrid backend pick, use `ft bench bw`
 instead — it writes the JSON profile the engine reads.
 
+**`bench_draft_expert_motivation.py`** runs a standalone resident fused diagnostic:
+native MTP and autoregressive shared-weight self-drafts retaining top-h=2/4/6/8
+routed experts, each at draft lengths 1..32. Every cell completes the same first
+10 GSM8K prompts with exactly 256 greedy output tokens and EOS disabled. The
+self-draft preserves selected native top-8 weights without renormalization;
+shared experts remain active. It snapshots canonical GDN state before drafting,
+carries private draft state across steps, and restores it before full top-8
+verification. Final verification overwrites the private KV suffix. This benchmark
+does not enable or modify three-level speculative decoding.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python:benchmarks python benchmarks/bench_draft_expert_motivation.py --output /path/to/new_run
+PYTHONPATH=python:benchmarks python benchmarks/bench_draft_expert_motivation.py --output /path/to/new_run --analyze
+python benchmarks/plot_draft_expert_motivation.py /path/to/new_run
+```
+
+`readme.md` and `metrics.json` report the mean number of routed experts activated
+by one full verification, deduplicated within each layer across the anchor and
+draft rows and then summed across layers, and the mean accepted draft prefix
+length excluding the correction/bonus token. Full requested draft-length windows
+and shortened output-tail windows are separate; pooled window averages and equal
+sample averages are both retained. Each cell keeps complete output token IDs and
+accounting in `requests.jsonl`, and every final verification's original expert IDs,
+draft IDs and target predictions in `windows.jsonl.gz`. This instrumented run is
+motivation evidence, with no performance or strict AR parity claim. It has no
+32 GiB limit and requires enough GPU memory for the resident BF16 checkpoint.
+
+Add `--collect-draft-routes --draft-route-set native_top8 --methods top_h2 top_h4 top_h6 top_h8`
+to predict the complete verify expert union from every draft step's native top-8
+router selection, recorded before top-h pruning. Skipped experts are included
+in this prediction set, but computation still uses only the retained top-h.
+The predictor includes all L draft generation steps, regardless of acceptance;
+the target includes all L+1 verify inputs. No extra draft forward is added for
+the last generated token. Recall, precision, and IoU pool integer set counts
+across full-length windows; tail windows are separate. Raw native routes are
+saved and validated. Use this mode for the expert prediction motivation study.
+
+The legacy `--draft-route-set retained_top_h` option records
+the actual selected experts at every self-draft generation step. The accepted
+prefix selection uses the first A generation steps for A accepted drafts;
+step i consumes the preceding token and generates draft i. This selection is
+retrospective. The all-generation-steps selection is available before verify.
+Both predict the complete verify expert union, including the anchor and rejected
+suffix. Counts use distinct (layer, expert) pairs, excluding shared experts.
+Metrics include pooled recall, precision, IoU, integer set counts, and empty
+prediction window counts. Zero-acceptance windows remain in recall denominators;
+precision is null when its denominator is zero. CUDA Graph writes to fixed
+scratch storage, copied to the per-step trace after each replay. Raw draft
+routes are saved alongside verify routes and checked by `--analyze`.
+
+The plotter produces `draft_expert_combined` with all five methods on shared axes,
+and `draft_experts_per_token` with expert-union totals divided by verified input
+tokens or returned tokens. Both use full-length windows and ratios of integer
+totals recomputed from raw traces; the latter denominator includes correction/bonus
+tokens. Each figure folder contains PNG/PDF/Markdown, while the derived totals
+and raw trace hashes are saved in `derived/draft_expert_normalization.json`.
+
 **`run_multiloop_matrix.py`** — Qwen3.6/native-MTP motivation experiment: carry real
 approximate KV/GDN/MTP state through 1/2/4/8 sparse verification loops, then verify
 the accumulated candidates with the original full top-8 target. This freezes its
