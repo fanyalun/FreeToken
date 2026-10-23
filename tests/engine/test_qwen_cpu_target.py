@@ -158,7 +158,7 @@ def test_invalid_epoch_boundary_anchor_and_block_fail_without_state_mutation():
 def test_retained_tail_requires_full_accept_and_matching_bonus():
     from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, retained_tail
 
-    result = SimpleNamespace(terminal=False, accepted=3, input_count=4,
+    result = SimpleNamespace(start=8, terminal=False, accepted=3, input_count=4,
         checkpoint=SimpleNamespace(length=12), tokens=(2, 4, 6, 8), predictions=torch.zeros(4))
     block = GpuCandidateBlock(11, 6, (8, 10, 12))
     assert retained_tail(result, block) == GpuCandidateBlock(12, 8, (10, 12))
@@ -167,6 +167,18 @@ def test_retained_tail_requires_full_accept_and_matching_bonus():
     assert retained_tail(result, block) is None
     result.accepted, result.terminal = 3, True
     assert retained_tail(result, block) is None
+
+
+def test_retained_tail_checks_entire_regenerated_overlap_not_only_bonus():
+    from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, retained_tail
+
+    result = SimpleNamespace(start=8, terminal=False, accepted=3, input_count=4,
+        checkpoint=SimpleNamespace(length=12), tokens=(2, 4, 6, 8), predictions=torch.zeros(4))
+    block = GpuCandidateBlock(8, 0, (2, 4, 6, 8, 10, 12))
+    assert retained_tail(result, block) == GpuCandidateBlock(12, 8, (10, 12))
+    for candidates in ((2, 99, 6, 8, 10), (2, 4), (2, 4, 6, 99, 10)):
+        assert retained_tail(result, replace(block, candidates=candidates)) is None
+    assert retained_tail(result, GpuCandidateBlock(11, 99, (8, 10))) is None
 
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True])

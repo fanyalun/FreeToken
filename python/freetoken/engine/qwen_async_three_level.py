@@ -1,8 +1,4 @@
-"""Eager GPU primitives for the CPU-verify feasibility gate.
-
-The sliding request scheduler and graphs must only be enabled after measuring
-CPU publication, GPU generation and canonical install plus fixed-token replay.
-"""
+"""Eager GPU windows and recovery for asynchronous CPU Target verification."""
 
 from __future__ import annotations
 
@@ -43,10 +39,16 @@ def retained_tail(result, block):
     if (result.terminal or result.accepted != result.predictions.numel() - 1
             or result.accepted + 1 != result.input_count):
         return None
-    if (not block.candidates or block.start + 1 != result.checkpoint.length
-            or block.candidates[0] != result.tokens[-1]):
+    offset = result.checkpoint.length - block.start - 1
+    if not 0 <= offset < len(block.candidates) or block.start < result.start:
         return None
-    return GpuCandidateBlock(result.checkpoint.length, block.candidates[0], block.candidates[1:])
+    # Fixed recovery regenerates from the confirmed boundary while CPU checks old tokens.
+    confirmed = result.tokens[block.start - result.start:]
+    anchor_offset = block.start - result.start - 1
+    if (tuple(block.candidates[:offset + 1]) != tuple(confirmed)
+            or (anchor_offset >= 0 and block.anchor != result.tokens[anchor_offset])):
+        return None
+    return GpuCandidateBlock(result.checkpoint.length, block.candidates[offset], block.candidates[offset + 1:])
 
 
 class QwenAsyncGpuWindow:
@@ -308,6 +310,14 @@ class QwenAsyncGpuWindow:
             return event
 
     def recheck(self, block, remaining, *, eos_ids=()):
+        policy = self.experts.preverify_top_k, self.experts.keep_hits
+        self.experts.preverify_top_k, self.experts.keep_hits = 4, True
+        try:
+            return self._recheck(block, remaining, eos_ids=eos_ids)
+        finally:
+            self.experts.preverify_top_k, self.experts.keep_hits = policy
+
+    def _recheck(self, block, remaining, *, eos_ids=()):
         r, e = self.runner, self.engine
         if (not self.active or block.start != self.canonical_length
                 or block.start != r.frontier.target_valid_len
@@ -361,6 +371,61 @@ class QwenAsyncGpuWindow:
             self._record_timing("replay_end")
         return GpuRecoveryResult(GpuCandidateBlock(block.start, block.anchor, tuple(output)),
             matched, len(old) - matched, output[-1], end, reason, tuple(segments))
+
+    def recover(self, result, ahead, mode, loops, *, refill=True, candidate_cap=None, eos_ids=()):
+        if mode not in ("fixed_replay", "recheck") or loops < 1:
+            raise ValueError("recovery requires a supported mode and positive loops")
+        if (self.canonical_length != result.checkpoint.length
+                or self.runner.frontier.target_valid_len != self.canonical_length
+                or self.canonical_anchor != result.tokens[-1]):
+            raise ValueError("install the CPU result before candidate recovery")
+        self._record_timing("replay_start")
+        self._record_timing("replay_end")
+        if result.terminal:
+            return None, dict(reason="cpu_terminal", retained=False)
+        capacity = self.output_end - self.canonical_length
+        cap = min(loops * (self.engine.config.speculative_mtp_depth + 1) + 1, capacity - 1)
+        if candidate_cap is not None:
+            cap = min(cap, candidate_cap)
+        if cap < 0:
+            raise ValueError("nonterminal recovery requires space for the CPU anchor")
+        tail = retained_tail(result, ahead)
+        if tail is not None:
+            tail = GpuCandidateBlock(tail.start, tail.anchor, tail.candidates[:cap])
+        if tail is not None and tail.candidates:
+            if mode == "fixed_replay":
+                return tail, dict(reason="install_only", retained=True, matched=None, dropped=0)
+            # Recheck can produce one more token than the retained candidates.
+            checked = self.recheck(tail, cap, eos_ids=eos_ids)
+            block = checked.block
+            trace = dict(reason=checked.stop_reason, retained=True,
+                matched=checked.matched_old_tokens, dropped=checked.dropped_old_tokens,
+                bonus=checked.bonus_token, private_end=checked.private_end, segments=checked.segments,
+                recheck_top_k=4, recheck_keep_ready_hits=True)
+            if (checked.matched_old_tokens == 0 and refill and len(block.candidates) < cap
+                    and checked.stop_reason != "eos"):
+                extra, inner = self.generate_block(block.candidates[-1], loops,
+                    candidate_cap=cap - len(block.candidates))
+                block = GpuCandidateBlock(block.start, block.anchor, block.candidates + extra.candidates)
+                trace.update(reason="zero_match_refill", refill_inner=inner,
+                    private_end=self.runner.frontier.target_valid_len)
+                self._record_timing("replay_end")
+            return block, trace
+        if not refill:
+            return None, dict(reason="discarded", retained=False, dropped=len(ahead.candidates))
+        block, inner = self.generate_block(result.tokens[-1], loops, candidate_cap=cap)
+        self._record_timing("replay_end")
+        return block, dict(reason="regenerated", retained=False, dropped=len(ahead.candidates), inner=inner)
+
+    def generate_ahead(self, submitted, loops, *, candidate_cap=None):
+        start = self.runner.frontier.target_valid_len
+        if start == submitted.start:
+            anchor = submitted.anchor
+        elif submitted.candidates and start == submitted.start + len(submitted.candidates):
+            anchor = submitted.candidates[-1]
+        else:
+            raise ValueError("GPU frontier does not match the submitted candidate block")
+        return self.generate_block(anchor, loops, candidate_cap=candidate_cap)
 
     def replay(self, block):
         r, e = self.runner, self.engine

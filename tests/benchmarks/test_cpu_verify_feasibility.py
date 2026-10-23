@@ -4,34 +4,91 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("retained,mode", [(True, "fixed_replay"), (True, "recheck"),
-                                         (False, "fixed_replay"), (False, "recheck")])
-def test_recovery_produces_new_cpu_proposal_before_next_submission(monkeypatch, retained, mode):
+@pytest.mark.parametrize("mode", ["fixed_replay", "recheck"])
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize("delayed", [False, True])
+def test_recovery_keeps_cpu_and_gpu_async_until_cpu_completion(monkeypatch, mode, reject, delayed):
     from types import SimpleNamespace
+    import torch
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
     import bench_cpu_recovery as benchmark
-    from freetoken.engine.qwen_async_three_level import GpuCandidateBlock
+    from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, QwenAsyncGpuWindow
+    from freetoken.engine.speculative import SpeculativeFrontier
 
-    calls = []
-    tail = GpuCandidateBlock(10, 104, (105, 106, 107))
-    corrected = GpuCandidateBlock(10, 104, (999,))
-    monkeypatch.setattr(benchmark, "retained_tail", lambda *args: tail if retained else None)
-    def checked(block, remaining):
-        calls.append(("recheck", block, remaining))
-        return SimpleNamespace(block=corrected, stop_reason="mismatch", matched_old_tokens=0,
-            dropped_old_tokens=3, bonus_token=999, private_end=11, segments=())
-    window = SimpleNamespace(output_end=128, canonical_length=10, recheck=checked,
-        replay=lambda block: calls.append(("replay", block)),
-        generate_block=lambda anchor, loops: (corrected, [dict(anchor=anchor, loops=loops)]))
-    result = SimpleNamespace(terminal=False, tokens=(101, 102, 103, 104))
-    block, trace = benchmark.recover(window, result, tail, mode, 6, refill=True)
-    assert block == (tail if retained and mode == "fixed_replay" else corrected)
-    assert trace["retained"] == retained
-    if retained:
-        assert calls[0][0] == ("replay" if mode == "fixed_replay" else "recheck")
+    calls, jobs, polled = [], [], set()
+    w = QwenAsyncGpuWindow.__new__(QwenAsyncGpuWindow)
+    w.epoch, w.canonical_length, w.canonical_anchor, w.output_end = 1, 0, 0, 12
+    w.engine = SimpleNamespace(config=SimpleNamespace(speculative_mtp_depth=1),
+        stream=SimpleNamespace(synchronize=lambda: None))
+    w.runner = SimpleNamespace(frontier=SpeculativeFrontier(1, 0, 0, 12))
+    w.experts = SimpleNamespace(counters=torch.zeros(4), cache=SimpleNamespace(banks=[]))
+    w._record_timing = lambda _: None
+    w.replay = lambda *args: pytest.fail("fixed recovery must not replay old B")
+
+    def generate(anchor, loops, *, candidate_cap=None):
+        start = w.runner.frontier.target_valid_len
+        calls.append(("generate", start, anchor))
+        n = min(2 * loops, candidate_cap, w.output_end - start)
+        block = GpuCandidateBlock(start, anchor, tuple(range(anchor + 1, anchor + n + 1)))
+        w.runner.frontier = SpeculativeFrontier(1, start + n, start + n, 12)
+        return block, []
+
+    def recheck(block, remaining, **kwargs):
+        calls.append(("recheck", block.start))
+        n = min(len(block.candidates) + 1, remaining)
+        tokens = tuple(range(block.anchor + 1, block.anchor + n + 1))
+        w.runner.frontier = SpeculativeFrontier(1, block.start + n, block.start + n, 12)
+        return SimpleNamespace(block=GpuCandidateBlock(block.start, block.anchor, tokens),
+            stop_reason="exhausted", matched_old_tokens=min(len(block.candidates), n),
+            dropped_old_tokens=0, bonus_token=tokens[-1], private_end=block.start + n, segments=())
+
+    def install(result):
+        calls.append(("install", result.block_id))
+        w.canonical_length, w.canonical_anchor = result.checkpoint.length, result.tokens[-1]
+        w.runner.frontier = SpeculativeFrontier(1, w.canonical_length, w.canonical_length, 12)
+        return object()
+
+    def submit(job):
+        assert job.start == w.canonical_length and job.anchor == w.canonical_anchor
+        assert job.start + len(job.candidates) + 1 <= 12
+        jobs.append(job)
+        calls.append(("submit", job.block_id, job.start))
+
+    def poll():
+        job = jobs[-1]
+        calls.append(("poll", job.block_id))
+        if delayed and job.block_id not in polled:
+            polled.add(job.block_id)
+            return None
+        accepted = 0 if reject and job.block_id == 1 else len(job.candidates)
+        n = min(accepted + 1, job.remaining)
+        tokens = tuple(range(job.anchor + 1, job.anchor + n + 1))
+        if reject and job.block_id == 1:
+            tokens = (999,)
+        result = SimpleNamespace(start=job.start, block_id=job.block_id, terminal=n == job.remaining,
+            accepted=accepted, input_count=n, predictions=torch.zeros(len(job.candidates) + 1),
+            checkpoint=SimpleNamespace(length=job.start + n), tokens=tokens)
+        return result, dict(compute_seconds=0, publish_seconds=0)
+
+    w.generate_block, w.recheck, w.install = generate, recheck, install
+    worker = SimpleNamespace(submit=submit, poll=poll, release=lambda *args: None)
+    measured = benchmark.run_pair(w, worker, SimpleNamespace(length=0, anchor=0), 1, mode,
+        handoff_limit=0)
+    assert measured["request_complete"] and measured["confirmed_tokens"] == 12
+    assert measured["actual_handoffs"] > 2 and len(measured["output_tokens"]) == 12
+    assert all(h["deadline_miss"] == delayed for h in measured["handoffs"])
+    for i, call in enumerate(calls):
+        if call[0] == "submit":
+            assert calls[i + 1][0] == "generate" and calls[i + 2][0] == "poll"
+    retained = [h for h in measured["handoffs"] if h["recovery"]["retained"]]
+    assert retained
+    if mode == "fixed_replay":
+        assert all(h["recovery"]["reason"] == "install_only" for h in retained)
+        first = retained[0]
+        next_handoff = measured["handoffs"][first["block_id"] + 1]
+        assert next_handoff["ahead"]["start"] == next_handoff["submitted"]["start"]
     else:
-        assert not calls and trace["reason"] == "regenerated"
-        assert benchmark.recover(window, result, tail, mode, 6, refill=False)[0] is None
+        assert any(c[0] == "recheck" for c in calls)
 
 
 @pytest.fixture
@@ -246,9 +303,9 @@ def test_rejected_cpu_prefix_discards_gpu_tail_in_real_replay_budget(monkeypatch
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
     from bench_cpu_verify_feasibility import replay_block_for_result, GpuCandidateBlock
 
-    result = SimpleNamespace(terminal=False, accepted=1, predictions=SimpleNamespace(numel=lambda: 4),
+    result = SimpleNamespace(start=4, terminal=False, accepted=1, predictions=SimpleNamespace(numel=lambda: 4),
         input_count=2, checkpoint=SimpleNamespace(length=6), tokens=(11, 12))
-    future = GpuCandidateBlock(7, 20, (21, 22, 23))
+    future = GpuCandidateBlock(7, 13, (21, 22, 23))
     block, retained = replay_block_for_result(result, future)
     assert not retained and block.start == 6 and block.anchor == 12 and block.candidates == ()
     diagnostic, retained = replay_block_for_result(result, future, "forced_diagnostic")

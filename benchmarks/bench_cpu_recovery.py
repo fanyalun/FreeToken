@@ -1,4 +1,4 @@
-"""Pair fixed replay and candidate recheck over two CPU/GPU handoffs."""
+"""Compare install-only recovery and recheck across asynchronous CPU/GPU handoffs."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from frozen_cpu_runtime import create_cpu_worker
 from qwen_mtp_config import prepare_experiment
 from freetoken.distributed import DistributedInfo
 from freetoken.engine import Engine
-from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, QwenAsyncGpuWindow, retained_tail
+from freetoken.engine.qwen_async_three_level import QwenAsyncGpuWindow
 from freetoken.engine.qwen_cpu_target import VerifyJob
 from freetoken.mm.config import MultimodalConfig
 
@@ -104,38 +104,29 @@ class RecoveryEvents:
 
 
 def recover(window, result, ahead, mode, loops, *, refill):
-    tail = retained_tail(result, ahead)
-    if result.terminal:
-        return None, dict(reason="cpu_terminal", retained=False)
-    if tail is None or not tail.candidates:
-        if not refill:
-            return None, dict(reason="discarded", retained=False, dropped=len(ahead.candidates))
-        block, inner = window.generate_block(result.tokens[-1], loops)
-        return block, dict(reason="regenerated", retained=False, dropped=len(ahead.candidates), inner=inner)
-    if mode == "fixed_replay":
-        window.replay(tail)
-        return tail, dict(reason="fixed_replay", retained=True, matched=None, dropped=0)
-    checked = window.recheck(tail, window.output_end - window.canonical_length)
-    return checked.block, dict(reason=checked.stop_reason, retained=True,
-        matched=checked.matched_old_tokens, dropped=checked.dropped_old_tokens,
-        bonus=checked.bonus_token, private_end=checked.private_end, segments=checked.segments)
+    return window.recover(result, ahead, mode, loops, refill=refill)
 
 
-def run_pair(window, worker, checkpoint, loops, mode, reference=None):
+def run_pair(window, worker, checkpoint, loops, mode, reference=None, *, handoff_limit=2):
+    if handoff_limit < 0:
+        raise ValueError("handoff limit must be nonnegative; zero runs until CPU completion")
     engine = window.engine
+    output_tokens = window.output_end - checkpoint.length
+    candidate_cap = loops * (engine.config.speculative_mtp_depth + 1)
     started = time.perf_counter()
-    a, inner_a = window.generate_block(checkpoint.anchor, loops)
+    a, inner_a = window.generate_block(checkpoint.anchor, loops,
+        candidate_cap=min(candidate_cap, output_tokens - 1))
     engine.stream.synchronize()
     initial_generation = time.perf_counter() - started
     submitted_block, offset = a, 0
-    handoffs = []
+    handoffs, confirmed = [], []
     pair_start = time.perf_counter()
-    for block_id in range(2):
+    for block_id in range(handoff_limit or output_tokens):
         submitted_at = time.perf_counter()
         worker.submit(VerifyJob(window.epoch, block_id, submitted_block.start, submitted_block.anchor,
-                                submitted_block.candidates, 256 - offset))
+                                submitted_block.candidates, output_tokens - offset))
         generation_start = time.perf_counter()
-        ahead, inner = window.generate_block(submitted_block.candidates[-1], loops)
+        ahead, inner = window.generate_ahead(submitted_block, loops, candidate_cap=candidate_cap)
         engine.stream.synchronize()
         generation_seconds = time.perf_counter() - generation_start
         ready = worker.poll()
@@ -165,7 +156,8 @@ def run_pair(window, worker, checkpoint, loops, mode, reference=None):
         recovery_events = RecoveryEvents(window) if reference is not None else None
         recovery_start = time.perf_counter()
         try:
-            following, recovery = recover(window, result, ahead, mode, loops, refill=block_id == 0)
+            continuing = not handoff_limit or block_id + 1 < handoff_limit
+            following, recovery = recover(window, result, ahead, mode, loops, refill=continuing)
             engine.stream.synchronize()
         finally:
             recovery_stream = recovery_events.close() if recovery_events is not None else None
@@ -187,14 +179,16 @@ def run_pair(window, worker, checkpoint, loops, mode, reference=None):
         if recovery_stream is not None:
             handoffs[-1]["recovery_stream"] = recovery_stream
         offset += count
+        confirmed.extend(result.tokens)
         if following is None:
-            if block_id == 0 and not result.terminal:
-                raise RuntimeError("first handoff did not produce a next CPU proposal")
+            if continuing and not result.terminal:
+                raise RuntimeError("nonterminal handoff did not produce a next CPU proposal")
             break
         submitted_block = following
     elapsed = time.perf_counter() - pair_start
     return dict(handoffs=handoffs, initial_inner=inner_a, initial_generation_seconds=initial_generation,
         pair_seconds=elapsed, confirmed_tokens=offset, actual_handoffs=len(handoffs),
+        output_tokens=confirmed, request_complete=result.terminal, handoff_limit=handoff_limit,
         cpu_serial_and_install_exact=reference is not None)
 
 
@@ -211,6 +205,7 @@ def summarize(rows):
         handoffs = [h for r in group for h in r["handoffs"]]
         unique = [r for r in group if r["repeat"] == 0]
         summary.append(dict(top_k=top_k, loops=loops, mode=mode, timing_windows=len(group),
+            cpu_completed_requests=sum(r["request_complete"] for r in group),
             samples=len(unique), mean_pair_seconds=statistics.mean(r["pair_seconds"] for r in group),
             median_pair_seconds=statistics.median(r["pair_seconds"] for r in group),
             confirmed_tokens_per_second=sum(r["confirmed_tokens"] for r in group) / sum(r["pair_seconds"] for r in group),
@@ -238,15 +233,16 @@ def report(output, summary, validation):
             confirmed_tokens_change=checked["mean_confirmed_tokens"] - fixed["mean_confirmed_tokens"],
             recovery_ms_change=checked["mean_recovery_ms"] - fixed["mean_recovery_ms"]))
     write(output / "paired_comparison.json", comparisons)
-    lines = ["# CPU candidate recovery over two handoffs", "",
-        "Paired fixed windows with original development prompts. This is not complete-request throughput.", "",
+    lines = ["# CPU candidate recovery across asynchronous handoffs", "",
+        "The timing scope excludes initial generation and prefill, including when handoffs=0 runs to CPU completion. These rates are not complete-request throughput.", "",
         "CPU owns all confirmed output. Each independent audit checks tokens, hidden, valid KV and recurrent/conv state against serial CPU Target, plus GPU canonical installation.", "",
         "| top-k | loops | recovery | pair ms | confirmed tokens/pair | confirmed tokens/s | recovery ms/handoff | demand experts/handoff | deadline misses |",
         "|---|---|---|---|---|---|---|---|---|"]
     for r in summary:
         lines.append(f"| {r['top_k']} | {r['loops']} | {r['mode']} | {1000*r['mean_pair_seconds']:.2f} | {r['mean_confirmed_tokens']:.2f} | {r['confirmed_tokens_per_second']:.3f} | {r['mean_recovery_ms']:.2f} | {r['mean_recovery_demand_experts']:.2f} | {r['deadline_misses']}/{r['handoffs']} |")
-    lines += ["", "The wall interval begins immediately before submitting A and ends after recovering C from the second CPU result. Initial A generation, prefill, restoration, warmup and independent audits are excluded. CPU wait, installation, recovery and the two ahead generations are included.", "",
-        "Top-4/top-6 plus ready hits, original routing weights, zero replacement, no renormalization, no prefetch, eager. Mandatory missing experts are demand-loaded. Demand bytes count logical weight copies; event intervals include device waits and are not hardware PCIe bandwidth measurements.", "",
+    lines += ["", "The wall interval begins immediately before submitting A and ends after the last handoff recovery. Initial A generation, prefill, restoration, warmup and independent audits are excluded. CPU wait, installation, recovery and ahead generations are included.", "",
+        "fixed_replay installs CPU state without replaying B, submits compatible old B tokens, and regenerates concurrently from the CPU boundary. recheck uses top-4 plus ready routed hits; zero matches trigger loops rounds of refill before submission, subject to capacity. Generation uses the configured top-4/top-6 policy. CPU submission precedes the next GPU generation in every handoff.", "",
+        "Original routing weights, zero replacement, no renormalization, no prefetch, eager. Mandatory missing experts are demand-loaded. Demand bytes count logical weight copies; event intervals include device waits and are not hardware PCIe bandwidth measurements.", "",
         "Fixed output windows ignore EOS; EOS behavior is covered separately. GPU provisional state is not CPU canonical state, and CPU serial parity is not GPU AR parity.", "",
         f"Validation: {validation['timing_windows']} timing windows, {validation['audit_windows']} independent audits; absolute GPU peak {validation['gpu_peak_process_bytes']/(1<<30):.3f} GiB / 24 GiB.", "",
         "[Configuration](config.json), [measurements](measurements.jsonl), [independent audits](audit.jsonl), [validation](validation.json), [paired changes](paired_comparison.json), [resources](resources.jsonl).", ""]
@@ -262,7 +258,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--loops", type=int, nargs="+", default=[6, 12])
     parser.add_argument("--top-k", type=int, nargs="+", choices=(4, 6), default=[4, 6])
+    parser.add_argument("--handoffs", type=int, default=2,
+                        help="CPU/GPU handoffs per run; zero continues until CPU output completion")
     args = parser.parse_args()
+    if args.handoffs < 0:
+        parser.error("handoffs must be nonnegative")
     out = args.output
     out.mkdir(parents=True, exist_ok=False)
     rows, audits = [], []
@@ -293,12 +293,15 @@ def main():
             raise RuntimeError("frozen recovery runtime changed before initialization")
         cases = tuple(itertools.product(args.top_k, args.loops, ("fixed_replay", "recheck")))
         config = dict(**identity, samples=args.samples, repeats=args.repeats, cases=cases,
+            handoffs=args.handoffs, recovery_semantics="install_only_or_top4_recheck_v2",
+            recheck_top_k=4, zero_match_refill_loops="loops", bonus_consumed_on_install=False,
+            cpu_max_rows=4 * max(args.loops) + 2,
             original_sample_ids=parent["original_sample_ids"][:args.samples], prompt_lengths=list(map(len, prompts)),
             expert_slots=2048, budget_gib=24, max_input_tokens=512, max_output_tokens=256, kv_pages=768,
             cpu_cores=list(range(23)), coordinator_core=23, kernel_profile="ggml_v2", components=["attention", "gdn"],
             prefetch=False, graph=False, mtp_depth=3, keep_ready_hits=True, replacement="zero", renormalize=False,
-            measurement_scope="two fixed CPU/GPU handoffs; no complete-request throughput claim",
-            timing_scope="submit A through recovery of C after second CPU result; excludes initial A generation and prefill",
+            measurement_scope="bounded handoffs or CPU-confirmed completion; no complete-request throughput claim",
+            timing_scope="submit A through final recovery; excludes initial A generation and prefill",
             eos_policy="fixed windows ignore EOS; recovery EOS behavior covered separately by unit tests",
             source_manifest=manifest, command=list(__import__("sys").argv))
         write(out / "config.json", config)
@@ -320,7 +323,7 @@ def main():
         window = QwenAsyncGpuWindow(runner, instrument_components=False)
         text = json.loads((Path(model) / "config.json").read_text())["text_config"]
         worker = create_cpu_worker(model, text, list(range(23)), max_context=768,
-            max_rows=49, grouped=True, backend="optimized", kernel_profile="ggml_v2",
+            max_rows=4 * max(args.loops) + 2, grouped=True, backend="optimized", kernel_profile="ggml_v2",
             components=("attention", "gdn"), bind_openmp=False)
         worker.wait_ready()
         config["cpu_runtime"] = worker.metadata
@@ -341,7 +344,8 @@ def main():
                 snapshot = ModelSnapshot(engine, runner, 0, engine.max_seq_len)
                 cache_snapshot = CacheSnapshot(cache)
                 epoch += 1
-                reference = cpu_reference(worker, checkpoint, epoch, 2 * (4 * max(args.loops) + 1))
+                reference_count = min(256, args.handoffs * (4 * max(args.loops) + 2)) if args.handoffs else 256
+                reference = cpu_reference(worker, checkpoint, epoch, reference_count)
                 write(out / f"reference_sample{sample}.json", [dict(token=r["token"], recurrent=r["recurrent"], conv=r["conv"],
                     **{name: tensor_hash(r[name]) for name in ("hidden", "keys", "values")}) for r in reference])
                 order = cases[sample % len(cases):] + cases[:sample % len(cases)]
@@ -370,7 +374,8 @@ def main():
                             raise RuntimeError(f"external activity prevents recovery timing: {interference}")
                         meter = PhaseAudit(runner) if audit else None
                         try:
-                            measured = run_pair(window, worker, checkpoint, loops, mode, reference if audit else None)
+                            measured = run_pair(window, worker, checkpoint, loops, mode, reference if audit else None,
+                                                handoff_limit=args.handoffs)
                         finally:
                             if meter is not None:
                                 phase_times = meter.drain()
@@ -409,12 +414,16 @@ def main():
                 window.close_request()
             if len(rows) != args.samples * len(cases) * args.repeats or len(audits) != args.samples * len(cases):
                 raise RuntimeError("recovery matrix coverage mismatch")
+            if not args.handoffs and not all(r["request_complete"] for r in rows + audits):
+                raise RuntimeError("CPU-confirmed request completion is missing")
             if any(hashlib.sha256((root / name).read_bytes()).hexdigest() != digest for name, digest in manifest.items()):
                 raise RuntimeError("frozen source changed during recovery measurements")
             summary = summarize(rows)
             write(out / "summary.json", summary)
             validation = dict(valid=True, cpu_serial_and_install_exact=True, timing_audit_parity=True,
                 source_unchanged=True, timing_windows=len(rows), audit_windows=len(audits),
+                request_completion_requested=args.handoffs == 0,
+                cpu_requests_complete=all(r["request_complete"] for r in rows + audits),
                 gpu_peak_process_bytes=monitor.peak, gpu_budget_bytes=24 << 30, pipeline_complete=False)
             write(out / "validation.json", validation)
             report(out, summary, validation)

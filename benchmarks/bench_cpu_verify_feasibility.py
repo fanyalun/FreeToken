@@ -340,8 +340,8 @@ def main():
         parser.error("startup timing requires the current streamed CPU Target implementation")
     if args.prefix_audit_only and args.prefix_transfer == "sync":
         parser.error("prefix audit requires a layerwise transfer")
-    if args.recovery_mode == "recheck" and args.replay_policy != "retained":
-        parser.error("candidate recheck cannot use forced diagnostic tails")
+    if args.replay_policy != "retained":
+        parser.error("recovery requires retained tails; forced replay belongs to the historical diagnostic")
     if args.idle_seconds < 0 or args.idle_timeout <= args.idle_seconds:
         parser.error("idle-seconds must be nonnegative and smaller than idle-timeout")
     if args.gpu_slots < 1 or args.budget_gib < 1:
@@ -396,7 +396,7 @@ def main():
         "generation_plus_replay_criterion": GPU_WORK_CRITERION,
         "install_replay_device": "GPU execution and host orchestration, reported separately",
         "legacy_cycle_fields": "historical aliases; feasibility matches the generation-plus-replay criterion",
-        "replay_scope": "install accepted CPU state, refresh MTP, replay only retained B unless forced_diagnostic",
+        "replay_scope": "install CPU state and refresh MTP; fixed_replay skips B; recheck verifies B and refills zero matches",
         "replay_rows": 8, "graph": False, "prefetch": False, "retain_prior_routes": False}
     write("config.json", config)
     write("prompts.json", prompts)
@@ -467,6 +467,8 @@ def main():
                                         shared_private_workspace=True)
         config["preverify_topk"] = args.preverify_top_k
         config["gpu_components"]["replay_target_head"] = args.recovery_mode == "recheck"
+        config.update(recovery_semantics="install_only_or_top4_recheck_v2", recheck_top_k=4,
+                      zero_match_refill_loops="loops", bonus_consumed_on_install=False)
         config["preverify_keep_cache_hits"] = window.experts.keep_hits
         config.update(gpu=torch.cuda.get_device_name(engine.device), actual_slots=engine.moe_offload_cache.cache_size,
             actual_kv_pages=engine.num_pages,
@@ -485,7 +487,7 @@ def main():
         for threads in args.threads:
             worker = create_cpu_worker(args.model, text_config, core_sets[threads],
                 frozen_root=args.frozen_cpu_root,
-                max_rows=max(33, max(args.loops) * 4 + 1), grouped=not args.ungrouped, backend=args.backend,
+                max_rows=max(33, max(args.loops) * 4 + 2), grouped=not args.ungrouped, backend=args.backend,
                 kernel_profile=args.kernel_profile, components=args.components,
                 bind_openmp=args.bind_openmp,
                 prefix_receiver=receiver,
@@ -606,13 +608,9 @@ def main():
                         with annotate("Install CPU state and refresh confirmed MTP"):
                             reader = window.install(result)
                             worker.release(result, reader)
-                        with annotate("GPU fixed token private tail replay"):
-                            recovery = None
-                            if args.recovery_mode == "recheck" and not result.terminal:
-                                recovery = window.recheck(replay_block,
-                                    window.output_end - result.checkpoint.length)
-                            else:
-                                window.replay(replay_block)
+                        with annotate("GPU install-only or candidate recheck recovery"):
+                            following, recovery = window.recover(result, b, args.recovery_mode, loops,
+                                refill=args.recovery_mode == "recheck")
                             engine.stream.synchronize()
                         restore_seconds = time.perf_counter() - restore_start
                         if startup_monitor is not None:
@@ -679,10 +677,12 @@ def main():
                             prefix_preparation_wall_seconds=window.prefill_wall_seconds,
                             deadline_miss=missed, gpu_wait_seconds=waiting,
                             accepted=result.accepted, input_count=result.input_count,
-                            original_b_retained=tail_retained, replay_rows=len(replay_block.candidates),
+                            original_b_retained=tail_retained, retained_candidate_rows=len(replay_block.candidates),
+                            replay_rows=sum(len(s["inputs"]) for s in recovery.get("segments", ())),
                             replay_policy=args.replay_policy,
                             recovery_mode=args.recovery_mode,
-                            recheck=asdict(recovery) if recovery is not None else None,
+                            recovery=recovery,
+                            following=asdict(following) if following is not None else None,
                             cpu_rss_kib=timing["rss_kib"], gpu_loops=a_loops, gpu_ahead_loops=b_loops,
                             recurrent_transfer_bytes=result.checkpoint.recurrent.numel() * 4,
                             state_transfer_bytes=sum(t.numel() * t.element_size() for t in (

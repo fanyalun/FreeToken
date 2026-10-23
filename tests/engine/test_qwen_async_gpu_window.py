@@ -27,7 +27,8 @@ def window(monkeypatch):
     r._execute = execute
     keys, values = torch.zeros(64, 1, 1, 4), torch.zeros(64, 1, 1, 4)
     e = SimpleNamespace(device=torch.device("cpu"), stream=SimpleNamespace(synchronize=lambda: calls.append(("wait",))),
-        config=SimpleNamespace(model_config=SimpleNamespace(num_layers=2, is_linear_layer=lambda i: i == 0)),
+        config=SimpleNamespace(speculative_mtp_depth=3,
+            model_config=SimpleNamespace(num_layers=2, is_linear_layer=lambda i: i == 0)),
         kv_cache=SimpleNamespace(k_cache=lambda _: keys, v_cache=lambda _: values),
         linear_state_pool=SimpleNamespace(recurrent_states=torch.zeros(1, 2, 2, 4, 4),
                                          conv_states=torch.zeros(1, 2, 16, 3)))
@@ -41,7 +42,7 @@ def window(monkeypatch):
                                      conv_states=torch.zeros(1, 1, 16, 3))
     w.states = {i: SimpleNamespace(commit=lambda count, width=i: calls.append(("commit", width, int(count))))
                 for i in range(1, 9)}
-    w.experts = SimpleNamespace(check_error=lambda: None)
+    w.experts = SimpleNamespace(check_error=lambda: None, preverify_top_k=6, keep_hits=False)
     w.token_buffer = torch.empty(8, dtype=torch.int32)
     w.shift_buffer = torch.empty_like(w.token_buffer)
     w.hidden_buffer = torch.empty(8, 4)
@@ -241,6 +242,113 @@ def test_recheck_clips_physical_output_capacity(monkeypatch):
     result = w.recheck(GpuCandidateBlock(5, 20, (21, 22, 23)), 50)
     assert result.block.candidates == (21, 22) and result.stop_reason == "capacity"
     assert all(c[1] <= 7 for c in calls if c[0] == "reserve")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_recheck_forces_top4_and_ready_hits_then_restores_generation_policy(monkeypatch, fail):
+    w, _, _, _ = window(monkeypatch)
+    def forward(ids, start):
+        assert (w.experts.preverify_top_k, w.experts.keep_hits) == (4, True)
+        if fail:
+            raise RuntimeError("forward failed")
+        return ids + 1, ids.float().unsqueeze(1).repeat(1, 4)
+    w._lossy = forward
+    if fail:
+        with pytest.raises(RuntimeError, match="forward failed"):
+            w.recheck(GpuCandidateBlock(5, 20, (21,)), 10)
+    else:
+        w.recheck(GpuCandidateBlock(5, 20, (21,)), 10)
+    assert (w.experts.preverify_top_k, w.experts.keep_hits) == (6, False)
+
+
+def installed_result():
+    return SimpleNamespace(start=1, terminal=False, accepted=3, input_count=4,
+        checkpoint=SimpleNamespace(length=5), tokens=(17, 18, 19, 20), predictions=torch.zeros(4))
+
+
+def test_fixed_recovery_preserves_candidates_without_running_or_advancing_gpu(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    before = w.private_pool.recurrent_states.clone()
+    tail, trace = w.recover(installed_result(), GpuCandidateBlock(4, 19, (20, 21, 22)),
+        "fixed_replay", 2)
+    assert tail == GpuCandidateBlock(5, 20, (21, 22))
+    assert trace["reason"] == "install_only" and not calls
+    assert w.runner.frontier.target_valid_len == w.canonical_length == 5
+    assert torch.equal(before, w.private_pool.recurrent_states)
+    generated = []
+    w.generate_block = lambda anchor, loops, **kw: generated.append((anchor, loops, kw))
+    w.generate_ahead(tail, 2)
+    assert generated == [(20, 2, dict(candidate_cap=None))]
+
+
+@pytest.mark.parametrize("matched", [0, 1])
+def test_recovery_refills_only_zero_match_and_keeps_correction_for_cpu(monkeypatch, matched):
+    w, calls, _, _ = window(monkeypatch)
+    def forward(ids, start):
+        predicted = ids + 1
+        predicted[matched] = 999
+        return predicted, ids.float().unsqueeze(1).repeat(1, 4)
+    w._lossy = forward
+    generated = []
+    def generate(anchor, loops, *, candidate_cap):
+        generated.append((anchor, loops, candidate_cap))
+        start = w.runner.frontier.target_valid_len
+        assert start == 6 and anchor == 999
+        w.runner.frontier = SpeculativeFrontier(1, start + 2, start + 2, 64)
+        return GpuCandidateBlock(start, anchor, (1000, 1001)), [dict(returned=2)]
+    w.generate_block = generate
+    block, trace = w.recover(installed_result(), GpuCandidateBlock(4, 19, (20, 21, 22)),
+        "recheck", 2)
+    assert block.start == 5 and block.anchor == 20
+    if matched == 0:
+        assert generated == [(999, 2, 8)]
+        assert block.candidates == (999, 1000, 1001)
+        assert trace["reason"] == "zero_match_refill"
+    else:
+        assert not generated and block.candidates == (21, 999)
+    assert w.canonical_length == 5
+    assert w.runner.frontier.target_valid_len == 5 + len(block.candidates)
+
+
+@pytest.mark.parametrize("terminal,eos,output_end", [(True, False, 64), (False, True, 64), (False, False, 7)])
+def test_recovery_does_not_refill_terminal_eos_or_full_candidate_capacity(monkeypatch, terminal, eos, output_end):
+    w, _, _, _ = window(monkeypatch)
+    w.output_end = output_end
+    result = installed_result()
+    result.terminal = terminal
+    w._lossy = lambda ids, start: (torch.full_like(ids, 999), ids.float().unsqueeze(1).repeat(1, 4))
+    w.generate_block = lambda *a, **kw: pytest.fail("refill must not run")
+    block, trace = w.recover(result, GpuCandidateBlock(4, 19, (20, 21, 22)),
+        "recheck", 2, eos_ids=(999,) if eos else ())
+    if terminal:
+        assert block is None and trace["reason"] == "cpu_terminal"
+    else:
+        assert block.candidates == (999,) and w.runner.frontier.target_valid_len == 6
+
+
+@pytest.mark.parametrize("mode", ["fixed_replay", "recheck"])
+def test_partial_cpu_acceptance_discards_old_tail_and_generates_from_correction(monkeypatch, mode):
+    w, _, _, _ = window(monkeypatch)
+    result = installed_result()
+    result.accepted = 1
+    generated = []
+    def generate(anchor, loops, **kwargs):
+        generated.append((anchor, loops))
+        return GpuCandidateBlock(5, anchor, (21,)), []
+    w.generate_block = generate
+    block, trace = w.recover(result, GpuCandidateBlock(4, 19, (20, 21, 22)), mode, 3)
+    assert generated == [(20, 3)] and not trace["retained"]
+    assert block == GpuCandidateBlock(5, 20, (21,))
+
+
+def test_recovery_rejects_uninstalled_result_and_ahead_rejects_wrong_frontier(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    w.runner.frontier = SpeculativeFrontier(1, 6, 6, 64)
+    with pytest.raises(ValueError, match="install"):
+        w.recover(installed_result(), GpuCandidateBlock(4, 19, (20, 21)), "fixed_replay", 2)
+    with pytest.raises(ValueError, match="frontier"):
+        w.generate_ahead(GpuCandidateBlock(5, 20, (21, 22)), 2)
+    assert not calls
 
 
 def test_common_execute_skips_target_head_and_projects_one_mtp_row():

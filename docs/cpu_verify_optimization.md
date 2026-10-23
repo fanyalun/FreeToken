@@ -244,11 +244,36 @@ and is not added to the CPU cost. Record the actual result-poll deadline miss
 and GPU wait separately; passing the second budget does not prove no wait.
 The older eight/four-loop measurements above retain their historical scope.
 
-The feasibility harness now replays only a retained GPU tail by default.
+The earlier feasibility harness replayed only a retained GPU tail by default.
 On rejection or an incompatible bonus, it installs the accepted CPU state
 and refreshes MTP without replaying the discarded tail. The old forced-tail
-diagnostic remains explicitly available with `--replay-policy forced_diagnostic`.
+diagnostic was explicitly available with `--replay-policy forced_diagnostic`.
 The first dual-criterion run exposed this historical diagnostic behavior;
 its timing is preserved separately from the corrected retained-tail runs in
 `coverage_4_4_20261022`. The current eight-row projection binary is a candidate,
 not an established full-request performance improvement.
+
+## Recovery semantics after 2026-10-22
+
+The current recovery contract supersedes the retained-tail replay policy above.
+`fixed_replay` keeps its CLI name but only installs the accepted CPU KV,
+recurrent/conv state and confirmed MTP suffix. Bonus remains unconsumed. A
+compatible B tail is submitted to CPU without any GPU replay; concurrently GPU
+regenerates from A's confirmed boundary. Overlapping regenerated candidates are
+retained only if their entire overlap matches the CPU-confirmed tokens.
+
+`recheck` runs B again with top-4 plus ready routed cache hits, then submits its
+matching prefix and final correction/bonus to CPU. If no old candidate matches,
+it continues from the correction for `loops` generation rounds before CPU
+submission, unless EOS or capacity prevents extension. The generation policy is
+restored after recheck. The CPU row budget includes the extra correction and
+the pending anchor. Every handoff submits CPU work before generating the next
+GPU window.
+
+`bench_cpu_recovery.py --handoffs 0` repeats this exchange until CPU-confirmed
+output completion; positive values bound the handoff count (default 2). This is
+an experimental eager request loop, not integration into the serving scheduler.
+The measured interval still excludes initial generation and prefill. Historical
+performance values above do not validate these new recovery semantics. The
+single-window feasibility harness also uses the new policies and rejects
+`forced_diagnostic` to avoid silently invoking the former replay behavior.

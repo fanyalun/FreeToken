@@ -7,10 +7,10 @@ The current harness defaults to `optimized`; historical comparisons must select
 `--backend legacy --prompt-chunk-size 128` explicitly.
 
 This branch adds the first feasibility milestone for asynchronous CPU Target
-verification of Qwen3.6-35B-A3B. It exposes experimental primitives and a bounded
-measurement harness. The ordinary AR, native MTP, and existing three-level
-coordinators keep their current entry points. A sliding request scheduler and
-CUDA Graph integration require a passing feasibility gate first.
+verification of Qwen3.6-35B-A3B. It exposes experimental primitives, a bounded
+measurement harness and an eager CPU/GPU handoff loop. The ordinary AR, native
+MTP, and existing three-level coordinators keep their current entry points.
+Serving scheduler and CUDA Graph integration are not enabled by this harness.
 
 ## Experiment status
 
@@ -72,25 +72,32 @@ stale slot generations cannot be consumed. Worker errors and process death
 surface as errors. The CPU process checks that CUDA was never initialized.
 
 `qwen_async_three_level.py` supplies eager GPU initialization, candidate
-generation, canonical CPU-state installation, confirmed MTP refresh, and fixed
-token replay. Correct CPU state is installed only at a GPU block boundary after
-its last reader. Confirmed prefix pages stay in place; provisional writes start
-at the refreshed frontier. Replay processes at most eight input rows per segment
-and pairs each Target hidden row with the fixed next token for MTP. It does not
-run the Draft chain again or resample the supplied tail.
+generation, canonical CPU-state installation, confirmed MTP refresh and
+candidate recovery. Correct CPU state is installed only at a GPU block boundary
+after its last reader. Installation copies both canonical and private recurrent
+and conv state, overwrites only the accepted Target KV suffix, refreshes the
+confirmed MTP suffix and leaves the bonus unconsumed. The low-level `replay()`
+primitive remains available for historical diagnostics, but the `fixed_replay`
+recovery setting no longer calls it.
 
 If CPU accepts all of A, the next block B is retainable only when its first
 candidate equals A's bonus and its start boundary agrees. That first B token
-becomes the new anchor; the rest are replayed. A rejected A or mismatched bonus
-invalidates B. The helper for this decision is covered separately from the
-future sliding scheduler.
+becomes the new anchor. A rejected A or mismatched bonus invalidates B. Fixed
+recovery can also regenerate a window overlapping the next CPU job; retaining
+that window requires its entire confirmed overlap to match, not only the bonus.
 
 The GPU controller keeps native top-4 plus ready hits with original weights.
 It disables prefetch and accumulated route leases. Current demand allocation,
 pending-copy protection, and stream ordering still protect the current GEMM.
 Old hit experts can be evicted and are loaded on demand during replay.
 
-## Candidate recheck and two handoffs
+## Install-only recovery and candidate recheck
+
+The `fixed_replay` setting keeps compatible B tokens as the next CPU proposal,
+without executing B on GPU or advancing its private state. Once that proposal
+is submitted, GPU generates from A's confirmed boundary and pending bonus. Old
+B SSM is never reused. If no compatible tail exists, generate `loops` rounds
+from the CPU correction before submitting a new proposal.
 
 `QwenAsyncGpuWindow.recheck()` installs no canonical state. Call `install()`
 first, then pass a tail whose start and anchor match that CPU result. Recheck
@@ -104,25 +111,32 @@ predictions are compared to the next old candidate before proceeding.
 For confirmed bonus `104` and old candidates `[105,106,107]`, a refreshed
 prediction `104 -> 999` commits only input `104`, drops all three candidates,
 and refreshes MTP using `hidden(104)` with shifted token `999`. The next Draft
-starts from `999`. The corrected branch remains provisional until CPU Target
-verification. An approximate EOS pauses extension without completing the
-request on the GPU.
+starts from `999`. Because zero old tokens matched, recovery first generates
+`loops` rounds from `999`, concatenates those candidates after `999`, and only
+then submits the proposal to CPU. Capacity can shorten this refill; approximate
+EOS skips it. With at least one old token matched, submit the checked prefix and
+correction/bonus immediately. All these tokens remain provisional until CPU
+Target verification. An approximate EOS does not complete the request on GPU.
 
-Both generation and recheck retain top-4 or top-6 plus ready cache hits, with
-original weights and zero replacement. Missing mandatory experts still cause
-demand IO. The shared controller defaults to top-4, preserving other callers.
-Prefetch remains disabled in the CPU window primitive.
+Generation retains the configured top-4 or top-6 plus ready cache hits. Recheck
+always uses top-4 plus ready hits among the native routed experts, with original
+weights and zero replacement, and restores the generation policy even on error.
+Previously used experts may have been evicted, and routes can change after CPU
+installation; missing mandatory experts still cause demand IO. Prefetch remains
+disabled in the CPU window primitive.
 
-`bench_cpu_recovery.py` compares fixed replay against recheck over two handoffs:
-CPU verifies A while GPU builds B; GPU installs A and repairs B into B-prime;
-only then is B-prime submitted while GPU builds C. The second CPU result is
-installed before recovering C. A rejected A or mismatched bonus discards B;
-the first handoff generates a fresh proposal, while the final handoff stops at
-the restored frontier. This avoids cancellation or rollback of an already
-submitted CPU job and does not enable a continuous request scheduler.
+`bench_cpu_recovery.py` compares these modes across asynchronous handoffs. Each
+iteration submits a CPU proposal before GPU generation, then polls CPU and
+waits only if its result is not ready. It installs that result and prepares the
+next proposal using the selected recovery policy. `--handoffs 2` is the default
+bounded experiment; `--handoffs 0` continues until CPU confirms the output
+budget. The last token is always a pending anchor, and every CPU input block
+fits both the physical context and worker row capacity. Zero-match refill needs
+up to `loops * (mtp_depth + 1) + 2` CPU input rows, including correction and
+anchor. This loop does not integrate the HTTP or multi-request scheduler.
 
 The benchmark restores identical model and physical expert-cache snapshots
-for paired runs. Independent audits compare both CPU commits, valid hidden/KV,
+for paired runs. Independent audits compare every CPU commit, valid hidden/KV,
 recurrent and conv state against serial CPU Target and check GPU installation.
 Timing excludes prefill, snapshot restoration, warmup and serial audits. It
 includes CPU wait, state installation, expert demand IO, candidate recovery,
@@ -142,8 +156,13 @@ The entry point runs from an immutable source snapshot with
 `source_identity.json` and `source_manifest.json`. Its fixed contract is 24 GiB,
 2048 expert slots, 512 input tokens, 256 output tokens, 768 KV pages, native MTP
 depth 3, and a 23-core CPU Target with the `ggml_v2` Attention/GDN components.
-The existing feasibility harness also accepts `--recovery-mode recheck` and
-`--preverify-top-k 6`; its default remains fixed replay for historical callers.
+Add `--handoffs 0` for CPU-confirmed completion. This entry point requires a
+frozen runtime with `source_manifest.json` and the paired parent's configuration.
+The existing single-window feasibility harness also accepts
+`--recovery-mode recheck` and `--preverify-top-k 6`; its default `fixed_replay`
+now means install-only. New records identify
+`recovery_semantics=install_only_or_top4_recheck_v2`; historical results retain
+their original meaning and are not evidence for the new policy.
 
 ## Build and verification
 
@@ -187,9 +206,11 @@ different topologies fail closed rather than silently changing the CPU quota.
 Before timing, the harness warms all replay widths 1..8, including state commit.
 Each cell submits A to CPU while GPU generates B and records actual candidate
 length, CPU compute/publication, GPU generation, and CPU-state installation plus
-MTP refresh plus fixed B replay. On rejection, the forced replay probe uses the
-corrected anchor and is explicitly recorded as a discarded original B. It
-measures restoration cost without treating that tail as accepted output.
+MTP refresh plus selected recovery work. Fixed mode performs no B forward.
+Recheck records the checked segments and any zero-match refill. The old
+`forced_diagnostic` CLI policy is rejected rather than mixed with the new
+install-only semantics. The historical timing field `fixed_replay_seconds`
+measures recovery device time; `recovery_semantics` identifies its meaning.
 
 `measurements.jsonl` retains every raw cell. `summary.json` estimates
 `max(c_pub(K), r(K) + D_o)` and records whether each measured `c_pub` fits its
