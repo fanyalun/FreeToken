@@ -347,6 +347,9 @@ class QwenMTPRunner:
         return tokens, hidden if features is None else features
 
     def _draft(self, batch, hidden, count=None, *, need_logits=True, last_only=False):
+        recorder = getattr(getattr(self.engine, "config", None), "_prefetch_calibration_recorder", None)
+        if recorder is not None:
+            recorder.draft_begin()
         with self.engine.ctx.forward_batch(batch):
             output = self.engine.mtp.forward(batch.input_ids, hidden)
             logits_hidden, recursive_hidden = output if isinstance(output, tuple) else (output, output)
@@ -359,6 +362,8 @@ class QwenMTPRunner:
             tokens = self.engine.mtp.logits(logits_hidden).argmax(-1).to(torch.int32) if need_logits else None
             if tokens is not None and hasattr(self.engine.mtp, "map_tokens"):
                 tokens = self.engine.mtp.map_tokens(tokens)
+        if recorder is not None:
+            recorder.draft_end()
         return tokens, recursive_hidden
 
     def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False):
@@ -624,6 +629,9 @@ class QwenMTPRunner:
             raise
         cancelled = lambda: cancel is not None and cancel.is_set()
         self.active = True
+        recorder = getattr(getattr(self.engine, "config", None), "_prefetch_calibration_recorder", None)
+        if recorder is not None:
+            recorder.reset_request()
         output, rounds = [], []
         self.graph_replays, self.graph_fallbacks = {}, {}
         started = time.perf_counter()
@@ -744,6 +752,8 @@ class QwenMTPRunner:
                 if result is not None:
                     result.wall_seconds = time.perf_counter() - started
             finally:
+                if recorder is not None:
+                    recorder.reset_request()
                 self.active = False
                 self._request_lock.release()
 

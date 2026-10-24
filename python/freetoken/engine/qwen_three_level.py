@@ -114,6 +114,10 @@ class ThreeLevelCoordinator:
                                                use_graph=runner.use_graph, audit=engine.config.speculative_audit,
                                                layer_quota=engine.config.speculative_prefetch_layer_experts,
                                                gap_capacity=engine.config.speculative_prefetch_gap_capacity, **extra)
+        recorder = getattr(engine.config, "_prefetch_calibration_recorder", None)
+        if recorder is not None:
+            self.experts.calibration_recorder = recorder
+            recorder.attach(engine, self.experts)
         if getattr(self.experts, "optimize_admission", False):
             self.experts.eos_mask = runner.eos_mask
         if hybrid_phases:

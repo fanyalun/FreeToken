@@ -794,6 +794,10 @@ class GPUExpertCache:
                 owners, slots, count, c.num_experts, len(c.banks), 256)
         if retire:
             _ready[(1,)](self.pool_pending[pool], slots, count, triton.next_power_of_2(self.plan_capacity))
+        recorder = getattr(self, "calibration_recorder", None)
+        if recorder is not None and kind in ("layer", "verify"):
+            recorder.mark("prefetch_copy_done", layer if kind == "layer" else layer - 1,
+                          stream=self.copy_stream)
 
     def _plan_gap(self, control=None):
         self.gap_remaining.fill_(max(0, self.gap_capacity - 1))
@@ -847,6 +851,9 @@ class GPUExpertCache:
         if ids.shape != (rows, self.top_k) or weights.shape != ids.shape:
             raise ValueError("GPU speculative route shape mismatch")
         ids, weights = ids.contiguous(), weights.contiguous()
+        recorder = getattr(self, "calibration_recorder", None)
+        if recorder is not None:
+            recorder.mark("route_ready", li)
         if self.phase == "verify" and self.verify_prefetch_enabled and self.verify_layer_quotas[li]:
             self.join_verify(li)
         # Batch fences replace per-expert host polling and join every captured fork.
@@ -943,6 +950,10 @@ class GPUExpertCache:
             self._copy(li, self.plans[0])
             _resolve[(1,)](c.slot_for_id, pending, ids, slots, selected, *self.plans[0][1::2],
                 li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()), valid_rows, self.top_k)
+        recorder = getattr(self, "calibration_recorder", None)
+        if last and recorder is not None:
+            recorder.record_compute(layer, hidden, selected, slots, ids)
+            recorder.mark("fork_ready", li)
         quota = self.layer_quotas[li] if self.layer_quotas is not None else self.layer_quota
         if last and self.phase == "preverify" and self.prefetch and quota:
             plan = self.layer_plans[li] if self.cross_layer_prefetch else self.plans[1]
@@ -963,6 +974,8 @@ class GPUExpertCache:
             torch.cuda.nvtx.range_push("HYBRID/GPU_EXPERT_COMPUTE")
         result = layer._expert_gemm(c, hidden, selected, slots, views=c.pool_bank_views(li), n=None,
                                     alphas=c.alphas_for_slots(li), is_prefill=False)
+        if last and recorder is not None:
+            recorder.mark("compute_done", li)
         if hybrid and self.profile_hybrid:
             torch.cuda.nvtx.range_pop()
         if hybrid:
@@ -1055,6 +1068,9 @@ class GPUExpertCache:
                         _ready[(1,)](self.pool_pending[pool], plan[1], plan[3],
                                       triton.next_power_of_2(self.plan_capacity))
             self.gap_active = self.cross_layer_prefetch
+            recorder = getattr(self, "calibration_recorder", None)
+            if recorder is not None:
+                recorder.gap_copied(self.copy_stream)
             self.gap_planned = False
         self.queue.fill_(2147483647)
 

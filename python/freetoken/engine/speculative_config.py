@@ -42,6 +42,15 @@ def resolve_speculative_config(config) -> None:
         put("max_running_req", 4 if legacy else 1)
     if config.speculative_prefetch is None:
         put("speculative_prefetch", True if legacy else three)
+    if config.speculative_prefetch_profile is not None and (
+            not isinstance(config.speculative_prefetch_profile, str) or not config.speculative_prefetch_profile):
+        raise ValueError("speculative_prefetch_profile must be auto or a profile path")
+    if legacy:
+        for name, default in (("speculative_prefetch_layer_experts", 4),
+                              ("speculative_prefetch_gap_capacity", 0),
+                              ("speculative_verify_prefetch_layer_experts", 0)):
+            if getattr(config, name) is None:
+                put(name, default)
     if config.speculative_hybrid_phases is None:
         phases = ("verify",) if legacy or mode in (None, "sd") else (
             ("preverify", "verify") if three else ("preverify",))
@@ -63,6 +72,13 @@ def resolve_speculative_config(config) -> None:
         put("speculative_prefetch", False)
     elif not (config.moe_cache_size or config.moe_cache_rate is not None or config.moe_cache_mem is not None):
         put("moe_cache_auto", True)
+    if not config.speculative_prefetch or mode == "sd":
+        for name in ("speculative_prefetch_layer_experts", "speculative_prefetch_gap_capacity",
+                     "speculative_verify_prefetch_layer_experts"):
+            if getattr(config, name) is None:
+                put(name, 0)
+    if mode == "cpu_async" and config.speculative_verify_prefetch_layer_experts is None:
+        put("speculative_verify_prefetch_layer_experts", 0)
     if config.attention_backend == "auto":
         put("attention_backend", "triton")
     if config.attention_backend != "triton":

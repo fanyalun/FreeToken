@@ -13,6 +13,103 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 from analyze_three_level_demo import MODES, analyze
 from analyze_speculative_policy import analyze_stopping, evaluate_threshold
 from analyze_speculative_io_budget import make_budget, io_summary
+from three_level_prefetch_calibration import (build_prefetch_profile, evaluate_prefetch_promotion,
+    gap_capacity_for_experts, gap_experts_for_capacity, mixed_pool_gap_costs, monotone_copy_curves)
+
+
+def offline_calibration_samples():
+    coverage = dict(contexts=["short", "long"], preverify_rows=list(range(1, 5)),
+                    verify_rows=list(range(1, 18)), draft_gap_rows=list(range(1, 5)))
+    windows = [dict(phase=phase, layer=layer, rows=rows, context=context, duration_ms=1.)
+               for phase, layer in (("preverify", 0), ("verify", 1), ("draft_gap", None))
+               for rows in coverage[phase + "_rows"] for context in coverage["contexts"] for _ in range(8)]
+    copies = [dict(phase=phase, pool=pool, experts=count, samples_ms=[max(.01, count * cost)] * 8)
+              for phase in ("preverify", "draft_gap", "verify") for pool, cost in (("bf16", .1), ("q4", .15))
+              for count in range(5)]
+    return windows, copies, dict(identity={"checkpoint": "fixture"}, coverage=coverage, layer_pools=["bf16", "q4"])
+
+
+def test_offline_prefetch_uses_worst_shape_context_and_preserves_terminal_layers():
+    windows, copies, options = offline_calibration_samples()
+    for row in windows:
+        if row["phase"] == "preverify" and row["rows"] == 1 and row["context"] == "long":
+            row["duration_ms"] = .2
+    result = build_prefetch_profile(windows, copies, **options)
+    assert result["quotas"] == dict(preverify=[1, 0], verify=[0, 4], gap_capacity=5)
+    assert result["candidates"]["half"] == dict(preverify=[0, 0], verify=[0, 2], gap_experts=2, gap_capacity=3)
+    assert result["coverage_complete"] and not result["automatic_publishable"]
+    reduced = build_prefetch_profile(windows, copies, shared_preverify_retire_ms=.1, **options)
+    assert reduced["quotas"]["preverify"] == [0, 0]
+    assert reduced["quotas"]["verify"] == result["quotas"]["verify"]
+
+
+def test_offline_prefetch_missing_shape_or_copy_pool_fails_closed():
+    windows, copies, options = offline_calibration_samples()
+    with pytest.raises(ValueError, match="coverage"):
+        build_prefetch_profile([row for row in windows if not (row["phase"] == "verify" and row["rows"] == 17)],
+                               copies, **options)
+    with pytest.raises(ValueError, match="missing production copy"):
+        build_prefetch_profile(windows, [row for row in copies if not (row["phase"] == "verify" and row["pool"] == "q4")],
+                               **options)
+    windows[0]["capture"] = True
+    with pytest.raises(ValueError, match="coverage"):
+        build_prefetch_profile(windows, copies, **options)
+
+
+def test_offline_copy_p90_is_monotone_and_gap_uses_worst_pool_composition():
+    samples = [dict(phase="draft_gap", pool="q4", experts=1, samples_ms=[.1] * 7 + [.5]),
+               dict(phase="draft_gap", pool="q4", experts=2, samples_ms=[.2] * 8)]
+    curve = monotone_copy_curves(samples)["draft_gap"]["q4"]["cost_ms"]
+    assert curve == {0: 0., 1: .5, 2: .5}
+    mixed = mixed_pool_gap_costs({"a": {0: 0., 1: .5, 2: .6}, "b": {0: 0., 1: .4, 2: .5}})
+    assert mixed == {0: 0., 1: .5, 2: .9}
+    costs, witness = mixed_pool_gap_costs(
+        {"a": {0: 0., 1: .5, 2: .6}, "b": {0: 0., 1: .4, 2: .5}}, return_allocations=True)
+    assert costs == mixed and witness[2] == {"a": 1, "b": 1}
+    fixed = mixed_pool_gap_costs({"a": {0: .05, 1: .5, 2: .6}, "b": {0: .06, 1: .4, 2: .5}})
+    assert fixed[0] == 0 and fixed[1] == pytest.approx(.56)
+    with pytest.raises(ValueError, match="coverage"):
+        mixed_pool_gap_costs({"a": curve}, max_experts=3)
+
+
+def test_offline_copy_does_not_hide_rare_slow_context_in_pooled_percentile():
+    rows = [dict(phase="verify", pool="q4", experts=1, rows=1, context="short", samples_ms=[.1] * 80),
+            dict(phase="verify", pool="q4", experts=1, rows=17, context="long", samples_ms=[.9] * 8)]
+    assert monotone_copy_curves(rows)["verify"]["q4"]["cost_ms"][1] == .9
+
+
+@pytest.mark.parametrize("capacity,experts", [(0, 0), (1, 0), (12, 11)])
+def test_offline_gap_capacity_preserves_legacy_reserved_entry(capacity, experts):
+    assert gap_experts_for_capacity(capacity) == experts
+    assert gap_capacity_for_experts(experts) == (capacity if experts else 0)
+
+
+def promotion_requests(tpot_ms):
+    return [dict(dataset="fixture.jsonl", sample=sample, repeat=repeat, returned_tokens=11,
+                 wall_seconds=1. + value / 100., ttft_seconds=1., graph_fallbacks={}, warmup=False)
+            for repeat, value in enumerate(tpot_ms) for sample in range(2)]
+
+
+def test_prefetch_promotion_requires_complete_paired_requests_and_all_repeat_gains():
+    audit = dict.fromkeys(("same_protocol", "same_source", "coverage_complete", "cleanup_valid", "accounting_valid",
+                          "baseline_complete", "candidate_complete", "baseline_formal_eligible", "candidate_formal_eligible"), True)
+    result = evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]), promotion_requests([9., 9., 9.]), audit=audit)
+    assert result["eligible"] and result["tpot_reduction_fraction"] == pytest.approx(.1)
+    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]),
+        promotion_requests([9., 10.1, 9.]), audit=audit)["eligible"]
+    bad = promotion_requests([9., 9., 9.])
+    bad[0]["graph_fallbacks"] = {"draft": 1}
+    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]), bad, audit=audit)["eligible"]
+    audit["same_source"] = False
+    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]),
+        promotion_requests([9., 9., 9.]), audit=audit)["eligible"]
+
+
+def test_prefetch_promotion_rejects_missing_shapes_and_profiled_timing():
+    rows = promotion_requests([9., 9., 9.])
+    rows[0]["profiled"] = True
+    with pytest.raises(ValueError, match="profiled"):
+        evaluate_prefetch_promotion(rows, rows, audit={})
 
 
 def test_io_budget_uses_only_no_prefetch_calibration_and_zeroes_last_layer():

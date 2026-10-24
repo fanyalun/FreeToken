@@ -115,11 +115,14 @@ class EngineConfig:
     speculative_reference_math: bool = False
     speculative_overlap_loops: int = 3
     speculative_prefetch: bool | None = None
-    speculative_prefetch_layer_experts: int = 4
+    speculative_prefetch_profile: str | None = "auto"
+    _speculative_prefetch_allow_candidate: bool = field(default=False, init=False, repr=False)
+    _speculative_prefetch_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
+    speculative_prefetch_layer_experts: int | None = None
     speculative_prefetch_layer_quotas: List[int] | None = None
     speculative_prefetch_demand_fence: bool = False
-    speculative_prefetch_gap_capacity: int = 0
-    speculative_verify_prefetch_layer_experts: int = 0
+    speculative_prefetch_gap_capacity: int | None = None
+    speculative_verify_prefetch_layer_experts: int | None = None
     speculative_verify_prefetch_layer_quotas: List[int] | None = None
     speculative_audit: bool = False
     speculative_expert_scheduler: str = "host"
@@ -214,16 +217,18 @@ class EngineConfig:
                 raise ValueError("speculative Hybrid requires optimized compact reference/full execution")
             if self.moe_hybrid_max_fetch < -1:
                 raise ValueError("moe_hybrid_max_fetch must be -1 or nonnegative")
-        if min(self.speculative_prefetch_layer_experts, self.speculative_prefetch_gap_capacity) < 0:
+        if any(value is not None and (type(value) is not int or value < 0) for value in
+               (self.speculative_prefetch_layer_experts, self.speculative_prefetch_gap_capacity)):
             raise ValueError("speculative prefetch quotas must be nonnegative")
-        if (type(self.speculative_verify_prefetch_layer_experts) is not int
-                or self.speculative_verify_prefetch_layer_experts < 0):
+        if (self.speculative_verify_prefetch_layer_experts is not None
+                and (type(self.speculative_verify_prefetch_layer_experts) is not int
+                     or self.speculative_verify_prefetch_layer_experts < 0)):
             raise ValueError("verify prefetch quota must be a nonnegative integer")
         quotas = self.speculative_verify_prefetch_layer_quotas
         if quotas is not None and (not quotas or quotas[0] != 0
                 or any(type(q) is not int or q < 0 for q in quotas)):
             raise ValueError("verify prefetch quotas must be nonnegative integers with first quota 0")
-        enabled = any(quotas) if quotas is not None else self.speculative_verify_prefetch_layer_experts > 0
+        enabled = any(quotas) if quotas is not None else (self.speculative_verify_prefetch_layer_experts or 0) > 0
         if self.speculative_prefetch and enabled:
             if (self.speculative_expert_scheduler != "gpu"
                     or self.speculative_execution_implementation != "optimized"

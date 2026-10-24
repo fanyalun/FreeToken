@@ -56,7 +56,8 @@ def make_budget(mapping, copy_ms, *, layers=40, max_experts=2, fraction=.1, safe
             median_window_ms=statistics.median(values) if values else None,
             lower_quantile_ms=quantile(values, fraction) if values else None,
             safe_copy_budget_ms=safe, quota=quota))
-    return dict(layer_quotas=quotas, layers=records, calibration_forwards=len(forwards),
+    return dict(schema_version=0, status="legacy_diagnostic", automatic_publishable=False,
+        layer_quotas=quotas, layers=records, calibration_forwards=len(forwards),
         copy_ms=copy_ms, max_experts=max_experts, policy=policy, window_quantile=fraction, safety=safety,
         launch_margin_ms=margin_ms,
         scope="No-prefetch demand-end to next-layer demand-start GPU intervals; fixed offline quotas, not online deadlines; final layer quota zero because it has no following layer window")
@@ -99,12 +100,27 @@ def io_summary(mapping, layers=40):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("sqlite", type=Path)
+    parser.add_argument("sqlite", type=Path, nargs="?")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--offline-calibration", type=Path)
     parser.add_argument("--copy-cost", type=Path)
     parser.add_argument("--max-experts", type=int, default=2)
     parser.add_argument("--policy", choices=("conservative", "median_round"), default="conservative")
     args = parser.parse_args()
+    if bool(args.sqlite) == bool(args.offline_calibration):
+        parser.error("provide either a legacy SQLite trace or --offline-calibration")
+    if args.offline_calibration:
+        if args.copy_cost or args.policy != "conservative":
+            parser.error("offline calibration includes production copy samples and uses conservative bounds")
+        from three_level_prefetch_calibration import build_prefetch_profile
+        source = json.loads(args.offline_calibration.read_text())
+        result = build_prefetch_profile(source["window_samples"], source["copy_samples"],
+            identity=source["identity"], coverage=source["coverage"], layer_pools=source["layer_pools"],
+            **source.get("policy", {}))
+        result["calibration_source"] = dict(path=str(args.offline_calibration.resolve()),
+            sha256=hashlib.sha256(args.offline_calibration.read_bytes()).hexdigest())
+        args.output.write_text(json.dumps(result, indent=2) + "\n")
+        return
     data = analyze(args.sqlite)
     mapping = data.pop("raw_kernel_mapping")
     result = dict(trace_summary=data, io=io_summary(mapping), sqlite=str(args.sqlite.resolve()))

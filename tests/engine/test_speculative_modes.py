@@ -64,6 +64,115 @@ def test_explicit_prefetch_and_preverify_policy_override_mode_defaults():
     assert c.cpu_async_recovery == "recheck"
 
 
+def test_prefetch_defaults_distinguish_legacy_from_uncalibrated_modes():
+    from freetoken.engine.speculative_prefetch_profile import QUOTA_FIELDS, prepare_prefetch_profile
+
+    assert tuple(getattr(config(), name) for name in QUOTA_FIELDS) == (4, 0, 0)
+    current = config(speculative_mode="three_level_gpu")
+    assert tuple(getattr(current, name) for name in QUOTA_FIELDS) == (None, None, None)
+    for mode, backend in (("sd", "offload"), ("cpu_async", "offload"), ("three_level_gpu", "fused")):
+        c = config(speculative_mode=mode, moe_strategy=backend)
+        assert prepare_prefetch_profile(c, None)["source"] == "disabled"
+
+
+@pytest.mark.parametrize("mode", ["three_level_gpu", "cpu_async"])
+def test_all_manual_prefetch_quotas_bypass_profile_lookup(monkeypatch, mode):
+    import freetoken.engine.speculative_prefetch_profile as profiles
+
+    monkeypatch.setattr(profiles, "build_prefetch_identity", lambda *args, **kwargs: pytest.fail("unexpected profile lookup"))
+    c = config(speculative_mode=mode, speculative_prefetch=True, speculative_prefetch_layer_experts=1,
+               speculative_prefetch_gap_capacity=12,
+               speculative_verify_prefetch_layer_experts=2 if mode == "three_level_gpu" else None)
+    receipt = profiles.prepare_prefetch_profile(c, None)
+    assert receipt["source"] == "manual"
+    assert c.moe_cache_auto
+    assert tuple(getattr(c, name) for name in profiles.QUOTA_FIELDS) == (1, 12, 2 if mode == "three_level_gpu" else 0)
+
+
+@pytest.mark.parametrize("directory", [True, False])
+def test_prefetch_identity_tracks_every_gguf_shard(tmp_path, directory):
+    from freetoken.engine.speculative_prefetch_profile import _checkpoint_identity, profile_key
+
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    source = tmp_path if directory else first
+    before = _checkpoint_identity(source)
+    assert [row["name"] for row in before["weights"]] == [first.name, second.name]
+    second.write_bytes(b"different quantized weights")
+    assert profile_key(_checkpoint_identity(source)) != profile_key(before)
+
+
+@pytest.mark.parametrize("case", ["loaded", "zero_override", "missing", "identity", "candidate", "candidate_opt_in",
+                                  "auto_candidate", "slots_conflict", "geometry", "runtime_change", "evidence", "zero_profile"])
+def test_prefetch_profile_resolution_and_frozen_geometry(tmp_path, monkeypatch, case):
+    import copy
+    import json
+    from types import SimpleNamespace
+    import freetoken.engine.speculative_prefetch_profile as profiles
+
+    identity = {"target": "fixture", "settings": {"budget": 40 * 2**30}}
+    geometry = dict(total_slots=12, pool_sizes=[7, 5], pool_of_layer=[0, 1], layer_layout=[0, 1],
+                    expert_bytes_by_layer=[64, 80], bank_layouts=[[], []])
+    data = dict(schema_version=1, identity=identity, quotas=dict(preverify=[1, 2], gap_capacity=12, verify=[0, 2]),
+                geometry=geometry, evidence=dict(status="validated", artifact_sha256={"raw.json": "a" * 64},
+                    promotion=dict(passed=True)))
+    path = tmp_path / (profiles.profile_key(identity) + ".json")
+    if case == "identity":
+        data["identity"] = {"target": "other"}
+    if case in ("candidate", "candidate_opt_in", "auto_candidate"):
+        data["evidence"]["status"] = "candidate"
+    if case == "evidence":
+        data["evidence"]["promotion"]["passed"] = False
+    if case == "zero_profile":
+        data["quotas"] = dict(preverify=[0, 0], gap_capacity=0, verify=[0, 0])
+    if case != "missing":
+        path.write_text(json.dumps(data))
+    monkeypatch.setattr(profiles, "build_prefetch_identity", lambda *args, **kwargs: copy.deepcopy(identity))
+    monkeypatch.setattr(profiles, "profile_directory", lambda: tmp_path)
+    values = dict(speculative_mode="three_level_gpu", speculative_prefetch_profile=str(path),
+                  gpu_memory_budget_bytes=40 * 2**30)
+    if case in ("loaded", "auto_candidate"):
+        values["speculative_prefetch_profile"] = "auto"
+    if case == "zero_override":
+        values["speculative_prefetch_layer_experts"] = 0
+    if case == "slots_conflict":
+        values["moe_cache_size"] = 13
+    c = config(**values)
+    object.__setattr__(c, "model_config", SimpleNamespace(num_moe_layers=2))
+    if case in ("candidate_opt_in", "auto_candidate"):
+        object.__setattr__(c, "_speculative_prefetch_allow_candidate", True)
+    errors = dict(missing="profile missing", identity="identity mismatch", candidate="must be validated",
+                  auto_candidate="must be validated", slots_conflict="slots mismatch", evidence="passed promotion")
+    if case in errors:
+        with pytest.raises(ValueError, match=errors[case]):
+            profiles.prepare_prefetch_profile(c, None)
+        return
+    receipt = profiles.prepare_prefetch_profile(c, None)
+    assert c.moe_cache_size == 12 and not c.moe_cache_auto
+    assert receipt["effective"]["preverify"] == ([0, 0] if case in ("zero_override", "zero_profile") else [1, 2])
+    assert receipt["effective"]["verify"] == ([0, 0] if case == "zero_profile" else [0, 2])
+    assert receipt["effective"]["max_gap_expert_loads"] == (0 if case == "zero_profile" else 11)
+    if case == "zero_profile":
+        assert not c.speculative_prefetch and receipt["reason"] == "calibrated_zero_profile"
+    actual = copy.deepcopy(geometry)
+    if case == "geometry":
+        actual["pool_sizes"] = [6, 6]
+    if case == "runtime_change":
+        object.__setattr__(c, "speculative_prefetch_gap_capacity", 8)
+    monkeypatch.setattr(profiles, "prefetch_geometry", lambda engine: actual)
+    engine = SimpleNamespace(config=c)
+    if case in ("geometry", "runtime_change"):
+        with pytest.raises(ValueError, match="geometry mismatch|configuration changed"):
+            profiles.validate_prefetch_profile(engine)
+    else:
+        assert profiles.validate_prefetch_profile(engine)["validated"]
+        exported = profiles.prefetch_receipt(c)
+        exported["geometry"]["pool_sizes"][0] = 99
+        assert profiles.prefetch_receipt(c)["geometry"]["pool_sizes"] == [7, 5]
+
+
 def test_fused_bf16_rejects_impossible_expert_storage_before_loading(monkeypatch):
     from types import SimpleNamespace
     from freetoken.engine.speculative_config import validate_fused_capacity

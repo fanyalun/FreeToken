@@ -90,6 +90,7 @@ class QwenSpeculativeGraphSet:
         self.coordinator = coordinator
         self.runner, self.engine = coordinator.runner, coordinator.engine
         self.experts = coordinator.experts
+        self.calibration = getattr(self.experts, "calibration_recorder", None)
         self.gap_ready = torch.cuda.Event(external=True)
         self.gap_ready.record(self.experts.copy_stream)
         self.width = max(1, coordinator.inner_width)
@@ -194,6 +195,8 @@ class QwenSpeculativeGraphSet:
 
     def _body(self, inner):
         lane = self.inner if inner else self.outer
+        if self.calibration is not None:
+            self.calibration.begin("preverify" if inner else "verify", lane.width, "body")
         if inner:
             lane.inputs[:1].copy_(self.anchor)
             seed, hidden = self.seed, self.seed_hidden
@@ -206,6 +209,8 @@ class QwenSpeculativeGraphSet:
             _assemble[(1,)](self.anchor, self.experts.candidate_buffer, lane.inputs, self.context,
                             lane.width, triton.next_power_of_2(lane.width))
         # The external event is re-recorded by gap copies between graph replays.
+        if self.calibration is not None:
+            self.calibration.mark("gap_join")
         self.engine.stream.wait_event(self.gap_ready)
         self.experts.retire_gap()
         self.metadata(lane.batch, lane.inputs)
@@ -218,14 +223,20 @@ class QwenSpeculativeGraphSet:
             lane.width, triton.next_power_of_2(lane.width))
         self.experts.write_control(lane.tokens, lane.commit, inner=inner, context=self.context,
                                    depth=self.engine.config.speculative_mtp_depth, eos_mask=self.eos)
+        if self.calibration is not None:
+            self.calibration.end()
 
     def _tail(self, inner):
         lane = self.inner if inner else self.outer
+        if self.calibration is not None:
+            self.calibration.begin("preverify" if inner else "verify", lane.width, "tail")
         self._commit(inner)
         self.metadata(lane.batch, lane.tokens)
         seed, hidden = self.runner._draft(lane.batch, lane.hidden, count=lane.commit.input_count)
         self.seed.copy_(seed)
         self.seed_hidden.copy_(hidden)
+        if self.calibration is not None:
+            self.calibration.end()
 
     def _commit(self, inner):
         lane = self.inner if inner else self.outer
@@ -354,15 +365,21 @@ class QwenSpeculativeGraphSet:
         self.experts.gap_active = False
         self.experts.gap_planned = inner and self.experts.prefetch and self.experts.gap_capacity > 1
         control = self.experts.drain_control(lane.width)
+        if self.calibration is not None:
+            self.calibration.body_finished("preverify" if inner else "verify", rows, start + rows)
         return lane.tokens, lane.hidden, lane.commit, control
 
     def tail(self, inner, continuing):
         lane = self.active_lanes.pop(inner)
         if inner:
+            if self.calibration is not None:
+                self.calibration.fork_gap(continuing)
             self.experts.finish_loop(continuing)
             self.gap_ready.record(self.experts.copy_stream)
         if continuing:
             self._replay(inner, "tail", lane.width)
+            if self.calibration is not None:
+                self.calibration.tail_submitted("preverify" if inner else "verify", lane.width)
             self.runner.next_draft, self.runner.last_draft_hidden = self.seed, self.seed_hidden
         else:
             self._replay(inner, "commit", lane.width)

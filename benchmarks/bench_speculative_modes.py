@@ -270,6 +270,14 @@ def prompt_inputs(args, tokenizer):
     return records
 
 
+def prefetch_config_kwargs(args):
+    return dict(speculative_prefetch=False if args.calibrate_prefetch else args.prefetch,
+        speculative_prefetch_layer_experts=args.layer_prefetch_experts,
+        speculative_prefetch_gap_capacity=args.gap_prefetch_capacity,
+        speculative_verify_prefetch_layer_experts=args.verify_prefetch_experts,
+        speculative_prefetch_profile=args.prefetch_profile)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Single-request speculative decoding across MoE backends")
     parser.add_argument("--model", required=True)
@@ -281,8 +289,16 @@ def main():
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--preverify-top-h", type=int, default=4)
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--layer-prefetch-experts", type=int, default=4)
-    parser.add_argument("--gap-prefetch-capacity", type=int, default=0)
+    parser.add_argument("--layer-prefetch-experts", type=int)
+    parser.add_argument("--gap-prefetch-capacity", type=int)
+    parser.add_argument("--verify-prefetch-experts", type=int)
+    parser.add_argument("--prefetch-profile", default="auto")
+    parser.add_argument("--allow-candidate-profile", action="store_true",
+                        help="Explicit benchmark opt-in; candidate profiles are never loaded automatically")
+    parser.add_argument("--calibrate-prefetch", action="store_true")
+    parser.add_argument("--profile-prefetch", action="store_true",
+                        help="Diagnostic graph timing and residual waits; never formal timing")
+    parser.add_argument("--calibration-max-experts", type=int, default=64)
     parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
     parser.add_argument("--max-loops", type=int, default=6)
     parser.add_argument("--cpu-async-loops", type=int, default=4)
@@ -309,6 +325,22 @@ def main():
     parser.add_argument("--expect-capacity-rejection", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.profile_prefetch and (args.purpose == "formal" or args.calibrate_prefetch
+                                 or args.mode != "three_level_gpu" or args.graph not in (None, "full")):
+        parser.error("--profile-prefetch requires a separate three_level_gpu/full diagnostic run")
+    if args.allow_candidate_profile and args.prefetch_profile == "auto":
+        parser.error("candidate opt-in requires an explicit --prefetch-profile path")
+    if args.calibrate_prefetch:
+        if args.mode != "three_level_gpu" or args.backend != "offload" or args.graph not in (None, "full"):
+            parser.error("prefetch calibration currently requires three_level_gpu/offload/full")
+        if args.budget_gib is None or args.budget_gib <= 2 or args.slots:
+            parser.error("calibration requires a total --budget-gib > 2 and automatic bootstrap slots")
+        if not 1 <= args.calibration_max_experts <= 64:
+            parser.error("calibration search cap must be in [1, 64]")
+        if args.purpose == "formal":
+            parser.error("profiled calibration is diagnostic; use --purpose diagnostic")
+        if args.prefetch_profile != "auto" or args.allow_candidate_profile:
+            parser.error("calibration produces a new profile rather than consuming an existing profile")
     out = args.output.resolve()
     if out == Path("/tmp") or Path("/tmp") in out.parents:
         parser.error("use a persistent output directory outside /tmp")
@@ -324,6 +356,7 @@ def main():
     frozen = source_identity(root)
     write("source_manifest.json", frozen)
     engine = monitor = None
+    profile_running = False
     try:
         if args.repeats < 1 or args.warmups < 0 or not 1 <= args.tokens <= args.max_output_tokens:
             raise ValueError("invalid repeats, warmups or output limit")
@@ -337,9 +370,8 @@ def main():
             rendezvous_file=str(out / "rendezvous"), speculative_mode=args.mode,
             speculative_depth=args.depth, speculative_draft_model=args.draft_model,
             speculative_graph=args.graph, speculative_preverify_top_h=args.preverify_top_h,
-            speculative_prefetch=args.prefetch, speculative_max_loops=args.max_loops,
-            speculative_prefetch_layer_experts=args.layer_prefetch_experts,
-            speculative_prefetch_gap_capacity=args.gap_prefetch_capacity,
+            speculative_max_loops=args.max_loops,
+            **prefetch_config_kwargs(args),
             cpu_async_loops=args.cpu_async_loops, cpu_async_recovery=args.recovery,
             cpu_async_core_ids=tuple(map(int, args.cpu_cores.split(","))) if args.cpu_cores else None,
             moe_cpu_core_ids=tuple(map(int, args.hybrid_cores.split(","))) if args.hybrid_cores else None,
@@ -348,10 +380,15 @@ def main():
             moe_cpu_threads=args.cpu_threads,
             moe_hybrid_max_fetch=args.hybrid_max_fetch,
             memory_ratio=1.0 if args.budget_gib is not None else 0.9,
-            gpu_memory_budget_bytes=int(args.budget_gib * 2**30) if args.budget_gib else None,
+            gpu_memory_budget_bytes=(int((args.budget_gib - (2 if args.calibrate_prefetch else 0)) * 2**30)
+                                     if args.budget_gib else None),
             speculative_max_input_tokens=args.max_input_tokens,
             speculative_max_output_tokens=args.max_output_tokens,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))))
+        object.__setattr__(config, "_speculative_prefetch_allow_candidate", args.allow_candidate_profile)
+        if args.calibrate_prefetch or args.profile_prefetch:
+            from speculative_prefetch_recorder import PrefetchWindowRecorder
+            object.__setattr__(config, "_prefetch_calibration_recorder", PrefetchWindowRecorder())
         tokenizer = load_tokenizer(model)
         prompts = prompt_inputs(args, tokenizer)
         eos = () if args.ignore_eos else tuple(load_eos_token_ids(model, tokenizer))
@@ -374,8 +411,27 @@ def main():
         engine = Engine(config)
         write("resolved_config.json", asdict(config))
         write("memory_plan.json", memory_report(engine))
+        from freetoken.engine.speculative_prefetch_profile import prefetch_receipt
+        write("prefetch_receipt.json", prefetch_receipt(config))
         if args.expect_capacity_rejection:
             raise RuntimeError("expected capacity rejection but the model initialized")
+        if args.calibrate_prefetch:
+            from speculative_prefetch_driver import run_calibration_entry
+            run_calibration_entry(engine, prompts, out, tokens=args.tokens,
+                max_experts=args.calibration_max_experts, total_budget_bytes=int(args.budget_gib * 2**30))
+            engine.shutdown()
+            engine = None
+            resources = monitor.close()
+            monitor = None
+            write("resource_validation.json", resources)
+            changed = frozen != source_identity(root)
+            write("complete.json", dict(status="complete", valid=not changed,
+                formal_eligible=False, purpose="diagnostic", source_changed=changed,
+                resource_eligible=resources["resource_eligible"], shutdown_complete=True,
+                calibration_status="candidate", automatic_publishable=False))
+            if changed or not resources["resource_eligible"]:
+                raise RuntimeError("calibration source or resource validation failed; candidate must not be published")
+            return
         if args.mode == "cpu_async":
             from freetoken.engine.cpu_async import CpuAsyncRuntime
             if getattr(engine, "cpu_async_runtime", None) is None:
@@ -383,13 +439,19 @@ def main():
             engine.cpu_async_runtime._prepare_worker()
             write("cpu_target_runtime.json", engine.cpu_async_runtime.worker.metadata)
         rows = []
+        recorder = getattr(config, "_prefetch_calibration_recorder", None)
+        if args.profile_prefetch:
+            torch.cuda.profiler.start()
+            profile_running = True
         for repeat in range(-args.warmups, args.repeats):
+            if args.profile_prefetch:
+                recorder.enabled = repeat >= 0
             for prompt in prompts:
                 torch.cuda.reset_peak_memory_stats(engine.device)
                 result = engine.generate_speculative(prompt["input_ids"], max_tokens=args.tokens,
                     eos_ids=eos, prompt_chunk_size=args.prompt_chunk_size)
                 record = dict(repeat=repeat, warmup=repeat < 0, dataset=prompt["dataset"], sample=prompt["sample"],
-                    input_tokens=len(prompt["input_ids"]), **asdict(result))
+                    input_tokens=len(prompt["input_ids"]), profiled=args.profile_prefetch, **asdict(result))
                 validate_request(record, args.tokens, eos, config.speculative_graph)
                 record["returned_tokens"] = len(result.token_ids)
                 record["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(engine.device)
@@ -402,6 +464,11 @@ def main():
                     stream.write(json.dumps(record) + "\n")
                 if repeat >= 0:
                     rows.append(record)
+        if args.profile_prefetch:
+            torch.cuda.profiler.stop()
+            profile_running = False
+            write("prefetch_diagnostics.json", dict(windows=recorder.windows, stages=recorder.stages,
+                scope="instrumented Graph replay; residual copy completion beyond join-ready; not formal timing"))
         if checkpoints != dict(target=checkpoint_identity(model),
                 draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp"):
             raise RuntimeError("checkpoint files changed during the run")
@@ -427,8 +494,12 @@ def main():
             raise
     finally:
         try:
-            if engine is not None:
-                engine.shutdown()
+            try:
+                if profile_running:
+                    torch.cuda.profiler.stop()
+            finally:
+                if engine is not None:
+                    engine.shutdown()
         finally:
             if monitor is not None:
                 write("resource_validation.json", monitor.close())

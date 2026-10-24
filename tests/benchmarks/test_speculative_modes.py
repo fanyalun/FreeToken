@@ -10,6 +10,20 @@ import bench_speculative_modes as bench
 from bench_speculative_modes import checkpoint_identity, memory_report, prompt_inputs, resolve_model, validate_request
 
 
+@pytest.mark.parametrize("quotas", [(None, None, None), (1, 12, 2), (0, 0, 0)])
+def test_prefetch_entry_preserves_profile_overrides_and_full_verify(quotas):
+    import torch
+    from freetoken.distributed import DistributedInfo
+
+    args = SimpleNamespace(calibrate_prefetch=False, prefetch=True, prefetch_profile="profile.json",
+        layer_prefetch_experts=quotas[0], gap_prefetch_capacity=quotas[1], verify_prefetch_experts=quotas[2])
+    config = bench.BenchmarkConfig(model_path="unused", tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16, speculative_mode="three_level_gpu", **bench.prefetch_config_kwargs(args))
+    assert config.speculative_prefetch_profile == "profile.json"
+    assert (config.speculative_prefetch_layer_experts, config.speculative_prefetch_gap_capacity,
+            config.speculative_verify_prefetch_layer_experts) == quotas
+
+
 def test_memory_report_distinguishes_initial_measurement_from_final_boundary():
     from types import SimpleNamespace
 

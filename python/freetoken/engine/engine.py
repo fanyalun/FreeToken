@@ -386,6 +386,8 @@ class Engine:
         if config.speculative_mode == "cpu_async":
             from .cpu_async import configure_cpu_resources
             configure_cpu_resources(config)
+        from .speculative_prefetch_profile import prepare_prefetch_profile
+        prepare_prefetch_profile(config, self.device)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -471,6 +473,8 @@ class Engine:
             from freetoken.moe.host_banks import shared_bank_allocations
             with shared_bank_allocations(config.speculative_mode == "cpu_async"):
                 self._init_offload_moe_cache(config)
+        from .speculative_prefetch_profile import validate_prefetch_profile
+        validate_prefetch_profile(self)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -1345,6 +1349,9 @@ class Engine:
         #     recoverably with the old cache intact -- NOT after teardown, which would
         #     leave the server unable to serve. These checks are model-agnostic.
         if moe_cache_size is not None:
+            receipt = getattr(config, "_speculative_prefetch_receipt", None)
+            if receipt and receipt.get("geometry") and moe_cache_size != receipt["geometry"]["total_slots"]:
+                raise CacheRebuildRejected("prefetch profile fixes expert slots; recalibrate before resizing")
             if self.moe_offload_cache is None:
                 raise CacheRebuildRejected(
                     "moe_cache_size requested but this model has no MoE offload cache"
@@ -1495,6 +1502,8 @@ class Engine:
 
         if config.speculative_mtp_depth:
             from .qwen_mtp import QwenMTPRunner
+            from .speculative_prefetch_profile import validate_prefetch_profile
+            validate_prefetch_profile(self)
             self.speculative_runner = QwenMTPRunner(self)
             if is_native_sd(config):
                 self._validate_baseline_sd_peak()
