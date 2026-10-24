@@ -24,9 +24,11 @@ The supported checkpoint pairs are:
 | Qwen/Qwen3.6-35B-A3B | BF16 | Native MTP from the Target checkpoint |
 | unsloth/Qwen3-235B-A22B-Instruct-2507-GGUF | Q4_K_M, including Q4_K/Q6_K expert layouts | RedHatAI/Qwen3-235B-A22B-Instruct-2507-speculator.eagle3 |
 
-BF16 is the compute dtype for both pairs. A quantized Target keeps its GGUF
-weights packed on CPU; dense projections and routed experts use quantized CPU
-kernels. EAGLE3 has its own BF16 weights, embeddings, normalization and rotary
+BF16 is the compute dtype for both pairs. The CPU Target keeps its GGUF weights
+packed and uses quantized CPU kernels for dense projections and routed experts.
+The GPU Target uses GGML CUDA for its quantized projections; Hybrid assigns
+selected routed experts to the CPU executor. EAGLE3 has its own BF16 weights,
+embeddings, normalization and rotary
 configuration. Its three residual-complete Target feature boundaries are
 2, 47 and 91 for the 94-layer Qwen3 Target. The reduced Draft vocabulary is
 mapped back using the checkpoint's `d2t` offsets.
