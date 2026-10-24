@@ -78,6 +78,13 @@ those remaining cores are split approximately 3:1 between the CPU Target and
 the Hybrid executor. Explicit lists must not overlap, including SMT siblings.
 These executors have separate work queues and completion signals.
 
+CPU async is currently a functional demo. The GGUF CPU Target's attention kernel
+parallelizes across KV heads, four for this 235B checkpoint. Increasing the CPU
+thread count therefore does not give attention the same parallelism as dense
+projections and routed experts. Long-context performance needs separate
+measurement and optimization; asynchronous scheduling alone does not guarantee
+a speedup.
+
 The old `speculative_mtp_depth`, `speculative_three_level` and
 `speculative_preverify_top_k` fields remain available. A conflicting old/new
 pair raises a configuration error. Existing callers that do not select a new
