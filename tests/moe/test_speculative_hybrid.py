@@ -41,6 +41,8 @@ def test_baseline_balancing_protects_hits_and_matches_reference(cap, width):
         expert_recency=torch.full((2, 8), -1, device=device, dtype=torch.int64),
         num_missing_full=torch.zeros(1, device=device, dtype=torch.int64),
         active_mask=torch.zeros(8, device=device, dtype=torch.int32))
+    cache.pool_state = lambda _: (cache.id_of_slot, cache.usage)
+    cache.pool_slots, cache.layer_layout = lambda _: cache.cache_size, [0, 0]
     cache.slot_for_id[0, 0] = 0
     cache.slot_for_id[1, 1:4] = torch.arange(1, 4, device=device, dtype=torch.int32)
     cache.expert_recency[0, 3] = 9
@@ -126,6 +128,8 @@ def test_baseline_balancer_real_cache_geometry(slots, cap):
         expert_recency=torch.full((40, 256), -1, device=device, dtype=torch.int64),
         num_missing_full=torch.zeros(1, device=device, dtype=torch.int64),
         active_mask=torch.zeros(256, device=device, dtype=torch.int32))
+    cache.pool_state = lambda _: (cache.id_of_slot, cache.usage)
+    cache.pool_slots, cache.layer_layout = lambda _: cache.cache_size, [0] * 40
     profile = baseline_profile(top_k=8)
     profile["identity"]["geometry"][:2] = [40, 256]
     planner = BaselineHybridPlanner(cache, profile, cap)
@@ -138,6 +142,45 @@ def test_baseline_balancer_real_cache_geometry(slots, cap):
     assert planner.plans[4][1][:q].tolist() == list(range(q))
     assert cache.id_of_slot[:q].tolist() == list(range(17 * 256, 17 * 256 + q))
     assert ids.ge(0).sum().item() == q
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_baseline_hybrid_two_layouts_copy_local_slots_without_cross_pool_eviction():
+    from freetoken.moe.baseline_hybrid import BaselineHybridPlanner, predict_prefix
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    device = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.arange(8, dtype=torch.float32).view(8, 1).expand(8, 32).contiguous().pin_memory() for _ in range(2)],
+        "down": [torch.arange(8, dtype=torch.float32).add(20 * li).view(8, 1).expand(8, 32 * (li + 1)).contiguous().pin_memory()
+                 for li in range(2)],
+    }
+    cache = OffloadMoeCache(2, 8, 12, device, decode_target="hybrid",
+                            pool_of_layer=[1, 0], pool_sizes=[6, 6])
+    cache.set_bank_sources(sources)
+    cache.collect_stats = True
+    profile = baseline_profile(width=2, top_k=4)
+    expected_fetch, _ = predict_prefix(profile, 2, [1] * 8, available=6)
+    planner = BaselineHybridPlanner(cache, profile, -1)
+    for li in range(2):
+        planner.add_profile(cache.layer_layout[li], profile)
+        ids = torch.arange(8, device=device, dtype=torch.int32).reshape(2, 4)
+        planner.ensure(li, ids, torch.ones(2, 4, device=device))
+        cache.copy_missing()
+    torch.cuda.synchronize()
+    for li in range(2):
+        resident = cache.slot_for_id[li] >= 0
+        assert resident.sum() == expected_fetch
+        for expert, slot in enumerate(cache.slot_for_id[li].tolist()):
+            if slot >= 0:
+                assert cache.pool_state(li)[0][slot] == li * 8 + expert
+                for (src, _), bank in zip(cache.banks, cache.pool_bank_views(li)):
+                    assert torch.equal(bank[slot].cpu(), src[li][expert])
+    metrics = cache.request_metrics()
+    assert metrics["logical_total_loads"] == 2 * expected_fetch
+    assert metrics["logical_total_bytes"] == expected_fetch * sum(metrics["expert_bytes_by_layer"])
+    cache.reset_request_metrics()
+    assert cache.request_metrics()["logical_total_bytes"] == 0
 
 
 @pytest.fixture(autouse=True)
@@ -466,6 +509,12 @@ def make_cache(stream, *, layers=2, slots=8, hidden=64, intermediate=32, num_thr
         step=torch.zeros((), device="cuda", dtype=torch.int64),
         bank_views=lambda: tuple(bank for _, bank in banks),
         pool_bank_views=lambda _: tuple(bank for _, bank in banks), alphas_for_slots=lambda _: None)
+    cache.pool_of_layer, cache.pool_sizes, cache.pool_bases = [0] * layers, [slots], [0]
+    cache.layer_layout = [0] * layers
+    cache._pool_id_of_slot, cache._pool_usage = [cache.id_of_slot], [cache.usage]
+    cache._pool_bank_views = [tuple(bank for _, bank in banks)]
+    cache.pool_state = lambda _: (cache.id_of_slot, cache.usage)
+    cache.pool_slots = lambda _: slots
     cache.cpu_executor = CpuMoeExecutor(cache, top_k=8, activation="silu", apply_router_weight_on_input=False,
         num_threads=num_threads, max_tokens=25, device=cache.device, grouped_widths=tuple(range(1, 26)),
         grouped_compat=grouped_compat)
@@ -695,8 +744,8 @@ def test_eager_failure_after_cpu_submit_drains_native_task_before_reuse(use_grap
                 runner._execute("verify", batch)
             control.close(abort=True)
             stream.synchronize()
-            assert cache.cpu_executor._ext.flag_active_slot() == -1
-            assert not cache.cpu_executor._ready.any()
+            assert cache.cpu_executor._pending is None
+            assert not cache.cpu_executor._ext.flag_pending()
             fail = False
             control.begin(2)
             control.set_phase("verify")
@@ -750,7 +799,8 @@ def test_calibration_uses_real_graph_branches_and_checks_profile_identity(tmp_pa
         cache.reset_stats = lambda: None
         def gemm(cache, x, weights, slots, **kwargs):
             return fused_experts_decode_impl(x, *cache.bank_views(), weights, slots, "silu", False)
-        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm,
+                                quant_method=SimpleNamespace(cfg=SimpleNamespace(scheme="bf16")))
         control = GPUExpertCache(cache, stream, max_loops=1, max_rows=2, inner_rows=2,
             compact_control=True, implementation="optimized", prefetch=False, hybrid_phases=("verify",), use_graph=use_graph)
         try:
@@ -797,7 +847,8 @@ def test_baseline_calibration_incrementally_extends_real_measurements(tmp_path, 
         cache.reset_stats = lambda: None
         def gemm(cache, x, weights, slots, **kwargs):
             return fused_experts_decode_impl(x, *cache.bank_views(), weights, slots, "silu", False)
-        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm,
+                                quant_method=SimpleNamespace(cfg=SimpleNamespace(scheme="bf16")))
         try:
             first = load_or_calibrate(cache, layer, cache.cpu_executor, [1], eager=not use_graph)
             cache.cache_size = 2

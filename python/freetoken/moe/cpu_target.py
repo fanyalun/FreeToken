@@ -62,6 +62,20 @@ class CpuTargetExperts:
                 ) or any(t.shape != down_shape for t in down):
             raise ValueError("inconsistent CPU expert geometry")
         self.hidden, self.top_k, self.max_rows = hidden, top_k, max_rows
+        self.executor = None
+        if not packed and schedule != "expert_numa":
+            from .cpu_executor import CpuMoeExecutor
+
+            self.executor = CpuMoeExecutor.from_banks(
+                {"gate_up": gate_up, "down": down}, layer_formats=[("bf16", {})] * len(gate_up),
+                num_experts=experts, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+                num_threads=len(core_ids), core_ids=core_ids, max_tokens=max_rows,
+                grouped_widths=tuple(range(1, max_rows + 1)) if grouped else (), grouped_compat=grouped)
+            self.ext = self.executor._ext
+            self.io = {rows: tuple(self.executor._io[key][:rows] for key in ("x", "ids", "w", "y"))
+                       for rows in range(1, max_rows + 1)}
+            self.tasks = {}
+            return
         self.ext = _cpu_moe.SpeculativeBf16Executor(
             len(core_ids), len(gate_up), experts, top_k, hidden, inter, max_rows,
             0, 0, self.tables[0].data_ptr(), self.tables[1].data_ptr(),
@@ -94,6 +108,8 @@ class CpuTargetExperts:
                         layer, rows, xx.data_ptr(), ii.data_ptr(), ww.data_ptr(), yy.data_ptr())
 
     def __call__(self, layer, x, weights, ids):
+        if self.executor is not None:
+            return self.executor.run_cpu(layer, x, weights, ids)
         rows = x.shape[0]
         if self.ext is None:
             raise RuntimeError("CPU experts are closed")
@@ -118,6 +134,8 @@ class CpuTargetExperts:
         return yy if self.backend == "optimized" else yy.clone()
 
     def close(self):
+        if self.executor is not None:
+            self.executor.close()
         self.ext = None
         self.tasks.clear()
         self.io.clear()

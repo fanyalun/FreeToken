@@ -25,6 +25,7 @@ from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
+_failed_gpu_executors = []
 
 # Flag-based GPU<->CPU handshake for hybrid/cpu decode. The default host-func path
 # (cudaLaunchHostFunc submit+sync per layer) pays ~30-50us of callback dispatch latency
@@ -161,17 +162,8 @@ class CpuMoeExecutor:
     """Decode-time CPU expert compute over an ``OffloadMoeCache``'s host banks
     (the formats ``_cpu_moe.weight_formats()`` lists — see ``_resolve_banks``).
 
-    Explicit grouped execution selects the BF16 speculative executor, whose
-    reduction and task-slot contracts are shared with the CPU Target.
+    Grouped execution uses the same formats, IO and doorbell as ordinary decode.
     """
-
-    def __new__(cls, cache, *, grouped_widths=(), grouped_compat=False, **kwargs):
-        if grouped_widths or grouped_compat:
-            from freetoken.moe.speculative_cpu import SpeculativeBf16Executor
-
-            return SpeculativeBf16Executor(cache, grouped_widths=grouped_widths,
-                                          grouped_compat=grouped_compat, **kwargs)
-        return super().__new__(cls)
 
     def __init__(
         self,
@@ -188,10 +180,14 @@ class CpuMoeExecutor:
         layer_formats: list[tuple[str, dict[str, int]]] | None = None,
         grouped_widths: tuple[int, ...] = (),
         grouped_compat: bool = False,
+        core_ids: list[int] | None = None,
+        coordinator_core: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
         from freetoken.moe.legacy_format import canonical_role
 
+        if not hasattr(_cpu_moe.CpuMoeExecutor, "shutdown"):
+            raise RuntimeError("rebuild _cpu_moe for safe executor shutdown")
         # layer_formats[l] = (format, options) of layer l; None runs every layer in cache.quant_format
         if layer_formats is None:
             layer_formats = [(cache.quant_format, {})] * int(cache.num_layers)
@@ -239,8 +235,15 @@ class CpuMoeExecutor:
         self.quant_format = ",".join(names)
         self.device = device
         self.max_tokens = int(max_tokens)
-        self.grouped_widths = ()
-        self.grouped_compat = False
+        self.grouped_widths = tuple(sorted(set(grouped_widths or (range(1, max_tokens + 1) if grouped_compat else ()))))
+        if any(width < 1 or width > max_tokens for width in self.grouped_widths):
+            raise ValueError("grouped widths exceed CPU MoE capacity")
+        self.grouped_compat = grouped_compat
+        self._pending = None
+        self._pending_captured = False
+        self._io_stream = None
+        self._io_last_stream = None
+        self._cpu_lock = threading.Lock()
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self.activation_signature = [activation, self.apply_router_weight_on_input, float(swiglu_alpha), swiglu_limit]
         # The per-layer tensors and their pointer tables must outlive the executor
@@ -294,9 +297,28 @@ class CpuMoeExecutor:
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        if core_ids is None:
+            nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        else:
+            core_ids = list(core_ids)
+            if not core_ids or len(set(core_ids)) != len(core_ids) or any(c < 0 or c >= os.cpu_count() for c in core_ids):
+                raise ValueError("CPU MoE core_ids must be distinct CPUs")
+            nthreads = len(core_ids)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
+        if coordinator_core is not None:
+            if type(coordinator_core) is not int or not 0 <= coordinator_core < (os.cpu_count() or 1):
+                raise ValueError("CPU MoE coordinator_core must name a CPU")
+            def siblings(cpu):
+                try:
+                    with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as stream:
+                        return stream.read().strip()
+                except OSError:
+                    return str(cpu)
+            if any(siblings(coordinator_core) == siblings(cpu) for cpu in core_ids):
+                raise ValueError("CPU MoE coordinator must use a separate physical core from its workers")
+            if self._flag_sync:
+                coord_core = coordinator_core
+        elif self._flag_sync and num_threads == 0 and nthreads > 2:
             # Auto sizing: give the coordinator the last physical core instead of
             # oversubscribing (workers drop from N to N-1).
             coord_core = core_ids[-1]
@@ -336,13 +358,17 @@ class CpuMoeExecutor:
         )
         self.num_threads = nthreads
         self.core_ids = core_ids
+        if self.grouped_widths:
+            if not hasattr(self._ext, "configure_grouped"):
+                raise RuntimeError("rebuild _cpu_moe for unified grouped execution")
+            self._ext.configure_grouped(self.grouped_widths, grouped_compat)
         self.isa = self._ext.isa_name()
-        self.spin_wait = _spin_wait_ok(core_ids, coord_core)
+        self.spin_wait = device.type == "cuda" and _spin_wait_ok(core_ids, coord_core)
         self._ext.set_spin_wait(self.spin_wait)
 
         spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
-        if clamp < torch.get_num_threads():
+        if device.type == "cuda" and clamp < torch.get_num_threads():
             logger.info_rank0(
                 f"torch intra-op threads: {torch.get_num_threads()} -> {clamp} "
                 "(cores reserved for the pinned CPU MoE pool)"
@@ -409,6 +435,54 @@ class CpuMoeExecutor:
         self._banks.append(table)
         self._banks.extend(layers)
         return table
+
+    @classmethod
+    def from_banks(cls, bank_sources, *, layer_formats, num_experts, **kwargs):
+        from types import SimpleNamespace
+
+        cache = SimpleNamespace(bank_sources=bank_sources, num_layers=len(layer_formats),
+                                num_experts=num_experts, quant_format=layer_formats[0][0])
+        return cls(cache, layer_formats=layer_formats, device=torch.device("cpu"), **kwargs)
+
+    def run_cpu(self, layer_id, hidden_states, topk_weights, topk_ids):
+        if self.device.type != "cpu" or any(t.device.type != "cpu" for t in (hidden_states, topk_weights, topk_ids)):
+            raise ValueError("run_cpu requires CPU executor and tensors")
+        rows = hidden_states.shape[0]
+        if not 1 <= rows <= self.max_tokens or hidden_states.shape != (rows, self.H) or (
+                topk_weights.shape != (rows, self.top_k) or topk_ids.shape != topk_weights.shape):
+            raise ValueError("CPU MoE input exceeds reserved geometry")
+        if not self._cpu_lock.acquire(blocking=False):
+            raise RuntimeError("CPU MoE executor supports one in-flight task")
+        try:
+            if self._ext is None:
+                raise RuntimeError("CPU MoE executor is closed")
+            for key, value in (("x", hidden_states), ("ids", topk_ids), ("w", topk_weights)):
+                self._io[key][:rows].copy_(value)
+            self._ext.run(layer_id, rows)
+            return self._io["y"][:rows].clone()
+        finally:
+            self._cpu_lock.release()
+
+    def validate_grouped_graph(self, stream):
+        if not self.grouped_widths or not self._graph_capture_safe:
+            raise RuntimeError("grouped CPU MoE graph requires prepared widths and a safe handshake")
+        with torch.cuda.stream(stream):
+            for width in self.grouped_widths:
+                x = torch.ones(width, self.H, device=self.device, dtype=torch.bfloat16)
+                ids = torch.zeros(width, self.top_k, device=self.device, dtype=torch.int32)
+                weights = torch.full((width, self.top_k), 1 / self.top_k, device=self.device)
+                expected = self.decode(0, x, weights, ids).clone()
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    result = self.decode(0, x, weights, ids)
+                for active in (True, False, True):
+                    ids.fill_(0 if active else -1)
+                    graph.replay()
+                    stream.synchronize()
+                    self.raise_if_unhealthy()
+                    if not torch.equal(result, expected if active else torch.zeros_like(expected)):
+                        raise RuntimeError("grouped graph handshake returned stale output")
 
     def _tables(self, **roles: list[torch.Tensor]) -> dict[str, int]:
         """Per-layer table addresses keyed by canonical bank role."""
@@ -488,13 +562,20 @@ class CpuMoeExecutor:
         ``scaled`` adds global [E, 4] fp32, each expert's (gate, up, down, 1) NVFP4 weight_scale_2."""
         from freetoken.layers.quantization.ggml_types import float_dtype, row_bytes, type_name
 
-        gate_up, down = banks["gate_up"], banks["down"]
-        H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // 2)
+        split = "gate_up" not in banks
+        gate_up, down = banks["gate" if split else "gate_up"], banks["down"]
+        H, I = int(down[rep].shape[1]), int(gate_up[rep].shape[1] // (1 if split else 2))
         for role, t, ggml_type, k in (("gate_up", gate_up[rep], gate_up_type, H), ("down", down[rep], down_type, I)):
             dtype = float_dtype(ggml_type) if float_dtype(ggml_type) is not None else torch.uint8
             if t.dtype != dtype or t.shape[-1] * t.element_size() != row_bytes(ggml_type, k):
                 raise ValueError(f"MoE layer {rep} {role} bank {tuple(t.shape)} {t.dtype} is not {type_name(ggml_type)} rows of {k} values")
         types = {"gate_up_type": gate_up_type, "down_type": down_type}
+        if split:
+            if scaled:
+                raise ValueError("split GGUF experts do not support external scales")
+            if banks["up"][rep].shape != gate_up[rep].shape or banks["up"][rep].dtype != gate_up[rep].dtype:
+                raise ValueError("GGUF gate and up banks must have identical layouts")
+            return self._tables(gate=gate_up, up=banks["up"], down=down), types, (H, I)
         if not scaled:
             return self._tables(gate_up=gate_up, down=down), types, (H, I)
         scales = banks["global"]
@@ -575,12 +656,14 @@ class CpuMoeExecutor:
         computes only the routes assigned to it. Returns an opaque handle to pass to
         :meth:`decode_sync`. The output tensor is allocated here so it stays live (and
         distinct from the interleaved GPU work) across the overlap window."""
-        if grouped:
-            raise ValueError("grouped CPU MoE requires a speculative BF16 executor")
+        if self._pending is not None:
+            raise RuntimeError("CPU MoE executor supports one in-flight submit")
         if self._ext is None:
             raise RuntimeError("CPU MoE executor is closed")
         self.raise_if_unhealthy()
         bs = hidden_states.shape[0]
+        if grouped and bs not in self.grouped_widths:
+            raise ValueError("grouped CPU MoE width must be prepared before capture")
         if bs > self.max_tokens:
             raise ValueError(f"CPU MoE decode batch {bs} exceeds the executor's max_tokens {self.max_tokens}")
         if not self._graph_capture_safe and torch.cuda.is_current_stream_capturing():
@@ -598,14 +681,26 @@ class CpuMoeExecutor:
 
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=self._act_block)
 
-        stream = torch.cuda.current_stream().cuda_stream
+        current_stream = torch.cuda.current_stream()
+        stream = current_stream.cuda_stream
+        capturing = torch.cuda.is_current_stream_capturing()
+        if self._io_last_stream is not None and self._io_stream != stream:
+            if capturing:
+                if not self._io_last_stream.query():
+                    raise RuntimeError("drain the previous CPU MoE stream before capturing on another stream")
+            else:
+                current_stream.wait_stream(self._io_last_stream)
+        self._io_stream = stream
+        self._io_last_stream = current_stream
+        self._pending_captured = capturing
         if self._kernel_io and hidden_states.dtype == torch.bfloat16:
             x = hidden_states.contiguous()
             ids = topk_ids.to(torch.int32).contiguous()
             w = topk_weights.to(torch.float32).contiguous()
             assert x.shape == (bs, self.H) and ids.shape == w.shape == (bs, self.top_k), (x.shape, ids.shape, w.shape)
+            self._pending = (bs, torch.empty_like(x), True)
             self._ext.flag_publish(stream, x.data_ptr(), ids.data_ptr(), w.data_ptr(), layer_id, bs)
-            return (bs, torch.empty_like(x), True)
+            return self._pending
 
         # D2H: ship this step's activations + routing to pinned host memory.
         io = self._io
@@ -614,27 +709,34 @@ class CpuMoeExecutor:
         io["w"][:bs].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         out = torch.empty_like(hidden_states)
+        self._pending = (bs, out, False)
         if self._flag_sync:
             # Front-end memops: reset done, then ring the doorbell with (layer, bs).
             # No kernel launched; no host-func round trip.
             self._ext.flag_signal(stream, layer_id, bs)
         else:
             self._ext.submit_with_cuda_stream(stream, layer_id, bs)
-        return (bs, out, False)
+        return self._pending
 
     def decode_sync(self, pending: tuple, add_to: torch.Tensor | None = None) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done (set by the CPU coordinator); otherwise a cudaLaunchHostFunc.
         With ``add_to``, return ``add_to`` + the CPU output; the kernel path adds in place into ``add_to``."""
+        if pending is not self._pending or pending is None:
+            raise RuntimeError("CPU MoE sync must consume its outstanding submit exactly once")
         bs, out, kernel_io = pending
         stream = torch.cuda.current_stream().cuda_stream
+        if stream != self._io_stream:
+            raise RuntimeError("CPU MoE submit and sync must use the same CUDA stream")
         if self._flag_sync:
             # Front-end WAIT(done >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
             self._ext.flag_wait(stream)
         else:
             self._ext.sync_with_cuda_stream(stream)
+        self._pending = None
+        self._pending_captured = False
         if kernel_io:
             if add_to is not None and add_to.dtype == torch.bfloat16 and add_to.is_contiguous() and add_to.shape == out.shape:
                 self._ext.flag_combine(stream, add_to.data_ptr(), bs, True)
@@ -643,6 +745,17 @@ class CpuMoeExecutor:
             return out if add_to is None else add_to + out
         out.copy_(self._io["y"][:bs], non_blocking=True)
         return out if add_to is None else add_to + out
+
+    def drain_pending(self):
+        """Finish an eager/capturing submit, or forget a discarded capture's submit."""
+        if self._pending is None:
+            return
+        if self._pending_captured and not torch.cuda.is_current_stream_capturing():
+            # Capture never submitted its doorbell; waiting for it would hang.
+            self._pending = None
+            self._pending_captured = False
+            return
+        self.decode_sync(self._pending)
 
     def _watchdog_tick(self, suspect: dict) -> None:
         """One watchdog sampling round (called every 2 s by ``_watchdog_main``).
@@ -689,14 +802,24 @@ class CpuMoeExecutor:
     def close(self) -> None:
         if self._ext is None:
             return
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        self._watchdog_stop = True
-        watchdog = getattr(self, "_watchdog", None)
-        if watchdog is not None and watchdog is not threading.current_thread():
-            watchdog.join()
-        self._ext = None
-        self._io.clear()
+        synchronized = self.device.type != "cuda"
+        try:
+            if not synchronized:
+                torch.cuda.synchronize(self.device)
+                synchronized = True
+        finally:
+            self._watchdog_stop = True
+            watchdog = getattr(self, "_watchdog", None)
+            if watchdog is not None and watchdog is not threading.current_thread():
+                watchdog.join()
+            self._ext.shutdown()
+            if not synchronized:
+                # A failed context may retain raw callback and IO pointers until process exit.
+                self._quarantined_ext = self._ext
+                _failed_gpu_executors.append(self)
+            self._ext = None
+            if synchronized:
+                self._io.clear()
 
 
 def _watchdog_main(executor_ref) -> None:

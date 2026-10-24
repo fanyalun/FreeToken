@@ -27,6 +27,83 @@ class RowExperts:
         pass
 
 
+def tiny_qwen3_target():
+    import os
+    from freetoken.engine.qwen3_cpu_target import Qwen3CpuTarget, PackedCpuWeight, CpuPackedExperts
+
+    torch.manual_seed(67)
+    config = dict(hidden_size=16, vocab_size=64, num_hidden_layers=3, num_experts_per_tok=2,
+        num_attention_heads=2, num_key_value_heads=1, head_dim=8, rms_norm_eps=1e-6,
+        layer_types=["full_attention"] * 3, rope_theta=10000,
+        eagle3_aux_layer_boundaries=(1, 2, 3), draft_feature_size=48)
+    def weight(*shape):
+        return torch.randn(shape) * 0.1
+    def packed(*shape):
+        value = weight(*shape)
+        return PackedCpuWeight(value.view(torch.uint8), 0, shape[-1])
+    weights = {"embed_tokens.weight": packed(64, 16), "lm_head.weight": packed(64, 16),
+               "norm.weight": torch.ones(16)}
+    banks = {name: [] for name in ("gate_up", "down")}
+    for layer in range(3):
+        prefix = f"layers.{layer}."
+        weights[prefix + "input_layernorm.weight"] = torch.ones(16)
+        weights[prefix + "post_attention_layernorm.weight"] = torch.ones(16)
+        for name, outputs in (("q", 16), ("k", 8), ("v", 8), ("o", 16)):
+            weights[prefix + f"self_attn.{name}_proj.weight"] = packed(outputs, 16)
+        weights[prefix + "self_attn.q_norm.weight"] = torch.ones(8)
+        weights[prefix + "self_attn.k_norm.weight"] = torch.ones(8)
+        weights[prefix + "mlp.gate.weight"] = packed(4, 16)
+        banks["gate_up"].append(weight(4, 64, 16))
+        banks["down"].append(weight(4, 16, 32))
+    experts = CpuPackedExperts(banks, [("gguf", {"gate_up_type": 0, "down_type": 0})] * 3,
+                              4, 2, sorted(os.sched_getaffinity(0))[:2], 8, True)
+    target = Qwen3CpuTarget(config, weights, experts, max_context=32, max_rows=8)
+    checkpoint = PrefixCheckpoint(0, 3, target.keys[:, :0].clone(), target.values[:, :0].clone(),
+                                  torch.empty(0), torch.empty(0, dtype=torch.bfloat16))
+    target.initialize(checkpoint, 7)
+    return target, checkpoint
+
+
+@pytest.mark.parametrize("reject_at", [0, 2, None])
+def test_qwen3_full_attention_auxiliary_features_and_commit_equal_serial(reject_at):
+    target, checkpoint = tiny_qwen3_target()
+    try:
+        reference = serial(target, 7)
+        candidates = [r.tokens[0] for r in reference[:5]]
+        if reject_at is not None:
+            candidates[reject_at] = (candidates[reject_at] + 1) % 64
+        count = 6 if reject_at is None else reject_at + 1
+        target.initialize(checkpoint, 7)
+        actual = target.verify(VerifyJob(7, 0, 0, 3, tuple(candidates), 20))
+        assert actual.tokens == tuple(r.tokens[0] for r in reference[:count])
+        assert actual.hidden.shape == (count, 48)
+        assert actual.target_hidden.shape == (count, 16)
+        assert bitwise_equal(actual.hidden, torch.cat([r.hidden for r in reference[:count]]))
+        assert bitwise_equal(actual.checkpoint.keys, torch.cat([r.checkpoint.keys for r in reference[:count]], 1))
+        assert actual.checkpoint.recurrent.numel() == actual.checkpoint.conv.numel() == 0
+        state = target.state
+        following = target.verify(VerifyJob(7, 1, state.length, state.anchor, (), 20))
+        assert following.tokens == reference[count].tokens
+        assert bitwise_equal(following.hidden, reference[count].hidden)
+    finally:
+        target.close()
+
+
+def test_qwen3_cpu_rmsnorm_and_rope_use_ordinary_full_head_semantics():
+    target, _ = tiny_qwen3_target()
+    try:
+        x = torch.arange(16, dtype=torch.float32).view(2, 8).bfloat16() / 8
+        norm = target._norm(x, torch.ones(8), 1e-6)
+        expected = (x.float() / torch.sqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)).bfloat16()
+        assert torch.equal(norm, expected)
+        angles = 3 * 10000 ** (-torch.arange(0, 8, 2).float() / 8)
+        rotation = torch.cat((-x[:, 4:], x[:, :4]), -1).float()
+        expected_rope = (x.float() * angles.cos().repeat(2) + rotation * angles.sin().repeat(2)).bfloat16()
+        assert torch.equal(target._rope(x, 3), expected_rope)
+    finally:
+        target.close()
+
+
 def tiny_target(backend="legacy"):
     components = (("attention", "dense", "head", "gdn", "experts") if backend == "ggml_v2_all" else None)
     kernel_profile = "ggml_v2" if backend.startswith("ggml_v2") else "v1"

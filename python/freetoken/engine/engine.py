@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import collections
 import contextlib
 import errno
@@ -381,16 +383,20 @@ class Engine:
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        if config.speculative_mode == "cpu_async":
+            from .cpu_async import configure_cpu_resources
+            configure_cpu_resources(config)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        self.draft_method = None
         if config.speculative_mtp_depth:
+            from .speculative_config import resolve_draft_method
             from freetoken.kvcache.qwen_mtp_pool import QwenMTPKVCache
+            self.draft_method = resolve_draft_method(config)
             if config.active_encoders or config.max_running_req != 1 or config.attention_backend != "triton":
-                raise ValueError("native MTP requires text-only, max_running_req=1 and triton attention")
-            if config.model_config.model_type not in ("qwen3_5_moe", "qwen3_5_moe_text"):
-                raise ValueError("native MTP requires Qwen3.5/3.6 MoE")
+                raise ValueError("speculative decoding requires text-only, max_running_req=1 and triton attention")
             if config.speculative_three_level and (config.moe_strategy not in ("offload", "hybrid", "fused") or config.moe_cpu_layers):
                 raise ValueError("three-level decoding requires resident or GPU-offload experts in every layer")
             if config.speculative_three_level:
@@ -419,6 +425,9 @@ class Engine:
             torch.cuda.set_per_process_memory_fraction(free_min / total, self.device)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
+        if config.speculative_mode:
+            from .speculative_config import validate_fused_capacity
+            validate_fused_capacity(config, int(config.memory_ratio * init_free_memory))
 
         # ======================= Model initialization ========================
         set_rope_device(self.device)
@@ -426,14 +435,10 @@ class Engine:
             self.model = create_model(config.model_config)
         self._load_weights(config)
         self.mtp = None
+        self.draft_feature_size = config.model_config.hidden_size
         if config.speculative_mtp_depth:
-            from freetoken.models.qwen3_5_moe.mtp import QwenNativeMTP
-            with torch.device("meta"), torch_dtype(torch.bfloat16):
-                self.mtp = QwenNativeMTP(
-                    config.model_config, self.model.model.embed_tokens,
-                    self.model.lm_head, config.model_config.num_layers,
-                )
-            self.mtp.load_checkpoint(config.model_path, config.model_config, self.device)
+            from .draft_adapter import create_draft
+            self.mtp = create_draft(self, config)
             finalize_quant(self.mtp)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
@@ -463,7 +468,9 @@ class Engine:
             with _weight_load_context():
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
-            self._init_offload_moe_cache(config)
+            from freetoken.moe.host_banks import shared_bank_allocations
+            with shared_bank_allocations(config.speculative_mode == "cpu_async"):
+                self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -592,19 +599,33 @@ class Engine:
 
     def generate_speculative(self, input_ids, *, max_tokens: int, eos_ids=(), cancel=None, prompt_chunk_size=None):
         if self.speculative_runner is None:
-            raise ValueError("enable positive speculative_mtp_depth for native MTP generation")
+            raise ValueError("enable speculative_mode for speculative generation")
+        if self.config.speculative_mode == "cpu_async":
+            from .cpu_async import generate_cpu_async
+            return generate_cpu_async(self, input_ids, max_tokens=max_tokens, eos_ids=tuple(eos_ids),
+                                      cancel=cancel, prompt_chunk_size=prompt_chunk_size)
         return self.speculative_runner.generate(
             input_ids, max_tokens=max_tokens, eos_ids=tuple(eos_ids),
             cancel=cancel, prompt_chunk_size=prompt_chunk_size,
         )
 
     def _measure_baseline_sd_peak(self):
+        if (getattr(self, "cpu_async_runtime", None) is not None
+                and self.cpu_async_runtime.runner is not self.speculative_runner):
+            self.cpu_async_runtime.close()
+            self.cpu_async_runtime = None
+            gc.collect()
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         if is_baseline_sd(self.config):
             self._prepare_baseline_hybrid()
         self.speculative_runner.prepare_runtime()
+        if self.config.speculative_mode == "cpu_async":
+            from .cpu_async import CpuAsyncRuntime
+            if getattr(self, "cpu_async_runtime", None) is None:
+                self.cpu_async_runtime = CpuAsyncRuntime(self)
+            self.cpu_async_runtime.window.prepare_runtime()
         allocated = torch.cuda.memory_allocated(self.device) - self._baseline_allocated
         # mem_get_info also accounts for runtime allocations outside the PyTorch allocator.
         torch.cuda.empty_cache()
@@ -626,11 +647,22 @@ class Engine:
         from freetoken.moe.baseline_hybrid import BaselineHybridPlanner, load_or_calibrate
         widths = tuple(range(1, min(config.speculative_mtp_depth + 1,
                                    config.speculative_max_output_tokens) + 1))
-        profile = load_or_calibrate(cache, self.speculative_hybrid_layer, self.cpu_moe_executor,
-                                   widths, eager=config.cuda_graph_max_bs == 0,
-                                   profile_path=profile_path)
-        cache.baseline_hybrid = BaselineHybridPlanner(cache, profile, config.moe_hybrid_max_fetch)
-        cache.baseline_hybrid.profile_path = profile_path
+        layouts = {}
+        for layer in iter_offload_moe_layers(self.model):
+            layouts.setdefault(cache.layer_layout[layer.layer_id], layer)
+        planner = None
+        for layout, layer in layouts.items():
+            path = profile_path
+            if path is not None and len(layouts) > 1:
+                path = Path(path)
+                path = str(path.with_name(f"{path.stem}_layout_{layout}{path.suffix}"))
+            profile = load_or_calibrate(cache, layer, self.cpu_moe_executor, widths,
+                                       eager=config.cuda_graph_max_bs == 0, profile_path=path)
+            if planner is None:
+                planner = BaselineHybridPlanner(cache, profile, config.moe_hybrid_max_fetch)
+            planner.add_profile(layout, profile)
+        planner.profile_path = profile_path
+        cache.baseline_hybrid = planner
 
     def _initialize_baseline_sd_budget(self):
         config = self.config
@@ -641,9 +673,12 @@ class Engine:
             slot_bytes += sum(t.element_size() for t in
                               (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
         minimum = config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1) if cache else 0
+        if cache is not None:
+            minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
         maximum = min(cache.num_layers * cache.num_experts, cache.max_slots or cache.num_layers * cache.num_experts) if cache else 0
         peak = self._measure_baseline_sd_peak()
-        self._baseline_sd_initial_state_bytes = state_pool_bytes(config, self.linear_state_pool.num_slots)
+        self._baseline_sd_initial_state_bytes = state_pool_bytes(
+            config, self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         # BF16 fused routing allocates its worst-case padded arrays from shape, not route IDs.
         routing_reserve = 0
         plan = plan_measured_memory(
@@ -651,6 +686,7 @@ class Engine:
             budget_bytes=int(config.memory_ratio * self._baseline_free), measured_peak_bytes=peak,
             initial_slots=slots, expert_slot_bytes=slot_bytes, minimum_slots=minimum,
             maximum_slots=maximum, automatic=config.moe_cache_auto, routing_reserve_bytes=routing_reserve,
+            cache_bytes_for_slots=self._speculative_cache_bytes if cache is not None else None,
         )
         self.baseline_sd_memory_plan = plan
         self._sd_sizing = config.moe_cache_auto
@@ -673,6 +709,7 @@ class Engine:
             if getattr(self, "_sd_sizing", False) and cache is not None:
                 from dataclasses import replace
                 minimum = self.config.model_config.num_experts * (2 if self.config.moe_prefill_overlap else 1)
+                minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
                 overflow = peak + plan.routing_reserve_bytes - plan.budget_bytes
                 reduction = max(1, (overflow + plan.expert_slot_bytes - 1) // plan.expert_slot_bytes)
                 slots = max(minimum, cache.cache_size - reduction)
@@ -893,8 +930,8 @@ class Engine:
         locked_fetch = staging is not None
         layer_tags = locked_pool_tags(banks.layer_tags, cpu_layer_ids, num_moe_layers) if locked_fetch else banks.layer_tags
         self._moe_pool_groups = group_layers(config.moe_cache_scope, bank_layouts(banks.sources, layer_tags), self._moe_layer_slot_bytes)
-        if is_native_sd(config) and (len(self._moe_pool_groups) != 1 or locked_fetch):
-            raise ValueError("native MTP requires one pinned expert slot pool")
+        if is_native_sd(config) and locked_fetch:
+            raise ValueError("speculative decoding requires pinned expert banks")
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
@@ -915,7 +952,8 @@ class Engine:
         pools = self._moe_pools(1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto and is_native_sd(config):
-            size = config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1)
+            size = max(sum(p.min_num_slots for p in pools),
+                       config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1))
             if size > size_cap:
                 raise ValueError("baseline SD minimum expert buffers exceed kernel slot limit")
             object.__setattr__(config, "moe_cache_size", size)
@@ -1001,6 +1039,7 @@ class Engine:
         if locked_fetch:
             cache.locked_hybrid = cpu_layer_ids
         cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency, layer_tags=layer_tags, row_tail_bytes=banks.row_tail_bytes)
+        object.__setattr__(config, "moe_prefill_overlap", cache.prefill_overlap)
         cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
@@ -1022,6 +1061,10 @@ class Engine:
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
         if decode_target == "cpu" and not cpu_layer_ids:
+            decode_target = "gpu"
+        if (decode_target == "hybrid" and is_baseline_sd(config)
+                and not getattr(config, "_speculative_legacy", True)
+                and "verify" not in config.speculative_hybrid_phases):
             decode_target = "gpu"
         # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
@@ -1056,6 +1099,16 @@ class Engine:
 
     def _moe_pool_bytes(self, pool_sizes: list[int]) -> int:
         return sum(s * self._moe_layer_slot_bytes[g[0]] for g, s in zip(self._moe_pool_groups, pool_sizes))
+
+    def _speculative_cache_bytes(self, slots: int) -> int:
+        cache = self.moe_offload_cache
+        if cache is None:
+            return 0
+        sizes = split_slots(slots, self._moe_pools(1), self._moe_expert_counts)
+        banks = sum(cache._bank_bytes(k, sizes) for k in range(len(cache.banks)))
+        metadata = slots * sum(t.element_size() for t in
+                               (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
+        return banks + metadata
 
     def _moe_pools(self, batch: int) -> list:
         """The slot pools, each with room for the routed experts of ``batch`` decode tokens."""
@@ -1159,7 +1212,7 @@ class Engine:
         if grouped_compat:
             grouped_widths = tuple(range(1, min(config.speculative_mtp_depth + 1,
                                                config.speculative_max_output_tokens) + 1))
-        if config.moe_strategy == "hybrid" and config.speculative_three_level:
+        if config.moe_strategy == "hybrid" and (config.speculative_three_level or config.speculative_mode == "cpu_async"):
             maximum = config.speculative_submit_tokens or config.speculative_max_loops * (config.speculative_mtp_depth + 1) + 1
             maximum = min(maximum, config.speculative_max_loops * (config.speculative_mtp_depth + 1) + 1,
                           config.speculative_max_output_tokens)
@@ -1181,6 +1234,8 @@ class Engine:
             layer_formats=layer_formats,
             grouped_widths=grouped_widths,
             grouped_compat=grouped_compat,
+            core_ids=config.moe_cpu_core_ids,
+            coordinator_core=getattr(config, "_cpu_moe_coordinator_core", None),
         )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
@@ -1245,6 +1300,17 @@ class Engine:
             )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)
         self.kv_cache.attach_page_table(self.page_table)
+
+    def _invalidate_speculative_runtime(self):
+        runtime = getattr(self, "cpu_async_runtime", None)
+        runner = self.speculative_runner
+        self.cpu_async_runtime = self.speculative_runner = None
+        try:
+            if runtime is not None:
+                runtime.close()
+        finally:
+            if runner is not None:
+                runner.invalidate()
 
     @torch.inference_mode()
     def rebuild_runtime_cache(
@@ -1340,7 +1406,8 @@ class Engine:
             extra = (target_pages - plan.kv_pages) * per_page
             extra += state_pool_bytes(config, target_mamba) - self._baseline_sd_initial_state_bytes
             try:
-                plan.validate(target_moe, extra)
+                exact_bytes = self._speculative_cache_bytes(target_moe) if plan.initial_cache_bytes else None
+                plan.validate(target_moe, extra, cache_bytes=exact_bytes)
             except ValueError as exc:
                 raise CacheRebuildRejected(str(exc)) from exc
         self.kv_cache.validate_rebuild(
@@ -1367,10 +1434,9 @@ class Engine:
         # pools start being freed. A failure BEFORE this flag flips leaves the engine serving
         # untouched (no rollback needed); after it, only a rebuild restores service.
         self.rebuild_teardown_started = True
-        if runner is not None:
-            runner.invalidate()
-            self.speculative_runner = None
-            runner = None
+        self._invalidate_speculative_runtime()
+        runner = None
+        gc.collect()
         # 1. Tear down CUDA graphs + backend capture scratch (free-before-alloc).
         self.attn_backend.reset_capture()
         self.graph_runner.destroy_cuda_graphs()
@@ -1384,6 +1450,7 @@ class Engine:
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             self.moe_offload_cache.rebuild(moe_cache_size, moe_pool_sizes)
+            object.__setattr__(config, "moe_prefill_overlap", self.moe_offload_cache.prefill_overlap)
             if is_native_sd(config):
                 object.__setattr__(config, "moe_cache_size", moe_cache_size)
         if num_pages is not None:
@@ -1511,14 +1578,16 @@ class Engine:
         )
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
-        if self.speculative_runner is not None:
-            self.speculative_runner.invalidate()
-        self.graph_runner.destroy_cuda_graphs()
-        if self.cpu_moe_executor is not None:
-            self.cpu_moe_executor.close()
-        torch.distributed.destroy_process_group()
-        destroy_distributed()
+        # A failed GPU synchronization must still release CPU workers and shared readers.
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(destroy_distributed)
+            if torch.distributed.is_initialized():
+                cleanup.callback(torch.distributed.destroy_process_group)
+            if self.cpu_moe_executor is not None:
+                cleanup.callback(self.cpu_moe_executor.close)
+            cleanup.callback(self.graph_runner.destroy_cuda_graphs)
+            cleanup.callback(self._invalidate_speculative_runtime)
+            torch.cuda.synchronize(self.device)
 
 
 def _profile_gpu(index: "int | None" = None) -> Tuple[str | None, str | None]:
@@ -2024,7 +2093,7 @@ def _adjust_config(config: EngineConfig):
                 )
             override("cache_type", "swa_radix")
 
-    if has_linear_attention:
+    if has_linear_attention or is_native_sd(config):
         override(
             "cache_type",
             "naive" if getattr(config, "speculative_mtp_depth", 0) else _resolve_cache_type(True, getattr(config, "cache_type", "radix")),

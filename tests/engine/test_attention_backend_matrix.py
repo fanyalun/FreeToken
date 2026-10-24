@@ -406,3 +406,17 @@ def test_linear_attention_defaults_to_hybrid_radix():
 
     assert _resolve_cache_type(True, "radix") == "hybrid_radix"
     assert _resolve_cache_type(True, "naive") == "naive"
+    assert _resolve_cache_type(False, "radix") == "radix"
+    assert _resolve_cache_type(False, "naive") == "naive"
+
+
+@pytest.mark.parametrize("kind", ["full", "linear_hybrid"])
+def test_speculative_target_disables_cross_request_prefix_reuse(monkeypatch, kind):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    config = _config(kind, speculative_mode="sd", speculative_max_input_tokens=64,
+                     speculative_max_output_tokens=32)
+    _adjust_config(config)
+    assert config.cache_type == "naive"
+    assert config.max_seq_len_override == 96 and config.num_page_override == 96

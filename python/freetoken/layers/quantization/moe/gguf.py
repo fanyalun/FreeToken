@@ -102,7 +102,7 @@ class GgmlMoEKernel(MoEKernel):
         if not is_quantized(gate_up_type) and not is_quantized(down_type):
             return self._apply_float(layer, x, topk_weights, topk_ids, view, gate_up_type, is_prefill=is_prefill)
         assert not layer.apply_router_weight_on_input, "GGUF experts apply the router weights on the output"
-        ids = topk_ids.to(torch.int32)
+        ids = torch.where(topk_weights != 0, topk_ids, -1).to(torch.int32)
         gate_up = view.tensors["gate_up"]
         # a float half runs on the bf16 fused MoE's grouped GEMM, with its config for this layer's shape
         config = None
@@ -114,7 +114,7 @@ class GgmlMoEKernel(MoEKernel):
 
         def mul_mat_id(w: torch.Tensor, ggml_type: int, a: torch.Tensor) -> torch.Tensor:
             if is_quantized(ggml_type):
-                return ggml.mul_mat_id(w, ggml_type, a, ids)
+                return ggml.mul_mat_id(w, ggml_type, a, ids, skip_invalid_routes=True)
             return float_mul_mat_id(w, a, ids, topk_weights, config)
 
         # llama.cpp's build_moe_ffn: each NVFP4 GEMM result times the expert's weight_scale_2, gate and up before the glu, down before the routing weight
@@ -125,7 +125,7 @@ class GgmlMoEKernel(MoEKernel):
         small = x.shape[0] <= min(ggml.mmvq_max_tokens(t) for t in (gate_up_type, down_type) if is_quantized(t))
         if glu is not None and small and is_quantized(gate_up_type):
             gu = (None, None) if gate_up_scales is None else (gate_up_scales[:, 0], gate_up_scales[:, 1])
-            inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu)
+            inter = ggml.mul_mat_id_glu(gate_up, gate_up_type, x, ids, *glu, *gu, skip_invalid_routes=True)
         else:
             h = mul_mat_id(gate_up, gate_up_type, x)
             t, k, two_i = h.shape
@@ -135,7 +135,8 @@ class GgmlMoEKernel(MoEKernel):
             gated_act_and_mul(layer.activation, h.view(-1, two_i), inter.view(-1, two_i // 2), alpha=float(layer.alpha), limit=limit_or_inf(layer))
             del h  # free the gate_up output before the down GEMM allocates its own
         if down_scales is not None and x.shape[0] <= ggml.mmvq_max_tokens(down_type):
-            y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2])
+            y = ggml.mul_mat_id(view.tensors["down"], down_type, inter, ids, scale=down_scales[:, 2],
+                                skip_invalid_routes=True)
         else:
             y = mul_mat_id(view.tensors["down"], down_type, inter)
             if down_scales is not None:

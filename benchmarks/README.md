@@ -3,6 +3,12 @@
 Run from the repo root with `PYTHONPATH=python:.`, pinned to one GPU
 (`CUDA_VISIBLE_DEVICES=0`). Each script's `--help` / docstring has the details.
 
+**`bench_speculative_modes.py`** runs the single-request `sd`, `three_level_gpu`
+and `cpu_async` modes independently of the `offload`, `hybrid` and `fused` MoE
+backends. It supports native Qwen3.6 MTP and Qwen3 GGUF with EAGLE3. See
+[speculative modes](../docs/speculative_modes.md) for capacity limits, full Graph
+coverage, CPU state ownership and persistent result-directory examples.
+
 **`bench_decode_moe.py`** — bs=1 decode tok/s of a served MoE model. Spawns `ft serve`
 per backend and times token arrivals over streamed `/v1/chat/completions`, so numbers
 include the full serving path. AIME-25 prompt, checkpoint-recommended sampling.

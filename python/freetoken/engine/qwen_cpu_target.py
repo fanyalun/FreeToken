@@ -55,6 +55,7 @@ class CpuVerifyResult:
     checkpoint: PrefixCheckpoint
     hidden: torch.Tensor
     predictions: torch.Tensor
+    target_hidden: torch.Tensor | None = None
 
 
 def _rows(fn, x):
@@ -130,6 +131,7 @@ class QwenCpuTarget:
                                                 or _cpu_moe.target_isa() != "avx512f"):
                 raise RuntimeError("ggml_v2 requires the rebuilt extension and AVX-512F")
         self.config, self.weights, self.experts = config, weights, experts
+        self.expert_storage = "private_bf16"
         for component, entry in (("dense", "target_linear_v2"), ("head", "target_linear_v2"),
                                  ("gdn", "target_gdn_v2")):
             if component in selected and not hasattr(self.native, entry):
@@ -228,6 +230,8 @@ class QwenCpuTarget:
                         for w in self.weights.values() if isinstance(w, PackedProjection)),
                     packed_experts=bool(getattr(self.experts, "packed", False)),
                     expert_schedule=getattr(self.experts, "schedule", "tile"),
+                    expert_storage=self.expert_storage,
+                    dense_storage="private_fp32_or_packed_fp32",
                     expert_worker_nodes=getattr(self.experts, "worker_nodes", []),
                     components=dict(dense=bool(self.native), gdn=bool(self.native),
                                     attention=bool(self.native), streaming_head=bool(self.native)))
@@ -264,8 +268,15 @@ class QwenCpuTarget:
 
     @classmethod
     def from_checkpoint(cls, path, *, core_ids, max_context=4096, max_rows=33, grouped=True, backend="optimized",
-                        kernel_profile="v1", components=None):
+                        kernel_profile="v1", components=None, shared_banks=None, config_overrides=None):
         from safetensors import safe_open
+
+        if str(path).endswith(".gguf") or (Path(path).is_dir() and any(Path(path).glob("*.gguf"))):
+            from .qwen3_cpu_target import Qwen3CpuTarget
+
+            return Qwen3CpuTarget.from_checkpoint(path, core_ids=core_ids, max_context=max_context,
+                max_rows=max_rows, grouped=grouped, backend=backend, shared_banks=shared_banks,
+                config_overrides=config_overrides)
 
         components = _kernel_components(backend, kernel_profile, components)
         path = Path(path)
@@ -283,6 +294,8 @@ class QwenCpuTarget:
                     if not (name.startswith("model.language_model.") or name == "lm_head.weight"):
                         continue
                     key = name.removeprefix("model.language_model.")
+                    if ".experts." in key and shared_banks is not None:
+                        continue
                     tensor = reader.get_tensor(name)
                     if ".experts." in key:
                         layer = int(key.split(".")[1])
@@ -293,20 +306,28 @@ class QwenCpuTarget:
                             if components and "experts" in components else tensor.clone().contiguous())
                     else:
                         weights[key] = tensor.float().contiguous()
+        if shared_banks is not None:
+            if "experts" in components:
+                raise ValueError("packed v2 CPU experts cannot repack shared banks")
+            if shared_banks["layer_formats"] != [("bf16", {})] * 40:
+                raise ValueError("Qwen3.6 CPU Target requires BF16 shared expert banks")
+            from freetoken.moe.legacy_format import canonical_role
+
+            sources = {canonical_role(role): tensors for role, tensors in shared_banks["bank_sources"].items()}
+            gate_up, down = sources["gate_up"], sources["down"]
         experts = CpuTargetExperts(gate_up, down, 8, core_ids, max_rows, grouped=grouped, backend=backend,
                                    packed=bool(components and "experts" in components),
                                    schedule=("expert_numa" if components and "expert_numa" in components else
                                              "expert" if components and "expert_reuse" in components else "tile"))
-        return cls(config, weights, experts, max_context=max_context, max_rows=max_rows, backend=backend,
-                   kernel_profile=kernel_profile, components=components)
+        target = cls(config, weights, experts, max_context=max_context, max_rows=max_rows, backend=backend,
+                     kernel_profile=kernel_profile, components=components)
+        if shared_banks is not None:
+            target.expert_storage = "shared_memfd" if "_shared_mappings" in shared_banks else "shared_cpu_tensor"
+        return target
 
     def initialize(self, checkpoint, request_epoch=0):
-        c = self.config
-        h, k, v = c["linear_num_value_heads"], c["linear_key_head_dim"], c["linear_value_head_dim"]
-        channels = 2 * c["linear_num_key_heads"] * k + h * v
-        shapes = ((len(self.attention_layers), checkpoint.length, c["num_key_value_heads"], c["head_dim"]),
-                  (len(self.linear_layers), h, v, k),
-                  (len(self.linear_layers), channels, c["linear_conv_kernel_dim"] - 1))
+        spec = prefix_shapes(self.config, checkpoint.length)
+        shapes = tuple(spec[name][0] for name in ("keys", "recurrent", "conv"))
         if not 0 <= checkpoint.length <= self.max_context or checkpoint.keys.shape != shapes[0] or (
                 checkpoint.values.shape != shapes[0] or checkpoint.recurrent.shape != shapes[1]
                 or checkpoint.conv.shape != shapes[2]):
@@ -382,6 +403,9 @@ class QwenCpuTarget:
 
     def _weight(self, layer, suffix):
         return self.weights[f"layers.{layer}.{suffix}"]
+
+    def _embed(self, ids):
+        return F.embedding(ids, self.weights["embed_tokens.weight"]).to(torch.bfloat16)
 
     def snapshot(self):
         s = self.state
@@ -542,7 +566,8 @@ class QwenCpuTarget:
             barrier_seconds = time.perf_counter() - barrier_started
             self.prefix_barrier_pending = False
         ids = torch.tensor((job.anchor, *job.candidates), dtype=torch.long)
-        x = F.embedding(ids, self.weights["embed_tokens.weight"]).to(torch.bfloat16)
+        x = self._embed(ids)
+        auxiliary = []
         replay, windows = [], []
         li = ai = 0
         for layer, kind in enumerate(self.layer_types):
@@ -559,7 +584,10 @@ class QwenCpuTarget:
             x = x + mixed
             norm = self._norm(x, self._weight(layer, "post_attention_layernorm.weight"), self.config["rms_norm_eps"])
             x = x + self._moe(layer, norm)
+            if layer + 1 in getattr(self, "aux_boundaries", ()):
+                auxiliary.append(x)
         hidden = self._norm(x, self.weights["norm.weight"], self.config["rms_norm_eps"])
+        features = torch.cat(auxiliary, -1) if auxiliary else hidden
         predictions = self._predict(hidden)
         accepted = 0
         for candidate, prediction in zip(job.candidates, predictions.tolist()):
@@ -602,7 +630,7 @@ class QwenCpuTarget:
                 item["wait_seconds"] + item["import_seconds"] for item in self.prefix_timings[imports_before:]),
             commit_seconds=time.perf_counter() - commit_started)
         return CpuVerifyResult(job.request_epoch, job.block_id, old, accepted, count, tuple(tokens),
-                               terminal, delta, hidden[:count].clone(), predictions)
+                               terminal, delta, features[:count].clone(), predictions, hidden[:count].clone())
 
     def close(self):
         self.release_prefix()

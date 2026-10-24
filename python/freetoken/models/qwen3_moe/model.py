@@ -37,6 +37,10 @@ class Qwen3DecoderLayer(BaseOP):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x, residual = self.input_layernorm.forward(x, residual)
         x = self.self_attn.forward(x)
+        prefix = getattr(get_global_ctx().batch, "prefix_export", None)
+        if prefix is not None:
+            transfer, start, end, final = prefix
+            transfer.enqueue_layer(self._layer_id, start, end, final)
         x, residual = self.post_attention_layernorm.forward(x, residual)
         x = self.mlp.forward(x)
         return x, residual
@@ -60,12 +64,31 @@ class Qwen3Model(BaseOP):
             size=config.hidden_size,
             eps=config.rms_norm_eps,
         )
+        self._aux_boundaries = ()
+        self._last_aux_hidden = None
+
+    def enable_aux_hidden_capture(self, boundaries):
+        boundaries = tuple(boundaries)
+        if len(set(boundaries)) != len(boundaries) or any(
+            not 0 < n <= len(self.layers.op_list) for n in boundaries
+        ):
+            raise ValueError("auxiliary hidden boundaries must name distinct decoder outputs")
+        self._aux_boundaries = boundaries
+
+    @property
+    def last_aux_hidden(self):
+        return self._last_aux_hidden
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        features = {}
+        for boundary, layer in enumerate(self.layers.op_list, 1):
             x, residual = layer.forward(x, residual)
+            if boundary in self._aux_boundaries:
+                features[boundary] = x + residual if residual is not None else x
+        self._last_aux_hidden = (torch.cat([features[n] for n in self._aux_boundaries], dim=-1)
+                                 if self._aux_boundaries else None)
         return self.norm.forward(x, residual)[0]
 
 

@@ -81,6 +81,31 @@ def worker():
     return w
 
 
+@pytest.mark.parametrize("broken_pipe", [False, True])
+def test_close_stops_child_after_reader_failure(monkeypatch, broken_pipe):
+    events = []
+    w = worker()
+    def fail_reader():
+        events.append("reader")
+        raise RuntimeError("failed CUDA reader")
+    def send(message):
+        events.append(message["kind"])
+        if broken_pipe:
+            raise BrokenPipeError()
+    w.readers[0] = SimpleNamespace(synchronize=fail_reader)
+    w.pipe = SimpleNamespace(send=send, close=lambda: events.append("pipe_close"))
+    w.process = SimpleNamespace(is_alive=lambda: True,
+        join=lambda timeout: events.append("join"), terminate=lambda: events.append("terminate"))
+    retained = []
+    monkeypatch.setattr(qwen_cpu_worker, "_failed_reader_workers", retained)
+    with pytest.raises(RuntimeError, match="failed CUDA reader"):
+        w.close()
+    assert events == ["reader", "close", "join", "terminate", "join", "pipe_close"]
+    assert retained == [w] and w.closed
+    w.close()
+    assert len(events) == 6
+
+
 def publish(w, slot=0, block=0, epoch=3):
     w.pipe.messages.append(dict(kind="result", slot=slot, generation=w.generations[slot],
         request_epoch=epoch, block_id=block, start=4, accepted=1, input_count=2,

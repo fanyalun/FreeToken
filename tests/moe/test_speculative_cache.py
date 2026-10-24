@@ -54,6 +54,21 @@ def test_pending_copy_and_reader_block_slot_reuse():
         cache.observe(3, 0, 0, [[2]], 8)
 
 
+def test_pool_local_leases_cannot_evict_another_pools_pending_or_ready_slot():
+    cache = ExpertLeases([4, 5, 0, 1], pool_sizes=[2, 2], pool_of_layer=[1, 0], num_experts=4)
+    cache.begin(1)
+    pending = Event()
+    cache.pending[2] = pending
+    cache.readers[3] = Event()
+    with pytest.raises(NoEvictableSlot):
+        cache.allocate(2)
+    assert cache.allocate(6) == (0, True)
+    assert cache.local_slot(6) == 0 and cache.local_slot(0) == 0
+    pending.done = True
+    assert cache.allocate(2) == (2, True)
+    assert cache.owners == [6, 5, 2, 1]
+
+
 def test_layer_release_preserves_other_layers_and_window_generation():
     cache = ExpertLeases([-1] * 4)
     cache.begin(11)
@@ -107,7 +122,7 @@ def toy_cache(device, layers=2, experts=16, slots=128):
     source = [torch.arange(experts, dtype=torch.float32).reshape(experts, 1).add_(li * experts).pin_memory()
               for li in range(layers)]
     bank = torch.empty(slots, 1, device=device)
-    return SimpleNamespace(
+    cache = SimpleNamespace(
         device=device, quant_format="bf16", cpu_layer_ids=set(), _unpinned_layers=set(),
         num_layers=layers, num_experts=experts, cache_size=slots, decode_target="gpu",
         banks=[(source, bank)], id_of_slot=torch.full((slots,), -1, device=device, dtype=torch.int32),
@@ -116,6 +131,12 @@ def toy_cache(device, layers=2, experts=16, slots=128):
         expert_recency=torch.full((layers, experts), -1, device=device, dtype=torch.int64),
         bank_views=lambda: (bank,), alphas_for_slots=lambda _: None,
     )
+    cache.pool_of_layer, cache.pool_sizes, cache.pool_bases = [0] * layers, [slots], [0]
+    cache.layer_layout = [0] * layers
+    cache._pool_id_of_slot, cache._pool_usage = [cache.id_of_slot], [cache.usage]
+    cache._pool_bank_views = [(bank,)]
+    cache.pool_bank_views = lambda _: (bank,)
+    return cache
 
 
 def toy_layer(li):
@@ -123,6 +144,157 @@ def toy_layer(li):
         values = kwargs["views"][0][slots.long(), 0]
         return hidden + (values * weights).sum(-1, keepdim=True)
     return SimpleNamespace(layer_id=li, _expert_gemm=gemm)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pool_mode", ["unified", "per_layer"])
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("backend", ["offload", "hybrid"])
+def test_tiled_multi_pool_routes_preserve_weights_pending_and_full_layer_history(pool_mode, quantized, graph, backend, request):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization.moe.base import MoEConfig
+    from freetoken.layers.quantization.moe.gguf import GGUFMoEMethod
+    from freetoken.layers.quantization.scheme import gguf_scheme
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+    from freetoken.third_party.gguf import GGMLQuantizationType, quants
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    torch.manual_seed(601)
+    device, stream = torch.device("cuda"), torch.cuda.Stream()
+    layers, experts, hidden, intermediate, top_k = 4, 16, 256, 256, 8
+    methods, ops, dense = [], [], []
+    sources = {"gate_up": [], "down": []}
+    tags = []
+    for li in range(layers):
+        op = OffloadMoELayer(li, experts, top_k, hidden, intermediate)
+        types = (12, 12 if li % 2 == 0 else 14)
+        if quantized:
+            op.quant_method = GGUFMoEMethod(MoEConfig.from_layer(op, gguf_scheme((types[0], types[0], types[1]))))
+        matrices = []
+        for name, rows, kind in (("gate_up", 2 * intermediate, types[0]), ("down", hidden, types[1])):
+            if quantized:
+                row_bytes = 144 if kind == 12 else 210
+                values = torch.randint(0, 256, (experts, rows, row_bytes), dtype=torch.uint8)
+                scale = torch.tensor([0.001], dtype=torch.float16).view(torch.uint8)
+                if kind == 12:
+                    values[..., :2] = scale
+                    values[..., 2:4] = scale
+                else:
+                    values[..., -2:] = scale
+                matrix = torch.from_numpy(quants.dequantize(values.numpy(), GGMLQuantizationType(kind)))
+            else:
+                values = (torch.randn(experts, rows, hidden) / 32).to(torch.bfloat16)
+                matrix = values.float()
+            sources[name].append(values.pin_memory())
+            matrices.append(matrix)
+        tags.append(types if quantized else "bf16")
+        dense.append(matrices)
+        methods.append(op.quant_method)
+        ops.append(op)
+    if pool_mode == "per_layer":
+        pools, sizes = [2, 0, 3, 1], [8] * 4
+    elif quantized:
+        pools, sizes = [1, 0, 1, 0], [12, 12]
+    else:
+        pools, sizes = [0] * 4, [16]
+    cache = OffloadMoeCache(layers, experts, sum(sizes), device,
+        quant_format="gguf" if quantized else "bf16", layer_layouts=[m.layout() for m in methods],
+        pool_of_layer=pools, pool_sizes=sizes, decode_target="hybrid" if backend == "hybrid" else "gpu")
+    cache.set_bank_sources(sources, layer_tags=tags)
+    if backend == "hybrid":
+        from freetoken.moe.cpu_executor import CpuMoeExecutor
+        cache.cpu_executor = CpuMoeExecutor(cache, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+            num_threads=4, max_tokens=3, device=device, grouped_widths=(1, 2, 3),
+            layer_formats=[method.cpu_spec() for method in methods])
+        request.addfinalizer(cache.cpu_executor.close)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        control = GPUExpertCache(cache, stream, max_loops=2, max_rows=3, inner_rows=3,
+            top_k=top_k, prefetch=True, layer_quota=2, gap_capacity=3, keep_hits=False,
+            compact_control=True, implementation="optimized", verify_layer_quota=2,
+            hybrid_phases=("preverify", "verify") if backend == "hybrid" else (), hybrid_max_fetch=2)
+        if backend == "hybrid":
+            tables = dict(cpu=[[0.] + [100.] * 24 for _ in range(4)], gpu=[[0.] * 25 for _ in range(4)],
+                fixed=[0.] * 4, dispatch=[0.] * 4, gpu_fixed=[0.] * 4, dram=[0.] * 4, io=[0.] * 25)
+            control.hybrid_tables = {name: torch.tensor(value, device=device) for name, value in tables.items()}
+            control.hybrid_outputs[3] = (torch.empty(3, top_k, dtype=torch.int32, device=device),
+                                         torch.empty(3, top_k, device=device))
+        ids = (torch.arange(3 * top_k, device=device, dtype=torch.int32).reshape(3, top_k) + 3) % experts
+        weights = torch.arange(top_k, 0, -1, device=device, dtype=torch.float32).expand(3, top_k).contiguous() / 36
+        x = torch.randn(3, hidden, device=device, dtype=torch.bfloat16) / 4
+        outputs = []
+        for phase in ("preverify", "verify"):
+            cache.reset()
+            control.begin(1)
+            control.set_phase(phase)
+            def run():
+                result = [control.route(op, x.clone(), weights, ids) for op in ops]
+                if phase == "preverify":
+                    control._plan_gap()
+                    control.gap_planned = True
+                    control.finish_loop(True)
+                    control.join_gap()
+                return result
+            outputs = run()
+            stream.synchronize()
+            if graph:
+                captured = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(captured, stream=stream):
+                    outputs = run()
+                cache.reset()
+                control.pending.zero_()
+                captured.replay()
+            stream.synchronize()
+            control.check_error()
+            assert not control.pending.any()
+            if phase == "preverify":
+                assert torch.equal(control.history[0, :, :3].cpu(), ids.cpu().expand(layers, -1, -1))
+                assert sum(int(plan[3]) for plan in control.gap_plans) <= 2
+            references = []
+            for li, actual in enumerate(outputs):
+                expected = torch.zeros_like(x, dtype=torch.float32, device="cpu")
+                gu, down = dense[li]
+                for row in range(3):
+                    for column in range(4 if phase == "preverify" else top_k):
+                        expert = int(ids[row, column])
+                        gate, up = (gu[expert] @ x[row].float().cpu()).chunk(2)
+                        expected[row] += float(weights[row, column]) * (down[expert] @ (torch.nn.functional.silu(gate) * up))
+                torch.testing.assert_close(actual.float().cpu(), expected, rtol=0.04,
+                                           atol=0.025 * float(expected.abs().max()))
+                references.append(expected)
+                for expert, slot in enumerate(cache.slot_for_id[li].tolist()):
+                    if slot >= 0:
+                        assert slot < sizes[pools[li]]
+                        assert cache._pool_id_of_slot[pools[li]][slot] == li * experts + expert
+                        for (source, _), view in zip(cache.banks, cache.pool_bank_views(li)):
+                            assert torch.equal(view[slot].cpu(), source[li][expert])
+            control.close()
+            metrics = control.request_metrics()
+            assert metrics["logical_total_bytes"] == sum(
+                sum(value for name, value in row.items() if name not in ("target_timely_prefetch", "verify_prefetch_used"))
+                for row in metrics["layer_transfer_bytes"])
+            assert torch.equal(control.request_transfer_bytes, control.request_layer_transfer_bytes.sum(0))
+            if phase == "verify" and backend == "offload":
+                for op in ops:
+                    op.offload_cache = cache
+                def baseline():
+                    return [op._decode_routed(x.clone(), weights, ids.clone()) for op in ops]
+                cache.reset()
+                baseline_outputs = baseline()
+                if graph:
+                    captured_baseline = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(captured_baseline, stream=stream):
+                        baseline_outputs = baseline()
+                    cache.reset()
+                    captured_baseline.replay()
+                stream.synchronize()
+                for actual, expected in zip(baseline_outputs, references):
+                    torch.testing.assert_close(actual.float().cpu(), expected, rtol=0.04,
+                                               atol=0.025 * float(expected.abs().max()))
 
 
 @pytest.mark.parametrize("source", ["default", "keyword", "policy", "both"])
@@ -172,12 +344,16 @@ def test_cpu_recheck_routes_use_dynamic_top_k_without_prediction_leases(monkeypa
                  "queue", "demand", "cursor", "counters", "initial", "prefetched_device",
                  "used_device", "error", "weight_history", "keep_history", "valid_rows", "importance"):
         setattr(control, name, None)
-    control.cache = SimpleNamespace(num_layers=1, num_experts=8, slot_for_id=None)
+    control.cache = SimpleNamespace(num_layers=1, num_experts=8, slot_for_id=None,
+                                    pool_of_layer=[0], pool_sizes=[8])
+    control.pool_pending = [None]
+    control.transfer_bytes, control.expert_bytes = None, [0]
+    control.layer_transfer_bytes = [None]
     control.phase, control.max_rows, control.inner_rows, control.top_k = "preverify", 1, 1, 8
     control.cross_layer_prefetch, control.retain_routes = True, False
     control.renormalize, control.collect_signals = False, False
     control.preverify_policy = PreverifyPolicy(top_k=6)
-    control.outputs = {}
+    control.outputs, control.route_masks = {}, {}
     monkeypatch.setattr(speculative_gpu, "_plan", PlanProbe())
     for top_k, keep_hits in ((6, False), (4, True)):
         control.preverify_top_k, control.keep_hits = top_k, keep_hits
@@ -885,6 +1061,21 @@ def test_layer_prefetch_prefers_earliest_token_and_deduplicates():
     assert submitted == [6, 5]
     assert list(control.queued) == [1, 2]
     assert control.queued[1] == (0, 11, 0)
+
+
+def test_prefetch_pressure_in_one_pool_does_not_block_another_pool():
+    control = object.__new__(SpeculativeExpertCache)
+    control.ledger = ExpertLeases([0, -1], pool_sizes=[1, 1], pool_of_layer=[0, 1], num_experts=4)
+    control.ledger.begin(1)
+    control.ledger.pending[0] = Event()
+    control.queued = OrderedDict({1: (0, 0, 0), 4: (1, 0, 0)})
+    submitted = []
+    def copy(owner, active, prefetch):
+        control.ledger.allocate(owner)
+        submitted.append(owner)
+    control._copy = copy
+    assert control._pump_prefetch(1) == 1
+    assert submitted == [4] and list(control.queued) == [1]
 
 
 @pytest.mark.parametrize("continuing,capacity,expected", [(True, 0, []), (True, 1, []),

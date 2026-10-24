@@ -43,11 +43,14 @@ def gpu_local_affinity(device):
 
 
 def prefix_shapes(config, capacity):
-    kinds = config["layer_types"]
+    kinds = config.get("layer_types") or ["full_attention"] * config["num_hidden_layers"]
+    kv = (kinds.count("full_attention"), capacity, config["num_key_value_heads"], config["head_dim"])
+    if "linear_attention" not in kinds:
+        return dict(keys=(kv, torch.bfloat16), values=(kv, torch.bfloat16),
+                    recurrent=((0,), torch.float32), conv=((0,), torch.bfloat16))
     h, k, v = (config[name] for name in
                ("linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim"))
     channels = 2 * config["linear_num_key_heads"] * k + h * v
-    kv = (kinds.count("full_attention"), capacity, config["num_key_value_heads"], config["head_dim"])
     return dict(keys=(kv, torch.bfloat16), values=(kv, torch.bfloat16),
                 recurrent=((kinds.count("linear_attention"), h, v, k), torch.float32),
                 conv=((kinds.count("linear_attention"), channels, config["linear_conv_kernel_dim"] - 1),

@@ -85,6 +85,31 @@ _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
 _LIVE_BUFFERS: list[mmap.mmap] = []
+_SHARED_BANKS: list["HostBank"] = []
+_share_bank_allocations = False
+
+
+@contextlib.contextmanager
+def shared_bank_allocations(enabled: bool):
+    global _share_bank_allocations
+    previous, _share_bank_allocations = _share_bank_allocations, enabled
+    try:
+        yield
+    finally:
+        _share_bank_allocations = previous
+
+
+def _shared_bank_fd() -> int:
+    if hasattr(os, "memfd_create"):
+        return os.memfd_create("freetoken-experts", os.MFD_CLOEXEC)
+    libc = ctypes.CDLL(None, use_errno=True)
+    create = libc.memfd_create
+    create.argtypes, create.restype = (ctypes.c_char_p, ctypes.c_uint), ctypes.c_int
+    fd = create(b"freetoken-experts", 1)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -112,10 +137,13 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_share_fd")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
+        self._share_fd = None
+        if _share_bank_allocations:
+            backing = "mmap"
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
@@ -138,7 +166,18 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            if _share_bank_allocations:
+                self._share_fd = _shared_bank_fd()
+                try:
+                    os.ftruncate(self._share_fd, asize)
+                    self._buf = mmap.mmap(self._share_fd, asize, flags=mmap.MAP_SHARED,
+                                          prot=mmap.PROT_READ | mmap.PROT_WRITE)
+                except BaseException:
+                    os.close(self._share_fd)
+                    raise
+                _SHARED_BANKS.append(self)
+            else:
+                self._buf = mmap.mmap(-1, asize)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False

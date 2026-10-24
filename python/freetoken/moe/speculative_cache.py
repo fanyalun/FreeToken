@@ -10,8 +10,16 @@ class NoEvictableSlot(RuntimeError):
 
 
 class ExpertLeases:
-    def __init__(self, owners):
+    def __init__(self, owners, *, pool_sizes=None, pool_of_layer=None, num_experts=None):
         self.owners = list(owners)
+        self.pool_sizes = tuple(pool_sizes or (len(owners),))
+        self.pool_of_layer = pool_of_layer
+        self.num_experts = num_experts
+        self.pool_bases = [0]
+        for size in self.pool_sizes[:-1]:
+            self.pool_bases.append(self.pool_bases[-1] + size)
+        if sum(self.pool_sizes) != len(owners):
+            raise ValueError("expert pool sizes must cover every slot")
         self.slots = {owner: slot for slot, owner in enumerate(owners) if owner >= 0}
         if len(self.slots) != sum(owner >= 0 for owner in owners):
             raise ValueError("duplicate expert owners in cache")
@@ -79,8 +87,9 @@ class ExpertLeases:
             self.lru.move_to_end(slot)
             return slot, False
         active = set(active)
+        begin, end = self.pool_span(owner)
         slot = next((slot for slot in self.lru
-                     if not self.refs[self.owners[slot]] and self.owners[slot] not in active
+                     if begin <= slot < end and not self.refs[self.owners[slot]] and self.owners[slot] not in active
                      and slot not in self.pending and slot not in self.readers), None)
         if slot is None:
             raise NoEvictableSlot("no evictable expert slot; protected experts cannot be displaced")
@@ -91,6 +100,14 @@ class ExpertLeases:
         self.lru.move_to_end(slot)
         return slot, True
 
+    def pool_span(self, owner):
+        pool = 0 if self.pool_of_layer is None else self.pool_of_layer[owner // self.num_experts]
+        begin = self.pool_bases[pool]
+        return begin, begin + self.pool_sizes[pool]
+
+    def local_slot(self, owner):
+        return self.slots[owner] - self.pool_span(owner)[0]
+
     def end(self):
         if self.pending or self.readers:
             raise RuntimeError("wait for all expert readers and copies before ending the window")
@@ -100,11 +117,12 @@ class ExpertLeases:
 
 class SpeculativeExpertCache:
     def __init__(self, cache, stream, *, prefetch=True, use_graph=False, audit=False,
-                 layer_quota=4, gap_capacity=0):
-        if (cache.quant_format != "bf16" or cache.cpu_layer_ids or cache._unpinned_layers
-                or len(getattr(cache, "pool_sizes", (cache.cache_size,))) != 1
-                or getattr(cache, "_raw_banks", False)):
-            raise ValueError("three-level decoding requires BF16 experts with pinned GPU-offload banks")
+                 layer_quota=4, gap_capacity=0, preverify_policy=None, keep_hits=True):
+        if cache.cpu_layer_ids or cache._unpinned_layers:
+            raise ValueError("three-level decoding requires pinned GPU-offload banks")
+        from .preverify_policy import PreverifyPolicy
+        self.preverify_policy = preverify_policy or PreverifyPolicy()
+        self.keep_hits = keep_hits
         from freetoken.layers.moe import _HYBRID_OVERLAP, _HYBRID_WINDOW
         if cache.decode_target == "hybrid" and not _HYBRID_WINDOW:
             raise ValueError("three-level hybrid decoding requires FREETOKEN_HYBRID_WINDOW=1")
@@ -127,7 +145,8 @@ class SpeculativeExpertCache:
             raise RuntimeError("expert cache already has an active speculative owner")
         owners = self.cache.id_of_slot.cpu().tolist()
         usage = self.cache.usage.cpu().tolist()
-        self.ledger = ExpertLeases(owners)
+        self.ledger = ExpertLeases(owners, pool_sizes=self.cache.pool_sizes,
+                                  pool_of_layer=self.cache.pool_of_layer, num_experts=self.cache.num_experts)
         self.ledger.lru = OrderedDict((slot, None) for slot in sorted(range(len(owners)), key=lambda i: (usage[i], i)))
         self.ledger.begin(epoch)
         self.epoch, self.phase, self.loop = epoch, "preverify", 0
@@ -170,7 +189,7 @@ class SpeculativeExpertCache:
             try:
                 self._copy(owner, (), prefetch=True)
             except NoEvictableSlot:
-                break
+                continue
             del self.queued[owner]
             submitted += 1
         return submitted
@@ -197,8 +216,9 @@ class SpeculativeExpertCache:
         try:
             slot, missing = ledger.allocate(owner, active)
         except NoEvictableSlot:
+            begin, end = ledger.pool_span(owner)
             blocked = next((slot for slot in ledger.lru
-                            if not ledger.refs[ledger.owners[slot]] and ledger.owners[slot] not in active
+                            if begin <= slot < end and not ledger.refs[ledger.owners[slot]] and ledger.owners[slot] not in active
                             and (slot in ledger.pending or slot in ledger.readers)), None)
             if prefetch or blocked is None:
                 raise
@@ -215,14 +235,16 @@ class SpeculativeExpertCache:
                 begin = torch.cuda.Event(enable_timing=True) if self.audit else None
                 if begin is not None:
                     begin.record(stream)
-                for sources, bank in cache.banks:
-                    bank[slot].copy_(sources[layer][expert], non_blocking=True)
+                for (sources, _), bank in zip(cache.banks, cache.pool_bank_views(layer)):
+                    bank[ledger.local_slot(owner)].copy_(sources[layer][expert], non_blocking=True)
                 event = torch.cuda.Event(enable_timing=self.audit)
                 event.record(stream)
             if begin is not None:
                 self.transfers.append((owner, slot, "cache", self.phase, self.loop, prefetch, begin, event))
             ledger.pending[slot] = event
             self.stats["prefetch_loads" if prefetch else "demand_loads"] += 1
+            self.stats[("prefetch_loads" if prefetch else "demand_loads") + "_bytes"] += sum(
+                bank[0].numel() * bank.element_size() for bank in cache.pool_bank_views(layer))
             if prefetch:
                 self.prefetched.add(owner)
             else:
@@ -234,7 +256,7 @@ class SpeculativeExpertCache:
     def _compute(self, layer, hidden, weights, slots):
         cache = self.cache
         def run(x, w, ids):
-            return layer._expert_gemm(cache, x, w, ids, views=cache.bank_views(), n=None,
+            return layer._expert_gemm(cache, x, w, ids, views=cache.pool_bank_views(layer.layer_id), n=None,
                                       alphas=cache.alphas_for_slots(layer.layer_id), is_prefill=False)
         if not self.use_graph:
             return run(hidden, weights, slots)
@@ -278,8 +300,7 @@ class SpeculativeExpertCache:
         ready = [[li * experts + expert in ready_owners for expert in row] for row in rows]
         resident = torch.tensor(ready, dtype=torch.bool, device=ids.device)
         if self.phase == "preverify":
-            rank = weights.argsort(dim=-1, descending=True, stable=True).argsort(dim=-1)
-            keep = resident | (rank < min(4, ids.shape[1]))
+            keep = self.preverify_policy.mask(weights, li) | (resident & self.keep_hits)
         else:
             keep = torch.ones_like(resident)
         kept = keep.cpu().tolist()
@@ -294,6 +315,8 @@ class SpeculativeExpertCache:
             self.stats["target_unique_experts"] += len(actual)
             self.stats["target_initial_missing"] += len(actual - self.initial)
             self.stats["target_timely_prefetch"] += len(timely - self.initial)
+            self.stats["target_timely_prefetch_bytes"] += len(timely - self.initial) * sum(
+                bank[0].numel() * bank.element_size() for bank in cache.pool_bank_views(li))
         gpu = set(demanded)
         if cache.decode_target == "hybrid":
             from .offload_kernels import _HYBRID_FETCH_BY_RECENCY
@@ -324,11 +347,12 @@ class SpeculativeExpertCache:
                                   for expert, retained in zip(row, mask)] for row, mask in zip(rows, kept)],
                                 dtype=torch.bool, device=ids.device)
         # A zero-weight route must not read a slot concurrently overwritten by prefetch.
-        fallback = mapping[min(gpu)] if gpu else 0
-        gpu_ids = torch.tensor([[mapping[li * experts + expert] if retained and li * experts + expert in gpu else fallback
+        fallback = ledger.local_slot(min(gpu)) if gpu else 0
+        gpu_ids = torch.tensor([[ledger.local_slot(li * experts + expert) if retained and li * experts + expert in gpu else fallback
                                  for expert, retained in zip(row, mask)] for row, mask in zip(rows, kept)],
                                dtype=ids.dtype, device=ids.device)
         gpu_weights = torch.where(gpu_mask, weights, 0).contiguous()
+        identity = self.preverify_policy.identity_term(hidden, weights, keep) if self.phase == "preverify" else None
         pending_cpu = None
         cpu_result = None
         if cache.decode_target == "hybrid":
@@ -359,7 +383,8 @@ class SpeculativeExpertCache:
         self.records.append({"phase": self.phase, "loop": self.loop, "layer": li, "ids": rows,
                              "ready": ready} if self.audit else
                             {"phase": self.phase, "loop": self.loop, "layer": li, "ids": rows})
-        return result
+        from .preverify_policy import merge_identity
+        return merge_identity(result, identity)
 
     def decide(self, loop, consumed):
         self.ledger.decide(self.epoch, loop, consumed)
@@ -367,7 +392,9 @@ class SpeculativeExpertCache:
 
     def transfer_audit(self):
         return {"scope": "CUDA event times relative to window start; expert copies include all weight banks",
-                "transfers": [{"owner": owner, "slot": slot, "storage": storage, "phase": phase, "loop": loop,
+                "transfers": [{"owner": owner, "slot": slot - self.ledger.pool_span(owner)[0],
+                               "pool": self.cache.pool_of_layer[owner // self.cache.num_experts],
+                               "storage": storage, "phase": phase, "loop": loop,
                                "prefetch": prefetch, "start_ms": self.origin.elapsed_time(begin),
                                "end_ms": self.origin.elapsed_time(end)}
                               for owner, slot, storage, phase, loop, prefetch, begin, end in self.transfers],
@@ -390,7 +417,7 @@ class SpeculativeExpertCache:
         cache.id_of_slot.copy_(owners)
         mapping = [-1] * (cache.num_layers * cache.num_experts)
         for owner, slot in ledger.slots.items():
-            mapping[owner] = slot
+            mapping[owner] = ledger.local_slot(owner)
         cache.slot_for_id.copy_(torch.tensor(mapping, device=cache.device, dtype=cache.slot_for_id.dtype).reshape_as(cache.slot_for_id))
         stamps = [0] * cache.cache_size
         for stamp, slot in enumerate(ledger.lru, self.clock + 1):
@@ -399,8 +426,8 @@ class SpeculativeExpertCache:
         cache.step.fill_(max(stamps))
         cache.expert_recency.copy_(torch.tensor(self.recency, device=cache.device, dtype=cache.expert_recency.dtype).reshape_as(cache.expert_recency))
         cache.speculative_controller = None
-        expert_bytes = sum(bank[0].numel() * bank.element_size() for _, bank in cache.banks)
-        self.stats["expert_bytes"] = expert_bytes
-        for key in ("prefetch_loads", "demand_loads", "target_timely_prefetch"):
-            self.stats[key + "_bytes"] = self.stats[key] * expert_bytes
+        expert_bytes = [sum(bank[0].numel() * bank.element_size() for bank in cache.pool_bank_views(li))
+                        for li in range(cache.num_layers)]
+        self.stats["expert_bytes_by_layer"] = expert_bytes
+        self.stats["expert_bytes"] = expert_bytes[0] if len(set(expert_bytes)) == 1 else None
         self.active = False

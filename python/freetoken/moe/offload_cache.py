@@ -211,11 +211,8 @@ class OffloadMoeCache:
         self._raw_banks = False
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size, self.pool_sizes)
-        assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
-            "Prefill overlap borrows two full expert-layer buffers from the unified MoE "
-            "cache, so cache_size must be at least 2 * num_experts "
-            "(raise moe_cache_size or disable moe_prefill_overlap)"
-        )
+        # Resolve overlap after bank registration: mixed layouts borrow staging
+        # by bytes across pools, so a slot-count threshold is not sufficient.
         self.cache_policy_id = policy_ids[self.cache_policy]
         self.slot_for_id = torch.full(
             (self.num_layers, self.num_experts),
@@ -460,9 +457,9 @@ class OffloadMoeCache:
         return self._pool_bank_views[self.pool_of_layer[layer_id]]
 
     def bank_views(self) -> tuple[torch.Tensor, ...]:
-        """Single-pool views for the speculative cache controllers."""
+        """Legacy single-pool view; layer-aware callers use pool_bank_views(layer_id)."""
         if len(self.pool_sizes) != 1:
-            raise ValueError("speculative cache controllers require one expert slot pool")
+            raise ValueError("bank_views requires one expert pool; use pool_bank_views(layer_id)")
         return self.pool_bank_views(0)
 
     def set_bank_sources(
@@ -1179,6 +1176,21 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+
+    def reset_request_metrics(self) -> None:
+        self.reset_stats()
+
+    def request_metrics(self) -> dict:
+        if not self.collect_stats:
+            return {"available": False, "reason": "moe_collect_stats was disabled before graph capture"}
+        loads = (self.stat_fetched_layer.cpu().tolist() if self.decode_target == "hybrid"
+                 else self.lru_stats[:, Stat.MISS].cpu().tolist())
+        expert_bytes = [sum(self._row_bytes[self.layer_layout[li]]) for li in range(self.num_layers)]
+        byte_counts = [count * size for count, size in zip(loads, expert_bytes)]
+        return {"available": True, "scope": "gpu_decode", "logical_total_loads": sum(loads),
+                "logical_total_bytes": sum(byte_counts), "verify_demand_loads": sum(loads),
+                "verify_demand_loads_bytes": sum(byte_counts), "expert_bytes_by_layer": expert_bytes,
+                "layer_transfer_bytes": [{"verify_demand_loads": value} for value in byte_counts]}
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.

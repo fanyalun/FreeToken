@@ -121,10 +121,10 @@ def validate_profile(profile, identity):
     return profile
 
 
-def profile_identity(cache, executor, widths, *, eager):
+def profile_identity(cache, executor, widths, *, eager, layer=None):
     from freetoken.moe.speculative_hybrid import profile_identity as native_identity
     from freetoken.moe.fused import _GROUPED_DECODE
-    identity = native_identity(cache, executor, widths)
+    identity = native_identity(cache, executor, widths, layer=layer)
     identity.update(version=1, kind="baseline_hybrid", eager=eager,
                     dtype=executor.quant_format,
                     gpu_grouped=_GROUPED_DECODE, flag_sync=executor._flag_sync, triton=triton.__version__,
@@ -142,9 +142,6 @@ def profile_identity(cache, executor, widths, *, eager):
 
 class BaselineHybridPlanner:
     def __init__(self, cache, profile, cap):
-        if (len(getattr(cache, "pool_sizes", (cache.cache_size,))) != 1
-                or cache.quant_format != "bf16" or getattr(cache, "_raw_banks", False)):
-            raise ValueError("baseline Hybrid windows require one BF16 expert slot pool")
         self.cache, self.profile, self.cap = cache, profile, cap
         self.profile_path = None
         self.widths = tuple(profile["identity"]["widths"])
@@ -152,9 +149,17 @@ class BaselineHybridPlanner:
         self.stride = max(self.widths) * self.top_k + 1
         self.tables = {name: torch.tensor(profile[name], device=cache.device, dtype=torch.float32)
                        for name in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "io", "contention")}
+        self.tables_by_layout = {}
         self.plans = {w: (torch.empty(w * self.top_k, device=cache.device, dtype=torch.int32),
                           torch.empty(w * self.top_k, device=cache.device, dtype=torch.int32),
                           torch.zeros(1, device=cache.device, dtype=torch.int64)) for w in self.widths}
+
+    def add_profile(self, layout, profile):
+        if tuple(profile["identity"]["widths"]) != self.widths:
+            raise ValueError("Hybrid layouts must register identical verify widths")
+        self.tables_by_layout[layout] = {
+            name: torch.tensor(profile[name], device=self.cache.device, dtype=torch.float32)
+            for name in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "io", "contention")}
 
     def ensure(self, layer, ids, weights):
         cache = self.cache
@@ -162,14 +167,17 @@ class BaselineHybridPlanner:
         if width not in self.plans or top_k != self.top_k:
             raise ValueError("unregistered baseline Hybrid window")
         plan = self.plans[width]
+        owners, usage = cache.pool_state(layer)
+        size = cache.pool_slots(layer)
+        tables = self.tables_by_layout[cache.layer_layout[layer]] if self.tables_by_layout else self.tables
         if getattr(cache, "collect_decode_freq", False):
             raw = ids.reshape(-1).long()
             cache.decode_freq[layer].scatter_add_(0, raw, (weights.reshape(-1) != 0).to(raw.dtype))
-        _balance[(1,)](cache.slot_for_id, cache.id_of_slot, cache.usage, cache.step,
+        _balance[(1,)](cache.slot_for_id, owners, usage, cache.step,
             cache.expert_recency, ids, weights, *plan, cache.num_missing_full, cache.active_mask,
-            *(self.tables[n] for n in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "io", "contention")),
-            layer, cache.num_experts, cache.cache_size, width, top_k, self.stride, self.cap,
-            triton.next_power_of_2(cache.num_experts), triton.next_power_of_2(cache.cache_size),
+            *(tables[n] for n in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "io", "contention")),
+            layer, cache.num_experts, size, width, top_k, self.stride, self.cap,
+            triton.next_power_of_2(cache.num_experts), triton.next_power_of_2(size),
             triton.next_power_of_2(width * top_k), triton.next_power_of_2(cache.num_experts + 1),
             self.profile["identity"].get("overlap", "1") != "0", num_warps=8)
         cache._pending_src_layer = layer
@@ -182,7 +190,7 @@ class BaselineHybridPlanner:
 def load_or_calibrate(cache, layer, executor, widths, *, eager, profile_path=None):
     from .hybrid_profile import load_profile
 
-    identity = profile_identity(cache, executor, widths, eager=eager)
+    identity = profile_identity(cache, executor, widths, eager=eager, layer=layer)
     def measure(current, previous):
         if previous is None:
             return calibrate(cache, layer, executor, current)
@@ -250,7 +258,7 @@ def calibrate(cache, layer, executor, identity, previous=None):
         return statistics.median(samples), samples
 
     try:
-        limit = min(routes, cache.num_experts, cache.cache_size)
+        limit = min(routes, cache.num_experts, cache.pool_slots(layer.layer_id))
         if previous_io < limit:
             copy_zero, _ = measure(cache.copy_missing)
         copy_sources = plan[1].clone()
@@ -278,7 +286,7 @@ def calibrate(cache, layer, executor, identity, previous=None):
                 return executor.decode_sync(submit())
 
             def gpu_compute():
-                return layer._expert_gemm(cache, x, gpu_weights, slots, views=cache.bank_views(), n=None,
+                return layer._expert_gemm(cache, x, gpu_weights, slots, views=cache.pool_bank_views(layer.layer_id), n=None,
                                           alphas=cache.alphas_for_slots(layer.layer_id), is_prefill=False)
 
             def gpu_branch():

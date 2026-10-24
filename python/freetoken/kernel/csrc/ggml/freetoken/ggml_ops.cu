@@ -368,7 +368,10 @@ __global__ void moe_weighted_sum_kernel(const T * __restrict__ y, const float * 
     const int64_t row0 = token * top_k;
     float sum = 0.0f;
     for (int j = 0; j < top_k; ++j) {
-        sum += ggml_cuda_cast<float>(y[(row0 + j) * n + col]) * w[row0 + j];
+        const float weight = w[row0 + j];
+        if (weight != 0.0f) {
+            sum += ggml_cuda_cast<float>(y[(row0 + j) * n + col]) * weight;
+        }
     }
     out[token * n + col] = ggml_cuda_cast<T>(sum);
 }

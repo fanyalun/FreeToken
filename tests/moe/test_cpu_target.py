@@ -32,7 +32,6 @@ def test_grouped_experts_equal_original_row_dots(rows, threads, schedule):
         ids[:] = torch.arange(8)
         assert torch.equal(grouped(0, x, weights, ids).view(torch.int16),
                            serial(0, x, weights, ids).view(torch.int16))
-        assert len(grouped.tasks) == rows
         assert len({entry[0].untyped_storage().data_ptr() for entry in grouped.io.values()}) == 1
     finally:
         serial.close()

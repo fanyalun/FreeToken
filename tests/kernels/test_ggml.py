@@ -69,13 +69,35 @@ def test_q4_matrix_matches_cpu(dtype, batch):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch", [1, 17])
-def test_q4_moe_routes_match_cpu(dtype, batch):
+@pytest.mark.parametrize("masked", [False, True])
+def test_q4_moe_routes_match_cpu(dtype, batch, masked):
     w, ref = _q4_weights((4, 64, 256))
     x = _activation((batch, 256), dtype)
     ids = torch.tensor([[i % 4, (i + 1) % 4] for i in range(batch)], dtype=torch.int32, device="cuda")
-    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids)
     expected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.cpu().long()]).to(dtype)
+    if masked:
+        ids[::2, 0] = -1
+        ids[0] = -1
+        expected[ids.cpu() < 0] = 0
+    actual = ggml.mul_mat_id(w, int(QType.Q4_0), x, ids, skip_invalid_routes=masked)
     torch.testing.assert_close(actual.cpu(), expected, atol=2e-4, rtol=1e-3)
+
+
+@pytest.mark.parametrize("all_masked", [False, True])
+def test_q4_fused_glu_masked_routes_and_zero_weight_nan_reduction(all_masked):
+    w, ref = _q4_weights((4, 512, 256))
+    x = _activation((1, 256), torch.bfloat16)
+    ids = torch.tensor([[-1, -1 if all_masked else 2]], dtype=torch.int32, device="cuda")
+    actual = ggml.mul_mat_id_glu(w, int(QType.Q4_0), x, ids, "swiglu", skip_invalid_routes=True)
+    projected = torch.einsum("tk, tjok -> tjo", x.cpu().float(), ref[ids.clamp_min(0).cpu().long()])
+    gate, up = projected.chunk(2, -1)
+    expected = (F.silu(gate) * up).to(x.dtype)
+    expected[ids.cpu() < 0] = 0
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.04, rtol=0.015)
+    actual[:, 0] = float("nan")
+    weights = torch.tensor([[0., 0. if all_masked else 1.]], device="cuda")
+    reduced = ggml.moe_weighted_sum(actual, weights)
+    torch.testing.assert_close(reduced.cpu(), expected[:, 1], atol=0.04, rtol=0.015)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

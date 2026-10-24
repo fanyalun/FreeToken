@@ -4,8 +4,9 @@ The first adapter supports Qwen3.6-35B-A3B BF16 with its native BF16 MTP layer,
 greedy text generation, TP=1, and one active request. Draft depth is a positive
 integer `speculative_mtp_depth`; depth 3 remains the default benchmark setting. It provides
 a programmatic engine API. HTTP serving, scheduler streaming, continuous
-batching, cross-request prefix reuse, quantized checkpoints and other proposers
-require additional adapters and integration.
+batching and cross-request prefix reuse require additional integration. The unified
+[speculative modes API](speculative_modes.md) also provides Qwen3 GGUF with EAGLE3;
+the model examples and historical measurements on this page concern native MTP.
 
 ## Upstream integration
 
@@ -16,10 +17,10 @@ from `be176884968b5b5ddbb04c19e8bc180087c22ece` with official FreeToken
 extensions with `python setup.py build_ext --inplace`. An extension compiled for
 the earlier Torch environment must not be copied into this runtime.
 
-The upstream cache supports multiple expert slot pools. Native MTP and the
-three-level controllers currently require one BF16 pool; ordinary upstream
-offload and Hybrid retain their multiple-pool support. The measured-peak SD
-budget planner and idle-only cache rebuild operate on that single pool.
+The speculative controllers support the upstream layout-specific pools and
+per-layer pools. BF16 and Q4_K/Q6_K experts keep pool-local GEMM and copy indices.
+The measured-peak SD budget planner prices each bank's actual layout and padding.
+Small pools tile MoE rows while preserving the full model verification window.
 
 Qwen and MTP normalization now keep the checkpoint's raw zero-centered weights
 and add one in FP32 at execution time. MTP resident expert weights are attached
@@ -28,9 +29,9 @@ layer numbering. Earlier FTW files with pre-folded norm weights require
 reconversion according to the upstream checkpoint rules. Historical token
 comparisons and timing results below do not certify this new runtime.
 
-Ordinary CPU MoE uses the upstream multi-format executor. Explicit grouped
-speculative Hybrid tasks use the separate `SpeculativeBf16Executor` binding in
-the same native extension, preserving their task slots and ordered arithmetic.
+Ordinary CPU MoE and grouped speculative Hybrid use the upstream multi-format
+executor and its persistent worker pool. Grouped scheduling preserves its
+pre-registered task slots and ordered route reduction.
 The independent CPU Target keeps the install-only fixed recovery contract:
 `fixed_replay` installs CPU state without executing the old speculative B tail;
 `recheck` remains provisional until CPU verification. Profiles include the new
@@ -178,10 +179,11 @@ quota. Partitioning and copy plans remain on the GPU during decode.
 
 The baseline CPU grouped task shares expert-weight loads across token routes
 while preserving the ordinary CPU GEMV accumulator order, activation rounding,
-and original top-k reduction order. It uses separate tasks from the three-level
-GPU-rounding implementation. Legal widths and pinned buffers are prepared before
-capture, with a reusable GPU result per width. BF16 is required for this grouped
-backend. `speculative_hybrid_cpu_backend="legacy"` keeps ordinary CPU tasks;
+and original top-k reduction order. Baseline and three-level Hybrid now use the
+upstream multi-format executor's grouped schedule, including packed GGUF
+experts. Legal widths and pinned buffers are prepared before capture, with a
+reusable GPU result per width and BF16 activations.
+`speculative_hybrid_cpu_backend="legacy"` keeps ordinary CPU tasks;
 `speculative_hybrid_window_policy="legacy"` keeps the earlier cap/fraction
 placement. These two controls are independent. The benchmark exposes them as
 `--hybrid-cpu-backend` and `--hybrid-window-policy`.

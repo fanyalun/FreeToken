@@ -115,7 +115,7 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     tl.atomic_add(stats + (22 if PREVERIFY else 23), tl.sum(((counts > 0) & (current < 0) & (e < EXPERTS)).to(tl.int32), 0))
 
 
-def profile_identity(cache, executor, widths, *, execution="graph"):
+def profile_identity(cache, executor, widths, *, execution="graph", layer=None):
     from .hybrid_profile import pcie_identity
     from freetoken.kernel import _cpu_moe
     from freetoken.kernel.backend import is_flashinfer_installed
@@ -134,7 +134,7 @@ def profile_identity(cache, executor, widths, *, execution="graph"):
     for core in (*executor.core_ids, executor._coord_core):
         numa[str(core)] = [p.name for p in Path(f"/sys/devices/system/cpu/cpu{core}").glob("node*")]
     from freetoken.moe.fused import _GROUPED_DECODE
-    return dict(version=3, execution=execution, triton=triton.__version__,
+    return dict(version=4, execution=execution, triton=triton.__version__,
                 gpu_grouped=_GROUPED_DECODE, cpu_backend="grouped", flag_sync=executor._flag_sync,
                 cache_layout=[[name, list(bank.shape), list(bank.stride()), str(bank.dtype)]
                               for name, bank in cache.bank_caches.items()],
@@ -147,7 +147,13 @@ def profile_identity(cache, executor, widths, *, execution="graph"):
                 threads=executor.num_threads, cores=executor.core_ids, coordinator=executor._coord_core,
                 numa=numa, isa=executor.isa, torch=torch.__version__, cuda=torch.version.cuda,
                 kernels={str(p.name): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
-                cache_slots=cache.cache_size, activation=executor.activation_signature)
+                cache_slots=cache.cache_size, activation=executor.activation_signature,
+                expert_layout=None if layer is None else dict(
+                    format=cache.quant_format, layout=cache.layer_layout[layer.layer_id],
+                    pools=cache.pool_sizes, layer_pools=cache.pool_of_layer,
+                    bank_rows=[[str(bank.dtype), list(bank.shape[1:])]
+                               for bank in cache.pool_bank_views(layer.layer_id)],
+                    method=repr(layer.quant_method.cfg.scheme)))
 
 
 def validate_profile(profile, identity):
@@ -204,7 +210,8 @@ def load_or_calibrate(controller, layer, executor, profile_path=None):
 
     widths = tuple(range(1, max(controller.max_rows, controller.inner_rows) + 1))
     identity = profile_identity(controller.cache, executor, widths,
-                                execution=getattr(controller, "execution_mode", "graph" if controller.use_graph else "eager"))
+                                execution=getattr(controller, "execution_mode", "graph" if controller.use_graph else "eager"),
+                                layer=layer)
     def measure(current, previous):
         if previous is None:
             return calibrate(controller, layer, executor, current)
@@ -282,7 +289,7 @@ def calibrate(controller, layer, executor, identity, previous=None):
         if copy_zero is None and previous:
             copy_zero = next((m["us"] for m in previous.get("measurements", [])
                               if m.get("kind") == "weight_copy" and m.get("experts") == 0), None)
-        limit = min(cache.cache_size, cache.num_experts, routes)
+        limit = min(cache.pool_slots(layer.layer_id), cache.num_experts, routes)
         copy_counts = list(range(previous_io + 1, limit + 1))
         if copy_zero is None and 0 not in copy_counts:
             copy_counts.insert(0, 0)
@@ -308,7 +315,7 @@ def calibrate(controller, layer, executor, identity, previous=None):
             slots = torch.zeros_like(ids)
             gpu_weights = torch.zeros_like(weights)
             def gpu_compute():
-                return layer._expert_gemm(cache, x, gpu_weights, slots, views=cache.bank_views(), n=None,
+                return layer._expert_gemm(cache, x, gpu_weights, slots, views=cache.pool_bank_views(layer.layer_id), n=None,
                                           alphas=cache.alphas_for_slots(layer.layer_id), is_prefill=False)
             empty = measure(lambda: cpu_join(cpu_submit(x, weights, ids)))
             gpu_empty = measure(gpu_compute)
@@ -354,7 +361,7 @@ def calibrate(controller, layer, executor, identity, previous=None):
                 actual_rank = rank[host_ids].to(device=cache.device)
                 valid = host_valid.to(device=cache.device)
                 weights.copy_(valid / top_k)
-                limit = min(len(ordered), cache.cache_size)
+                limit = min(len(ordered), cache.pool_slots(layer.layer_id))
                 times, samples = [], []
                 for q in range(limit + 1):
                     owners = torch.tensor(ordered[:q], device=cache.device, dtype=torch.int32)
@@ -406,7 +413,7 @@ def calibrate(controller, layer, executor, identity, previous=None):
                     memory_samples.append(trial["measured_us"][q] / (q + tiles))
             profile["dram"][width] = min(memory_samples, default=0.)
             for trial in trials:
-                chosen, estimates = predict_prefix(profile, width, trial["counts"], available=cache.cache_size)
+                chosen, estimates = predict_prefix(profile, width, trial["counts"], available=cache.pool_slots(layer.layer_id))
                 times = trial["measured_us"]
                 optimum = min(range(len(times)), key=lambda q: (times[q], q))
                 profile["choice_audit"].append(dict(**trial, predicted_q=chosen, predicted_us=estimates,

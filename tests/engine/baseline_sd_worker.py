@@ -33,6 +33,8 @@ def main():
     parser.add_argument('--budget-gib', type=int)
     parser.add_argument('--output-limit', type=int, default=8)
     parser.add_argument('--layers', type=int, default=4)
+    parser.add_argument('--draft-method', choices=('mtp', 'eagle3'), default='mtp')
+    parser.add_argument('--modern', action='store_true')
     parser.add_argument('--compatibility-export', type=Path)
     parser.add_argument('--expect-pressure-error', action='store_true')
     parser.add_argument('--audit-lifecycle', action='store_true')
@@ -57,6 +59,28 @@ def main():
         (root / 'config.json').write_text(json.dumps(dict(
             architectures=['Qwen3_5MoeForConditionalGeneration'], model_type='qwen3_5_moe',
             tie_word_embeddings=False, text_config=text_config)))
+        draft_path = None
+        if args.draft_method == 'eagle3':
+            for key in ('rope_parameters', 'layer_types', 'partial_rotary_factor'):
+                text_config.pop(key, None)
+            text_config.update(model_type='qwen3_moe', architectures=['Qwen3MoeForCausalLM'],
+                               intermediate_size=512, rope_theta=1000000.0, norm_topk_prob=True)
+            (root / 'config.json').write_text(json.dumps(text_config))
+            draft_path = root / 'draft'
+            draft_path.mkdir()
+            (draft_path / 'config.json').write_text(json.dumps(dict(
+                architectures=['Eagle3DraftModel'], speculators_model_type='eagle3',
+                norm_before_residual=True, draft_vocab_size=192,
+                eagle_aux_hidden_state_layer_ids=[1, 2, args.layers],
+                transformer_layer_config=dict(hidden_size=256, num_attention_heads=2,
+                    num_key_value_heads=1, head_dim=128, intermediate_size=512, num_hidden_layers=1,
+                    vocab_size=256, rms_norm_eps=1e-6, hidden_act='silu', rope_theta=10000.0,
+                    max_position_embeddings=256))))
+            from freetoken.models.eagle3 import Eagle3Draft
+            def load_eagle_dummy(self, path, device):
+                self.load_state_dict(_make_dummy_weight_state_dict(self.state_dict(), device=device))
+                self._target_ids = torch.arange(self.config.draft_vocab_size, device=device) + 17
+            Eagle3Draft.load_checkpoint = load_eagle_dummy
 
         class Config(EngineConfig):
             @property
@@ -81,7 +105,10 @@ def main():
             speculative_hybrid_window_policy=args.hybrid_window_policy,
             speculative_hybrid_cpu_backend=args.hybrid_cpu_backend,
             speculative_mtp_depth=3, speculative_max_input_tokens=129, speculative_max_output_tokens=args.output_limit,
-            num_page_override=(129 + args.output_limit + 3) // 4,
+            speculative_mode=('three_level_gpu' if args.three_level else 'sd') if args.modern else None,
+            speculative_draft_method=args.draft_method,
+            speculative_draft_model=str(draft_path) if draft_path else None,
+            num_page_override=(129 + args.output_limit) if args.modern else (129 + args.output_limit + 3) // 4,
             max_seq_len_override=129 + args.output_limit,
             speculative_three_level=args.three_level,
             speculative_expert_scheduler=args.scheduler if args.three_level else 'host',
@@ -92,7 +119,7 @@ def main():
             speculative_prefetch_layer_experts=args.small_prefetch,
             speculative_verify_prefetch_layer_experts=args.verify_prefetch,
             speculative_prefetch_gap_capacity=args.prefetch_gap,
-            cuda_graph_max_bs=0 if args.eager else 4, page_size=4, use_dummy_weight=True,
+            cuda_graph_max_bs=0 if args.eager else 4, page_size=1 if args.modern else 4, use_dummy_weight=True,
             mm=MultimodalConfig(disabled_encoders=frozenset(('vision', 'audio')))))
         try:
             runner = engine.speculative_runner
@@ -112,20 +139,14 @@ def main():
                     args.hybrid_window_policy == 'balanced' and _HYBRID_WINDOW)
             assert not engine.graph_runner.graph_map
             def snapshot():
-                values = [engine.kv_cache._kv_buffer, engine.linear_state_pool.recurrent_states,
-                          engine.linear_state_pool.conv_states]
+                values = [engine.kv_cache._kv_buffer, *runner.state_adapter.tensors(engine.linear_state_pool)]
                 if args.three_level:
-                    values.extend((runner.three_level.private_pool.recurrent_states,
-                                   runner.three_level.private_pool.conv_states))
+                    values.extend(runner.state_adapter.tensors(runner.three_level.private_pool))
                 return [value.clone() for value in values]
 
             def reset():
                 engine.kv_cache._kv_buffer.zero_()
-                engine.linear_state_pool.recurrent_states.zero_()
-                engine.linear_state_pool.conv_states.zero_()
-                if args.three_level:
-                    runner.three_level.private_pool.recurrent_states.zero_()
-                    runner.three_level.private_pool.conv_states.zero_()
+                runner.state_adapter.reset(runner.three_level.private_pool if args.three_level else None)
                 if engine.moe_offload_cache:
                     engine.moe_offload_cache.reset()
                 torch.cuda.synchronize()
@@ -267,7 +288,7 @@ def main():
                 assert pointers == [runner.seed_hidden.data_ptr(), runner.seed_token.data_ptr(), runner.anchor_buffer.data_ptr()]
                 if args.three_level and runner.three_level.inner_width == 0:
                     assert all(row['loop_count'] == 0 for row in a.rounds)
-                    assert not runner.three_level.private_pool.recurrent_states.any()
+                    assert all(not tensor.any() for tensor in runner.state_adapter.tensors(runner.three_level.private_pool))
                 if args.three_level and args.scheduler == 'gpu' and args.slots == 16 and args.layers == 10:
                     conflicts = [row for row in a.rounds if row['cache_conflict']]
                     assert conflicts and all(row['loop_count'] == 1 for row in conflicts)
@@ -305,7 +326,10 @@ def main():
                 assert len(engine.generate_speculative([1, 2, 3], max_tokens=args.output_limit).token_ids) == args.output_limit
                 assert engine.moe_offload_cache.cache_size == rebuilt_slots
             print(json.dumps(dict(status='passed', backend=args.backend, eager=args.eager,
-                three_level=args.three_level, graph_implementation=args.graph_implementation,
+                three_level=args.three_level, graph_implementation=engine.config.speculative_graph_implementation,
+                draft_method=args.draft_method, mode=engine.config.speculative_mode,
+                graph_replays=a.graph_replays, graph_fallbacks=a.graph_fallbacks,
+                graph_captures=a.graph_captures,
                 scheduler=args.scheduler, phases=args.phases, layers=args.layers, output_limit=args.output_limit,
                 hybrid_window_policy=args.hybrid_window_policy, hybrid_cpu_backend=args.hybrid_cpu_backend,
                 request_outputs=request_outputs,

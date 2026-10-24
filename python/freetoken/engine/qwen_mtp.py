@@ -14,6 +14,7 @@ from freetoken.attention.triton import TritonMetadata
 from freetoken.core import Batch, Req, SamplingParams
 from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
 from .speculative import Proposal, VerifyResult, SpeculativeFrontier, SpeculativeCoordinator, greedy_commit
+from .speculative_state import TargetStateAdapter
 
 
 _EARLY_COMMIT = os.getenv("FREETOKEN_MTP_EARLY_COMMIT", "1") != "0"
@@ -31,22 +32,19 @@ def _drain_failed_cpu_branch(stream, controller):
     branch = getattr(controller, "cpu_stream", None)
     if branch is None:
         return
+    executor = getattr(getattr(controller, "cache", None), "cpu_executor", None)
     if torch.cuda.is_current_stream_capturing():
         if _can_join_capture_branch(branch):
+            if executor is not None:
+                with torch.cuda.stream(branch):
+                    executor.drain_pending()
             stream.wait_stream(branch)
         return
-    # A failed forward can stop between the CPU doorbell and its completion wait.
+    if executor is not None:
+        with torch.cuda.stream(branch):
+            executor.drain_pending()
     branch.synchronize()
-    executor = getattr(getattr(controller, "cache", None), "cpu_executor", None)
-    if executor is not None and getattr(executor, "_flag_sync", False):
-        # The coordinator publishes active before clearing ready; sample both sides.
-        pending = {executor._ext.flag_active_slot()}
-        pending.update(executor._ready.nonzero().flatten().tolist())
-        pending.add(executor._ext.flag_active_slot())
-        for slot in sorted(pending):
-            if slot >= 0:
-                executor._cpu_moe.speculative_memop_sync(branch.cuda_stream, executor._done.data_ptr(), slot)
-        branch.synchronize()
+    if executor is not None:
         executor.raise_if_unhealthy()
     stream.wait_stream(branch)
 
@@ -77,6 +75,8 @@ class GenerationResult:
     rounds: list[dict] = field(default_factory=list)
     graph_replays: dict[str, int] = field(default_factory=dict)
     graph_fallbacks: dict[str, int] = field(default_factory=dict)
+    graph_captures: dict[str, int] = field(default_factory=dict)
+    metrics: dict = field(default_factory=dict)
 
 
 @triton.jit(do_not_specialize=["start"])
@@ -171,21 +171,18 @@ class QwenMTPRunner:
         self.next_draft = None
         self.last_event = None
         self.states = {}
+        self.state_adapter = TargetStateAdapter(engine)
         self.draft_width = engine.config.speculative_mtp_depth + 1
         if self.native_sd:
             self.draft_width = min(self.draft_width, engine.config.speculative_max_output_tokens)
         self.coarse_graphs = None
         self._shared_indices = None
         if self.baseline:
-            layers = [l.linear_attn for l in engine.model.model.layers.op_list if l._is_linear]
-            if getattr(engine.config, "speculative_graph_implementation", "reference") == "reference":
-                workspace = QwenGDNVerifyState(engine.linear_state_pool, layers, self.draft_width, slot=1)
-                self.states = {self.draft_width: workspace}
-                self.states.update({w: QwenGDNVerifyState(engine.linear_state_pool, layers, w, slot=1,
-                                    workspace=workspace if self.baseline else None)
-                                    for w in range(1, self.draft_width)})
+            self.states = self.state_adapter.states(self.draft_width)
         self.use_graph = (engine.config.cuda_graph_max_bs != 0 and engine.config.cuda_graph_bs != []
                           and not reference_ar)
+        self.full_graph = self.use_graph and getattr(engine.config, "speculative_graph_implementation", "reference") == "full"
+        self.graph_captures = {}
         if self.native_sd:
             device = engine.device
             capacity = min(engine.num_pages * engine.config.page_size, engine.page_table.shape[1])
@@ -193,7 +190,8 @@ class QwenMTPRunner:
             self.proposal_buffer = torch.empty(self.draft_width - 1, dtype=torch.int32, device=device)
             self.verify_buffer = torch.empty(self.draft_width, dtype=torch.int32, device=device)
             self.anchor_buffer = torch.empty(1, dtype=torch.int32, device=device)
-            self.seed_hidden = torch.empty((1, engine.config.model_config.hidden_size), dtype=engine.dtype, device=device)
+            hidden_size = getattr(getattr(engine.mtp, "config", None), "model_config", engine.config.model_config).hidden_size
+            self.seed_hidden = torch.empty((1, hidden_size), dtype=engine.dtype, device=device)
             self.seed_token = torch.empty(1, dtype=torch.int32, device=device)
             self.eos_mask = torch.zeros(engine.config.model_config.vocab_size, dtype=torch.bool, device=device)
             self.drain_buffer = torch.empty(self.draft_width + 3, dtype=torch.int32, device=device)
@@ -345,17 +343,23 @@ class QwenMTPRunner:
         with self.engine.ctx.forward_batch(batch):
             hidden = self.engine.model.model.forward(batch.input_ids)
             tokens = self.engine.model.lm_head.forward(hidden).argmax(-1).to(torch.int32) if need_logits else None
-        return tokens, hidden
+        features = getattr(self.engine.model.model, "last_aux_hidden", None)
+        return tokens, hidden if features is None else features
 
     def _draft(self, batch, hidden, count=None, *, need_logits=True, last_only=False):
         with self.engine.ctx.forward_batch(batch):
             output = self.engine.mtp.forward(batch.input_ids, hidden)
+            logits_hidden, recursive_hidden = output if isinstance(output, tuple) else (output, output)
             if count is not None:
-                output = output.index_select(0, (count - 1).reshape(1).long())
+                indices = (count - 1).reshape(1).long()
+                logits_hidden = logits_hidden.index_select(0, indices)
+                recursive_hidden = recursive_hidden.index_select(0, indices)
             elif last_only:
-                output = output[-1:]
-            tokens = self.engine.mtp.logits(output).argmax(-1).to(torch.int32) if need_logits else None
-        return tokens, output
+                logits_hidden, recursive_hidden = logits_hidden[-1:], recursive_hidden[-1:]
+            tokens = self.engine.mtp.logits(logits_hidden).argmax(-1).to(torch.int32) if need_logits else None
+            if tokens is not None and hasattr(self.engine.mtp, "map_tokens"):
+                tokens = self.engine.mtp.map_tokens(tokens)
+        return tokens, recursive_hidden
 
     def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False):
         if last_only and (hidden is None or count is not None):
@@ -375,6 +379,8 @@ class QwenMTPRunner:
             return self._draft(current, source, selected, need_logits=need_logits, last_only=last_only)
         graph_ok = self.use_graph and batch.is_decode and 1 <= batch.size <= getattr(self, "max_verify_width", getattr(self, "draft_width", 4))
         if not graph_ok:
+            if getattr(self, "full_graph", False) and batch.is_decode:
+                raise RuntimeError(f"full speculative Graph has no decode capability for {phase}/{batch.size}")
             self.graph_fallbacks[phase] = self.graph_fallbacks.get(phase, 0) + 1
             with self.engine.model.forward_host_ctx(batch, False):
                 try:
@@ -385,6 +391,8 @@ class QwenMTPRunner:
                         _drain_failed_cpu_branch(self.engine.stream, getattr(cache, "speculative_controller", None))
                     raise
         if key not in self.graphs:
+            if getattr(self, "full_graph", False) and self.active:
+                raise RuntimeError(f"full speculative Graph was not prepared for {phase}/{batch.size}")
             static = batch
             fixed_hidden = hidden.clone() if hidden is not None else None
             fixed_count = count.clone() if count is not None else None
@@ -420,6 +428,8 @@ class QwenMTPRunner:
                 with torch.cuda.graph(graph, stream=self.engine.stream):
                     output = fn()
             self.graphs[key] = (graph, static, fixed_hidden, fixed_count, output)
+            captures = self.__dict__.setdefault("graph_captures", {})
+            captures[phase] = captures.get(phase, 0) + 1
         graph, static, fixed_hidden, fixed_count, output = self.graphs[key]
         if fixed_hidden is not None:
             fixed_hidden.copy_(hidden)
@@ -433,6 +443,18 @@ class QwenMTPRunner:
     def _gdn_workspace(self, width, layers):
         pool = self.engine.linear_state_pool
         workspace = self.states[max(self.states)] if self.states else None
+        if pool is None:
+            if workspace is not None and workspace.width >= width:
+                return None
+            if self.active or getattr(self, "coarse_graphs", None) is not None:
+                raise RuntimeError("attention workspace replacement requires an idle runner without captured graphs")
+            if self.graphs:
+                self.engine.stream.synchronize()
+            self.graphs.clear()
+            self._decode_batches.clear()
+            self._shared_indices = None
+            self.states = self.state_adapter.states(width)
+            return None
         if workspace is not None and workspace.pool is pool and workspace.width >= width:
             for w in range(1, width + 1):
                 if w not in self.states:
@@ -460,6 +482,8 @@ class QwenMTPRunner:
             state.commit(count)
             return
         if key not in self.graphs:
+            if getattr(self, "full_graph", False) and self.active:
+                raise RuntimeError("full speculative Graph commit was not prepared")
             fixed_count = count.clone()
             # Warm the fold kernels without advancing state before graph capture.
             state.commit(torch.zeros_like(fixed_count))
@@ -467,6 +491,8 @@ class QwenMTPRunner:
             with torch.cuda.graph(graph, stream=self.engine.stream):
                 state.commit(fixed_count)
             self.graphs[key] = (graph, fixed_count, state)
+            if hasattr(self, "graph_captures"):
+                self.graph_captures["commit"] = self.graph_captures.get("commit", 0) + 1
         graph, fixed_count, _ = self.graphs[key]
         fixed_count.copy_(count)
         graph.replay()
@@ -481,6 +507,8 @@ class QwenMTPRunner:
         width = verified.token_ids.numel()
         key = ("accept", width, eos_ids)
         if key not in self.graphs:
+            if getattr(self, "full_graph", False) and self.active:
+                raise RuntimeError("full speculative Graph acceptance was not prepared")
             fixed_proposal = Proposal(proposal.anchor.clone(), proposal.tokens.clone())
             fixed_verified = VerifyResult(verified.token_ids.clone(), verified.hidden_states.new_empty(width, 0))
             fixed_remaining = torch.tensor(remaining, dtype=torch.int32, device=self.engine.device)
@@ -490,6 +518,8 @@ class QwenMTPRunner:
             with torch.cuda.graph(graph, stream=self.engine.stream):
                 output = greedy_commit(fixed_proposal, fixed_verified, remaining=fixed_remaining, eos_ids=eos_ids, eos_mask=mask)
             self.graphs[key] = (graph, fixed_proposal, fixed_verified, fixed_remaining, output)
+            if hasattr(self, "graph_captures"):
+                self.graph_captures["accept"] = self.graph_captures.get("accept", 0) + 1
         graph, fixed_proposal, fixed_verified, fixed_remaining, output = self.graphs[key]
         fixed_proposal.tokens.copy_(proposal.tokens)
         fixed_verified.token_ids.copy_(verified.token_ids)
@@ -542,8 +572,7 @@ class QwenMTPRunner:
                 page_size = engine.config.page_size
                 self._reserve((capacity + page_size - 1) // page_size * page_size)
                 engine.kv_cache._kv_buffer.zero_()
-                engine.linear_state_pool.recurrent_states.zero_()
-                engine.linear_state_pool.conv_states.zero_()
+                self.state_adapter.reset()
                 for width in range(1, self.draft_width + 1):
                     ids = torch.zeros(width, dtype=torch.int32, device=engine.device)
                     state = self.states[width]
@@ -561,8 +590,7 @@ class QwenMTPRunner:
                     engine.cpu_moe_executor.raise_if_unhealthy()
             finally:
                 engine.stream.synchronize()
-                engine.linear_state_pool.recurrent_states.zero_()
-                engine.linear_state_pool.conv_states.zero_()
+                self.state_adapter.reset()
                 if engine.moe_offload_cache is not None:
                     engine.moe_offload_cache.reset()
                 engine.stream.synchronize()
@@ -611,6 +639,11 @@ class QwenMTPRunner:
                     result = GenerationResult([], 0.0, 0.0)
                     return result
                 anchor = self._prefill(ids, prompt_chunk_size)
+                three_level = getattr(self, "three_level", None)
+                metrics_owner = (three_level.experts if three_level is not None
+                                 else getattr(self.engine, "moe_offload_cache", None))
+                if hasattr(metrics_owner, "reset_request_metrics"):
+                    metrics_owner.reset_request_metrics()
                 first = int(anchor.item())
                 ttft = time.perf_counter() - started
                 if not cancelled():
@@ -689,7 +722,13 @@ class QwenMTPRunner:
                 self.engine.stream.synchronize()
                 if self.engine.cpu_moe_executor is not None:
                     self.engine.cpu_moe_executor.raise_if_unhealthy()
-                result = GenerationResult(output, time.perf_counter() - started, ttft, rounds, dict(self.graph_replays), dict(self.graph_fallbacks))
+                result = GenerationResult(output, time.perf_counter() - started, ttft, rounds,
+                    dict(self.graph_replays), dict(self.graph_fallbacks), dict(getattr(self, "graph_captures", {})))
+                if hasattr(metrics_owner, "request_metrics"):
+                    result.metrics = metrics_owner.request_metrics()
+                elif getattr(self.engine.config, "moe_strategy", None) == "fused":
+                    result.metrics = dict(available=True, scope="gpu_decode", resident=True,
+                                          logical_total_loads=0, logical_total_bytes=0)
                 return result
         finally:
             try:

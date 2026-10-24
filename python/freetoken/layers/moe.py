@@ -124,7 +124,11 @@ class MoELayer(BaseOP):
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
         shared branches that need the original input before calling this method.
         """
-        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        controller = getattr(self, "preverify_controller", None)
+        if controller is not None and controller.active and controller.phase in ("preverify", "verify"):
+            out = controller.route(self, hidden_states, topk_weights, topk_ids)
+        else:
+            out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
 
     def forward(
@@ -288,6 +292,14 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        tile_rows = max(1, cache.pool_slots(self.layer_id) // topk_ids.shape[1])
+        if hidden_states.shape[0] > tile_rows:
+            # Keep the model's full verify window while bounding each MoE working set.
+            return torch.cat([
+                self._decode_routed(hidden_states[i:i + tile_rows], topk_weights[i:i + tile_rows],
+                                    topk_ids[i:i + tile_rows])
+                for i in range(0, hidden_states.shape[0], tile_rows)
+            ], dim=0)
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(

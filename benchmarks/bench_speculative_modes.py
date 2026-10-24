@@ -1,0 +1,325 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+import torch
+
+from freetoken.distributed import DistributedInfo
+from freetoken.engine import Engine
+from freetoken.engine.config import EngineConfig
+from freetoken.mm.config import MultimodalConfig
+from freetoken.utils.hf import load_eos_token_ids, load_tokenizer
+
+from bench_cpu_verify_feasibility import resource_interference, resource_snapshot
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig(EngineConfig):
+    rendezvous_file: str = ""
+
+    @property
+    def distributed_addr(self):
+        return "file://" + self.rendezvous_file
+
+
+def source_identity(root):
+    suffixes = {".py", ".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".so"}
+    files = [p for p in (root / "python/freetoken").rglob("*") if p.suffix in suffixes and p.is_file()]
+    files.extend((root / "benchmarks").glob("*.py"))
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(files)}
+
+
+def resolve_model(path):
+    path = Path(path).resolve()
+    if path.is_dir() and not (path / "config.json").exists():
+        starts = sorted(path.glob("*-00001-of-*.gguf"))
+        if len(starts) == 1:
+            return str(starts[0])
+        files = sorted(path.glob("*.gguf"))
+        if len(files) == 1:
+            return str(files[0])
+        raise ValueError("GGUF directory must identify one checkpoint; pass its first shard explicitly")
+    return str(path)
+
+
+def checkpoint_identity(path):
+    path = Path(path).resolve()
+    directory = path if path.is_dir() else path.parent
+    if path.suffix == ".gguf":
+        stem = path.name.split("-00001-of-")[0]
+        weights = sorted(directory.glob(stem + "-*-of-*.gguf")) or [path]
+    else:
+        weights = sorted(directory.glob("*.safetensors"))
+    metadata = sorted(directory.glob("*.json"))
+    return dict(path=str(path),
+        weights=[dict(path=str(p), bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns) for p in weights],
+        metadata_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in metadata},
+        weight_identity="file sizes and nanosecond mtimes; full weight hashes not computed")
+
+
+def repository_identity(root):
+    frozen = root / "source_revision.json"
+    if frozen.exists():
+        return json.loads(frozen.read_text())
+    return dict(source_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+                git_status=subprocess.check_output(["git", "status", "--short"], cwd=root, text=True))
+
+
+class ResourceMonitor:
+    def __init__(self, output, initial):
+        self.output, self.previous = output, initial
+        self.detected = resource_interference(initial, {os.getpid()})["detected"]
+        self.error = None
+        self.samples = 0
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="speculative_resources", daemon=True)
+        self.thread.start()
+
+    def run(self):
+        try:
+            with self.output.open("a") as stream:
+                while not self.stop.wait(1):
+                    current = resource_snapshot(0)
+                    load = resource_interference(current, {os.getpid()}, self.previous)
+                    stream.write(json.dumps(dict(time=current["wall_time"], interference=load,
+                        gpu_processes=current["gpu_processes"], memory=current["memory"])) + "\n")
+                    stream.flush()
+                    self.detected |= load["detected"]
+                    self.samples += 1
+                    self.previous = current
+        except BaseException:
+            self.error = traceback.format_exc()
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        current = resource_snapshot()
+        load = resource_interference(current, {os.getpid()})
+        self.detected |= load["detected"]
+        return dict(samples=self.samples, external_interference=self.detected,
+                    monitor_error=self.error, final_interference=load,
+                    resource_eligible=not self.detected and self.error is None)
+
+
+def validate_request(record, tokens, eos, graph):
+    output = record["token_ids"]
+    if not 1 <= len(output) <= tokens or (len(output) < tokens and output[-1] not in eos):
+        raise RuntimeError("request stopped without reaching its output cap or EOS")
+    if any(token in eos for token in output[:-1]):
+        raise RuntimeError("request emitted tokens after EOS")
+    if not 0 <= record["ttft_seconds"] <= record["wall_seconds"]:
+        raise RuntimeError("invalid complete-request timing")
+    if graph == "full" and any(record["graph_fallbacks"].values()):
+        raise RuntimeError("full Graph request used an eager fallback")
+    committed = 0
+    for row in record["rounds"]:
+        drafted = row.get("drafted", row.get("candidates"))
+        matched = row.get("matched_drafts", row.get("accepted"))
+        returned = row.get("returned_tokens", row.get("returned"))
+        if not 0 <= matched <= drafted or not 1 <= returned <= drafted + 1:
+            raise RuntimeError("invalid accepted-prefix accounting")
+        if row.get("committed_input_rows", returned) != returned:
+            raise RuntimeError("committed prefix differs from returned prefix")
+        committed += returned
+    if committed + 1 != len(output):
+        raise RuntimeError("round accounting does not cover the returned request")
+
+
+def prompt_inputs(args, tokenizer):
+    if args.samples < 1:
+        raise ValueError("samples must be positive")
+    if args.input_tokens is not None and args.input_tokens < 1:
+        raise ValueError("input_tokens must be positive")
+    if args.input_tokens is not None and args.data:
+        raise ValueError("synthetic input_tokens and data are mutually exclusive")
+    records = []
+    for path in args.data or ():
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()][:args.samples]
+        if len(rows) != args.samples:
+            raise ValueError(f"{path} has fewer than {args.samples} requested rows")
+        for i, row in enumerate(rows):
+            if "question" in row:
+                tokens = tokenizer.apply_chat_template([dict(role="user", content=row["question"])],
+                    tokenize=True, add_generation_prompt=True, enable_thinking=False, return_dict=False)
+            else:
+                tokens = tokenizer.encode(row["prompt"], add_special_tokens=False)
+            records.append(dict(dataset=str(path.resolve()), sample=i, input_ids=list(tokens)))
+    if not records:
+        tokens = tokenizer.encode(args.prompt, add_special_tokens=False)
+        if args.input_tokens:
+            if not tokens:
+                raise ValueError("synthetic length requires a nonempty prompt")
+            tokens = (tokens * ((args.input_tokens + len(tokens) - 1) // len(tokens)))[:args.input_tokens]
+        records.append(dict(dataset="synthetic_length" if args.input_tokens else "prompt", sample=0, input_ids=tokens))
+    if any(not r["input_ids"] or len(r["input_ids"]) > args.max_input_tokens for r in records):
+        raise ValueError("prompt length exceeds the configured input capacity")
+    return records
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Single-request speculative decoding across MoE backends")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--draft-model")
+    parser.add_argument("--mode", choices=("sd", "three_level_gpu", "cpu_async"), required=True)
+    parser.add_argument("--backend", choices=("offload", "hybrid", "fused"), default="offload")
+    parser.add_argument("--graph", choices=("eager", "full"))
+    parser.add_argument("--cache-scope", choices=("unified", "per-layer"), default="unified")
+    parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--preverify-top-h", type=int, default=4)
+    parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--layer-prefetch-experts", type=int, default=4)
+    parser.add_argument("--gap-prefetch-capacity", type=int, default=0)
+    parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
+    parser.add_argument("--max-loops", type=int, default=6)
+    parser.add_argument("--cpu-async-loops", type=int, default=4)
+    parser.add_argument("--recovery", choices=("fixed_replay", "recheck"), default="fixed_replay")
+    parser.add_argument("--cpu-cores", help="CPU Target physical CPU ids, comma separated")
+    parser.add_argument("--hybrid-cores", help="Hybrid physical CPU ids, comma separated")
+    parser.add_argument("--cpu-threads", type=int, default=0)
+    parser.add_argument("--slots", type=int, default=0)
+    parser.add_argument("--budget-gib", type=float)
+    parser.add_argument("--max-input-tokens", type=int, default=4096)
+    parser.add_argument("--max-output-tokens", type=int, default=1024)
+    parser.add_argument("--tokens", type=int, default=1024)
+    parser.add_argument("--input-tokens", type=int)
+    parser.add_argument("--prompt-chunk-size", type=int, default=512)
+    parser.add_argument("--prompt", default="Explain why the sky is blue in simple terms.")
+    parser.add_argument("--data", type=Path, action="append")
+    parser.add_argument("--samples", type=int, default=16)
+    parser.add_argument("--warmups", type=int, default=2)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--ignore-eos", action="store_true")
+    parser.add_argument("--purpose", choices=("smoke", "diagnostic", "formal"), default="smoke")
+    parser.add_argument("--expect-capacity-rejection", action="store_true")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    out = args.output.resolve()
+    if out == Path("/tmp") or Path("/tmp") in out.parents:
+        parser.error("use a persistent output directory outside /tmp")
+    out.mkdir(parents=True, exist_ok=False)
+    (out / "tmp").mkdir()
+    os.environ["TMPDIR"] = str(out / "tmp")
+    import tempfile
+    tempfile.tempdir = str(out / "tmp")
+    def write(name, value):
+        (out / name).write_text(json.dumps(value, indent=2, default=str) + "\n")
+    write("complete.json", dict(status="incomplete", valid=False, formal_eligible=False))
+    root = Path(__file__).resolve().parents[1]
+    frozen = source_identity(root)
+    write("source_manifest.json", frozen)
+    engine = monitor = None
+    try:
+        if args.repeats < 1 or args.warmups < 0 or not 1 <= args.tokens <= args.max_output_tokens:
+            raise ValueError("invalid repeats, warmups or output limit")
+        if args.budget_gib is not None and (not math.isfinite(args.budget_gib) or args.budget_gib <= 0):
+            raise ValueError("budget_gib must be finite and positive")
+        model = resolve_model(args.model)
+        checkpoints = dict(target=checkpoint_identity(model),
+            draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp")
+        write("checkpoints.json", checkpoints)
+        config = BenchmarkConfig(model_path=model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+            rendezvous_file=str(out / "rendezvous"), speculative_mode=args.mode,
+            speculative_depth=args.depth, speculative_draft_model=args.draft_model,
+            speculative_graph=args.graph, speculative_preverify_top_h=args.preverify_top_h,
+            speculative_prefetch=args.prefetch, speculative_max_loops=args.max_loops,
+            speculative_prefetch_layer_experts=args.layer_prefetch_experts,
+            speculative_prefetch_gap_capacity=args.gap_prefetch_capacity,
+            cpu_async_loops=args.cpu_async_loops, cpu_async_recovery=args.recovery,
+            cpu_async_core_ids=tuple(map(int, args.cpu_cores.split(","))) if args.cpu_cores else None,
+            moe_cpu_core_ids=tuple(map(int, args.hybrid_cores.split(","))) if args.hybrid_cores else None,
+            moe_strategy=args.backend, moe_cache_scope=args.cache_scope, moe_cache_size=args.slots,
+            moe_collect_stats=True,
+            moe_cpu_threads=args.cpu_threads,
+            moe_hybrid_max_fetch=args.hybrid_max_fetch,
+            memory_ratio=1.0 if args.budget_gib is not None else 0.9,
+            gpu_memory_budget_bytes=int(args.budget_gib * 2**30) if args.budget_gib else None,
+            speculative_max_input_tokens=args.max_input_tokens,
+            speculative_max_output_tokens=args.max_output_tokens,
+            mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))))
+        tokenizer = load_tokenizer(model)
+        prompts = prompt_inputs(args, tokenizer)
+        eos = () if args.ignore_eos else tuple(load_eos_token_ids(model, tokenizer))
+        write("protocol.json", dict(arguments=vars(args), model=model, prompts=prompts, eos_ids=eos,
+            dataset_sha256={str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in args.data or ()},
+            sampling="greedy", timing="complete request including prefill and resource drain; model load excluded",
+            python=sys.executable, torch=str(torch.__version__), cuda=torch.version.cuda,
+            **repository_identity(root)))
+        initial = resource_snapshot()
+        interference = resource_interference(initial, {os.getpid()})
+        write("resources_before.json", dict(resources=initial, interference=interference))
+        if args.purpose == "formal" and interference["detected"]:
+            raise RuntimeError("formal run requires idle GPUs and external CPU; see resources_before.json")
+        monitor = ResourceMonitor(out / "resources.jsonl", initial)
+        engine = Engine(config)
+        write("resolved_config.json", asdict(config))
+        write("memory_plan.json", engine.baseline_sd_memory_plan.as_dict())
+        if args.expect_capacity_rejection:
+            raise RuntimeError("expected capacity rejection but the model initialized")
+        if args.mode == "cpu_async":
+            from freetoken.engine.cpu_async import CpuAsyncRuntime
+            if getattr(engine, "cpu_async_runtime", None) is None:
+                engine.cpu_async_runtime = CpuAsyncRuntime(engine)
+            engine.cpu_async_runtime._prepare_worker()
+            write("cpu_target_runtime.json", engine.cpu_async_runtime.worker.metadata)
+        rows = []
+        for repeat in range(-args.warmups, args.repeats):
+            for prompt in prompts:
+                torch.cuda.reset_peak_memory_stats(engine.device)
+                result = engine.generate_speculative(prompt["input_ids"], max_tokens=args.tokens,
+                    eos_ids=eos, prompt_chunk_size=args.prompt_chunk_size)
+                record = dict(repeat=repeat, warmup=repeat < 0, dataset=prompt["dataset"], sample=prompt["sample"],
+                    input_tokens=len(prompt["input_ids"]), **asdict(result))
+                validate_request(record, args.tokens, eos, config.speculative_graph)
+                record["returned_tokens"] = len(result.token_ids)
+                record["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(engine.device)
+                record["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(engine.device)
+                record["tokens_per_second"] = len(result.token_ids) / result.wall_seconds
+                record["tpot_seconds"] = ((result.wall_seconds - result.ttft_seconds) / (len(result.token_ids) - 1)
+                                           if len(result.token_ids) > 1 else None)
+                record["text"] = tokenizer.decode(result.token_ids)
+                with (out / "requests.jsonl").open("a") as stream:
+                    stream.write(json.dumps(record) + "\n")
+                if repeat >= 0:
+                    rows.append(record)
+        changed = frozen != source_identity(root)
+        if checkpoints != dict(target=checkpoint_identity(model),
+                draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp"):
+            raise RuntimeError("checkpoint files changed during the run")
+        engine.shutdown()
+        engine = None
+        resource_result = monitor.close()
+        monitor = None
+        write("resource_validation.json", resource_result)
+        write("complete.json", dict(status="complete", valid=True, requests=len(rows), source_changed=changed,
+            formal_eligible=False, formal_requested=args.purpose == "formal",
+            resource_eligible=resource_result["resource_eligible"], accounting_valid=True,
+            limitation="independent state audit is a separate gate; arithmetic parity is not inferred from accounting",
+            returned_tokens=sum(r["returned_tokens"] for r in rows), wall_seconds=sum(r["wall_seconds"] for r in rows)))
+    except BaseException as exc:
+        capacity = "capacity_rejected:" in str(exc)
+        write("complete.json", dict(status="capacity_rejected" if capacity else "failed", valid=False,
+            formal_eligible=False, error=str(exc), traceback=traceback.format_exc()))
+        if not (capacity and args.expect_capacity_rejection):
+            raise
+    finally:
+        try:
+            if engine is not None:
+                engine.shutdown()
+        finally:
+            if monitor is not None:
+                write("resource_validation.json", monitor.close())
+
+
+if __name__ == "__main__":
+    main()

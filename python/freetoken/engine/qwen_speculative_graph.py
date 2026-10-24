@@ -9,8 +9,6 @@ import triton.language as tl
 from freetoken.attention.linear import FLAMetadata
 from freetoken.attention.triton import TritonMetadata
 from freetoken.core import Batch
-from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
-from freetoken.moe.speculative_gpu import _ready
 from .speculative import Commit
 from .qwen_mtp import _can_join_capture_branch, _drain_failed_cpu_branch
 
@@ -103,19 +101,20 @@ class QwenSpeculativeGraphSet:
         # start, valid rows, loop, candidate offset, candidate limit, remaining, accept cap
         self.context = torch.zeros(7, dtype=torch.int32, device=self.engine.device)
         self.anchor = torch.zeros(1, dtype=torch.int32, device=self.engine.device)
-        hidden_size = self.engine.config.model_config.hidden_size
+        hidden_size = getattr(self.engine, "draft_feature_size", self.engine.config.model_config.hidden_size)
         self.seed = torch.zeros_like(self.anchor)
-        self.seed_hidden = torch.zeros(1, hidden_size, dtype=torch.bfloat16, device=self.engine.device)
+        self.seed_hidden = torch.zeros_like(self.runner.seed_hidden)
         self.eos = torch.zeros(self.engine.config.model_config.vocab_size, dtype=torch.bool,
                                device=self.engine.device)
         self.indices = torch.arange(self.engine.max_seq_len, dtype=torch.int32,
                                     device=self.engine.device).repeat(max(self.width, self.outer_width))
-        layers = [layer.linear_attn for layer in self.engine.model.model.layers.op_list if layer._is_linear]
-        workspace = self.runner._gdn_workspace(max(self.width, self.outer_width), layers)
+        adapter = self.runner.state_adapter
+        workspace = self.runner._gdn_workspace(max(self.width, self.outer_width), adapter.layers)
         inner_widths = range(1, self.width + 1) if self.exact else (self.width,)
         outer_widths = range(1, self.outer_width + 1) if self.exact else (self.outer_width,)
-        coordinator.private_states = {n: QwenGDNVerifyState(coordinator.private_pool, layers, n, 0,
-                                      workspace=workspace) for n in inner_widths}
+        private_states = adapter.states(self.width, pool=coordinator.private_pool, private=True,
+                                        workspace=workspace)
+        coordinator.private_states = {n: private_states[n] for n in inner_widths}
         self.runner.states = {n: self.runner.states[n] for n in outer_widths}
         self.target_states = self.runner.states
         self.private_states = coordinator.private_states
@@ -141,13 +140,15 @@ class QwenSpeculativeGraphSet:
                 c.speculative_prefetch_gap_capacity, self.engine.max_seq_len, cache.cache_size,
                 str(self.engine.device), id(self.engine.model), self.engine.num_pages,
                 cache.num_layers, cache.num_experts,
-                self.engine.page_table.data_ptr(), self.engine.linear_state_pool.recurrent_states.data_ptr(),
-                self.coordinator.private_pool.recurrent_states.data_ptr(),
-                self.coordinator.private_pool.conv_states.data_ptr(),
+                self.engine.page_table.data_ptr(), id(self.engine.mtp),
+                self.runner.state_adapter.signature(self.coordinator.private_pool),
                 id(self.runner.states), id(self.coordinator.private_states),
-                tuple(bank.data_ptr() for _, bank in cache.banks),
+                tuple((bank.data_ptr(), tuple(bank.shape)) for _, bank in cache.banks),
+                tuple(getattr(cache, "pool_sizes", ())), tuple(getattr(cache, "pool_of_layer", ())),
                 self.experts.prefetch, self.experts.layer_quota, self.experts.gap_capacity,
                 self.experts.keep_hits, self.experts.renormalize, self.experts.collect_signals,
+                getattr(self.experts, "preverify_policy", None),
+                getattr(self.experts, "preverify_top_k", None),
                 getattr(self.experts, "layer_quotas", None), getattr(self.experts, "demand_fence", False),
                 getattr(c, "speculative_verify_prefetch_layer_experts", 0),
                 tuple(getattr(c, "speculative_verify_prefetch_layer_quotas", None) or ()),
@@ -206,8 +207,7 @@ class QwenSpeculativeGraphSet:
                             lane.width, triton.next_power_of_2(lane.width))
         # The external event is re-recorded by gap copies between graph replays.
         self.engine.stream.wait_event(self.gap_ready)
-        _ready[(1,)](self.experts.pending, self.experts.gap_plan[1], self.experts.gap_plan[3],
-                      triton.next_power_of_2(self.experts.plan_capacity))
+        self.experts.retire_gap()
         self.metadata(lane.batch, lane.inputs)
         self.experts.valid_rows = lane.batch.speculative_valid_rows
         with self.engine.model.forward_host_ctx(lane.batch, True):
@@ -221,11 +221,15 @@ class QwenSpeculativeGraphSet:
 
     def _tail(self, inner):
         lane = self.inner if inner else self.outer
-        lane.state.commit(lane.commit.input_count)
+        self._commit(inner)
         self.metadata(lane.batch, lane.tokens)
         seed, hidden = self.runner._draft(lane.batch, lane.hidden, count=lane.commit.input_count)
         self.seed.copy_(seed)
         self.seed_hidden.copy_(hidden)
+
+    def _commit(self, inner):
+        lane = self.inner if inner else self.outer
+        lane.state.commit(lane.commit.input_count)
 
     def prepare(self, eos_ids):
         if self.closed or self._signature() != self.signature:
@@ -241,15 +245,14 @@ class QwenSpeculativeGraphSet:
             return
         engine, experts = self.engine, self.experts
         saved_table = engine.page_table[0].clone()
-        pool = engine.linear_state_pool
-        saved_state = pool.recurrent_states[:, 1:2].clone(), pool.conv_states[:, 1:2].clone()
+        saved_state = self.runner.state_adapter.snapshot()
         before = torch.cuda.memory_reserved(engine.device)
         try:
             self.runner._reserve(max(self.width, self.outer_width))
             # Outer warmup runs before inner proposals exist; its token IDs must be valid.
             experts.candidate_buffer.zero_()
-            self.coordinator.private_pool.recurrent_states.zero_()
-            self.coordinator.private_pool.conv_states.zero_()
+            for tensor in self.runner.state_adapter.tensors(self.coordinator.private_pool):
+                tensor.zero_()
             lanes = [(inner, lane) for inner, choices in ((False, self.outer_lanes), (True, self.inner_lanes))
                      for _, lane in sorted(choices.items(), reverse=True)]
             for inner, lane in lanes:
@@ -265,7 +268,7 @@ class QwenSpeculativeGraphSet:
                 experts.set_phase("preverify" if inner else "verify")
                 rows = min(lane.width, self.outer_width) if inner else lane.width
                 self.stage(0, rows, 0, 0, self.outer_width - 1, self.outer_width, rows)
-                for suffix, fn in (("body", self._body), ("tail", self._tail)):
+                for suffix, fn in (("body", self._body), ("tail", self._tail), ("commit", self._commit)):
                     fn(inner)
                     if inner and suffix == "body":
                         experts.finish_loop(False)
@@ -307,6 +310,8 @@ class QwenSpeculativeGraphSet:
                         self.pool = graph.pool()
                     self.graphs[self._key(inner, suffix, lane.width)] = graph
                     self.captures += 1
+                    phase = f"{self.implementation}_{'inner' if inner else 'outer'}_{suffix}"
+                    self.runner.graph_captures[phase] = self.runner.graph_captures.get(phase, 0) + 1
                 experts.close(abort=True)
                 self.capture_memory.append(dict(inner=inner, rows=lane.width,
                     allocated_bytes=torch.cuda.memory_allocated(engine.device),
@@ -323,8 +328,7 @@ class QwenSpeculativeGraphSet:
             experts.close(abort=True)
             engine.stream.synchronize()
             engine.page_table[0].copy_(saved_table)
-            pool.recurrent_states[:, 1:2].copy_(saved_state[0])
-            pool.conv_states[:, 1:2].copy_(saved_state[1])
+            self.runner.state_adapter.restore(saved_state)
             experts.cache.reset()
             experts.valid_rows = None
             self.runner._reserved_len = 0
@@ -361,7 +365,7 @@ class QwenSpeculativeGraphSet:
             self._replay(inner, "tail", lane.width)
             self.runner.next_draft, self.runner.last_draft_hidden = self.seed, self.seed_hidden
         else:
-            lane.state.commit(lane.commit.input_count)
+            self._replay(inner, "commit", lane.width)
 
     def _key(self, inner, suffix, width):
         return (inner, suffix, width) if self.exact else (inner, suffix)
@@ -379,7 +383,10 @@ class QwenSpeculativeGraphSet:
         scratch = {}
         for lane in (*self.inner_lanes.values(), *self.outer_lanes.values()):
             if lane is not None:
-                for tensor in (lane.state.conv_windows, *lane.state.replay_inputs):
+                for tensor in (getattr(lane.state, "conv_windows", None),
+                               *getattr(lane.state, "replay_inputs", ())):
+                    if tensor is None:
+                        continue
                     storage = tensor.untyped_storage()
                     scratch[storage.data_ptr()] = storage.nbytes()
         return dict(implementation=self.implementation, draft_depth=self.engine.config.speculative_mtp_depth, inner_rows=self.width,

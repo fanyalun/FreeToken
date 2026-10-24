@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
-from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
 from freetoken.moe.speculative_cache import SpeculativeExpertCache
+from .candidate_runner import CandidateRunner
 from .speculative import Proposal, SpeculativeFrontier, VerifyResult
 from .speculative_window import SpeculativeWindow, WindowBudget
 
@@ -58,19 +58,17 @@ class ThreeLevelCoordinator:
         if runner.active or getattr(runner, "coarse_graphs", None) is not None:
             raise RuntimeError("coordinator replacement requires an idle runner without captured coarse/full graphs")
         self.runner, self.engine = runner, runner.engine
+        self.candidate_runner = CandidateRunner(runner)
         engine = self.engine
         cache = engine.moe_offload_cache
         resident = getattr(engine.config, "moe_strategy", "offload") == "fused"
         if (cache is None and not resident) or engine.mtp is None or runner.reference_ar:
-            raise ValueError("three-level decoding requires native MTP and an offload expert cache")
+            raise ValueError("three-level decoding requires a Draft and a resident or offload expert backend")
         mc = engine.config.model_config
         from freetoken.moe.preverify_policy import PreverifyPolicy
         policy = PreverifyPolicy.from_config(engine.config, layers=mc.num_moe_layers,
                                              model_path=getattr(engine.config, "model_path", ""))
         if resident:
-            if (runner.use_graph or engine.config.speculative_graph_implementation != "reference"
-                    or engine.config.speculative_prefetch):
-                raise ValueError("resident three-level experiments require eager execution without prefetch")
             from freetoken.moe.speculative_resident import ResidentExpertController
             cache = SimpleNamespace(cache_size=mc.num_moe_layers * mc.num_experts,
                                     num_experts=mc.num_experts)
@@ -110,8 +108,8 @@ class ThreeLevelCoordinator:
         if resident:
             self.experts = ResidentExpertController(engine, policy, audit=engine.config.speculative_audit)
         else:
-            if cache_type is SpeculativeExpertCache and policy != PreverifyPolicy():
-                raise ValueError("custom Pre-Verify policy requires GPU expert scheduling")
+            if cache_type is SpeculativeExpertCache:
+                extra["preverify_policy"] = policy
             self.experts = cache_type(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
                                                use_graph=runner.use_graph, audit=engine.config.speculative_audit,
                                                layer_quota=engine.config.speculative_prefetch_layer_experts,
@@ -125,23 +123,22 @@ class ThreeLevelCoordinator:
             if engine.config.moe_cache_auto and (getattr(engine, "baseline_sd_memory_plan", None) is None
                                                  or getattr(engine, "_sd_sizing", False)):
                 profile_path = None
-            self.experts.prepare_hybrid(engine.speculative_hybrid_layer,
-                profile_path)
+            from freetoken.layers.moe import iter_moe_layers
+            layouts = set()
+            for layer in iter_moe_layers(engine.model):
+                layout = cache.layer_layout[layer.layer_id]
+                if layout not in layouts:
+                    self.experts.prepare_hybrid(layer, profile_path)
+                    layouts.add(layout)
         self.verify_prefetch_signature = self._verify_prefetch_signature()
         self.compact_control = getattr(self.experts, "compact_control", False)
-        pool = engine.linear_state_pool
-        self.private_pool = SimpleNamespace(
-            recurrent_states=torch.empty_like(pool.recurrent_states[:, 1:2]),
-            conv_states=torch.empty_like(pool.conv_states[:, 1:2]),
-            local_index=pool.local_index, num_slots=1,
-        )
-        layers = [layer.linear_attn for layer in engine.model.model.layers.op_list if layer._is_linear]
+        self.private_pool = runner.state_adapter.private_pool()
         runner.max_verify_width = self.outer_width
         self.private_states = {}
         if not coarse:
-            workspace = runner._gdn_workspace(runner.max_verify_width, layers)
-            self.private_states = {w: QwenGDNVerifyState(self.private_pool, layers, w, 0, workspace=workspace)
-                                   for w in range(1, self.inner_width + 1)}
+            workspace = runner._gdn_workspace(runner.max_verify_width, runner.state_adapter.layers)
+            self.private_states = runner.state_adapter.states(max(1, self.inner_width),
+                pool=self.private_pool, private=True, workspace=workspace)
         device = engine.device
         self.inputs = torch.empty(runner.max_verify_width, dtype=torch.int32, device=device)
         self.first_anchor = torch.empty(1, dtype=torch.int32, device=device)
@@ -159,10 +156,7 @@ class ThreeLevelCoordinator:
                 capacity = engine.max_seq_len
                 runner._reserve((capacity + engine.config.page_size - 1) // engine.config.page_size * engine.config.page_size)
                 engine.kv_cache._kv_buffer.zero_()
-                engine.linear_state_pool.recurrent_states.zero_()
-                engine.linear_state_pool.conv_states.zero_()
-                self.private_pool.recurrent_states.zero_()
-                self.private_pool.conv_states.zero_()
+                runner.state_adapter.reset(self.private_pool)
                 if runner.coarse_graphs is None:
                     for phase, states in (("preverify", self.private_states), ("verify", runner.states)):
                         for width, state in states.items():
@@ -187,8 +181,7 @@ class ThreeLevelCoordinator:
             finally:
                 self.experts.close()
                 engine.stream.synchronize()
-                engine.linear_state_pool.recurrent_states.zero_()
-                engine.linear_state_pool.conv_states.zero_()
+                runner.state_adapter.reset(self.private_pool)
                 if engine.moe_offload_cache is not None:
                     engine.moe_offload_cache.reset()
                 engine.stream.synchronize()
@@ -260,7 +253,6 @@ class ThreeLevelCoordinator:
         start = exact.target_valid_len
         self.epoch += 1
         window = SpeculativeWindow(self.epoch, start, min(self.budget.candidates, remaining - 1))
-        pool = engine.linear_state_pool
         private = SpeculativeFrontier(exact.page_size, start, start, exact.allocated_len)
         self.first_anchor.copy_(anchor)
         self.current.copy_(anchor)
@@ -280,12 +272,11 @@ class ThreeLevelCoordinator:
         try:
             while width > 0 and not stop_reason and not cancelled():
                 if not window.loops:
-                    self.private_pool.recurrent_states.copy_(pool.recurrent_states[:, 1:2])
-                    self.private_pool.conv_states.copy_(pool.conv_states[:, 1:2])
+                    runner.state_adapter.fork(self.private_pool)
                 previous_experts = capacity["protected_experts"]
                 runner.frontier = private
                 if coarse is None:
-                    proposal = runner.coordinator.prepare(private, current, width - 1)
+                    proposal = self.candidate_runner.prepare(current, width)
                     inputs = self.inputs[:width]
                     inputs[:1].copy_(proposal.anchor)
                     inputs[1:].copy_(proposal.tokens)
@@ -295,9 +286,8 @@ class ThreeLevelCoordinator:
                 self.experts.input_offset = len(window.candidates)
                 self.experts.set_phase("preverify", len(window.loops))
                 if coarse is None:
-                    tokens, hidden = self._forward(inputs, private.target_valid_len, self.private_states[width])
-                    verified = VerifyResult(tokens, hidden)
-                    commit = runner._accept(proposal, verified, width, eos_ids)
+                    tokens, hidden, commit = self.candidate_runner.verify(proposal, inputs,
+                        forward=self._forward, state=self.private_states[width], remaining=width, eos_ids=eos_ids)
                 else:
                     tokens, hidden, commit, control = coarse.body(current, inner=True,
                         start=private.target_valid_len, rows=width, loop=len(window.loops),

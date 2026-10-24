@@ -13,11 +13,14 @@ import traceback
 import torch
 
 from .qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, bitwise_equal
-from .prefix_transfer import PrefixAborted, PrefixTicket
+from .prefix_transfer import PrefixAborted, PrefixTicket, prefix_shapes
+
+_failed_reader_workers = []
 
 
 def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, backend,
-              kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None):
+              kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None,
+              shared_banks=None, config_overrides=None):
     target = None
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -27,9 +30,14 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
         if bind_openmp:
             os.sched_setaffinity(0, [core_ids[0]])
         initialization_start = time.perf_counter()
+        if shared_banks is not None:
+            from freetoken.moe.shared_banks import materialize_cpu_banks
+
+            shared_banks = materialize_cpu_banks(shared_banks)
         target = QwenCpuTarget.from_checkpoint(model, core_ids=core_ids, max_context=max_context,
                                                max_rows=max_rows, grouped=grouped, backend=backend,
-                                               kernel_profile=kernel_profile, components=components)
+                                               kernel_profile=kernel_profile, components=components,
+                                               shared_banks=shared_banks, config_overrides=config_overrides)
         if torch.cuda.is_initialized():
             raise RuntimeError("CPU worker created a CUDA context")
         import hashlib
@@ -140,7 +148,8 @@ def audit_cpu_blocks(target, tokens, first_logits=None):
         s = target.state
         reference.append(target.verify(VerifyJob(epoch, block, s.length, s.anchor, (), tokens + 1)))
     if first_logits is not None:
-        first_logits.copy_(target.logits(reference[0].hidden)[0].float())
+        first_logits.copy_(target.logits(reference[0].target_hidden if reference[0].target_hidden is not None
+                                        else reference[0].hidden)[0].float())
     candidates = tuple(r.tokens[0] for r in reference[:tokens - 1])
     checks = []
     for reject in (0, (tokens - 1) // 2, None):
@@ -184,28 +193,26 @@ def audit_cpu_blocks(target, tokens, first_logits=None):
                 serial_tensor_sha256=hashes, valid_state_finite=True, cuda_initialized=torch.cuda.is_initialized())
 
 
+def cpu_target_state_spec(config, max_context, max_rows):
+    return {**prefix_shapes(config, max_context),
+            "hidden": ((max_rows, config.get("draft_feature_size", config["hidden_size"])), torch.bfloat16),
+            "predictions": ((max_rows,), torch.int64),
+            "audit_logits": ((config["vocab_size"],), torch.float32)}
+
+
 class CpuVerifierWorker:
     def __init__(self, model, config, core_ids, *, max_context=4096, max_rows=33, grouped=True, backend="optimized",
-                 kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None):
+                 kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None, shared_banks=None):
         self.prefix_receiver = prefix_receiver
         if backend not in ("legacy", "optimized") or (backend == "optimized" and not grouped):
             raise ValueError("optimized backend requires grouped experts; ungrouped is legacy-only")
         if not core_ids or max_context < 1 or max_rows < 1:
             raise ValueError("positive CPU worker capacity and affinity required")
-        c = config
-        linear = c["layer_types"].count("linear_attention")
-        attention = c["layer_types"].count("full_attention")
-        vh, kd, vd = c["linear_num_value_heads"], c["linear_key_head_dim"], c["linear_value_head_dim"]
-        channels = 2 * c["linear_num_key_heads"] * kd + vh * vd
-        shapes = {
-            "keys": ((attention, max_context, c["num_key_value_heads"], c["head_dim"]), torch.bfloat16),
-            "values": ((attention, max_context, c["num_key_value_heads"], c["head_dim"]), torch.bfloat16),
-            "recurrent": ((linear, vh, vd, kd), torch.float32),
-            "conv": ((linear, channels, c["linear_conv_kernel_dim"] - 1), torch.bfloat16),
-            "hidden": ((max_rows, c["hidden_size"]), torch.bfloat16),
-            "predictions": ((max_rows,), torch.int64),
-            "audit_logits": ((c["vocab_size"],), torch.float32),
-        }
+        if shared_banks is not None:
+            from freetoken.moe.shared_banks import validate_shared_banks
+
+            validate_shared_banks(shared_banks)
+        shapes = cpu_target_state_spec(config, max_context, max_rows)
         self.slots = [{key: torch.empty(shape, dtype=dtype).share_memory_()
                        for key, (shape, dtype) in shapes.items()} for _ in range(2)]
         self.generations = [0, 0]
@@ -220,7 +227,7 @@ class CpuVerifierWorker:
         self.pipe, child = context.Pipe()
         self.process = context.Process(target=_cpu_main,
             args=(child, self.slots, str(model), list(core_ids), max_context, max_rows, grouped, backend,
-                  kernel_profile, components, bind_openmp, prefix_receiver), daemon=True)
+                  kernel_profile, components, bind_openmp, prefix_receiver, shared_banks, config), daemon=True)
         saved_environment = {key: os.environ.get(key) for key in ("GOMP_CPU_AFFINITY", "OMP_PROC_BIND")}
         saved_affinity = os.sched_getaffinity(0) if bind_openmp else None
         try:
@@ -405,18 +412,26 @@ class CpuVerifierWorker:
         if self.closed:
             return
         self.closed = True
-        if self.prefix_receiver is not None:
-            self.prefix_receiver.abort()
-        for event in self.readers:
-            if event is not None:
-                event.synchronize()
-        if self.process.is_alive():
+        try:
+            if self.prefix_receiver is not None:
+                self.prefix_receiver.abort()
+            for event in self.readers:
+                if event is not None:
+                    event.synchronize()
+        except BaseException:
+            # Keep shared slots alive if a failed CUDA reader may still reference them.
+            _failed_reader_workers.append(self)
+            raise
+        finally:
             try:
-                self.pipe.send(dict(kind="close"))
-            except (BrokenPipeError, EOFError):
-                pass
-            self.process.join(timeout=5)
-            if self.process.is_alive():
-                self.process.terminate()
-                self.process.join(timeout=5)
-        self.pipe.close()
+                if self.process.is_alive():
+                    try:
+                        self.pipe.send(dict(kind="close"))
+                    except (BrokenPipeError, EOFError, OSError):
+                        pass
+                    self.process.join(timeout=5)
+                    if self.process.is_alive():
+                        self.process.terminate()
+                        self.process.join(timeout=5)
+            finally:
+                self.pipe.close()

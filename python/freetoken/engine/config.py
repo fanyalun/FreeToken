@@ -25,7 +25,7 @@ class EngineConfig:
     dtype: torch.dtype
     # --hf-overrides: applied to the checkpoint config the model is built from (cached_load_hf_config)
     hf_overrides: Mapping[str, Any] = field(default_factory=dict)
-    max_running_req: int = 4
+    max_running_req: int | None = None
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
     # old name of moe_strategy; __post_init__ folds it in
@@ -89,19 +89,32 @@ class EngineConfig:
     page_size: int = 1
     memory_ratio: float = 0.9
     gpu_memory_budget_bytes: int | None = None
-    speculative_mtp_depth: int = 0
+    speculative_mode: str | None = None
+    speculative_depth: int | None = None
+    speculative_draft_method: str = "auto"
+    speculative_draft_model: str | None = None
+    speculative_graph: str | None = None
+    speculative_preverify_top_h: int | None = None
+    cpu_async_loops: int = 4
+    cpu_async_recovery: str = "fixed_replay"
+    cpu_async_timeout: float = 600.0
+    cpu_async_core_ids: tuple[int, ...] | None = None
+    moe_cpu_core_ids: tuple[int, ...] | None = None
+    _cpu_moe_coordinator_core: int | None = field(default=None, init=False, repr=False)
+    _speculative_legacy: bool | None = field(default=None, repr=False)
+    speculative_mtp_depth: int | None = None
     speculative_max_input_tokens: int | None = None
     speculative_max_output_tokens: int | None = None
-    speculative_three_level: bool = False
+    speculative_three_level: bool | None = None
     speculative_submit_tokens: int = 0
     speculative_max_loops: int = 6
     speculative_preverify_policy: str = "fixed_topk"
-    speculative_preverify_top_k: int = 4
+    speculative_preverify_top_k: int | None = None
     speculative_preverify_replacement: str = "zero"
     speculative_modes_calibration: str | None = None
     speculative_reference_math: bool = False
     speculative_overlap_loops: int = 3
-    speculative_prefetch: bool = True
+    speculative_prefetch: bool | None = None
     speculative_prefetch_layer_experts: int = 4
     speculative_prefetch_layer_quotas: List[int] | None = None
     speculative_prefetch_demand_fence: bool = False
@@ -113,7 +126,7 @@ class EngineConfig:
     speculative_compact_control: bool = True
     speculative_execution_implementation: str = "reference"
     speculative_graph_implementation: str = "reference"
-    speculative_hybrid_phases: tuple[str, ...] = ("verify",)
+    speculative_hybrid_phases: tuple[str, ...] | None = None
     speculative_hybrid_profile: str | None = None
     speculative_hybrid_window_policy: str = "balanced"
     speculative_hybrid_cpu_backend: str = "grouped"
@@ -143,6 +156,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        from .speculative_config import resolve_speculative_config
+        resolve_speculative_config(self)
         from freetoken.moe.preverify_policy import PreverifyPolicy
         if self.speculative_preverify_policy not in ("fixed_topk", "modes"):
             raise ValueError("invalid Pre-Verify policy")
@@ -154,7 +169,7 @@ class EngineConfig:
             raise ValueError("MoDES calibration requires the modes policy")
         if self.speculative_reference_math and self.moe_strategy != "fused":
             raise ValueError("reference arithmetic is restricted to resident fused experiments")
-        if self.speculative_three_level and self.moe_strategy == "fused" and (
+        if self._speculative_legacy and self.speculative_three_level and self.moe_strategy == "fused" and (
                 self.speculative_prefetch or self.cuda_graph_max_bs not in (0, None)
                 or self.speculative_graph_implementation != "reference"):
             raise ValueError("resident three-level experiments require eager execution without prefetch")
@@ -185,7 +200,7 @@ class EngineConfig:
             raise ValueError("speculative_execution_implementation must be reference or optimized")
         if self.speculative_execution_implementation == "optimized" and not self.speculative_compact_control:
             raise ValueError("optimized execution requires compact control")
-        if self.speculative_expert_scheduler == "gpu" and not self.speculative_three_level:
+        if self.speculative_expert_scheduler == "gpu" and not self.speculative_mode:
             raise ValueError("GPU expert scheduling requires three-level decoding")
         phases = self.speculative_hybrid_phases
         if (not isinstance(phases, (tuple, list)) or len(set(phases)) != len(phases)
@@ -234,7 +249,7 @@ class EngineConfig:
                 raise ValueError("coarse/full graphs require Triton attention and one active request")
             if self.cuda_graph_max_bs == 0 or self.cuda_graph_bs == []:
                 raise ValueError("coarse/full graphs require CUDA Graph enabled")
-        if self.speculative_submit_tokens and not self.speculative_three_level:
+        if self.speculative_submit_tokens and not (self.speculative_three_level or self.speculative_mode == "cpu_async"):
             raise ValueError("speculative_submit_tokens requires three-level decoding")
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")

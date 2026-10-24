@@ -49,6 +49,22 @@ def test_baseline_budget_rejects_minimum_and_fused_overcommit():
                 minimum_slots=slots, maximum_slots=20, automatic=True)
 
 
+def test_measured_budget_uses_mixed_pool_allocations():
+    from freetoken.engine.baseline_sd import plan_measured_memory
+    # Each pair of slots allocates one 100-byte and one 160-byte layout row.
+    sizes = [0, 160, 260, 420, 520, 680, 780, 940, 1040]
+    plan = plan_measured_memory(capacity_tokens=10, kv_pages=10, budget_bytes=1200,
+        measured_peak_bytes=660, initial_slots=2, expert_slot_bytes=160,
+        minimum_slots=2, maximum_slots=8, automatic=True,
+        cache_bytes_for_slots=sizes.__getitem__)
+    assert plan.non_expert_peak_bytes == 400
+    assert plan.final_slots == 6
+    assert plan.initial_cache_bytes == 260 and plan.final_cache_bytes == 780
+    plan.validate(6, cache_bytes=sizes[6])
+    with pytest.raises(ValueError, match="shortfall"):
+        plan.validate(7, cache_bytes=sizes[7])
+
+
 @pytest.mark.parametrize("automatic", [False, True])
 def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
     from freetoken.engine.engine import Engine
@@ -56,6 +72,8 @@ def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
     engine = object.__new__(Engine)
     engine.config = SimpleNamespace(model_config=SimpleNamespace(num_experts=2), moe_prefill_overlap=False)
     engine.moe_offload_cache = SimpleNamespace(cache_size=8)
+    from freetoken.moe.pool_policy import PoolSpec
+    engine._moe_pools = lambda batch: [PoolSpec((0,), 2, 8)]
     engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 2, 8, 400, 0)
     engine._sd_sizing = automatic
     peaks = iter((1200, 900))
@@ -86,6 +104,31 @@ def test_hybrid_partial_reservation_does_not_charge_preallocated_storage_twice()
     full = speculative_hybrid_workspace_bytes(config)
     pending = speculative_hybrid_workspace_bytes(config, include_cpu_partials=False)
     assert full - pending == 2 * (1 + 2 + 3) * 64
+
+
+def test_cache_teardown_releases_async_private_storage_before_reallocation():
+    import weakref
+    from freetoken.engine.engine import Engine
+
+    calls = []
+    class Runner:
+        def invalidate(self):
+            calls.append("runner")
+    class Runtime:
+        def __init__(self, runner):
+            self.runner = runner
+            self.private_storage = torch.empty(8)
+        def close(self):
+            calls.append("worker")
+    engine = object.__new__(Engine)
+    engine.speculative_runner = Runner()
+    engine.cpu_async_runtime = Runtime(engine.speculative_runner)
+    old_runner = weakref.ref(engine.speculative_runner)
+    old_storage = weakref.ref(engine.cpu_async_runtime.private_storage)
+    engine._invalidate_speculative_runtime()
+    assert calls == ["worker", "runner"]
+    assert engine.cpu_async_runtime is None and engine.speculative_runner is None
+    assert old_runner() is None and old_storage() is None
 
 
 def test_baseline_rebuild_accounts_for_previously_expanded_state_pool(monkeypatch):

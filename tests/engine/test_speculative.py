@@ -265,7 +265,11 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             slot_for_id=torch.full((2, 16), -1, device=device, dtype=torch.int32),
             usage=torch.zeros(cache_slots, device=device, dtype=torch.int64),
             step=torch.zeros((), device=device, dtype=torch.int64),
-            bank_views=lambda: (bank,), alphas_for_slots=lambda _: None)
+            bank_views=lambda: (bank,), pool_bank_views=lambda _: (bank,),
+            pool_bases=[0], pool_sizes=[cache_slots], pool_of_layer=[0, 0],
+            _pool_bank_views=[(bank,)], alphas_for_slots=lambda _: None)
+        cache._pool_id_of_slot = [cache.id_of_slot]
+        cache._pool_usage = [cache.usage]
         def reset():
             cache.slot_for_id.fill_(-1)
             cache.id_of_slot.fill_(-1)
@@ -283,10 +287,14 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             conv_states=torch.zeros(1, 1, 3, 2, device=device), num_slots=1, local_index=lambda _: 0)
         engine = SimpleNamespace(config=config, device=device, stream=stream, max_seq_len=64,
             num_pages=64, page_table=torch.zeros(1, 64, device=device, dtype=torch.int32),
-            linear_state_pool=pool, model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[])),
+            linear_state_pool=pool, mtp=object(), model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[])),
                 forward_host_ctx=lambda *a: nullcontext()))
         runner = object.__new__(QwenMTPRunner)
         runner.engine, runner._reserved_len, runner.graph_replays = engine, 0, {}
+        runner.graph_captures = {}
+        runner.seed_hidden = torch.zeros(1, 2, dtype=torch.bfloat16, device=device)
+        from freetoken.engine.speculative_state import TargetStateAdapter
+        runner.state_adapter = TargetStateAdapter(engine)
         runner.states, runner.graphs, runner._decode_batches = {}, {}, {}
         runner.active, runner.coarse_graphs = False, None
         runner.model_state = SimpleNamespace(current=None)
@@ -309,7 +317,7 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 self.pool, self.width, self.slot = pool, width, slot
             def commit(self, count):
                 self.pool.recurrent_states[:, self.slot].add_(count)
-        monkeypatch.setattr("freetoken.engine.qwen_speculative_graph.QwenGDNVerifyState", State)
+        monkeypatch.setattr("freetoken.engine.speculative_state.QwenGDNVerifyState", State)
         monkeypatch.setattr("freetoken.engine.qwen_mtp.QwenGDNVerifyState", State)
         def gemm(cache, hidden, weights, slots, **kwargs):
             return hidden + (kwargs["views"][0][slots.long(), 0] * weights).sum(-1, keepdim=True) * 0
@@ -332,7 +340,7 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         graphs = QwenSpeculativeGraphSet(coordinator)
         experts.candidate_buffer.fill_(-1000000)
         graphs.prepare(())
-        expected_graphs = 2 * (depth + 1 + budget.submit_rows) if implementation == "full" else 4
+        expected_graphs = 3 * (depth + 1 + budget.submit_rows) if implementation == "full" else 6
         assert graphs.ready and len(graphs.graphs) == graphs.captures == expected_graphs
         for n in (1, min(depth + 1, budget.submit_rows), 1):
             experts.begin(1)
@@ -416,6 +424,12 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 limit=budget.submit_rows - 1, remaining=32)
         torch.testing.assert_close(private.recurrent_states, before, atol=0, rtol=0)
         experts.close(abort=True)
+        policy = experts.preverify_policy
+        from dataclasses import replace
+        experts.preverify_policy = replace(policy, top_k=2)
+        with pytest.raises(RuntimeError, match="configuration changed"):
+            graphs.prepare(())
+        experts.preverify_policy = policy
         runner.three_level = SimpleNamespace()
         with pytest.raises(RuntimeError, match="configuration changed"):
             graphs.prepare(())
@@ -427,6 +441,7 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
         if implementation == "full" and depth == 1 and limit == 0 and verify_quota == 0:
             config.speculative_mtp_depth = depth
             experts.cpu_stream = torch.cuda.Stream()
+            cache.cpu_executor = SimpleNamespace(drain_pending=lambda: None, raise_if_unhealthy=lambda: None)
             def failed_target(batch):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError("injected failure before CPU fork")
@@ -704,9 +719,11 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
         def transfer_audit(self):
             return {}
 
-    monkeypatch.setattr("freetoken.engine.qwen_three_level.QwenGDNVerifyState", State)
+    monkeypatch.setattr("freetoken.engine.speculative_state.QwenGDNVerifyState", State)
     monkeypatch.setattr("freetoken.engine.qwen_mtp.QwenGDNVerifyState", State)
     monkeypatch.setattr("freetoken.engine.qwen_three_level.SpeculativeExpertCache", Cache)
+    from freetoken.engine.speculative_state import TargetStateAdapter
+    runner.state_adapter = TargetStateAdapter(engine)
     runner.states = {w: State(engine.linear_state_pool, [], w, 1) for w in range(1, 5)}
     runner.graphs, runner.graph_replays, runner.graph_fallbacks = {}, {}, {}
     runner.use_graph, runner.active = graph_mode, False
@@ -855,6 +872,39 @@ def test_repeated_rejection_does_not_promote_scratch():
         start, _ = frontier.releasable_tail()
         frontier.allocated_len = start
     assert frontier.target_valid_len == frontier.draft_valid_len == 23
+
+
+def test_candidate_window_cap_reconciles_before_next_private_round(monkeypatch):
+    from freetoken.engine.candidate_runner import CandidateRunner
+    from freetoken.engine.qwen_mtp import _QwenProposer, _QwenReservation, _QwenState
+    from freetoken.engine.speculative import SpeculativeCoordinator
+    from freetoken.engine.speculative_state import AttentionVerifyState
+
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.frontier = SpeculativeFrontier(4, 1, 1, 4)
+    canonical = runner.frontier
+    private = SpeculativeFrontier(4, 3, 3, 4)
+    runner.use_graph, runner.graph_fallbacks = False, {}
+    runner.next_draft, runner.last_draft_hidden = torch.tensor([8]), torch.zeros(1, 2)
+    def execute(phase, batch, hidden, *, count=None):
+        tokens = batch.input_ids + 1
+        features = hidden + 1
+        return (tokens, features) if count is None else (tokens[count - 1:count], features[count - 1:count])
+    runner._execute = execute
+    runner.coordinator = SpeculativeCoordinator(_QwenProposer(runner), _QwenState(runner), _QwenReservation(runner))
+    def forward(inputs, start, state):
+        return inputs + 1, torch.full((len(inputs), 2), float(start))
+    candidates = CandidateRunner(runner)
+    first = candidates.step(torch.tensor([7]), 4, forward=forward, state=AttentionVerifyState(4),
+                            remaining=4, frontier=private)
+    assert first.terminal and first.returned == [8, 9, 10, 11]
+    assert runner.frontier is canonical and canonical.target_valid_len == 1
+    assert private.target_valid_len == private.draft_valid_len == 7
+    assert runner.next_draft.tolist() == [12]
+    second = candidates.step(torch.tensor([11]), 2, forward=forward, state=AttentionVerifyState(2),
+                             remaining=2, frontier=private)
+    assert second.returned == [12, 13] and second.accepted == 1
+    assert private.target_valid_len == private.draft_valid_len == 9
 
 
 def test_chain_preserves_tokens_across_reused_graph_output():
@@ -1029,6 +1079,27 @@ def test_baseline_tiny_engine_lifecycle(backend, eager):
     result = subprocess.run(command, capture_output=True, text=True, timeout=240)
     assert result.returncode == 0, result.stdout + result.stderr
     assert '"status": "passed"' in result.stdout
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("backend", ["fused", "offload", "hybrid"])
+@pytest.mark.parametrize("three_level", [False, True])
+@pytest.mark.parametrize("eager", [False, True])
+def test_eagle3_tiny_engine_lifecycle(backend, three_level, eager):
+    import subprocess
+    import sys
+    from pathlib import Path
+    command = [sys.executable, str(Path(__file__).with_name("baseline_sd_worker.py")),
+               "--modern", "--draft-method", "eagle3", "--backend", backend,
+               "--graph-implementation", "full", "--phases", "both"]
+    if three_level:
+        command.append("--three-level")
+    if eager:
+        command.append("--eager")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"status": "passed"' in result.stdout
+    assert ('"graph_replays": {}' if eager else '"graph_fallbacks": {}') in result.stdout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

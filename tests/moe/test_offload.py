@@ -214,17 +214,29 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     assert prefill_down_buffer.data_ptr() == cache.bank_caches["down"].data_ptr()
 
 
-def test_offload_moe_cache_prefill_overlap_requires_two_layer_slots():
+@pytest.mark.parametrize("sizes,widths,overlap", [
+    ([3, 2, 2], [4, 4, 4], False),
+    ([3, 3, 3], [8, 4, 4], False),
+    ([4, 4, 4], [8, 4, 4], True),
+])
+def test_offload_moe_cache_prefill_overlap_uses_bank_bytes(sizes, widths, overlap):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
-    with pytest.raises(AssertionError):
-        OffloadMoeCache(
-            num_layers=3,
-            num_experts=4,
-            cache_size=7,
-            device=torch.device("cpu"),
-            prefill_overlap=True,
-        )
+    cache = OffloadMoeCache(
+        num_layers=3, num_experts=4, cache_size=sum(sizes),
+        device=torch.device("cpu"), prefill_overlap=True,
+        pool_of_layer=[0, 1, 2], pool_sizes=sizes,
+    )
+    sources = {name: [torch.randn(4, width) for width in widths]
+               for name in ("gate_up", "down")}
+    cache.set_bank_sources(sources)
+    assert cache.cache_size == sum(sizes)
+    assert cache.prefill_overlap is overlap
+    for layer in range(3):
+        for (source, bank), stage in zip(cache.banks, cache.stage_views(layer, 0)):
+            assert stage.shape == source[layer].shape
+            assert stage.data_ptr() == bank.data_ptr()
+        assert (cache._stage_views[cache.layer_layout[layer]][1] is not None) is overlap
 
 
 def test_offload_moe_cache_marlin_rejects_slot_count_beyond_kernel_limit():

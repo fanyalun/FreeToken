@@ -19,8 +19,12 @@ class QwenMTPKVCache(MHAKVCache):
     def kv_cost(cls, config):
         per_page, fixed, page_tokens, reserve = MHAKVCache.kv_cost(config)
         mc = config.model_config
-        draft_page = 2 * mc.num_kv_heads * mc.head_dim * config.dtype.itemsize * config.page_size
+        from freetoken.engine.draft_adapter import draft_geometry
+        draft_heads, draft_dim = draft_geometry(config)
+        draft_page = 2 * draft_heads * draft_dim * config.dtype.itemsize * config.page_size
         group = mc.linear_attention_group()
+        if group is None:
+            return per_page + draft_page, fixed, page_tokens, reserve
         channels = 2 * group.num_key_heads * group.key_head_dim + group.num_value_heads * group.value_head_dim
         layers = len(group.layer_ids)
         vectors = group.num_key_heads * group.key_head_dim + group.num_value_heads * group.value_head_dim
@@ -73,8 +77,11 @@ class QwenMTPKVCache(MHAKVCache):
     def create(cls, config, num_pages, device, dtype):
         mc = config.model_config
         specs = mc.kv_cache_group_specs()
-        if len(specs) != 1 or not mc.has_linear_attention or mc.has_swa_attention:
-            raise ValueError("Qwen MTP requires one paged full-attention group plus GDN")
+        from freetoken.engine.draft_adapter import draft_geometry
+        if len(specs) != 1 or mc.has_swa_attention:
+            raise ValueError("speculative decoding requires one paged full-attention group")
+        if draft_geometry(config) != (mc.num_kv_heads, mc.head_dim):
+            raise ValueError("the shared token-domain pool requires matching Target/Draft KV geometry")
         return cls(
             num_kv_heads=mc.num_kv_heads, num_layers=mc.num_layers + 1,
             head_dim=mc.head_dim, num_pages=num_pages + 1, page_size=config.page_size,

@@ -150,3 +150,46 @@ def test_host_bank_pin_registers_and_translates():
         assert dev == bank.addr
     else:
         assert dev != 0
+
+
+def _read_shared_bank(descriptor, connection):
+    from freetoken.moe.shared_banks import materialize_cpu_banks
+    banks = materialize_cpu_banks(descriptor)
+    tensor = banks["bank_sources"]["gate_up"][0]
+    connection.send((tensor.tolist(), torch.cuda.is_initialized()))
+    connection.recv()
+    connection.send(tensor.tolist())
+    connection.close()
+
+
+def test_shared_expert_bank_spawn_keeps_strided_views_without_copying():
+    import multiprocessing as mp
+    from freetoken.moe.host_banks import HostBank, shared_bank_allocations
+    from freetoken.moe.shared_banks import export_cpu_banks
+
+    with shared_bank_allocations(True):
+        bank = HostBank((8, 4), torch.bfloat16)
+    bank.tensor.copy_(torch.arange(32).reshape(8, 4))
+    source = bank.tensor[:, 1::2]
+    descriptor = export_cpu_banks({"gate_up": [source]}, [("bf16", {})], 8)
+    context = mp.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(target=_read_shared_bank, args=(descriptor, child))
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(60)
+        values, cuda_initialized = parent.recv()
+        assert values == [[4 * i + 1, 4 * i + 3] for i in range(8)]
+        assert not cuda_initialized
+        source.fill_(17)
+        parent.send("read")
+        assert parent.poll(60)
+        assert parent.recv() == [[17, 17]] * 8
+        process.join(60)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        parent.close()
