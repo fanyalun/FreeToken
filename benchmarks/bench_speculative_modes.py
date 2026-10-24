@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ from freetoken.engine.config import EngineConfig
 from freetoken.mm.config import MultimodalConfig
 from freetoken.utils.hf import load_eos_token_ids, load_tokenizer
 
-from bench_cpu_verify_feasibility import resource_interference, resource_snapshot
+from bench_cpu_verify_feasibility import resource_interference as _resource_interference, resource_snapshot
 
 
 @dataclass(frozen=True)
@@ -83,15 +84,102 @@ def memory_report(engine):
         explicit_budget_initial_used_bytes=engine._budget_initial_used)
 
 
+def _python_executable(path):
+    name = Path(str(path).removesuffix(" (deleted)")).name.lower()
+    return re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?[dmt]*", name) is not None
+
+
+def _python_command(command):
+    words = str(command or "").split()
+    if not words:
+        return False
+    name = Path(words[0]).name.lower()
+    return (_python_executable(name) or name in ("pytest", "py.test", "ipython", "pt_main_thread")
+            or name.startswith("vllm::"))
+
+
+def _recorded_python_process(row):
+    # Saved PIDs may have been reused by the time an offline reassessment runs.
+    if "is_python_process" in row:
+        return bool(row["is_python_process"])
+    if row.get("executable") is not None:
+        return _python_executable(row["executable"])
+    return _python_command(row.get("command")) or _python_command(row.get("snapshot_command"))
+
+
+def _classify_cpu_process(row, snapshot_command=None):
+    if "is_python_process" in row:
+        return row
+    result = dict(row)
+    if snapshot_command:
+        result["snapshot_command"] = snapshot_command
+    try:
+        executable = str(Path(f"/proc/{int(row['pid'])}/exe").readlink())
+    except OSError as exc:
+        result.update(executable=None, executable_error=type(exc).__name__,
+            is_python_process=_recorded_python_process(result),
+            python_detection="command_fallback")
+    else:
+        result.update(executable=executable, is_python_process=_python_executable(executable),
+                      python_detection="proc_exe")
+    return result
+
+
+def resource_interference(snapshot, allowed_pids, previous=None):
+    commands = {}
+    parents = []
+    for line in snapshot.get("processes", "").splitlines()[1:]:
+        fields = line.split(maxsplit=4)
+        if len(fields) == 5 and fields[0].isdigit():
+            commands[int(fields[0])] = fields[4]
+            parents.append((int(fields[0]), int(fields[1])))
+    # Workers may exit between the CPU counter sample and the later ps snapshot.
+    parents.extend((int(pid), row["ppid"]) for pid, row in
+                   snapshot.get("process_cpu_counters", {}).get("processes", {}).items())
+    allowed = set(allowed_pids)
+    while True:
+        children = {pid for pid, ppid in parents if ppid in allowed}
+        if children <= allowed:
+            break
+        allowed.update(children)
+    load = _resource_interference(snapshot, allowed, previous)
+    return dict(load, external_cpu_processes=[
+        _classify_cpu_process(row, commands.get(row["pid"])) for row in load["external_cpu_processes"]])
+
+
+def resource_blocked(load, cpu_policy):
+    if cpu_policy not in ("strict", "python", "ignore"):
+        raise ValueError(f"unknown CPU interference policy: {cpu_policy}")
+    cpu = load["external_cpu_processes"]
+    return bool(load["external_gpu_pids"] or (cpu_policy == "strict" and load["detected"])
+                or (cpu_policy == "python" and any(_recorded_python_process(row) for row in cpu)))
+
+
+def formal_timing_eligible(*, purpose, resource_eligible, source_changed, accounting_valid, shutdown_complete):
+    return (purpose == "formal" and resource_eligible and not source_changed
+            and accounting_valid and shutdown_complete)
+
+
 class ResourceMonitor:
-    def __init__(self, output, initial):
+    def __init__(self, output, initial, *, cpu_policy="strict", initial_interference=None):
         self.output, self.previous = output, initial
-        self.detected = resource_interference(initial, {os.getpid()})["detected"]
+        self.cpu_policy = cpu_policy
+        self.detected = self.blocked = False
+        self.cpu_detected = self.python_detected = self.gpu_detected = False
+        self.observe(initial_interference if initial_interference is not None
+                     else resource_interference(initial, {os.getpid()}))
         self.error = None
         self.samples = 0
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, name="speculative_resources", daemon=True)
         self.thread.start()
+
+    def observe(self, load):
+        self.detected |= load["detected"]
+        self.blocked |= resource_blocked(load, self.cpu_policy)
+        self.cpu_detected |= bool(load["external_cpu_processes"])
+        self.gpu_detected |= bool(load["external_gpu_pids"])
+        self.python_detected |= any(_recorded_python_process(row) for row in load["external_cpu_processes"])
 
     def run(self):
         try:
@@ -100,9 +188,11 @@ class ResourceMonitor:
                     current = resource_snapshot(0)
                     load = resource_interference(current, {os.getpid()}, self.previous)
                     stream.write(json.dumps(dict(time=current["wall_time"], interference=load,
+                        blocked_by_resource_policy=resource_blocked(load, self.cpu_policy),
+                        cpu_interference_policy=self.cpu_policy,
                         gpu_processes=current["gpu_processes"], memory=current["memory"])) + "\n")
                     stream.flush()
-                    self.detected |= load["detected"]
+                    self.observe(load)
                     self.samples += 1
                     self.previous = current
         except BaseException:
@@ -113,10 +203,16 @@ class ResourceMonitor:
         self.thread.join()
         current = resource_snapshot()
         load = resource_interference(current, {os.getpid()})
-        self.detected |= load["detected"]
+        self.observe(load)
         return dict(samples=self.samples, external_interference=self.detected,
+                    external_cpu_interference=self.cpu_detected,
+                    external_python_cpu_interference=self.python_detected,
+                    external_gpu_interference=self.gpu_detected,
                     monitor_error=self.error, final_interference=load,
-                    resource_eligible=not self.detected and self.error is None)
+                    cpu_interference_policy=self.cpu_policy,
+                    effective_policy=dict(external_cpu=self.cpu_policy, external_gpu="reject"),
+                    strict_idle_eligible=not self.detected and self.error is None,
+                    resource_eligible=not self.blocked and self.error is None)
 
 
 def validate_request(record, tokens, eos, graph):
@@ -208,6 +304,8 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--purpose", choices=("smoke", "diagnostic", "formal"), default="smoke")
+    parser.add_argument("--cpu-interference-policy", choices=("strict", "python", "ignore"), default="strict",
+                        help="External CPU admission policy; external GPU processes always block formal runs")
     parser.add_argument("--expect-capacity-rejection", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -264,10 +362,15 @@ def main():
             **repository_identity(root)))
         initial = resource_snapshot()
         interference = resource_interference(initial, {os.getpid()})
-        write("resources_before.json", dict(resources=initial, interference=interference))
-        if args.purpose == "formal" and interference["detected"]:
-            raise RuntimeError("formal run requires idle GPUs and external CPU; see resources_before.json")
-        monitor = ResourceMonitor(out / "resources.jsonl", initial)
+        blocked = resource_blocked(interference, args.cpu_interference_policy)
+        write("resources_before.json", dict(resources=initial, interference=interference,
+            cpu_interference_policy=args.cpu_interference_policy,
+            strict_idle_eligible=not interference["detected"], resource_eligible=not blocked))
+        if args.purpose == "formal" and blocked:
+            raise RuntimeError(f"formal run violates resource policy {args.cpu_interference_policy!r}; "
+                               "see resources_before.json")
+        monitor = ResourceMonitor(out / "resources.jsonl", initial, cpu_policy=args.cpu_interference_policy,
+                                  initial_interference=interference)
         engine = Engine(config)
         write("resolved_config.json", asdict(config))
         write("memory_plan.json", memory_report(engine))
@@ -299,7 +402,6 @@ def main():
                     stream.write(json.dumps(record) + "\n")
                 if repeat >= 0:
                     rows.append(record)
-        changed = frozen != source_identity(root)
         if checkpoints != dict(target=checkpoint_identity(model),
                 draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp"):
             raise RuntimeError("checkpoint files changed during the run")
@@ -307,11 +409,15 @@ def main():
         engine = None
         resource_result = monitor.close()
         monitor = None
+        changed = frozen != source_identity(root)
         write("resource_validation.json", resource_result)
         write("complete.json", dict(status="complete", valid=True, requests=len(rows), source_changed=changed,
-            formal_eligible=False, formal_requested=args.purpose == "formal",
-            resource_eligible=resource_result["resource_eligible"], accounting_valid=True,
-            limitation="independent state audit is a separate gate; arithmetic parity is not inferred from accounting",
+            formal_eligible=formal_timing_eligible(purpose=args.purpose,
+                resource_eligible=resource_result["resource_eligible"], source_changed=changed,
+                accounting_valid=True, shutdown_complete=True), formal_requested=args.purpose == "formal",
+            resource_eligible=resource_result["resource_eligible"], accounting_valid=True, shutdown_complete=True,
+            independent_state_audit="not_established", strict_ar_parity="not_established",
+            limitation="timing eligibility follows the selected resource policy; state audit and arithmetic parity are separate",
             returned_tokens=sum(r["returned_tokens"] for r in rows), wall_seconds=sum(r["wall_seconds"] for r in rows)))
     except BaseException as exc:
         capacity = "capacity_rejected:" in str(exc)

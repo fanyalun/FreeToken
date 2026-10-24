@@ -174,10 +174,30 @@ the first token divided by `returned_tokens - 1`; throughput uses all returned
 tokens divided by complete-request wall time. Metrics marked unavailable must
 not be interpreted as zero IO.
 
+Use `--purpose formal` for performance measurements. Its default resource gate,
+`--cpu-interference-policy strict`, rejects active external CPU processes and
+external GPU processes. `python` permits non-Python CPU activity and rejects
+active external Python/PyPy processes; `ignore` permits all external CPU activity.
+Every policy rejects external GPU processes. Python detection reads the active
+process executable, so renamed PyTorch workers remain identifiable, and falls
+back to recorded process names when the executable is unavailable. The existing
+50% CPU activity threshold and exclusion of this run's child processes apply to
+all policies; idle Python resource trackers do not trigger the CPU gate.
+
+`resources_before.json` and `resources.jsonl` preserve raw interference and CPU
+process records, including ignored activity. `resource_validation.json` reports
+both `strict_idle_eligible` and `resource_eligible` under the selected policy.
+It retains any interference observed during the run even if the final snapshot
+is idle. A monitoring error invalidates resource eligibility.
+
 `complete.json` is written successfully only after engine shutdown. Functional
 completion, strict AR equality and performance eligibility are separate checks.
-Smoke runs and runs whose sources changed during execution do not establish
-performance. Changing BF16 reduction order or CPU/GPU arithmetic can change
+`formal_eligible` requires a formal run, valid complete-request accounting, normal
+shutdown, unchanged sources and resource eligibility under the recorded policy.
+Independent state audit and strict AR parity remain separate fields marked
+`not_established`; timing eligibility does not establish either result. Smoke,
+diagnostic and capacity runs are not upgraded by selecting a relaxed resource
+policy. Changing BF16 reduction order or CPU/GPU arithmetic can change
 tokens; the important state checks are the accepted-prefix boundary, canonical
 KV/SSM state, Draft reconciliation, cancellation and reader completion.
 
