@@ -14,6 +14,7 @@ def test_recovery_keeps_cpu_and_gpu_async_until_cpu_completion(monkeypatch, mode
     import bench_cpu_recovery as benchmark
     from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, QwenAsyncGpuWindow
     from freetoken.engine.speculative import SpeculativeFrontier
+    from freetoken.moe.preverify_policy import PreverifyPolicy
 
     calls, jobs, polled = [], [], set()
     w = QwenAsyncGpuWindow.__new__(QwenAsyncGpuWindow)
@@ -21,7 +22,8 @@ def test_recovery_keeps_cpu_and_gpu_async_until_cpu_completion(monkeypatch, mode
     w.engine = SimpleNamespace(config=SimpleNamespace(speculative_mtp_depth=1),
         stream=SimpleNamespace(synchronize=lambda: None))
     w.runner = SimpleNamespace(frontier=SpeculativeFrontier(1, 0, 0, 12))
-    w.experts = SimpleNamespace(counters=torch.zeros(4), cache=SimpleNamespace(banks=[]))
+    w.experts = SimpleNamespace(counters=torch.zeros(4), cache=SimpleNamespace(banks=[]), keep_hits=True)
+    w.policy = PreverifyPolicy()
     w._record_timing = lambda _: None
     w.replay = lambda *args: pytest.fail("fixed recovery must not replay old B")
 
