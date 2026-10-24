@@ -69,25 +69,37 @@ def test_measured_budget_uses_mixed_pool_allocations():
 def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
     from freetoken.engine.engine import Engine
     from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
     engine = object.__new__(Engine)
-    engine.config = SimpleNamespace(model_config=SimpleNamespace(num_experts=2), moe_prefill_overlap=False)
-    engine.moe_offload_cache = SimpleNamespace(cache_size=8)
-    from freetoken.moe.pool_policy import PoolSpec
-    engine._moe_pools = lambda batch: [PoolSpec((0,), 2, 8)]
-    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 2, 8, 400, 0)
+    engine.config = SimpleNamespace(model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+                                    moe_prefill_overlap=False)
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+                           pool_of_layer=[0, 1], pool_sizes=[4, 4])
+    cache.set_bank_sources({name: [torch.zeros(4, 8), torch.zeros(4, 4)] for name in ("gate_up", "down")},
+                           row_tail_bytes={"gate_up": [16, 0], "down": [0, 0]})
+    engine.moe_offload_cache = cache
+    engine._moe_pool_groups = [[0], [1]]
+    engine._moe_slot_limit = engine._moe_expert_counts = None
+    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 8, 8, 776, 0, 576, 576)
     engine._sd_sizing = automatic
     peaks = iter((1200, 900))
     engine._measure_baseline_sd_peak = lambda: next(peaks)
     rebuilt = []
     def rebuild(*, moe_cache_size):
         rebuilt.append(moe_cache_size)
-        engine.moe_offload_cache.cache_size = moe_cache_size
+        cache.rebuild(moe_cache_size, pool_sizes=[3, 3])
         engine._validate_baseline_sd_peak()
     engine.rebuild_runtime_cache = rebuild
     if automatic:
         engine._validate_baseline_sd_peak()
         assert rebuilt == [6]
         assert engine.baseline_sd_memory_plan.final_slots == 6
+        allocated = sum(bank.numel() * bank.element_size() for _, bank in cache.banks)
+        allocated += sum(t.numel() * t.element_size() for t in
+                         (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
+        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == 440
+        assert engine.baseline_sd_memory_plan.initial_cache_bytes == 576
         assert engine.baseline_sd_final_peak_bytes == 900
     else:
         with pytest.raises(ValueError, match="final boundary warmup"):

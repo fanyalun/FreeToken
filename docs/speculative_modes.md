@@ -66,7 +66,7 @@ Useful `EngineConfig` fields:
 | `cpu_async_core_ids` | Physical CPU ids assigned to the full CPU Target |
 | `moe_cpu_core_ids` | Separate physical CPU ids for Hybrid routed experts |
 | `moe_cache_scope` | `unified` (one pool per compatible layout) or `per-layer` |
-| `gpu_memory_budget_bytes` | Absolute process GPU cap; `memory_ratio` reserves a fraction of the remaining budget |
+| `gpu_memory_budget_bytes` | GPU planning budget in bytes; `memory_ratio` reserves a fraction of the remaining budget |
 
 The default Hybrid phases are `verify` for SD, `preverify,verify` for three-level
 GPU, and `preverify` for CPU async. Explicit phase restrictions are honored.
@@ -151,8 +151,13 @@ algorithms. Add `--draft-model /path/to/speculator.eagle3` for the 235B Target.
 `--no-prefetch`, `--cpu-cores 2,3,4,5` and `--hybrid-cores 6,7` are independent
 overrides. `--input-tokens 4096 --ignore-eos --tokens 1024` exercises an exact
 input/output capacity boundary with a repeated synthetic prompt.
-`--budget-gib` sets an absolute process cap and sets `memory_ratio=1` so the CLI
-does not apply a second fractional reserve to that explicit cap.
+`--budget-gib` sets the GPU planning budget and sets `memory_ratio=1` so the CLI
+does not apply a second fractional reserve. The planner subtracts memory already
+in use at initialization and validates boundary warmup using the PyTorch peak
+plus observed external CUDA allocations. It also limits the PyTorch allocator;
+this is not a hard limit on later driver allocations or the process total shown
+by `nvidia-smi`. `memory_plan.json` distinguishes the initial measurement from
+the final boundary peak; each request records its allocated and reserved peaks.
 
 The run preserves configuration, source hashes, every warmup and measured
 request, token IDs, acceptance counts, Graph counts and expert-transfer bytes.

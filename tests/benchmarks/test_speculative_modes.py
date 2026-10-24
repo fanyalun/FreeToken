@@ -4,7 +4,20 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
-from bench_speculative_modes import checkpoint_identity, prompt_inputs, resolve_model, validate_request
+from bench_speculative_modes import checkpoint_identity, memory_report, prompt_inputs, resolve_model, validate_request
+
+
+def test_memory_report_distinguishes_initial_measurement_from_final_boundary():
+    from types import SimpleNamespace
+
+    plan = dict(measured_peak_bytes=900, final_cache_bytes=600, final_slots=12, budget_bytes=1000)
+    engine = SimpleNamespace(baseline_sd_memory_plan=SimpleNamespace(as_dict=lambda: plan),
+        baseline_sd_final_peak_bytes=990, _budget_initial_used=100)
+    report = memory_report(engine)
+    assert report["measured_peak_bytes"] == 900
+    assert report["final_boundary_peak_bytes"] == 990
+    assert report["explicit_budget_initial_used_bytes"] == 100
+    assert "final_boundary_peak_bytes" not in plan
 
 
 def request():

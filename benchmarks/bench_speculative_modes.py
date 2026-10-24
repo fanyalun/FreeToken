@@ -76,6 +76,13 @@ def repository_identity(root):
                 git_status=subprocess.check_output(["git", "status", "--short"], cwd=root, text=True))
 
 
+def memory_report(engine):
+    return dict(engine.baseline_sd_memory_plan.as_dict(),
+        final_boundary_peak_bytes=engine.baseline_sd_final_peak_bytes,
+        peak_scope="boundary warmup: PyTorch peak plus observed external CUDA allocation",
+        explicit_budget_initial_used_bytes=engine._budget_initial_used)
+
+
 class ResourceMonitor:
     def __init__(self, output, initial):
         self.output, self.previous = output, initial
@@ -263,7 +270,7 @@ def main():
         monitor = ResourceMonitor(out / "resources.jsonl", initial)
         engine = Engine(config)
         write("resolved_config.json", asdict(config))
-        write("memory_plan.json", engine.baseline_sd_memory_plan.as_dict())
+        write("memory_plan.json", memory_report(engine))
         if args.expect_capacity_rejection:
             raise RuntimeError("expected capacity rejection but the model initialized")
         if args.mode == "cpu_async":

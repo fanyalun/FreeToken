@@ -714,7 +714,12 @@ class Engine:
                 reduction = max(1, (overflow + plan.expert_slot_bytes - 1) // plan.expert_slot_bytes)
                 slots = max(minimum, cache.cache_size - reduction)
                 if slots < cache.cache_size:
-                    self.baseline_sd_memory_plan = replace(plan, final_slots=slots)
+                    cache_bytes = self._speculative_cache_bytes(slots)
+                    self.baseline_sd_memory_plan = replace(plan, final_slots=slots, final_cache_bytes=cache_bytes)
+                    logger.info_rank0(
+                        f"native SD auto-sizing retry: slots={cache.cache_size}->{slots}, overflow={overflow} B, "
+                        f"cache_bytes={plan.final_cache_bytes}->{cache_bytes}"
+                    )
                     self.rebuild_runtime_cache(moe_cache_size=slots)
                     return
             raise ValueError(f"baseline SD final boundary warmup needs {peak + plan.routing_reserve_bytes} B "
