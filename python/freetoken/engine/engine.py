@@ -686,15 +686,18 @@ class Engine:
             config, self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
         # BF16 fused routing allocates its worst-case padded arrays from shape, not route IDs.
         routing_reserve = 0
+        budget = int(config.memory_ratio * self._baseline_free)
         plan = plan_measured_memory(
             capacity_tokens=self.max_seq_len, kv_pages=self.num_pages,
-            budget_bytes=int(config.memory_ratio * self._baseline_free), measured_peak_bytes=peak,
+            budget_bytes=budget, measured_peak_bytes=peak,
             initial_slots=slots, expert_slot_bytes=slot_bytes, minimum_slots=minimum,
             maximum_slots=maximum, automatic=config.moe_cache_auto, routing_reserve_bytes=routing_reserve,
             cache_bytes_for_slots=self._speculative_cache_bytes if cache is not None else None,
+            sizing_headroom_bytes=max(256 << 20, budget // 100) if config.moe_cache_auto else 0,
         )
         self.baseline_sd_memory_plan = plan
         self._sd_sizing = config.moe_cache_auto
+        self._sd_sizing_retries = 0
         try:
             if cache is not None and (plan.final_slots != slots or config.moe_cache_auto):
                 self.rebuild_runtime_cache(moe_cache_size=plan.final_slots)
@@ -711,15 +714,18 @@ class Engine:
         plan = self.baseline_sd_memory_plan
         if peak + plan.routing_reserve_bytes > plan.budget_bytes:
             cache = self.moe_offload_cache
-            if getattr(self, "_sd_sizing", False) and cache is not None:
+            if (getattr(self, "_sd_sizing", False) and cache is not None
+                    and getattr(self, "_sd_sizing_retries", 0) == 0):
                 from dataclasses import replace
                 minimum = self.config.model_config.num_experts * (2 if self.config.moe_prefill_overlap else 1)
                 minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
                 minimum = max(minimum, getattr(self, "_baseline_sd_minimum_slots", 0))
                 overflow = peak + plan.routing_reserve_bytes - plan.budget_bytes
-                reduction = max(1, (overflow + plan.expert_slot_bytes - 1) // plan.expert_slot_bytes)
+                reduction = max(1, (overflow + plan.sizing_headroom_bytes + plan.expert_slot_bytes - 1)
+                                // plan.expert_slot_bytes)
                 slots = max(minimum, cache.cache_size - reduction)
                 if slots < cache.cache_size:
+                    self._sd_sizing_retries = 1
                     cache_bytes = self._speculative_cache_bytes(slots)
                     self.baseline_sd_memory_plan = replace(plan, final_slots=slots, final_cache_bytes=cache_bytes)
                     logger.info_rank0(

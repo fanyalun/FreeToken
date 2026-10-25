@@ -28,13 +28,15 @@ def test_baseline_capacity_is_bounded_independently_of_chunk(page_size, pages):
         resolve_capacity(config)
 
 
-@pytest.mark.parametrize("automatic,expected", [(True, 8), (False, 2)])
-def test_baseline_measured_budget_preserves_runtime_and_caps_experts(automatic, expected):
+@pytest.mark.parametrize("automatic,headroom,expected", [(True, 0, 8), (False, 250, 2),
+                                                       (True, 250, 5), (True, 2000, 2)])
+def test_baseline_measured_budget_preserves_runtime_and_caps_experts(automatic, headroom, expected):
     from freetoken.engine.baseline_sd import plan_measured_memory
     plan = plan_measured_memory(capacity_tokens=10, kv_pages=3, budget_bytes=1200,
         measured_peak_bytes=600, initial_slots=2, expert_slot_bytes=100, minimum_slots=2,
-        maximum_slots=20, automatic=automatic)
+        maximum_slots=20, automatic=automatic, sizing_headroom_bytes=headroom)
     assert plan.non_expert_peak_bytes == 400 and plan.final_slots == expected
+    assert plan.sizing_headroom_bytes == (min(headroom, 600) if automatic else 0)
     plan.validate(expected)
     with pytest.raises(ValueError, match="shortfall"):
         plan.validate(9)
@@ -93,8 +95,10 @@ def test_staging_minimum_preserves_overlap_and_is_minimal(case):
         minimum_staging_slots(sources, constrained, experts, buffers=2, counts=counts, row_tail_bytes=tails)
 
 
-@pytest.mark.parametrize("automatic,minimum", [(False, 0), (True, 0), (True, 7)])
-def test_native_final_peak_only_shrinks_automatic_initialization(automatic, minimum):
+@pytest.mark.parametrize("automatic,minimum,headroom,final_peak,expected_slots", [
+    (False, 0, 0, 900, 8), (True, 0, 0, 900, 6), (True, 7, 0, 900, 7),
+    (True, 0, 100, 900, 5), (True, 0, 100, 1100, 5)])
+def test_native_final_peak_only_shrinks_automatic_initialization(automatic, minimum, headroom, final_peak, expected_slots):
     from freetoken.engine.engine import Engine
     from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -109,10 +113,10 @@ def test_native_final_peak_only_shrinks_automatic_initialization(automatic, mini
     engine.moe_offload_cache = cache
     engine._moe_pool_groups = [[0], [1]]
     engine._moe_slot_limit = engine._moe_expert_counts = None
-    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 8, 8, 776, 0, 576, 576)
+    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 8, 8, 776, 0, 576, 576, headroom)
     engine._sd_sizing = automatic
     engine._baseline_sd_minimum_slots = minimum
-    peaks = iter((1200, 900))
+    peaks = iter((1200, final_peak))
     engine._measure_baseline_sd_peak = lambda: next(peaks)
     rebuilt = []
     def rebuild(*, moe_cache_size):
@@ -120,20 +124,20 @@ def test_native_final_peak_only_shrinks_automatic_initialization(automatic, mini
         cache.rebuild(moe_cache_size, pool_sizes=[(moe_cache_size + 1) // 2, moe_cache_size // 2])
         engine._validate_baseline_sd_peak()
     engine.rebuild_runtime_cache = rebuild
-    if automatic:
+    if automatic and final_peak <= 1000:
         engine._validate_baseline_sd_peak()
-        assert rebuilt == [max(6, minimum)]
-        assert engine.baseline_sd_memory_plan.final_slots == max(6, minimum)
+        assert rebuilt == [expected_slots]
+        assert engine.baseline_sd_memory_plan.final_slots == expected_slots
         allocated = sum(bank.numel() * bank.element_size() for _, bank in cache.banks)
         allocated += sum(t.numel() * t.element_size() for t in
                          (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
-        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == (524 if minimum == 7 else 440)
+        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == {5: 388, 6: 440, 7: 524}[expected_slots]
         assert engine.baseline_sd_memory_plan.initial_cache_bytes == 576
         assert engine.baseline_sd_final_peak_bytes == 900
     else:
         with pytest.raises(ValueError, match="final boundary warmup"):
             engine._validate_baseline_sd_peak()
-        assert rebuilt == []
+        assert rebuilt == ([expected_slots] if automatic else [])
 
 
 def test_hybrid_partial_reservation_does_not_charge_preallocated_storage_twice():

@@ -279,6 +279,12 @@ the selected pool split. With prefill overlap enabled this means two buffers;
 mixed quantized layouts cannot use `2 * num_experts` as a sufficient slot count.
 The measured budget planner and overflow retries retain this minimum, so
 calibration does not silently turn off overlap while sizing the cache.
+Final automatic sizing estimates the slot count from that baseline measurement,
+leaving 1% of the available budget (at least 256 MiB) as headroom, limited by the
+minimum staging allocation. One final boundary measurement confirms the result.
+An overflow permits one coarse reduction covering the excess plus the headroom;
+if it still does not fit, initialization fails instead of repeatedly rebuilding
+CUDA Graphs to approach the memory ceiling. Explicit/profile-frozen slots stay fixed.
 The default initialization ceilings are therefore 38 GiB for 35B and 78 GiB for
 235B. Every candidate subsequently uses that same fixed pool geometry under its
 model's total budget. If a candidate does not fit, the matrix stops; it does not shrink
