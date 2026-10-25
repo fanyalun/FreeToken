@@ -262,15 +262,20 @@ activity remains recorded without invalidating timing.
 The optional expected manifest maps repository-relative paths to SHA-256 values
 and is checked before source freezing; a changed queued checkout stops the run.
 The default local checkpoints are the 35B BF16/MTP pair and 235B Q4_K_M/EAGLE3
-pair. Both use GPU 0, 40 GiB total budget, offload, full Graph, top-h 4 and loop4.
+pair. Their default total GPU memory ceilings are 40 GiB for 35B and 80 GiB for
+235B. Both use GPU 0, offload, full Graph, top-h 4 and loop4.
+`--qwen36-budget-gib` and `--qwen235-budget-gib` override the budgets independently.
+The engine also caps allocations at the physical memory available on the selected GPU;
+an 80 GiB ceiling does not guarantee 80 GiB of usable memory.
 `--qwen36`, `--qwen235`, `--draft`, `--gpu` and `--data-dir` change those paths or
 device explicitly. The source datasets must contain the frozen 64 prompts.
 
 Calibration uses zero-based prompts 16-23 from each dataset; development uses
 24-31; final measurements preserve the earlier first sixteen prompts. The
 calibrator reserves 2 GiB for instrumentation while finding initial slots.
-Every candidate subsequently uses that same fixed pool geometry under the
-40 GiB budget. If a candidate does not fit, the matrix stops; it does not shrink
+The default initialization ceilings are therefore 38 GiB for 35B and 78 GiB for
+235B. Every candidate subsequently uses that same fixed pool geometry under its
+model's total budget. If a candidate does not fit, the matrix stops; it does not shrink
 only that candidate's cache or change its quotas to make the comparison pass.
 
 Nsight captures the actual phase windows and production weight-copy paths using
@@ -292,7 +297,7 @@ logical transfer bytes per returned token.
 Final measurements run SD, three-level without prefetch, historical `1/12/2`
 and the selected profile, with two warmups and three measured repeats for each
 of 32 prompts. SD uses its own automatic cache allocation within the same
-40 GiB total budget; the three-level variants share the calibrated pool sizes.
+model-specific total budget; the three-level variants share the calibrated pool sizes.
 Candidate profiles require an explicit path and
 `--allow-candidate-profile`; this permits formal A/B timing but does not make
 them eligible for automatic loading. If no positive gain is reproduced, a

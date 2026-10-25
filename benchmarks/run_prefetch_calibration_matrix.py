@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -156,8 +157,10 @@ class Matrix:
         manifest = {str(path.relative_to(self.runtime)): digest(path)
                     for path in sorted(self.runtime.rglob("*")) if path.is_file()}
         write(self.root / "source_manifest.json", manifest)
-        self.protocol = dict(schema_version=1, datasets=records, models=self.args.models, draft=self.args.draft,
-            python=str(Path(self.args.python).absolute()), gpu=self.args.gpu, budget_gib=40, bootstrap_budget_gib=38,
+        self.protocol = dict(schema_version=2, datasets=records, models=self.args.models, draft=self.args.draft,
+            python=str(Path(self.args.python).absolute()), gpu=self.args.gpu,
+            budget_gib_by_model=self.args.budgets,
+            bootstrap_budget_gib_by_model={model: budget - 2 for model, budget in self.args.budgets.items()},
             max_loops=4, preverify_top_h=4, depth=3, graph="full", backend="offload", cache_scope="unified",
             max_input_tokens=4096, max_output_tokens=1024, greedy=True, normal_eos=True,
             development=dict(samples_per_dataset=8, warmups=1, repeats=3),
@@ -255,10 +258,13 @@ class Matrix:
                 or receipt.get("resource_eligible") is not True or (formal and receipt.get("formal_eligible") is not True)):
             raise RuntimeError("case source, shutdown or resource eligibility failed")
 
+    def budget_gib(self, model):
+        return self.protocol.get("budget_gib_by_model", {}).get(model, self.protocol.get("budget_gib"))
+
     def base_command(self, model, phase, output, *, mode="three_level_gpu"):
         command = [self.args.python, str(self.runtime / "benchmarks/bench_speculative_modes.py"),
             "--model", self.protocol["models"][model], "--mode", mode, "--backend", "offload", "--graph", "full",
-            "--depth", "3", "--preverify-top-h", "4", "--max-loops", "4", "--budget-gib", "40",
+            "--depth", "3", "--preverify-top-h", "4", "--max-loops", "4", "--budget-gib", f"{self.budget_gib(model):g}",
             "--max-input-tokens", "4096", "--max-output-tokens", "1024", "--tokens", "1024",
             "--cpu-interference-policy", "python", "--output", str(output)]
         for dataset in ("gsm8k", "humaneval"):
@@ -505,8 +511,10 @@ class Matrix:
         write(self.root / "summary.json", dict(status=self.state["status"], cases=cases,
             scope="all measured complete requests; warmups excluded; no fastest-repeat selection",
             strict_ar_parity="not_established"))
+        budgets = {model: self.budget_gib(model) for model in self.protocol["models"]}
+        budget_description = ", ".join(f"{model} {budget:g} GiB" for model, budget in budgets.items())
         lines = ["# Prefetch calibration and complete-request validation", "",
-                 f"Status: {self.state['status']}. Two models, one GPU, TP1, offload, 40 GiB, top-h 4 and loop4.", "",
+                 f"Status: {self.state['status']}. Two models, one GPU, TP1, offload, {budget_description}, top-h 4 and loop4.", "",
                  "Calibration uses separate phase/layer/shape/context measurements and production copy curves.",
                  "Development selects a static profile; formal timing uses the original first sixteen prompts per dataset.",
                  "Strict AR parity and independent canonical-state audit are not established by these timing results.", "",
@@ -522,7 +530,7 @@ class Matrix:
             raise ValueError("matrix output must be inside --archive-root for catalog registration")
         run_id = "prefetch_calibration_" + self.root.name + "_" + hashlib.sha256(str(self.root).encode()).hexdigest()[:8]
         record = dict(id=run_id, category="speculative", series="speculative_prefetch_calibration",
-            config=dict(models=self.protocol["models"], budget_gib=40, tp=1, concurrent_requests=1,
+            config=dict(models=self.protocol["models"], budget_gib_by_model=budgets, tp=1, concurrent_requests=1,
                 max_loops=4, preverify_top_h=4, cpu_interference_policy="python", gpu=self.protocol["gpu"],
                 source_commit=self.protocol["source"]["source_commit"]),
             measurement_scope="offline phase/copy calibration and separately unprofiled complete-request A/B",
@@ -564,12 +572,19 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=SOURCE_DATA)
     parser.add_argument("--qwen36", default=MODELS["qwen36"])
     parser.add_argument("--qwen235", default=MODELS["qwen235"])
+    parser.add_argument("--qwen36-budget-gib", type=float, default=40,
+                        help="Total GPU memory ceiling for the 35B model (default: 40 GiB)")
+    parser.add_argument("--qwen235-budget-gib", type=float, default=80,
+                        help="Total GPU memory ceiling for the 235B model (default: 80 GiB)")
     parser.add_argument("--draft", default=DRAFT)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--cuda-home", default="/usr/local/cuda-13.0")
     parser.add_argument("--nsys", default="/home/fanya/.local/bin/nsys")
     args = parser.parse_args()
     args.models = dict(qwen36=args.qwen36, qwen235=args.qwen235)
+    args.budgets = dict(qwen36=args.qwen36_budget_gib, qwen235=args.qwen235_budget_gib)
+    if any(not math.isfinite(budget) or budget <= 2 for budget in args.budgets.values()):
+        parser.error("model budgets must be finite and greater than the 2 GiB calibration reserve")
     matrix = Matrix(args)
     try:
         matrix.run()
