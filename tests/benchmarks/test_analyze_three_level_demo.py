@@ -17,6 +17,72 @@ from three_level_prefetch_calibration import (build_prefetch_profile, evaluate_p
     gap_capacity_for_experts, gap_experts_for_capacity, mixed_pool_gap_costs, monotone_copy_curves)
 
 
+@pytest.mark.parametrize("phase", ["preverify", "verify", "draft_gap"])
+@pytest.mark.parametrize("count", [0, 1, 2])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_prefetch_receipts_survive_retirement_without_instrumenting_timing(phase, count, mixed):
+    import torch
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from speculative_prefetch_measurement import ComputeWorkload, _OperationProbe, _measure_shared_retire, _sample
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(2, 16, 32, device,
+        pool_of_layer=[0, 1] if mixed else [0, 0], pool_sizes=[16, 16] if mixed else [32])
+    sources = {name: [torch.arange(16 * size, dtype=torch.float32).reshape(16, size).pin_memory()
+        for size in ([8, 16] if mixed else [8, 8])] for name in ("gate_up", "down")}
+    cache.set_bank_sources(sources)
+    parent = SimpleNamespace(cache=cache, active=False, max_loops=4, max_rows=17,
+        top_k=4, inner_rows=4, preverify_policy=None)
+    value = torch.ones(1, device=device)
+    workload = ComputeWorkload(phase, 0, 1, lambda: value.mul_(1),
+        lambda: torch.testing.assert_close(value, torch.ones_like(value)), enqueue=lambda: value.mul_(1))
+    allocation = {0: count // 2, 1: count - count // 2} if mixed and phase == "draft_gap" else None
+    probe = _OperationProbe(parent, 1 if phase == "verify" else 0, count, phase, workload,
+        torch.cuda.mem_get_info()[1], pool_counts=allocation)
+    try:
+        for mode in ("copy_only", "concurrent"):
+            for _ in range(2):
+                probe.prepare()
+                with torch.cuda.stream(probe.stream):
+                    for receipt in probe.validation_plans.values():
+                        receipt[3].fill_(-7)
+                    probe.graphs[mode].replay()
+                probe.events[mode]["end"].synchronize()
+                probe.validate_completion()
+                assert all(receipt[3].item() == -7 for receipt in probe.validation_plans.values())
+                probe.prepare()
+                with torch.cuda.stream(probe.stream):
+                    probe.graphs["validate_" + mode].replay()
+                probe.events["validate_" + mode]["end"].synchronize()
+                probe.validate(weights=True)
+                assert sum(receipt[3].item() for receipt in probe.validation_plans.values()) == count
+                if phase != "draft_gap":
+                    assert all(plan[3].item() == 0 for plan in probe._plans().values())
+        if count:
+            probe.prepare()
+            with torch.cuda.stream(probe.stream):
+                if phase == "verify":
+                    probe.controller.refs.zero_()
+                else:
+                    probe.controller.queue.fill_(2147483647)
+                probe.graphs["validate_concurrent"].replay()
+            probe.events["validate_concurrent"]["end"].synchronize()
+            with pytest.raises(RuntimeError, match="prefetch plan admitted 0"):
+                probe.validate()
+        samples = _sample(probe, workload, warmups=1, samples=2)
+        assert set(samples) == {"copy_only", "compute_only", "concurrent"}
+        assert all(len(series) == 2 for series in samples.values())
+    finally:
+        probe.close()
+    assert cache.speculative_controller is None
+    if phase == "preverify" and count:
+        shared = _measure_shared_retire(parent, count, torch.cuda.mem_get_info()[1], samples=8, warmups=2)
+        assert len(shared["preverify_retire_ms_samples"]) == 8
+        assert shared["layer_counts"] == [count, count]
+
+
 def offline_calibration_samples():
     coverage = dict(contexts=["short", "long"], preverify_rows=list(range(1, 5)),
                     verify_rows=list(range(1, 18)), draft_gap_rows=list(range(1, 5)))

@@ -178,23 +178,27 @@ class _OperationProbe:
             ) if phase == "draft_gap" else (
             "fast_index_copy_multi" if getattr(self.cache, "_copy_fused_ok", False) else "global")
         self.candidates, self.resident = self._metadata()
+        self.validation_plans = {pool: tuple(torch.empty_like(tensor) for tensor in plan)
+            for pool, plan in self._plans().items()}
         self.stream.wait_stream(torch.cuda.current_stream(self.cache.device))
         self.graphs, self.events = {}, {}
         try:
-            for mode in ("copy_only", "compute_only", "concurrent"):
+            for key in ("copy_only", "compute_only", "concurrent", "validate_copy_only", "validate_concurrent"):
+                snapshot = key.startswith("validate_")
+                mode = key.removeprefix("validate_")
                 events = {name: torch.cuda.Event(enable_timing=True, external=True) for name in
                     ("begin", "allocated", "copy_begin", "copy_end", "compute_begin", "compute_end",
                      "retire_begin", "retire_end", "end")}
-                self.events[mode] = events
+                self.events[key] = events
                 self.prepare()
                 with torch.cuda.stream(self.stream):
-                    self._body(mode, workload, events, compute_repeats)
+                    self._body(mode, workload, events, compute_repeats, snapshot=snapshot)
                 self.stream.synchronize()
                 self.prepare()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=self.stream):
-                    self._body(mode, workload, events, compute_repeats)
-                self.graphs[mode] = graph
+                    self._body(mode, workload, events, compute_repeats, snapshot=snapshot)
+                self.graphs[key] = graph
         except BaseException:
             self.close()
             raise
@@ -296,7 +300,14 @@ class _OperationProbe:
             _ready[(1,)](ctrl.pool_pending[self.pool], plan[1], plan[3],
                 triton.next_power_of_2(ctrl.plan_capacity))
 
-    def _body(self, mode, workload, events, repeats):
+    def _plans(self):
+        ctrl = self.controller
+        if self.phase == "draft_gap":
+            return {pool: ctrl.gap_plans[pool] for pool in self.pool_counts}
+        return {self.pool: ctrl.verify_plans[self.layer] if self.phase == "verify"
+            else ctrl.layer_plans[self.layer]}
+
+    def _body(self, mode, workload, events, repeats, *, snapshot=False):
         import torch
 
         ctrl = self.controller
@@ -327,6 +338,11 @@ class _OperationProbe:
         events["compute_end"].record(self.stream)
         if mode != "compute_only":
             self.stream.wait_stream(ctrl.copy_stream)
+            if snapshot:
+                # Retirement clears plan counts; only untimed validation graphs retain receipts.
+                for pool, plan in self._plans().items():
+                    for saved, tensor in zip(self.validation_plans[pool], plan):
+                        saved.copy_(tensor)
             events["retire_begin"].record(self.stream)
             self._retire()
             events["retire_end"].record(self.stream)
@@ -335,14 +351,8 @@ class _OperationProbe:
     def validate(self, *, weights=False):
         import torch
 
-        ctrl, cache = self.controller, self.cache
-        if self.phase == "draft_gap":
-            plans = [(pool, ctrl.gap_plans[pool]) for pool in self.pool_counts]
-        else:
-            plans = [(self.pool, ctrl.verify_plans[self.layer] if self.phase == "verify"
-                else ctrl.layer_plans[self.layer])]
-        expected_bytes = 0
-        for pool, plan in plans:
+        cache = self.cache
+        for pool, plan in self.validation_plans.items():
             count = int(plan[3].item())
             if count != self.pool_counts.get(pool, 0):
                 raise RuntimeError(f"prefetch plan admitted {count} experts instead of {self.pool_counts.get(pool, 0)}")
@@ -352,11 +362,16 @@ class _OperationProbe:
                 raise RuntimeError("production admission selected unexpected expert IDs")
             for owner, slot in zip(owners, slots):
                 layer, expert = divmod(owner, cache.num_experts)
-                expected_bytes += ctrl.expert_bytes[layer]
                 if weights:
                     for (sources, _), bank in zip(cache.banks, cache.pool_bank_views(layer)):
                         if not torch.equal(bank[slot].cpu(), sources[layer][expert]):
                             raise RuntimeError("production prefetch copied incorrect expert bank bytes")
+        self.validate_completion()
+
+    def validate_completion(self):
+        ctrl, cache = self.controller, self.cache
+        expected_bytes = sum(count * ctrl.expert_bytes[cache.pool_of_layer.index(pool)]
+            for pool, count in self.pool_counts.items())
         byte_index = {"preverify": 2, "verify": 4, "draft_gap": 3}[self.phase]
         if int(ctrl.transfer_bytes[byte_index].item()) != expected_bytes:
             raise RuntimeError("production prefetch byte accounting disagrees with admitted experts")
@@ -388,7 +403,7 @@ def _sample(probe, workload, *, warmups, samples, compute_repeats=1):
             events = probe.events[mode]
             events["end"].synchronize()
             if mode != "compute_only":
-                probe.validate()
+                probe.validate_completion()
             if iteration >= warmups:
                 elapsed = lambda start, end: events[start].elapsed_time(events[end])
                 retire = elapsed("retire_begin", "retire_end") if mode != "compute_only" else 0.0
@@ -400,12 +415,14 @@ def _sample(probe, workload, *, warmups, samples, compute_repeats=1):
                     copy_ms=operation, retire_ms=retire,
                     payload_and_accounting_ms=elapsed("copy_begin", "copy_end") if mode != "compute_only" else 0.0,
                     admission_ms=elapsed("begin", "allocated") if mode != "compute_only" else 0.0))
-    probe.prepare()
-    with torch.cuda.stream(probe.stream):
-        probe.graphs["concurrent"].replay()
-    probe.events["concurrent"]["end"].synchronize()
-    probe.validate(weights=True)
-    workload.validate()
+    for mode in ("validate_copy_only", "validate_concurrent"):
+        probe.prepare()
+        with torch.cuda.stream(probe.stream):
+            probe.graphs[mode].replay()
+        probe.events[mode]["end"].synchronize()
+        probe.validate(weights=True)
+        if mode == "validate_concurrent":
+            workload.validate()
     return series
 
 
@@ -432,6 +449,7 @@ def _measure_shared_retire(parent, max_experts, budget_bytes, *, samples, warmup
             ctrl.layer_plan_counts[layer] = count
             cursors[pool] += count
             counts.append(count)
+        initial_counts = ctrl.layer_plan_counts.clone()
     stream.synchronize()
     before, after = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(2)]
 
@@ -451,6 +469,8 @@ def _measure_shared_retire(parent, max_experts, budget_bytes, *, samples, warmup
     values = []
     for iteration in range(warmups + samples):
         with torch.cuda.stream(stream):
+            # Each retirement consumes its counts; restore them outside the timed graph.
+            ctrl.layer_plan_counts.copy_(initial_counts)
             ctrl.pending.zero_()
             for pool, used in enumerate(cursors):
                 ctrl.pool_pending[pool][:used].fill_(1)
