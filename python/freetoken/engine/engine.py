@@ -679,6 +679,7 @@ class Engine:
         minimum = config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1) if cache else 0
         if cache is not None:
             minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
+            minimum = max(minimum, getattr(self, "_baseline_sd_minimum_slots", 0))
         maximum = min(cache.num_layers * cache.num_experts, cache.max_slots or cache.num_layers * cache.num_experts) if cache else 0
         peak = self._measure_baseline_sd_peak()
         self._baseline_sd_initial_state_bytes = state_pool_bytes(
@@ -714,6 +715,7 @@ class Engine:
                 from dataclasses import replace
                 minimum = self.config.model_config.num_experts * (2 if self.config.moe_prefill_overlap else 1)
                 minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
+                minimum = max(minimum, getattr(self, "_baseline_sd_minimum_slots", 0))
                 overflow = peak + plan.routing_reserve_bytes - plan.budget_bytes
                 reduction = max(1, (overflow + plan.expert_slot_bytes - 1) // plan.expert_slot_bytes)
                 slots = max(minimum, cache.cache_size - reduction)
@@ -961,10 +963,11 @@ class Engine:
         pools = self._moe_pools(1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto and is_native_sd(config):
-            size = max(sum(p.min_num_slots for p in pools),
-                       config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1))
-            if size > size_cap:
-                raise ValueError("baseline SD minimum expert buffers exceed kernel slot limit")
+            from .cache_budget import minimum_staging_slots
+            size = minimum_staging_slots(banks.sources, pools, config.model_config.num_experts,
+                buffers=2 if config.moe_prefill_overlap else 1, counts=self._moe_expert_counts,
+                row_tail_bytes=banks.row_tail_bytes, layer_tags=layer_tags)
+            self._baseline_sd_minimum_slots = size
             object.__setattr__(config, "moe_cache_size", size)
         elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)

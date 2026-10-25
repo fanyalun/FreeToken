@@ -273,6 +273,12 @@ device explicitly. The source datasets must contain the frozen 64 prompts.
 Calibration uses zero-based prompts 16-23 from each dataset; development uses
 24-31; final measurements preserve the earlier first sixteen prompts. The
 calibrator reserves 2 GiB for instrumentation while finding initial slots.
+Native speculative auto-sizing starts at the smallest slot count whose actual
+per-bank byte capacities can hold the requested prefill staging buffers under
+the selected pool split. With prefill overlap enabled this means two buffers;
+mixed quantized layouts cannot use `2 * num_experts` as a sufficient slot count.
+The measured budget planner and overflow retries retain this minimum, so
+calibration does not silently turn off overlap while sizing the cache.
 The default initialization ceilings are therefore 38 GiB for 35B and 78 GiB for
 235B. Every candidate subsequently uses that same fixed pool geometry under its
 model's total budget. If a candidate does not fit, the matrix stops; it does not shrink

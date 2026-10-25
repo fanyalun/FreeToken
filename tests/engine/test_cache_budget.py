@@ -65,8 +65,36 @@ def test_measured_budget_uses_mixed_pool_allocations():
         plan.validate(7, cache_bytes=sizes[7])
 
 
-@pytest.mark.parametrize("automatic", [False, True])
-def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
+@pytest.mark.parametrize("case", ["uniform", "mixed", "padded", "hot", "per_layer"])
+def test_staging_minimum_preserves_overlap_and_is_minimal(case):
+    from freetoken.engine.cache_budget import minimum_staging_slots, layer_slot_bytes
+    from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
+    from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots
+
+    experts = 8
+    widths = ([128] * 4, [64] * 4) if case == "uniform" else ([128, 128, 64, 64], [48, 48, 96, 96])
+    sources = {name: [torch.zeros(experts, width, dtype=torch.uint8) for width in rows]
+               for name, rows in zip(("gate_up", "down"), widths)}
+    tails = {"gate_up": [1, 17, 0, 0], "down": [0, 0, 3, 0]} if case == "padded" else None
+    groups = group_layers("per-layer" if case == "per_layer" else "unified",
+                          bank_layouts(sources), layer_slot_bytes(sources))
+    pools = make_pools(groups, experts, 1, None)
+    counts = torch.arange(32, dtype=torch.float64).reshape(4, experts) if case == "hot" else None
+    minimum = minimum_staging_slots(sources, pools, experts, buffers=2, counts=counts, row_tail_bytes=tails)
+    for slots in (minimum - 1, minimum):
+        cache = OffloadMoeCache(num_layers=4, num_experts=experts, cache_size=slots,
+            device=torch.device("cpu"), prefill_overlap=True, pool_of_layer=pool_of_layer(pools, 4),
+            pool_sizes=split_slots(slots, pools, counts))
+        cache.set_bank_sources(sources, row_tail_bytes=tails)
+        assert cache.prefill_overlap is (slots == minimum)
+        assert cache._stage_fits(2) is (slots == minimum)
+    constrained = make_pools(groups, experts, 1, 1)
+    with pytest.raises(ValueError, match="prefill staging buffers"):
+        minimum_staging_slots(sources, constrained, experts, buffers=2, counts=counts, row_tail_bytes=tails)
+
+
+@pytest.mark.parametrize("automatic,minimum", [(False, 0), (True, 0), (True, 7)])
+def test_native_final_peak_only_shrinks_automatic_initialization(automatic, minimum):
     from freetoken.engine.engine import Engine
     from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -83,22 +111,23 @@ def test_native_final_peak_only_shrinks_automatic_initialization(automatic):
     engine._moe_slot_limit = engine._moe_expert_counts = None
     engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 8, 8, 776, 0, 576, 576)
     engine._sd_sizing = automatic
+    engine._baseline_sd_minimum_slots = minimum
     peaks = iter((1200, 900))
     engine._measure_baseline_sd_peak = lambda: next(peaks)
     rebuilt = []
     def rebuild(*, moe_cache_size):
         rebuilt.append(moe_cache_size)
-        cache.rebuild(moe_cache_size, pool_sizes=[3, 3])
+        cache.rebuild(moe_cache_size, pool_sizes=[(moe_cache_size + 1) // 2, moe_cache_size // 2])
         engine._validate_baseline_sd_peak()
     engine.rebuild_runtime_cache = rebuild
     if automatic:
         engine._validate_baseline_sd_peak()
-        assert rebuilt == [6]
-        assert engine.baseline_sd_memory_plan.final_slots == 6
+        assert rebuilt == [max(6, minimum)]
+        assert engine.baseline_sd_memory_plan.final_slots == max(6, minimum)
         allocated = sum(bank.numel() * bank.element_size() for _, bank in cache.banks)
         allocated += sum(t.numel() * t.element_size() for t in
                          (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
-        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == 440
+        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == (524 if minimum == 7 else 440)
         assert engine.baseline_sd_memory_plan.initial_cache_bytes == 576
         assert engine.baseline_sd_final_peak_bytes == 900
     else:

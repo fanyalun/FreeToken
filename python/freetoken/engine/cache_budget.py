@@ -56,6 +56,43 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     return -(-sum(per_layer) // len(per_layer))
 
 
+def minimum_staging_slots(sources, pools, num_experts, *, buffers, counts=None, row_tail_bytes=None, layer_tags=None):
+    """Smallest split-slot allocation that fits every bank's complete prefill buffers."""
+    from freetoken.moe.legacy_format import canonical_role
+    from freetoken.moe.offload_cache import bank_layouts
+    from freetoken.moe.pool_policy import split_slots
+
+    layouts = bank_layouts(sources, layer_tags)
+    tails = {canonical_role(name): values for name, values in (row_tail_bytes or {}).items()}
+    banks = []
+    for name, layers in sources.items():
+        rows = [t[0].numel() * t.element_size() for t in layers]
+        pads_by_layout = {}
+        for layout, tail in zip(layouts, tails.get(canonical_role(name), [0] * len(layers))):
+            pads_by_layout[layout] = max(pads_by_layout.get(layout, 0), -(-tail // 16) * 16)
+        pads = [pads_by_layout[layout] for layout in layouts]
+        banks.append((rows, pads, buffers * (num_experts * max(rows) + max(pads))))
+
+    def fits(total):
+        sizes = split_slots(total, pools, counts)
+        return all(sum(size * rows[pool.layers[0]] + pads[pool.layers[0]]
+                       for size, pool in zip(sizes, pools)) + max(pads) >= required
+                   for rows, pads, required in banks)
+
+    low = max(num_experts, sum(pool.min_num_slots for pool in pools))
+    high = sum(pool.max_num_slots for pool in pools)
+    if low > high or not fits(high):
+        raise ValueError(f"expert slot pools cannot hold {buffers} complete prefill staging buffers")
+    # Both split policies allocate a fixed ordered sequence of slots, so each bank grows monotonically.
+    while low < high:
+        middle = (low + high) // 2
+        if fits(middle):
+            high = middle
+        else:
+            low = middle + 1
+    return low
+
+
 def net_cache_budget_bytes(
     memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
 ) -> int:
