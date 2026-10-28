@@ -121,7 +121,8 @@ def main():
                     decode=wall-result.ttft_seconds,graphs=len(runner.graphs))),flush=True)
         return rows
     def trajectory(rows):
-        return [(r["token_ids"],[(w["drafted"],w["accepted"],w["returned"],w.get("loop_count")) for w in r["rounds"]]) for r in rows]
+        return [(r["token_ids"],[(w["drafted"],w["accepted"],w["returned"],w.get("loop_count"),
+            w.get("draft_tail"),w.get("draft_loop_count")) for w in r["rounds"]]) for r in rows]
     try:
         for mode in controls:
             for attempt in range(5):
@@ -170,6 +171,7 @@ def main():
                 tpot_ms=1000*decode/(len(rows)*(args.tokens-1)),
                 mean_ttft_ms=1000*sum(r["ttft_seconds"] for r in rows)/len(rows),
                 mean_loops=sum(w.get("loop_count",0) for w in windows)/len(windows),
+                mean_draft_loops=sum(w.get("draft_loop_count",w.get("loop_count",0)) for w in windows)/len(windows),
                 inner_accepted=sum(l["accepted"] for l in inner),inner_drafted=sum(l["drafted"] for l in inner),
                 outer_accepted=sum(w["accepted"] for w in windows),outer_drafted=sum(w["drafted"] for w in windows))
         write("metrics.json",dict(methods=metrics,validation=checks,

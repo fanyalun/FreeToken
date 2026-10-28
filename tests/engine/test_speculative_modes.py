@@ -13,13 +13,18 @@ def config(**kwargs):
 
 
 @pytest.mark.parametrize("backend", ["offload", "hybrid", "fused"])
-@pytest.mark.parametrize("mode,graph,prefetch,phases", [
-    ("sd", "full", False, ("verify",)),
-    ("three_level_gpu", "full", True, ("preverify", "verify")),
-    ("cpu_async", "eager", False, ("preverify",)),
+@pytest.mark.parametrize("mode,requested_graph,graph,prefetch,phases", [
+    ("sd", None, "full", False, ("verify",)),
+    ("three_level_gpu", None, "full", True, ("preverify", "verify")),
+    ("cpu_async", None, "eager", False, ("preverify",)),
+    ("cpu_async", "full", "full", False, ("preverify",)),
 ])
-def test_mode_and_moe_backend_resolve_independently(backend, mode, graph, prefetch, phases):
-    c = config(speculative_mode=mode, moe_strategy=backend)
+def test_mode_and_moe_backend_resolve_independently(backend, mode, requested_graph, graph, prefetch, phases):
+    if mode == "cpu_async" and requested_graph == "full" and backend != "offload":
+        with pytest.raises(ValueError, match="require offload MoE"):
+            config(speculative_mode=mode, moe_strategy=backend, speculative_graph=requested_graph)
+        return
+    c = config(speculative_mode=mode, moe_strategy=backend, speculative_graph=requested_graph)
     assert c.speculative_mode == mode and c.moe_strategy == backend
     assert c.speculative_graph == graph and c.speculative_depth == 3
     assert c.speculative_prefetch == (prefetch and backend != "fused")
@@ -38,10 +43,32 @@ def test_mode_and_moe_backend_resolve_independently(backend, mode, graph, prefet
     (dict(speculative_mode="sd", speculative_preverify_top_h=2, speculative_preverify_top_k=4), "conflicts"),
     (dict(speculative_mode="sd", max_running_req=2), "one request"),
     (dict(speculative_mode="sd", speculative_graph="full", cuda_graph_max_bs=0), "conflicts"),
-    (dict(speculative_mode="cpu_async", speculative_graph="full"), "eager"),
+    (dict(speculative_mode="cpu_async", speculative_graph_implementation="coarse"), "coarse"),
+    (dict(speculative_mode="cpu_async", speculative_graph="full", speculative_draft_method="eagle3"), "native MTP"),
+    (dict(speculative_mode="cpu_async", speculative_graph="full", speculative_draft_model="draft"), "native MTP"),
     (dict(speculative_mode="cpu_async", cpu_async_loops=0), "positive"),
     (dict(speculative_mode="cpu_async", cpu_async_timeout=float("nan")), "timeout"),
     (dict(speculative_mode="cpu_async", cpu_async_timeout=float("inf")), "timeout"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="unknown"), "ggml_v2 requires"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_components=("gdn",)), "v2 components require"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="ggml_v2",
+          cpu_async_kernel_components=("gdn", "gdn")), "duplicate v2 component"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="ggml_v2",
+          cpu_async_kernel_components="gdn"), "component names"),
+    (dict(speculative_mode="sd", cpu_async_kernel_profile="ggml_v2"), "requires speculative_mode=cpu_async"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="ggml_v2",
+          cpu_async_kernel_components=("experts",)), "shared banks"),
+    (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="ggml_v2",
+          speculative_draft_method="eagle3"), "native BF16"),
+    (dict(speculative_mode="sd", cpu_async_prefix_layers=4), "requires speculative_mode=cpu_async"),
+    (dict(speculative_mode="cpu_async", cpu_async_prefix_layers=0), "positive integer"),
+    (dict(speculative_mode="cpu_async", cpu_async_prefix_layers=4), "requires Hybrid"),
+    (dict(speculative_mode="cpu_async", cpu_async_prefix_layers=4, moe_strategy="hybrid",
+          speculative_prefetch=False), "suffix-only"),
+    (dict(speculative_mode="cpu_async", cpu_async_prefix_layers=4, moe_strategy="hybrid",
+          cpu_async_suffix_gpu_experts=0), "native routing top-k"),
+    (dict(speculative_mode="cpu_async", cpu_async_prefix_layers=4, moe_strategy="hybrid",
+          cpu_async_kernel_profile="ggml_v2", cpu_async_kernel_components=("head",)), "CPU head"),
     (dict(speculative_mode="three_level_gpu", attention_backend="fa"), "triton"),
     (dict(speculative_mode="sd", moe_strategy="cpu"), "offload, hybrid or fused"),
 ])
@@ -62,6 +89,62 @@ def test_explicit_prefetch_and_preverify_policy_override_mode_defaults():
                speculative_preverify_top_h=2, cpu_async_recovery="recheck")
     assert c.speculative_prefetch and c.speculative_preverify_top_k == 2
     assert c.cpu_async_recovery == "recheck"
+
+
+def test_split_profile_selection_respects_deadlines_and_total_period(tmp_path):
+    import json
+    from freetoken.engine.cpu_async_split_profile import build_split_profile, load_split_profile
+
+    measurements = []
+    for layers, cpu, hidden, suffix in ((2, 0.2, 0.1, 1.1), (3, 0.4, 0.4, 0.25),
+                                       (4, 0.7, 0.1, 0.3), (5, 0.85, 0.1, 0.6), (6, 1.1, 0.1, 0.1)):
+        for context, rows in ((128, 4), (512, 8)):
+            measurements.append(dict(prefix_layers=layers, context_tokens=context, rows=rows,
+                cpu_prefix_seconds=cpu, gpu_generation_seconds=1.0, hidden_transfer_seconds=hidden,
+                gpu_suffix_seconds=suffix, recovery_seconds=0.05))
+    profile = build_split_profile({"frozen": "model/core/kernel identity"}, measurements, 40)
+    assert profile["selection"]["prefix_layers"] == 4
+    periods = {row["prefix_layers"]: row["mean_period_seconds"] for row in profile["selection"]["candidates"]}
+    assert periods[3] == pytest.approx(1.0 + 0.4 + 0.25 + 0.05)
+    assert periods[4] == pytest.approx(1.0 + 0.1 + 0.3 + 0.05)
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps(profile))
+    assert load_split_profile(path, profile["identity"])["selection"] == profile["selection"]
+    with pytest.raises(ValueError, match="identity mismatch"):
+        load_split_profile(path, {"frozen": "different CPU cores"})
+    profile["state_protocol"] = "per_token_recurrent_snapshots"
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="state protocol mismatch"):
+        load_split_profile(path)
+    from freetoken.engine.cpu_async_split_profile import CPU_PREFIX_PROTOCOL, SCHEMA_VERSION
+    profile["state_protocol"] = CPU_PREFIX_PROTOCOL
+    profile["schema_version"] = 1
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="schema.*recalibrate"):
+        load_split_profile(path)
+    profile["schema_version"] = SCHEMA_VERSION
+    profile["selection"]["prefix_layers"] = 6
+    path.write_text(json.dumps(profile))
+    with pytest.raises(ValueError, match="does not match"):
+        load_split_profile(path)
+
+
+def test_split_profile_cannot_compare_different_row_workloads():
+    from freetoken.engine.cpu_async_split_profile import select_split
+
+    measurements = [dict(prefix_layers=layers, context_tokens=128, rows=width,
+        cpu_prefix_seconds=0.1, gpu_generation_seconds=1.0, hidden_transfer_seconds=0.01,
+        gpu_suffix_seconds=0.2, recovery_seconds=0.05) for layers, width in ((2, 4), (4, 8))]
+    with pytest.raises(ValueError, match="same context and row workloads"):
+        select_split(measurements, 40)
+
+
+@pytest.mark.parametrize("gpu_experts", [0, 8])
+def test_split_suffix_rejects_empty_cpu_or_gpu_partition(gpu_experts):
+    from freetoken.engine.cpu_async_split_profile import validate_suffix_gpu_experts
+
+    with pytest.raises(ValueError, match="native routing top-k"):
+        validate_suffix_gpu_experts(gpu_experts, 8)
 
 
 def test_prefetch_defaults_distinguish_legacy_from_uncalibrated_modes():
@@ -89,6 +172,57 @@ def test_all_manual_prefetch_quotas_bypass_profile_lookup(monkeypatch, mode):
     assert tuple(getattr(c, name) for name in profiles.QUOTA_FIELDS) == (1, 12, 2 if mode == "three_level_gpu" else 0)
 
 
+@pytest.mark.parametrize("backend", ["offload", "hybrid"])
+@pytest.mark.parametrize("overrides,pre,full,gap", [
+    ({}, [1] * 39 + [0], [0] + [2] * 39, 10),
+    ({"speculative_prefetch_layer_experts": 0}, [0] * 40, [0] + [2] * 39, 10),
+    ({"speculative_prefetch_layer_quotas": [0] * 40}, [0] * 40, [0] + [2] * 39, 10),
+    ({"speculative_verify_prefetch_layer_experts": 0}, [1] * 39 + [0], [0] * 40, 10),
+    ({"speculative_verify_prefetch_layer_quotas": [0] * 40}, [1] * 39 + [0], [0] * 40, 10),
+    ({"speculative_prefetch_gap_capacity": 0}, [1] * 39 + [0], [0] + [2] * 39, 0),
+])
+def test_qwen35_fixed_prefetch_defaults_preserve_overrides(monkeypatch, backend, overrides, pre, full, gap):
+    from types import SimpleNamespace
+    import freetoken.engine.speculative_prefetch_profile as profiles
+
+    monkeypatch.setattr(profiles, "build_prefetch_identity", lambda *args: pytest.fail("unexpected profile lookup"))
+    c = config(speculative_mode="three_level_gpu", moe_strategy=backend, **overrides)
+    object.__setattr__(c, "model_config", SimpleNamespace(model_type="qwen3_5_moe", hidden_size=2048,
+        moe_intermediate_size=512, num_experts=256, num_moe_layers=40))
+    receipt = profiles.prepare_prefetch_profile(c, None)
+    assert receipt["source"] == "model_default"
+    assert c.moe_cache_size == 0 and c.moe_cache_auto
+    monkeypatch.setattr(profiles, "prefetch_geometry", lambda engine: None)
+    effective = profiles.validate_prefetch_profile(SimpleNamespace(config=c))["effective"]
+    assert (effective["preverify"], effective["verify"], effective["gap_capacity"]) == (pre, full, gap)
+    assert effective["max_gap_expert_loads"] == max(0, gap - 1)
+
+
+@pytest.mark.parametrize("mode,model_changes,selection", [
+    ("three_level_gpu", {"model_type": "qwen3_moe"}, "auto"),
+    ("three_level_gpu", {"hidden_size": 4096}, "auto"),
+    ("three_level_gpu", {"moe_intermediate_size": 1024}, "auto"),
+    ("three_level_gpu", {"num_experts": 128}, "auto"),
+    ("three_level_gpu", {"num_moe_layers": 48}, "auto"),
+    ("three_level_gpu", {}, "chosen_profile.json"),
+    ("cpu_async", {}, "auto"),
+])
+def test_qwen35_defaults_do_not_replace_other_profile_paths(monkeypatch, mode, model_changes, selection):
+    from types import SimpleNamespace
+    import freetoken.engine.speculative_prefetch_profile as profiles
+
+    def profile_lookup(*args):
+        raise ValueError("profile lookup retained")
+
+    monkeypatch.setattr(profiles, "build_prefetch_identity", profile_lookup)
+    c = config(speculative_mode=mode, speculative_prefetch=True, speculative_prefetch_profile=selection)
+    model = dict(model_type="qwen3_5_moe", hidden_size=2048, moe_intermediate_size=512,
+                 num_experts=256, num_moe_layers=40)
+    object.__setattr__(c, "model_config", SimpleNamespace(**(model | model_changes)))
+    with pytest.raises(ValueError, match="profile lookup retained"):
+        profiles.prepare_prefetch_profile(c, None)
+
+
 @pytest.mark.parametrize("directory", [True, False])
 def test_prefetch_identity_tracks_every_gguf_shard(tmp_path, directory):
     from freetoken.engine.speculative_prefetch_profile import _checkpoint_identity, profile_key
@@ -104,8 +238,8 @@ def test_prefetch_identity_tracks_every_gguf_shard(tmp_path, directory):
     assert profile_key(_checkpoint_identity(source)) != profile_key(before)
 
 
-@pytest.mark.parametrize("case", ["loaded", "zero_override", "missing", "identity", "candidate", "candidate_opt_in",
-                                  "auto_candidate", "slots_conflict", "geometry", "runtime_change", "evidence", "zero_profile"])
+@pytest.mark.parametrize("case", ["loaded", "zero_override", "missing", "identity", "old_profile",
+                                  "slots_conflict", "geometry", "runtime_change", "evidence", "zero_profile"])
 def test_prefetch_profile_resolution_and_frozen_geometry(tmp_path, monkeypatch, case):
     import copy
     import json
@@ -115,16 +249,17 @@ def test_prefetch_profile_resolution_and_frozen_geometry(tmp_path, monkeypatch, 
     identity = {"target": "fixture", "settings": {"budget": 40 * 2**30}}
     geometry = dict(total_slots=12, pool_sizes=[7, 5], pool_of_layer=[0, 1], layer_layout=[0, 1],
                     expert_bytes_by_layer=[64, 80], bank_layouts=[[], []])
-    data = dict(schema_version=1, identity=identity, quotas=dict(preverify=[1, 2], gap_capacity=12, verify=[0, 2]),
-                geometry=geometry, evidence=dict(status="validated", artifact_sha256={"raw.json": "a" * 64},
-                    promotion=dict(passed=True)))
+    data = dict(schema_version=profiles.SCHEMA_VERSION, identity=identity,
+                quotas=dict(preverify=[1, 2], gap_capacity=12, verify=[0, 2]), geometry=geometry,
+                evidence=dict(status="calibrated", samples=1, method="single_sample_mean",
+                              artifact_sha256={"raw.json": "a" * 64}))
     path = tmp_path / (profiles.profile_key(identity) + ".json")
     if case == "identity":
         data["identity"] = {"target": "other"}
-    if case in ("candidate", "candidate_opt_in", "auto_candidate"):
-        data["evidence"]["status"] = "candidate"
+    if case == "old_profile":
+        data["schema_version"] = 1
     if case == "evidence":
-        data["evidence"]["promotion"]["passed"] = False
+        data["evidence"]["artifact_sha256"] = {}
     if case == "zero_profile":
         data["quotas"] = dict(preverify=[0, 0], gap_capacity=0, verify=[0, 0])
     if case != "missing":
@@ -133,7 +268,7 @@ def test_prefetch_profile_resolution_and_frozen_geometry(tmp_path, monkeypatch, 
     monkeypatch.setattr(profiles, "profile_directory", lambda: tmp_path)
     values = dict(speculative_mode="three_level_gpu", speculative_prefetch_profile=str(path),
                   gpu_memory_budget_bytes=40 * 2**30)
-    if case in ("loaded", "auto_candidate"):
+    if case == "loaded":
         values["speculative_prefetch_profile"] = "auto"
     if case == "zero_override":
         values["speculative_prefetch_layer_experts"] = 0
@@ -141,16 +276,14 @@ def test_prefetch_profile_resolution_and_frozen_geometry(tmp_path, monkeypatch, 
         values["moe_cache_size"] = 13
     c = config(**values)
     object.__setattr__(c, "model_config", SimpleNamespace(num_moe_layers=2))
-    if case in ("candidate_opt_in", "auto_candidate"):
-        object.__setattr__(c, "_speculative_prefetch_allow_candidate", True)
-    errors = dict(missing="profile missing", identity="identity mismatch", candidate="must be validated",
-                  auto_candidate="must be validated", slots_conflict="slots mismatch", evidence="passed promotion")
+    errors = dict(missing="profile missing", identity="identity mismatch", old_profile="unsupported",
+                  slots_conflict="slots mismatch", evidence="measurement hashes")
     if case in errors:
         with pytest.raises(ValueError, match=errors[case]):
             profiles.prepare_prefetch_profile(c, None)
         return
     receipt = profiles.prepare_prefetch_profile(c, None)
-    assert c.moe_cache_size == 12 and not c.moe_cache_auto
+    assert c.moe_cache_size == 0 and c.moe_cache_auto
     assert receipt["effective"]["preverify"] == ([0, 0] if case in ("zero_override", "zero_profile") else [1, 2])
     assert receipt["effective"]["verify"] == ([0, 0] if case == "zero_profile" else [0, 2])
     assert receipt["effective"]["max_gap_expert_loads"] == (0 if case == "zero_profile" else 11)
@@ -230,7 +363,7 @@ def test_cpu_worker_cleanup_survives_gpu_or_reader_failure(failure):
     def drained():
         if failure == "undrained":
             raise RuntimeError("reader still owned")
-    runtime.window = SimpleNamespace(close_request=gpu_close)
+    runtime.window = SimpleNamespace(close_request=gpu_close, close=gpu_close)
     runtime.worker = SimpleNamespace(close=lambda: closed.append(True), require_drained=drained)
     if failure == "request_failed":
         runtime._finish_request(True)
@@ -277,8 +410,11 @@ def test_cpu_async_precancel_does_not_reuse_previous_request_io_metrics():
     runtime.engine = SimpleNamespace(config=SimpleNamespace(speculative_max_output_tokens=16,
         model_config=SimpleNamespace(vocab_size=32), cpu_async_core_ids=(2,), moe_cpu_core_ids=None,
         _cpu_moe_coordinator_core=None, cpu_async_recovery="fixed_replay"))
+    runtime.runner = SimpleNamespace(graph_replays={}, graph_fallbacks={}, graph_captures={})
+    runtime._prepare_worker = lambda: pytest.fail("pre-cancelled request prepared CPU worker")
     closed = []
     runtime.window = SimpleNamespace(close_request=lambda: closed.append("gpu"),
+        prepare_graphs=lambda: pytest.fail("pre-cancelled request prepared CUDA graphs"),
         initialize=lambda *a, **k: pytest.fail("pre-cancelled request started prefill"),
         experts=SimpleNamespace(request_metrics=lambda: pytest.fail("pre-cancelled request read stale IO metrics")))
     runtime.worker = SimpleNamespace(epoch=None, require_drained=lambda: closed.append("worker"))

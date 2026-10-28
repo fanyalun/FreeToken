@@ -368,34 +368,9 @@ def test_cpu_interval_accounts_for_new_and_reused_processes(monkeypatch):
         process_cpu_interval(before, before)
 
 
-def test_cpu_window_budget_reserves_late_buffers_before_choosing_slots():
-    from freetoken.engine.baseline_sd import plan_measured_memory
-
-    root = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(root / "benchmarks"))
-    try:
-        from bench_cpu_verify_feasibility import plan_cpu_window_memory
-
-        mib = 1 << 20
-        native = plan_measured_memory(capacity_tokens=2176, kv_pages=2176,
-            budget_bytes=1024*mib, measured_peak_bytes=600*mib, initial_slots=40,
-            expert_slot_bytes=10*mib, minimum_slots=10, maximum_slots=200,
-            automatic=True)
-        actual = plan_cpu_window_memory(native, 800*mib, 40, 10, 200)
-        assert actual.final_slots == 56
-        assert actual.final_slots < native.final_slots
-        actual.validate(actual.final_slots)
-        import pytest
-        with pytest.raises(ValueError, match="budget insufficient"):
-            actual.validate(actual.final_slots + 1)
-        with pytest.raises(ValueError, match="budget insufficient"):
-            plan_cpu_window_memory(native, 2000*mib, 40, 10, 200)
-    finally:
-        sys.path.pop(0)
 
 
-@pytest.mark.parametrize("auto_slots", [False, True])
-def test_cpu_window_epochs_follow_gpu_after_sizing(monkeypatch, auto_slots):
+def test_cpu_window_epochs_follow_gpu_requests(monkeypatch):
     from types import SimpleNamespace
     import torch
 
@@ -438,26 +413,12 @@ def test_cpu_window_epochs_follow_gpu_after_sizing(monkeypatch, auto_slots):
             return dict(kind="initialized", epoch=self.epochs[-1])
 
     window = Window()
-    if auto_slots:
-        cache = SimpleNamespace(cache_size=512, num_layers=40, num_experts=256, max_slots=0)
-        engine = SimpleNamespace(moe_offload_cache=cache, baseline_sd_memory_plan=None,
-            config=SimpleNamespace(model_config=SimpleNamespace(num_experts=256), moe_prefill_overlap=True),
-            speculative_runner=None, device="cpu", _baseline_allocated=0, _physical_baseline_free=1000,
-            rebuild_runtime_cache=lambda **kw: setattr(cache, "cache_size", kw["moe_cache_size"]))
-        monkeypatch.setattr(benchmark, "QwenAsyncGpuWindow", Window)
-        monkeypatch.setattr(benchmark, "plan_cpu_window_memory", lambda *a: SimpleNamespace(final_slots=2000))
-        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a: 100)
-        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a: 100)
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (900, 1000))
-        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-        window, _ = benchmark.prepare_auto_window(engine, [7], None, False)
-        assert window.epoch == 1
     worker = Worker()
     for prompt in ([7], [0], [0], [1], [1]):
         checkpoint = benchmark.initialize_cpu_window(window, worker, prompt, None)
         assert checkpoint.prompt == prompt
         window.close_request()
-    assert worker.epochs == list(range(2 if auto_slots else 1, 7 if auto_slots else 6))
+    assert worker.epochs == list(range(1, 6))
 
 
 def test_feasibility_entrypoint_allows_runtime_inference_tensor_updates(tmp_path, monkeypatch):
@@ -554,3 +515,236 @@ def test_prefix_matrix_preserves_initialization_failure(monkeypatch, tmp_path):
     result = json.loads((output / "manifest.json").read_text())
     assert result["jobs"][0]["status"] == "incomplete_or_invalid"
     assert result["jobs"][0]["returncode"] == 1
+
+
+@pytest.mark.parametrize("output_tokens,reject,broken_replay,recheck_mismatch", [
+    (1, False, False, None), (3, False, False, None), (65, False, False, None),
+    (65, True, False, None), (65, False, True, None), (256, False, False, None),
+    (65, False, False, -1), (65, False, False, 0), (65, False, False, 3),
+])
+def test_algorithm_rolling_replays_old_tail_before_advancing(monkeypatch, output_tokens, reject, broken_replay, recheck_mismatch):
+    from types import SimpleNamespace
+    import torch
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from cpu_async_algorithm_roll import run_rolling
+    from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, GpuRecoveryResult
+
+    prefix, generated, verified, calls = 7, 0, 0, []
+    window = SimpleNamespace(runner=SimpleNamespace(frontier=SimpleNamespace(target_valid_len=prefix)),
+        canonical_length=prefix, canonical_anchor=0, output_end=prefix + output_tokens)
+    initial = SimpleNamespace(length=prefix, anchor=0)
+
+    def generate(anchor, loops=4, candidate_cap=None):
+        nonlocal generated
+        start = window.runner.frontier.target_valid_len
+        count = min(loops * 4, candidate_cap, window.output_end - start)
+        candidates = list(range(anchor + 1, anchor + count + 1))
+        if reject and generated == 0 and count > 7:
+            candidates[7] = 999
+        if generated == 1 and recheck_mismatch is not None and recheck_mismatch >= 0:
+            candidates[recheck_mismatch + 1] = 999
+        generated += 1
+        window.runner.frontier.target_valid_len += count
+        return GpuCandidateBlock(start, anchor, tuple(candidates)), []
+
+    def ahead(block, loops=4, candidate_cap=None):
+        value = generate(block.candidates[-1] if block.candidates else block.anchor, loops, candidate_cap)
+        calls.append("ahead")
+        return value
+
+    def verify(block, remaining):
+        nonlocal verified
+        assert calls[-1] == "ahead"
+        calls.append("verify")
+        predictions = (block.anchor + 1, *(token + 1 for token in block.candidates))
+        accepted = 0
+        for candidate, prediction in zip(block.candidates, predictions):
+            if candidate != prediction:
+                break
+            accepted += 1
+        count = min(accepted + 1, remaining)
+        result = SimpleNamespace(start=block.start, block_id=verified,
+            input_count=count, tokens=predictions[:count], accepted=accepted,
+            predictions=torch.tensor(predictions), terminal=count == remaining,
+            checkpoint=SimpleNamespace(length=block.start + count))
+        verified += 1
+        return result
+
+    def install(result):
+        assert result.start == window.canonical_length
+        window.canonical_length = result.checkpoint.length
+        window.canonical_anchor = result.tokens[-1]
+        window.runner.frontier.target_valid_len = result.checkpoint.length
+
+    def replay(block):
+        assert block.start == window.canonical_length and block.anchor == window.canonical_anchor
+        if not broken_replay:
+            window.runner.frontier.target_valid_len = block.start + len(block.candidates)
+
+    def recheck(block):
+        assert (block.start, block.anchor) == (window.canonical_length, window.canonical_anchor)
+        expected = tuple(range(block.anchor + 1, block.anchor + len(block.candidates) + 1))
+        matched = next((i for i, pair in enumerate(zip(block.candidates, expected))
+                        if pair[0] != pair[1]), len(expected))
+        tokens = expected[:min(len(expected), matched + 1)]
+        end = block.start + len(tokens)
+        window.runner.frontier.target_valid_len = end
+        calls.append("recheck")
+        return GpuRecoveryResult(GpuCandidateBlock(block.start, block.anchor, tokens),
+            matched, len(expected) - matched, tokens[-1], end,
+            "mismatch" if matched < len(expected) else "capacity", ())
+
+    session = SimpleNamespace(reset=lambda: initial, window=window, initial=initial,
+        engine=SimpleNamespace(config=SimpleNamespace(speculative_mtp_depth=3)),
+        output_tokens=output_tokens, reference_tokens=list(range(output_tokens)),
+        generate=generate, ahead=ahead, verify=verify, install=install, replay=replay, recheck=recheck)
+    recovery = "fixed_replay" if recheck_mismatch is None else "recheck"
+    if broken_replay:
+        with pytest.raises(RuntimeError, match="fixed replay did not reconstruct"):
+            run_rolling(session)
+        return
+    measured = run_rolling(session, recovery=recovery)
+    from analyze_cpu_async_lookahead import effective_lookahead, summarize_samples
+
+    lookahead = effective_lookahead(measured)
+    assert lookahead["useful_ahead_tokens"] == measured["cpu_accepted_old_ahead_tokens"]
+    assert sum(e["useful_tokens"] for e in lookahead["episodes"]) == lookahead["useful_ahead_tokens"]
+    assert measured["output_tokens"] == list(range(output_tokens))
+    assert measured["committed_input_rows"] == output_tokens - 1
+    assert measured["cpu_serial_output_exact"]
+    if output_tokens >= 65:
+        assert measured["longest_success_chain"] >= 2
+    for step in measured["handoffs"]:
+        if step["retained"]:
+            if recovery == "fixed_replay":
+                assert step["replay"]["start"] == step["confirmed_end"]
+                assert step["replay"]["end"] == step["ahead"]["start"] + len(step["ahead"]["candidates"])
+            else:
+                assert step["recheck"]["dropped_old_tokens"] == 0
+            assert step["next_proposal"]["start"] == step["confirmed_end"]
+        assert step["fresh_ahead_start"] == step["submitted"]["start"] + len(step["submitted"]["candidates"])
+    if reject:
+        assert measured["handoffs"][0]["reason"] == "A_rejected"
+        assert measured["regenerated_handoffs"] >= 1
+        assert measured["slide_cells"]["episodes"][0]["cells"] == 0
+        assert lookahead["episodes"][0]["useful_tokens"] == 0
+        assert not lookahead["episodes"][0]["censored"]
+    if recheck_mismatch is not None and recheck_mismatch >= 0:
+        first = measured["handoffs"][0]
+        assert first["recheck"]["matched_old_tokens"] == recheck_mismatch
+        assert not first["retained"]
+        assert first["next_proposal"]["candidates"] == tuple(range(18, 19 + recheck_mismatch))
+        assert measured["slide_cells"]["episodes"][0]["cells"] == 0
+        assert first["recheck"]["checked_quality"]["all_accepted"]
+        assert lookahead["useful_ahead_tokens"] == 42
+        if recheck_mismatch == 3:
+            assert len(lookahead["episodes"]) == 1
+            assert lookahead["episodes"][0]["useful_tokens"] == 42
+            assert lookahead["episodes"][0]["censored"]
+            lookahead["sample"] = 0
+            survival = summarize_samples([lookahead])["survival"]
+            assert survival["32"]["lower"] == survival["32"]["upper"] == 1
+            assert survival["64"]["lower"] == 0 and survival["64"]["upper"] == 1
+        else:
+            assert [e["useful_tokens"] for e in lookahead["episodes"]] == [0, 42]
+
+
+@pytest.mark.parametrize("failure", ["none", "A", "B", "C_bonus"])
+def test_algorithm_pairs_preserve_eligibility_and_exact_c_boundary(monkeypatch, failure):
+    from types import SimpleNamespace
+    import torch
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
+    from cpu_async_algorithm_pairs import run_pairs
+    from freetoken.engine.qwen_async_three_level import GpuCandidateBlock
+
+    class Session:
+        def __init__(self):
+            self.initial = SimpleNamespace(length=10, anchor=0)
+            self.reference_tokens = list(range(64))
+            self.window = SimpleNamespace(runner=SimpleNamespace(
+                frontier=SimpleNamespace(target_valid_len=10)))
+            self.verified, self.generated = [], []
+            self.resets = 0
+
+        def reset(self):
+            self.resets += 1
+            self.cpu_length, self.cpu_anchor = 10, 0
+            self.window.runner.frontier.target_valid_len = 10
+            self.replayed = False
+            return self.initial
+
+        def generate(self, anchor, loops=4, candidate_cap=None):
+            start = self.window.runner.frontier.target_valid_len
+            count = min(4, candidate_cap) if candidate_cap is not None else 4
+            candidates = list(range(anchor + 1, anchor + count + 1))
+            if failure == "A" and start == 10:
+                candidates[2] = 99
+            elif failure == "B" and start == 14:
+                candidates[2] = 99
+            elif failure == "C_bonus" and self.replayed:
+                candidates[0] = 99
+            block = GpuCandidateBlock(start, anchor, tuple(candidates))
+            self.generated.append(block)
+            self.window.runner.frontier.target_valid_len += count
+            return block, []
+
+        def ahead(self, block, loops=4, candidate_cap=None):
+            assert self.window.runner.frontier.target_valid_len == block.start + len(block.candidates)
+            return self.generate(block.candidates[-1], loops, candidate_cap)
+
+        def verify(self, block, remaining=255):
+            assert (block.start, block.anchor) == (self.cpu_length, self.cpu_anchor)
+            offset = block.start - self.initial.length
+            predictions = self.reference_tokens[offset + 1:offset + len(block.candidates) + 2]
+            accepted = 0
+            for proposed, expected in zip(block.candidates, predictions):
+                if proposed != expected:
+                    break
+                accepted += 1
+            count = min(accepted + 1, remaining)
+            self.cpu_length, self.cpu_anchor = block.start + count, predictions[count - 1]
+            self.verified.append(block)
+            return SimpleNamespace(start=block.start, accepted=accepted, input_count=count,
+                tokens=tuple(predictions[:count]), predictions=torch.tensor(predictions),
+                checkpoint=SimpleNamespace(length=self.cpu_length), terminal=False)
+
+        def install(self, result):
+            self.window.runner.frontier.target_valid_len = result.checkpoint.length
+
+        def replay(self, block):
+            self.replayed = True
+            self.window.runner.frontier.target_valid_len = block.start + len(block.candidates)
+
+    session = Session()
+    result = run_pairs(session)
+    raw = result["experiment1"]["continuous8"]
+    paired = result["experiment2"]
+    if failure == "A":
+        assert not raw["b"]["quality"]["valid_context"]
+        assert raw["b"]["quality"]["accepted"] is None and raw["b_cpu"] is None
+        assert paired == dict(status="skipped", eligible=False, skip_reason="proposal_rejected",
+            raw_a_candidates=4, discarded_b_candidates=4)
+        assert session.resets == 2 and len(session.verified) == 3
+        return
+    assert paired["eligible"]
+    if failure == "B":
+        assert paired["replay_old_b"]["b_cpu"]["full_proposal_accepted"] is False
+        assert paired["replay_old_b"]["c_quality"]["accepted"] is None
+        assert paired["replay_old_b"]["wasted_c_candidates"] == 4
+        assert paired["exact_b"] is None and paired["paired_c"]["reason"] == "b_rejected"
+        return
+    comparison = paired["paired_c"]
+    assert comparison["status"] == "complete" and comparison["candidates"] == 4
+    replayed_c, exact_c = paired["replay_old_b"]["c"]["block"], paired["exact_b"]["c"]["block"]
+    assert (replayed_c["start"], replayed_c["anchor"]) == (exact_c["start"], exact_c["anchor"]) == (18, 8)
+    assert session.verified[-1].candidates == (6, 7)
+    assert paired["exact_b"]["aligned_cpu_prefix"]["confirmed_end"] == 18
+    if failure == "C_bonus":
+        assert paired["replay_old_b"]["c_retention"]["reason"] == "bonus_mismatch"
+        assert comparison["first"]["accepted"] == 0
+        assert comparison["first"]["first_rejection_position"] == 19
+        assert comparison["second"]["accepted"] == 4
+    else:
+        assert comparison["first"]["accepted"] == comparison["second"]["accepted"] == 4

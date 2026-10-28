@@ -32,6 +32,9 @@ The prediction is the next layer's positive device reference counts after inner
 acceptance has released rejected input rows. Missing experts are ordered by
 descending reference count, then ascending expert ID. Resident or already assigned
 experts are skipped. Counts are a load-priority signal, not acceptance probabilities.
+The final raw Draft suffix has no Pre-Verify route references. Missing predictions
+for that suffix use ordinary full-verify demand admission; they are not inferred
+from the MTP layer or counted as zero-quality Pre-Verify predictions.
 
 Each target layer owns an independent plan. At layer entry, the compute stream
 joins the previous copy, clears its pending slots and retires its plan count before

@@ -178,62 +178,12 @@ def summarize(rows):
     return summary
 
 
-def plan_cpu_window_memory(native_plan, measured_peak, slots, minimum, maximum):
-    from freetoken.engine.baseline_sd import plan_measured_memory
-
-    # Private replay buffers are created after the native SD startup planner.
-    return plan_measured_memory(
-        capacity_tokens=native_plan.capacity_tokens, kv_pages=native_plan.kv_pages,
-        budget_bytes=native_plan.budget_bytes,
-        measured_peak_bytes=max(measured_peak,
-            native_plan.non_expert_peak_bytes + slots * native_plan.expert_slot_bytes),
-        initial_slots=slots, expert_slot_bytes=native_plan.expert_slot_bytes,
-        minimum_slots=minimum, maximum_slots=maximum, automatic=True,
-        routing_reserve_bytes=64 << 20)
-
-
-def prepare_auto_window(engine, prompt, chunk_size, instrument):
-    cache = engine.moe_offload_cache
-    native_plan = engine.baseline_sd_memory_plan
-    minimum = engine.config.model_config.num_experts * (2 if engine.config.moe_prefill_overlap else 1)
-    maximum = min(cache.num_layers * cache.num_experts,
-                  cache.max_slots or cache.num_layers * cache.num_experts)
-    sizing = []
-    for attempt in range(3):
-        window = QwenAsyncGpuWindow(engine.speculative_runner, instrument_components=instrument)
-        error = None
-        try:
-            checkpoint = window.initialize(prompt, chunk_size=chunk_size)
-            window.audit_gpu_anchor(checkpoint.anchor)
-            window.warm_widths(checkpoint.anchor)
-        except ValueError as exc:
-            if not str(exc).startswith("CPU async GPU peak "):
-                raise
-            error = str(exc)
-        finally:
-            window.close_request()
-        allocated = torch.cuda.memory_allocated(engine.device) - engine._baseline_allocated
-        external = max(0, engine._physical_baseline_free - torch.cuda.mem_get_info(engine.device)[0] - allocated)
-        peak = torch.cuda.max_memory_allocated(engine.device) - engine._baseline_allocated + external
-        sizing.append(dict(slots=cache.cache_size, measured_peak_bytes=peak, budget_error=error))
-        if attempt and error is None:
-            return window, sizing
-        plan = plan_cpu_window_memory(native_plan, peak, cache.cache_size, minimum, maximum)
-        if attempt and plan.final_slots >= cache.cache_size:
-            raise RuntimeError("CPU async memory sizing did not reduce the overflowing cache")
-        del window
-        gc.collect()
-        torch.cuda.empty_cache()
-        engine.baseline_sd_memory_plan = plan
-        engine.rebuild_runtime_cache(moe_cache_size=plan.final_slots)
-    raise RuntimeError("CPU async GPU memory sizing failed after three boundary warmups")
 
 
 def initialize_cpu_window(window, worker, prompt, chunk_size, transfer=None, mode="sync"):
     worker.require_drained()
     checkpoint = (window.initialize(prompt, chunk_size=chunk_size) if transfer is None else
                   window.initialize(prompt, chunk_size=chunk_size, prefix_transfer=transfer, prefix_mode=mode))
-    # Memory sizing may already have advanced the GPU window's request epoch.
     if transfer is None:
         worker.initialize(checkpoint, window.epoch)
     else:
@@ -438,13 +388,12 @@ def main():
     profiling = False
     try:
         initialization_start = time.perf_counter()
-        text_config = json.loads((Path(args.model) / "config.json").read_text())["text_config"]
-        initial_slots = 2 * text_config["num_experts"] if args.auto_slots else args.gpu_slots
         engine = Engine(BenchmarkConfig(
             rendezvous_file=str((out / "rendezvous").resolve()),
             model_path=args.model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
             max_running_req=1, attention_backend="triton", moe_strategy="offload",
-            moe_cache_size=initial_slots, moe_cache_auto=False, num_page_override=args.kv_pages,
+            moe_cache_size=0 if args.auto_slots else args.gpu_slots,
+            moe_cache_auto=args.auto_slots, num_page_override=args.kv_pages,
             max_seq_len_override=args.max_input_tokens + args.max_output_tokens, gpu_memory_budget_bytes=args.budget_gib << 30,
             speculative_max_input_tokens=args.max_input_tokens, speculative_max_output_tokens=args.max_output_tokens,
             speculative_mtp_depth=3, cuda_graph_max_bs=0, cache_type="naive",
@@ -453,14 +402,9 @@ def main():
             max_extend_tokens=args.prompt_chunk_size or args.max_input_tokens,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
         ))
-        if args.auto_slots:
-            window, sizing = prepare_auto_window(engine, max(prompts, key=len),
-                args.prompt_chunk_size, args.instrument_components or args.profile)
-            config["cpu_async_memory_sizing"] = sizing
-        else:
-            window = QwenAsyncGpuWindow(engine.speculative_runner,
-                instrument_components=args.instrument_components or args.profile,
-                preverify_top_k=args.preverify_top_k)
+        window = QwenAsyncGpuWindow(engine.speculative_runner,
+            instrument_components=args.instrument_components or args.profile,
+            preverify_top_k=args.preverify_top_k)
         window.experts.preverify_top_k = args.preverify_top_k
         window.measure_prefill = args.startup_timing
         config["gpu_initialization_seconds"] = time.perf_counter() - initialization_start
@@ -514,7 +458,8 @@ def main():
             audits.append(dict(threads=threads, **audit))
             write("cpu_correctness.json", audits)
             print(json.dumps(dict(event="cpu_correctness", threads=threads, checks=audit["checks"])), flush=True)
-            window.warm_widths(checkpoint.anchor)
+            # Static allocation leaves a runtime reserve outside the pool budget.
+            window.warm_widths(checkpoint.anchor, validate=False)
             window.close_request()
             if args.prefix_audit_only:
                 reports = audit_streamed_prefixes(window, worker, prompts, args.prompt_chunk_size,

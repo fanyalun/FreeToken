@@ -200,3 +200,36 @@ def test_slow_worker_poll_does_not_publish_provisional_output():
     for _ in range(5):
         assert w.poll() is None
     assert w.inflight is not None
+
+
+def test_prefix_slot_lease_survives_acceptance_and_dma_until_last_reader():
+    from dataclasses import asdict
+
+    w = worker()
+    w.cpu_prefix_layers, w.pending_prefix = 1, None
+    for slot in w.slots:
+        slot["prefix_replay"] = torch.zeros(1, 8, 2, 6)
+        slot["prefix_conv"] = torch.zeros(1, 8, 11)
+    job = VerifyJob(3, 0, 4, 2, (5,), 10)
+    w.submit_prefix(job)
+    w.pipe.messages.append(dict(kind="prefix_result", slot=0, generation=1, request_epoch=3,
+        block_id=0, start=4, width=2, job=asdict(job)))
+    result, _ = w.poll()
+    assert result.replay.shape == (1, 2, 2, 6)
+    assert result.conv.shape == (1, 8, 5)
+    with pytest.raises(RuntimeError, match="awaits acceptance"):
+        w.submit_prefix(job)
+    with pytest.raises(RuntimeError, match="committed before release"):
+        w.release(result)
+    with pytest.raises(ValueError, match="exceeds"):
+        w.commit_prefix(result, 3, 6)
+    w.commit_prefix(result, 1, 6)
+    assert w.pipe.sent[-1] == dict(kind="commit_prefix", slot=0, generation=1, epoch=3,
+        block_id=0, count=1, anchor=6)
+    w.pipe.messages.append(dict(kind="prefix_committed", epoch=3, block_id=0, slot=0, generation=1))
+    assert w.poll()["kind"] == "prefix_committed"
+    ready = [False]
+    w.release(result, SimpleNamespace(query=lambda: ready[0]))
+    assert w._free_slot() == 1
+    ready[0] = True
+    assert w._free_slot() == 0

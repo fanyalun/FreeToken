@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 from freetoken.kernel.backend import is_sgl_kernel_installed
 
 
 class QwenGDNVerifyState:
+    chunk_enabled = os.getenv("FREETOKEN_GDN_CHUNK_VERIFY", "0") == "1"
+    chunk_min_width = 8
+    chunk_max_width = 64
+
     def __init__(self, pool, layers, width: int, slot: int, *, workspace=None):
         if width < 1 or not 0 <= slot < pool.num_slots:
             raise ValueError("GDN verification requires positive width and a valid state slot")
@@ -44,6 +50,37 @@ class QwenGDNVerifyState:
         self.snapshots = None
         self.snapshot_index = None
 
+    def uses_chunk(self, dtype):
+        from freetoken.core import get_active_batch
+
+        return (self.chunk_enabled and self.chunk_min_width <= self.width <= self.chunk_max_width
+                and dtype == torch.bfloat16
+                and self.pool.recurrent_states.dtype == torch.float32
+                and self.pool.recurrent_states.shape[-2] <= 256
+                and self.snapshots is None
+                and not getattr(get_active_batch(), "speculative_reference_math", False))
+
+    def chunk_temporary_bytes(self):
+        if not self.uses_chunk(self.pool.conv_states.dtype):
+            return 0
+        _, _, hv, k, v = self.pool.recurrent_states.shape
+        channels = self.pool.conv_states.shape[2]
+        h = (channels - hv * v) // (2 * k)
+        return self.chunk_temporary_bytes_for_geometry(self.width, h, hv, k, v)
+
+    @classmethod
+    def chunk_temporary_bytes_for_geometry(cls, width, key_heads, value_heads, key_dim, value_dim,
+                                         *, activation_dtype=torch.bfloat16, state_dtype=torch.float32):
+        if (not cls.chunk_min_width <= width <= cls.chunk_max_width
+                or activation_dtype != torch.bfloat16 or state_dtype != torch.float32 or key_dim > 256):
+            return 0
+        h, hv, k, v = key_heads, value_heads, key_dim, value_dim
+        channels = 2 * h * k + hv * v
+        # Bound simultaneous chunk intermediates; replay and conv windows are persistent elsewhere.
+        return (2 * width * channels + 4 * width * h * k + 4 * width * hv
+                + 2 * width * hv * 64 + 2 * width * hv * k + 6 * width * hv * v
+                + 2 * ((width + 63) // 64) * hv * v * k)
+
     def verify_layer(self, layer, raw, a, b):
         # FLA imports probe CUDA, so defer them until the engine has bound its device.
         from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
@@ -56,7 +93,19 @@ class QwenGDNVerifyState:
             raw, layer._conv_weight(), self.pool.conv_states[li], self.conv_windows[li], self.slot,
             fp32_products=self.conv_fp32_products,
         )
+        if self.uses_chunk(raw.dtype) and a.stride(-1) == b.stride(-1) == 1:
+            from freetoken.kernel.fla.gdn_speculative import chunk_verify
+
+            return chunk_verify(mixed, a, b, layer, self.pool.recurrent_states[li], self.indices,
+                                tuple(x[li] for x in self.replay_inputs))
         q, k, v = torch.split(mixed, [layer.key_dim, layer.key_dim, layer.value_dim], dim=-1)
+        from freetoken.core import get_active_batch
+
+        small_value_tile = (self.width >= 2 and self.snapshots is None
+                            and raw.dtype == torch.bfloat16
+                            and self.pool.recurrent_states.dtype == torch.float32
+                            and layer.head_k_dim == layer.head_v_dim == 128
+                            and not getattr(get_active_batch(), "speculative_reference_math", False))
         reference = self.snapshots[layer.layer_id][0].unsqueeze(0) if self.snapshots is not None else None
         out = fused_sigmoid_gating_delta_rule_update(
             A_log=layer.A_log, a=a, b=b, dt_bias=layer.dt_bias,
@@ -70,6 +119,7 @@ class QwenGDNVerifyState:
             replay_inputs=tuple(x[li] for x in self.replay_inputs),
             intermediate_states_buffer=reference, intermediate_state_indices=self.snapshot_index,
             round_state_each_step=self.pool.recurrent_states.dtype != torch.float32,
+            small_value_tile=small_value_tile,
         )
         return out[0]
 

@@ -1094,15 +1094,6 @@ def test_gap_prefetch_subtracts_one_sorts_layers_and_discards_remainder(continui
     assert control.stats["discarded_queued_prefetch"] == 3 - len(expected)
 
 
-def test_calibration_uses_one_normal_case_and_one_expert_gap_margin():
-    path = Path(__file__).resolve().parents[2] / "benchmarks/three_level_prefetch_calibration.py"
-    spec = importlib.util.spec_from_file_location("three_level_prefetch_calibration", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    copies = [{"experts": 1, "median_wall_ms": 0.4}, {"experts": 2, "median_wall_ms": 0.6},
-              {"experts": 4, "median_wall_ms": 1.0}, {"experts": 5, "median_wall_ms": 1.2}]
-    assert module.select_quotas(1.0, 1.0, copies) == {"layer_experts": 4, "k_gap": 4, "gap_experts": 3}
-    assert module.select_quotas(0.1, 0.4, copies) == {"layer_experts": 0, "k_gap": 1, "gap_experts": 0}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1303,9 +1294,10 @@ def test_gpu_scheduler_gap_plan_can_span_more_than_one_layers_experts():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("inner", [True, False])
 @pytest.mark.parametrize("slots,limit,max_loops,reason,width", [
     (40, 3, 10, 0, 2), (39, 3, 10, 2, 2), (39, 3, 1, 1, 2), (8, 1, 10, 0, 0)])
-def test_compact_control_preserves_budget_equality_rejection_and_stop_priority(slots, limit, max_loops, reason, width):
+def test_compact_control_preserves_budget_equality_rejection_and_stop_priority(slots, limit, max_loops, reason, width, inner):
     from types import SimpleNamespace
     from freetoken.moe.speculative_gpu import GPUExpertCache
     device = torch.device("cuda:0")
@@ -1320,12 +1312,28 @@ def test_compact_control_preserves_budget_equality_rejection_and_stop_priority(s
         control.history[0, 0, :2].copy_(ids)
         control.widths[0, 0] = 2
         control.refs[0].copy_(torch.bincount(ids.flatten().long(), minlength=16))
+        refs_before = control.refs.clone()
+        control.stage_candidates = True
+        control.candidate_buffer.fill_(-1)
         commit = SimpleNamespace(input_count=torch.tensor(1, device=device),
-            accepted_drafts=torch.tensor(0, device=device), terminal=torch.tensor(False, device=device))
+            accepted_drafts=torch.tensor(0, device=device), terminal=torch.tensor(not inner, device=device))
         tokens = torch.tensor([23, 24], device=device)
-        status = control.read_control(tokens, commit, loop=0, candidate_limit=limit, remaining=128)
-        assert status == [1, 0, 0, 0, reason, width, 8, 0, 23, 24]
-        assert control.refs[0].tolist() == [1] * 8 + [0] * 8
+        status = control.read_control(tokens, commit, loop=0 if inner else None,
+                                      candidate_limit=limit, remaining=128)
+        if inner:
+            assert status == [1, 0, 0, 0, reason, width, 8, 0, 23, 24]
+            assert control.refs[0].tolist() == [1] * 8 + [0] * 8
+            assert control.candidate_buffer.tolist() == [23, -1, -1, -1, -1]
+        else:
+            assert status == [1, 0, 1, 0, 0, 0, 0, 0, 23, 24]
+            assert torch.equal(control.refs, refs_before)
+            assert control.candidate_buffer.eq(-1).all()
+            control.error.fill_(1)
+            with pytest.raises(NoEvictableSlot, match="R=0"):
+                control.read_control(tokens, commit, loop=None, candidate_limit=limit, remaining=128)
+            assert torch.equal(control.refs, refs_before)
+            assert control.candidate_buffer.eq(-1).all()
+            control.error.zero_()
         control.close()
 
 
@@ -1653,6 +1661,63 @@ def test_optimized_prefetch_joins_and_retires_on_compute_stream(graph_mode):
             resident = cache.slot_for_id[li] >= 0
             torch.testing.assert_close(cache.banks[0][1][cache.slot_for_id[li, resident].long(), 0],
                                        torch.arange(16, device="cuda")[resident].float() + li * 16)
+        control.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("fixed_gpu_routes", [None, 4])
+def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_mode, fixed_gpu_routes):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = toy_cache(torch.device("cuda"), layers=2, slots=32)
+        control = GPUExpertCache(cache, stream, max_loops=1, max_rows=4,
+            layer_quota=0, compact_control=True, implementation="optimized")
+        control.configure_external_prefetch(1)
+        control.fixed_gpu_routes = fixed_gpu_routes
+        control.begin(1)
+        ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+        weights = torch.arange(8, 0, -1, device="cuda").float().reshape(1, 8)
+        hidden = torch.zeros(1, 1, device="cuda")
+        for li in range(2):
+            control.route(toy_layer(li), hidden, weights, ids)
+        control.finish_loop(False)
+        hints = control.capture_prefetch_hints()
+        assert hints[0].tolist() == [0] * 16
+        hinted = 8
+        assert hints[1].tolist() == [1] * hinted + [0] * (16 - hinted)
+        assert (cache.slot_for_id[1, :4] >= 0).all()
+        assert (cache.slot_for_id[1, 4:8] == -1).all()
+        output = control.route(toy_layer(1), hidden, weights, ids)
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                output = control.route(toy_layer(1), hidden, weights, ids)
+        stream.synchronize()
+        prefix_mapping = cache.slot_for_id[0].clone()
+        cache.banks[0][1][cache.id_of_slot < 0] = float("nan")
+        control.queue.fill_(123)
+        original_copy = control._copy
+        def delayed_copy(layer, plan, **kwargs):
+            if not kwargs.get("retire", True):
+                torch.cuda._sleep(1_000_000)
+            return original_copy(layer, plan, **kwargs)
+        control._copy = delayed_copy
+        control.prefetch_suffix(hints, 8)
+        if graph_mode:
+            graph.replay()
+        else:
+            output = control.route(toy_layer(1), hidden, weights, ids)
+        stream.synchronize()
+        expected = ((torch.arange(hinted, device="cuda") + 16) * weights[0, :hinted]).sum().reshape(1, 1)
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cache.slot_for_id[0], prefix_mapping, rtol=0, atol=0)
+        assert (cache.slot_for_id[1, :hinted] >= 0).all()
+        assert not control.pending.any() and control.error.item() == 0
+        assert control.counters[9].item() == 4
         control.close()
 
 

@@ -32,7 +32,7 @@ def test_runtime_admission_preserves_lengths_and_default_loop_limit(slots):
     from freetoken.engine.speculative_window import WindowBudget
 
     budget = WindowBudget.resolve(slots, 40, 8, 256, runtime_admission=True)
-    assert budget.reachable_widths(3) == (4, 25)
+    assert budget.reachable_widths(3) == (4, 24)
     assert budget.before_loop(0, 10000, 4, blocked_slots=10000) is None
     assert budget.before_loop(5, 10000, 4) is None
     assert budget.before_loop(6, 0, 4) == "loop_limit"
@@ -74,33 +74,38 @@ def test_gpu_hybrid_config_rejects_unsupported_modes(values):
 def test_window_workspace_uses_loop_limit_and_counts_anchor(slots):
     from freetoken.engine.speculative_window import WindowBudget
     budget = WindowBudget.resolve(slots, 40, 8, 256)
-    assert budget.submit_rows == 25
-    assert budget.candidates == 24
+    assert budget.submit_rows == 24
+    assert budget.candidates == 23
     assert budget.max_loops == 6
-    assert WindowBudget.resolve(slots, 40, 8, 256, max_loops=9).submit_rows == 37
+    assert WindowBudget.resolve(slots, 40, 8, 256, max_loops=9).submit_rows == 36
     assert WindowBudget.resolve(slots, 40, 8, 256, 1).submit_rows == 1
 
 
-@pytest.mark.parametrize("slots,expected", [(256, (0, 1)), (512, (1, 2)), (1280, (4, 8)), (1600, (4, 25))])
+@pytest.mark.parametrize("slots,expected", [(256, (0, 4)), (512, (1, 4)), (1280, (4, 8)), (1600, (4, 24))])
 def test_reachable_widths_respect_initial_and_following_admission(slots, expected):
-    from freetoken.engine.speculative_window import WindowBudget
+    from freetoken.engine.speculative_window import SpeculativeWindow, WindowBudget
     budget = WindowBudget.resolve(slots, 40, 8, 256)
     assert budget.reachable_widths(3) == expected
+    for remaining in range(2, 6):
+        window = SpeculativeWindow(1, 0, min(budget.candidates, remaining - 1))
+        assert window.tail_count(3, budget.max_loops) + 1 <= expected[1]
     assert WindowBudget.resolve(slots, 40, 8, 256, 1).reachable_widths(3) == (0, 1)
-    assert WindowBudget.resolve(slots, 40, 8, 256, cpu_fallback=True).reachable_widths(3) == (4, 25)
+    assert WindowBudget.resolve(slots, 40, 8, 256, cpu_fallback=True).reachable_widths(3) == (4, 24)
 
 
 @pytest.mark.parametrize("depth", [1, 2, 3, 4, 8])
-def test_variable_draft_depth_configuration(depth):
+@pytest.mark.parametrize("loops", [1, 4, 6, 8, 17])
+def test_variable_draft_depth_configuration(depth, loops):
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
     from freetoken.engine.speculative_window import WindowBudget
 
     config = EngineConfig("unused", DistributedInfo(0, 1), torch.bfloat16,
         speculative_mtp_depth=depth, speculative_three_level=True,
+        speculative_max_loops=loops,
         speculative_max_input_tokens=128, speculative_max_output_tokens=32)
     assert config.speculative_mtp_depth == depth
-    assert WindowBudget.resolve(4907, 40, 8, 256, depth=depth).submit_rows == 6 * (depth + 1) + 1
+    assert WindowBudget.resolve(4907, 40, 8, 256, depth=depth, max_loops=loops).submit_rows == loops * (depth + 1)
 
 
 @pytest.mark.parametrize("values", [
@@ -331,16 +336,19 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 hidden = experts.route(SimpleNamespace(layer_id=li, _expert_gemm=gemm), hidden, weights, ids.int())
             return batch.input_ids + 1, hidden
         runner._target = target
+        draft_error_at = torch.full((), -1, device=device, dtype=torch.int32)
         def draft(batch, hidden, count=None):
             tokens = batch.input_ids + 1
             if count is not None:
                 return tokens.index_select(0, (count - 1).reshape(1).long()), hidden[:1].clone()
-            return tokens, hidden.clone()
+            return tokens + (batch.positions == draft_error_at).to(tokens.dtype), hidden.clone()
         runner._draft = draft
         graphs = QwenSpeculativeGraphSet(coordinator)
         experts.candidate_buffer.fill_(-1000000)
         graphs.prepare(())
-        expected_graphs = 3 * (depth + 1 + budget.submit_rows) if implementation == "full" else 6
+        combined = (sum(min(depth, n - 1) for n in range(2, budget.submit_rows + 1))
+                    if implementation == "full" else int(budget.submit_rows > 1))
+        expected_graphs = (3 * (depth + 1 + budget.submit_rows) if implementation == "full" else 6) + combined
         assert graphs.ready and len(graphs.graphs) == graphs.captures == expected_graphs
         for n in (1, min(depth + 1, budget.submit_rows), 1):
             experts.begin(1)
@@ -374,7 +382,38 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
                 assert not experts.pending.any() and not experts.refs.any()
             assert set(graphs.outer_lanes) == set(widths)
             assert set(graphs.inner_lanes) == set(range(1, depth + 2))
-            assert len(graphs.capture_memory) == depth + 1 + budget.submit_rows
+            assert len(graphs.capture_memory) >= depth + 1 + budget.submit_rows
+        for n in sorted({2, min(depth + 3, budget.submit_rows), budget.submit_rows}):
+            if n > budget.submit_rows or n < 2:
+                continue
+            for tail_count in range(1, min(depth, n - 1) + 1):
+                prefix = n - tail_count - 1
+                for rejected_at in ((-2,) if prefix else ()) + (-1, 0, tail_count - 1):
+                    experts.begin(2)
+                    experts.set_phase("verify")
+                    experts.candidate_buffer.fill_(-1000000)
+                    experts.candidate_buffer[:prefix].copy_(torch.arange(prefix, device=device) + 11)
+                    if rejected_at == -2:
+                        experts.candidate_buffer[0].add_(1)
+                    graphs.seed.fill_(11 + prefix + int(rejected_at == 0))
+                    draft_error_at.fill_(2 + prefix + rejected_at - 1 if rejected_at > 0 else -1)
+                    before_private = private.recurrent_states.clone()
+                    before_target = pool.recurrent_states.clone()
+                    tokens, hidden, commit, control = graphs.draft_then_verify(
+                        torch.tensor([10], device=device, dtype=torch.int32),
+                        torch.tensor([10 + prefix], device=device, dtype=torch.int32),
+                        start=2, prefix_rows=prefix, draft_count=tail_count, remaining=64)
+                    accepted = 0 if rejected_at == -2 else n - 1 if rejected_at == -1 else prefix + rejected_at
+                    assert control[:2] == [accepted + 1, accepted]
+                    assert tokens[:accepted + 1].tolist() == list(range(11, 12 + accepted))
+                    torch.testing.assert_close(private.recurrent_states, before_private, atol=0, rtol=0)
+                    torch.testing.assert_close(pool.recurrent_states, before_target, atol=0, rtol=0)
+                    graphs.tail(False, False)
+                    torch.testing.assert_close(pool.recurrent_states[:, 1],
+                                               before_target[:, 1] + accepted + 1, atol=0, rtol=0)
+                    experts.close(abort=True)
+                    assert not experts.pending.any() and not experts.refs.any()
+        draft_error_at.fill_(-1)
         assert len(graphs.graphs) == graphs.captures == expected_graphs
         graphs.prepare((11,))
         experts.begin(2)
@@ -473,6 +512,16 @@ def test_window_has_no_four_loop_limit_and_tracks_outer_survival():
     assert len(window.loops) == 12
     survival = window.survival(5)
     assert [loop["survived"] for loop in survival] == [1] * 5 + [0] * 7
+    window = SpeculativeWindow(2, 10, 15)
+    for _ in range(3):
+        window.append([1, 2, 3, 4], {"drafted": 3, "accepted": 3})
+    assert window.tail_count(3, 4) == 3
+    window.append_tail(3)
+    assert len(window.candidates) == 12 and window.candidate_count == 15
+    for accepted in (0, 11, 12, 13, 15):
+        tail = window.tail_survival(accepted)
+        assert tail == dict(offset=12, drafted=3, survived=max(0, accepted - 12), reached=accepted >= 12)
+        assert sum(row["survived"] for row in window.survival(accepted)) + tail["survived"] == accepted
     with pytest.raises(ValueError, match="budget"):
         window.append([13], {})
 
@@ -651,12 +700,12 @@ def test_route_metrics_align_consumed_input_rows_and_leave_final_correction_unkn
 @pytest.mark.parametrize("loss_at", [None, 0, 3, 8])
 @pytest.mark.parametrize("early_commit", [False, True])
 @pytest.mark.parametrize("max_loops,slots,repeated,expected_loops,reason,perfect_draft", [
-    (9, 128, True, 9, "loop_limit", False),
-    (6, 24, True, 6, "loop_limit", False),
+    (9, 128, True, 8, "loop_limit", False),
+    (6, 24, True, 5, "loop_limit", False),
     (6, 24, False, 3, "cache_pressure", False),
     (6, 16, True, 1, "cache_pressure", False),
     (6, 8, True, 0, "cache_pressure", False),
-    (6, 24, True, 6, "loop_limit", True),
+    (6, 24, True, 5, "loop_limit", True),
 ])
 def test_three_level_request_restarts_exact_state_and_admits_next_loop(
         monkeypatch, graph_mode, loss_at, early_commit, max_loops, slots, repeated, expected_loops, reason, perfect_draft):
@@ -786,13 +835,17 @@ def test_three_level_request_restarts_exact_state_and_admits_next_loop(
             assert first_row["flush_reason"] == reason
             if expected_loops:
                 assert first_row["loops"][-1]["verify_rows"] == 4
-                assert first_row["loops"][-1]["next_admission"]["stop_reason"] == reason
+                assert first_row["loops"][-1]["next_admission"]["stop_reason"] == (
+                    None if first_row["draft_tail"] else reason)
                 assert first_row["loops"][-1]["previous_unique_experts"] == (
                     4 if repeated and expected_loops > 1 else 4 * (expected_loops - 1))
             else:
                 assert first_row["initial_admission"]["stop_reason"] == "cache_pressure"
             if perfect_draft:
-                assert first_row["submit_rows"] == 25
+                assert first_row["submit_rows"] == 24
+            assert first_row["draft_loop_count"] == expected_loops + bool(first_row["draft_tail"])
+            assert first_row["drafted"] == sum(loop["returned"] for loop in first_row["loops"]) + (
+                first_row["draft_tail"]["drafted"] if first_row["draft_tail"] else 0)
         assert runner.frontier is None and runner.last_event is None
         assert not runner.active and not runner._request_lock.locked()
         assert not bool(engine.page_table.any())
@@ -874,7 +927,8 @@ def test_repeated_rejection_does_not_promote_scratch():
     assert frontier.target_valid_len == frontier.draft_valid_len == 23
 
 
-def test_candidate_window_cap_reconciles_before_next_private_round(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_candidate_window_cap_reconciles_before_next_private_round(monkeypatch, compact):
     from freetoken.engine.candidate_runner import CandidateRunner
     from freetoken.engine.qwen_mtp import _QwenProposer, _QwenReservation, _QwenState
     from freetoken.engine.speculative import SpeculativeCoordinator
@@ -894,17 +948,73 @@ def test_candidate_window_cap_reconciles_before_next_private_round(monkeypatch):
     runner.coordinator = SpeculativeCoordinator(_QwenProposer(runner), _QwenState(runner), _QwenReservation(runner))
     def forward(inputs, start, state):
         return inputs + 1, torch.full((len(inputs), 2), float(start))
+    def drain(tokens, commit):
+        return [int(commit.input_count), int(commit.accepted_drafts), int(commit.terminal),
+                0, 0, 0, 0, 0, *tokens.tolist()]
     candidates = CandidateRunner(runner)
     first = candidates.step(torch.tensor([7]), 4, forward=forward, state=AttentionVerifyState(4),
-                            remaining=4, frontier=private)
+                            remaining=4, frontier=private, drain=drain if compact else None)
     assert first.terminal and first.returned == [8, 9, 10, 11]
     assert runner.frontier is canonical and canonical.target_valid_len == 1
     assert private.target_valid_len == private.draft_valid_len == 7
     assert runner.next_draft.tolist() == [12]
     second = candidates.step(torch.tensor([11]), 2, forward=forward, state=AttentionVerifyState(2),
-                             remaining=2, frontier=private)
+                             remaining=2, frontier=private, drain=drain if compact else None)
     assert second.returned == [12, 13] and second.accepted == 1
     assert private.target_valid_len == private.draft_valid_len == 9
+
+
+@pytest.mark.parametrize("cross_layer", [False, True])
+def test_candidate_forward_waits_for_pending_expert_copy(monkeypatch, cross_layer):
+    from types import SimpleNamespace
+    from freetoken.engine.candidate_runner import CandidateRunner
+    from freetoken.engine.speculative_state import AttentionVerifyState
+
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    visible, pending = torch.tensor(0), torch.tensor(7)
+    copy_stream = object()
+    runner.engine.stream = SimpleNamespace(wait_stream=lambda _: visible.copy_(pending))
+    experts = SimpleNamespace(cross_layer_prefetch=cross_layer, copy_stream=copy_stream,
+        join_gap=lambda: visible.copy_(pending), check_error=lambda: None)
+    runner._execute = lambda phase, batch, **kwargs: (batch.input_ids + visible, batch.input_ids[:, None])
+    ids = torch.tensor([10, 11], dtype=torch.int32)
+    tokens, _ = CandidateRunner(runner).forward(ids, 3, AttentionVerifyState(2),
+        experts=experts, phase="preverify")
+    assert tokens.tolist() == [17, 18]
+
+
+@pytest.mark.parametrize("error", [1, 2, 3])
+def test_candidate_compact_error_preserves_uncommitted_state(monkeypatch, error):
+    from types import SimpleNamespace
+    from freetoken.engine.candidate_runner import CandidateRunner
+    from freetoken.engine.qwen_mtp import _QwenProposer, _QwenReservation, _QwenState
+    from freetoken.engine.speculative import SpeculativeCoordinator
+    from freetoken.engine.speculative_state import AttentionVerifyState
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    runner = _metadata_runner(monkeypatch, torch.device("cpu"))
+    runner.frontier = SpeculativeFrontier(4, 1, 1, 4)
+    canonical = runner.frontier
+    private = SpeculativeFrontier(4, 3, 3, 4)
+    runner.use_graph, runner.graph_fallbacks = False, {}
+    runner.next_draft, runner.last_draft_hidden = torch.tensor([8]), torch.zeros(1, 2)
+    state_value = torch.tensor(17)
+    runner._commit_state = lambda state, count: state_value.fill_(int(count))
+    runner.coordinator = SpeculativeCoordinator(_QwenProposer(runner), _QwenState(runner), _QwenReservation(runner))
+    controller = GPUExpertCache.__new__(GPUExpertCache)
+    controller.control_device = torch.tensor([1, 0, 0, error, 0, 0, 0, 0, 8])
+    controller.control_host = torch.empty_like(controller.control_device)
+    controller.control_event = SimpleNamespace(record=lambda _: None, synchronize=lambda: None)
+    controller.stream, controller.hybrid_phases = None, ()
+    with pytest.raises(RuntimeError):
+        CandidateRunner(runner).step(torch.tensor([7]), 1,
+            forward=lambda inputs, start, state: (inputs + 1, torch.zeros(1, 2)),
+            state=AttentionVerifyState(1), remaining=4, frontier=private,
+            drain=lambda tokens, commit: controller.drain_control(tokens.numel()))
+    assert state_value.item() == 17
+    assert runner.frontier is canonical and canonical.target_valid_len == canonical.draft_valid_len == 1
+    assert private.target_valid_len == private.draft_valid_len == 3
+    assert runner.next_draft.tolist() == [8]
 
 
 def test_chain_preserves_tokens_across_reused_graph_output():

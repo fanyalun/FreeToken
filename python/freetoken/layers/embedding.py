@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
@@ -9,6 +10,9 @@ from freetoken.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
 from .quantization import LayerKind, QuantConfig, quant_method_for
+
+
+_FUSED_GREEDY = os.getenv("FREETOKEN_FUSED_GREEDY", "1") != "0"
 
 
 class VocabParallelEmbedding(BaseOP):
@@ -150,3 +154,26 @@ class ParallelLMHead(VocabParallelEmbedding):
         output_tensor = output_tensor.permute(1, 0, 2).contiguous()
         output_tensor = output_tensor.reshape(input_shape[:1] + (self.tp_size * input_shape[1],))
         return output_tensor[:, : self.num_embeddings]
+
+    @nvtx_annotate("LMHeadGreedy")
+    def greedy(self, x: torch.Tensor) -> torch.Tensor:
+        from .quantization.linear.unquantized import UnquantizedLinearMethod
+
+        batch = get_global_ctx().batch
+        stable = getattr(batch, "stable_target_linear", False)
+        if (
+            _FUSED_GREEDY and not batch.is_prefill
+            and not getattr(batch, "speculative_reference_math", False)
+            and self.tp_size == 1 and self.tied_embedding is None and self.bias is None
+            and isinstance(self.quant_method, UnquantizedLinearMethod)
+            and x.is_cuda and x.dtype == torch.bfloat16 and x.ndim == 2
+            and (x.shape[0] >= 1 if stable else 2 <= x.shape[0] <= 64) and x.is_contiguous()
+            and self.weight.dtype == x.dtype and self.weight.is_contiguous()
+            and self.weight.device == x.device and self.weight.shape[1] == x.shape[1]
+            and 32768 <= self.weight.shape[0] <= 262144
+        ):
+            from freetoken.kernel.triton.greedy_head import greedy_head
+
+            return greedy_head(x, self.weight, getattr(batch, "speculative_valid_rows", None),
+                               tile_rows=16 if stable else None)
+        return self.forward(x).argmax(-1)

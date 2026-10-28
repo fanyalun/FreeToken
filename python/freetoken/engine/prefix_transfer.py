@@ -44,6 +44,8 @@ def gpu_local_affinity(device):
 
 def prefix_shapes(config, capacity):
     kinds = config.get("layer_types") or ["full_attention"] * config["num_hidden_layers"]
+    if config.get("cpu_prefix_layers") is not None:
+        kinds = kinds[:config["cpu_prefix_layers"]]
     kv = (kinds.count("full_attention"), capacity, config["num_key_value_heads"], config["head_dim"])
     if "linear_attention" not in kinds:
         return dict(keys=(kv, torch.bfloat16), values=(kv, torch.bfloat16),
@@ -62,7 +64,7 @@ class PrefixReceiver:
 
     def __init__(self, config, capacity, *, device=None):
         self.capacity = capacity
-        self.kinds = tuple(config["layer_types"])
+        self.kinds = tuple(config["layer_types"][:config.get("cpu_prefix_layers")])
         self.indices = tuple(self.kinds[:i].count(kind) for i, kind in enumerate(self.kinds))
         self.numa_node = None
         affinity, threads = os.sched_getaffinity(0), torch.get_num_threads()
@@ -209,6 +211,8 @@ class PrefixTransfer:
         r, e = self.receiver, self.engine
         if not self.accepting or self.closed:
             raise RuntimeError("prefix transfer is not accepting copies")
+        if layer_id >= len(r.kinds):
+            return
         r.check(r.epoch.value)
         if not 0 <= start < end <= r.length.value or final_chunk != (end == r.length.value):
             raise ValueError("invalid prefix chunk")

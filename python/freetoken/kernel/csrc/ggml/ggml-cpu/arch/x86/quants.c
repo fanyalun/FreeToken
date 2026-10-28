@@ -7,6 +7,7 @@
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
+#include "freetoken/cpu_kernels.h"
 
 #include <math.h>
 #include <string.h>
@@ -2274,6 +2275,83 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     UNUSED(kmask3);
     UNUSED(utmp);
     ggml_vec_dot_q4_K_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
+int ft_ggml_cpu_dot2(int type, int n, float * out, const void * weight,
+                    const void * activation0, const void * activation1) {
+#if defined __AVX2__
+    if (type != GGML_TYPE_Q4_K) return FT_GGML_NO_KERNEL;
+    if (n <= 0 || n % QK_K != 0) return FT_GGML_PARTIAL_BLOCK;
+
+    const block_q4_K * x = weight;
+    const block_q8_K * y[2] = {activation0, activation1};
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    __m256 acc[2] = {_mm256_setzero_ps(), _mm256_setzero_ps()};
+    __m128 acc_m[2] = {_mm_setzero_ps(), _mm_setzero_ps()};
+
+    for (int i = 0; i < n / QK_K; ++i) {
+        uint32_t utmp[4];
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & 0x0f0f0f0f) | (((utmp[1] >> 6) & 0x03030303) << 4);
+        const uint32_t uaux = utmp[1] & 0x3f3f3f3f;
+        utmp[1] = (utmp[2] & 0x0f0f0f0f) | (((utmp[0] >> 6) & 0x03030303) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= 0x3f3f3f3f;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales = MM256_SET_M128I(sc128, sc128);
+        const float weight_d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float weight_dmin = GGML_CPU_FP16_TO_FP32(x[i].dmin);
+        __m256i sumi[2] = {_mm256_setzero_si256(), _mm256_setzero_si256()};
+
+        for (int r = 0; r < 2; ++r) {
+            const float dmin = -y[r][i].d * weight_dmin;
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i *) y[r][i].bsums);
+            const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+            const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+            acc_m[r] = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m[r]);
+        }
+
+        // Share only weight unpacking; each activation keeps the original dot reduction order.
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i *) (x[i].qs + 32*j));
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            for (int r = 0; r < 2; ++r) {
+                const int8_t * q8 = y[r][i].qs + 64*j;
+                const __m256i q8l = _mm256_loadu_si256((const __m256i *) q8);
+                __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+                p16l = _mm256_madd_epi16(scale_l, p16l);
+                const __m256i q8h = _mm256_loadu_si256((const __m256i *) (q8 + 32));
+                __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+                p16h = _mm256_madd_epi16(scale_h, p16h);
+                sumi[r] = _mm256_add_epi32(sumi[r], _mm256_add_epi32(p16l, p16h));
+            }
+        }
+        for (int r = 0; r < 2; ++r) {
+            const float d = y[r][i].d * weight_d;
+            acc[r] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[r]), acc[r]);
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        acc_m[r] = _mm_add_ps(acc_m[r], _mm_movehl_ps(acc_m[r], acc_m[r]));
+        acc_m[r] = _mm_add_ss(acc_m[r], _mm_movehdup_ps(acc_m[r]));
+        out[r] = hsum_float_8(acc[r]) + _mm_cvtss_f32(acc_m[r]);
+    }
+    return FT_GGML_OK;
+#else
+    UNUSED(type);
+    UNUSED(n);
+    UNUSED(out);
+    UNUSED(weight);
+    UNUSED(activation0);
+    UNUSED(activation1);
+    return FT_GGML_NO_KERNEL;
 #endif
 }
 

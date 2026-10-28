@@ -10,7 +10,7 @@ HTTP scheduler does not expose these modes yet.
 | --- | --- | --- | --- | --- | --- |
 | `sd` | Native MTP or EAGLE3 | Full GPU Target | `offload` | Off | `full` |
 | `three_level_gpu` | Draft followed by repeated GPU Pre-Verify | Full GPU Target | `offload` | On | `full` |
-| `cpu_async` | Same Draft/Pre-Verify, with a private GPU window ahead of the CPU | Full CPU Target | `offload` | Off | `eager` |
+| `cpu_async` | Same Draft/Pre-Verify, with a private GPU window ahead of the CPU | Full CPU Target | `offload` | Off | `eager`; opt-in `full` for native 35B/offload |
 
 Each mode accepts `offload`, `hybrid` and `fused`. Fused requires the complete
 Target and Draft plus runtime memory to fit on the GPU. Capacity rejection does
@@ -37,41 +37,280 @@ mapped back using the checkpoint's `d2t` offsets.
 
 The common defaults are depth 3, Pre-Verify top-h 4, maximum input 4096 tokens,
 maximum output 1024 tokens and a GPU memory ratio of 0.9. Three-level GPU uses at
-most 6 inner loops. CPU async uses at most 4 loops for each GPU candidate window.
+most 6 Draft segments. The final segment goes directly to full verification;
+earlier segments use Pre-Verify to refresh the private state for the next Draft.
+CPU async uses at most 4 loops for each GPU candidate window and retains its
+existing final Pre-Verify for GPU lookahead state.
 Actual windows shrink at output, context and cache-admission boundaries.
 
-New three-level runs resolve prefetch quotas from an offline calibrated profile.
-`speculative_prefetch_profile="auto"` looks for a validated profile matching the
-checkpoint and Draft, hardware and PCIe placement, runtime kernels, quantized
-expert layouts, execution settings and memory budget. Missing or mismatched
-profiles fail before generation. The earlier BF16 `1/12/2` setting is a measured
-reference, not a universal default for quantized experts. Legacy callers retain
-their old configuration behavior.
+### CPU async CUDA Graph
 
-The three independent knobs are `speculative_prefetch_layer_experts`,
+`cpu_async` keeps eager execution as its default. Set `speculative_graph="full"`
+to capture the GPU lookahead and recovery paths for Qwen3.6-35B-A3B BF16 with
+native MTP, TP1 and the `offload` backend. Full CPU verification rejects
+EAGLE3/GGUF Targets, Hybrid and fused backends when full Graph is requested.
+The split verifier below also supports Hybrid with full Graph for GPU generation.
+The single-request, greedy text,
+Triton attention and naive page-size-1 KV constraints still apply.
+
+The CPU Target remains authoritative. GPU graphs update the private lookahead
+state; an accepted CPU result installs its KV and GDN state before recovery
+and MTP refresh. Capture uses private state and completes before the request's
+prefill and CPU verification begin, so capture cannot commit speculative state
+to the CPU or replace an accepted prefix. Graph storage is retained between
+requests; changing the configured capacities requires rebuilding the idle runner.
+
+The benchmark records per-request replay, fallback and capture counts. Full
+Graph requests reject eager fallbacks; CPU async requests returning more than
+the prefill token also require positive replay evidence. A one-token cap or
+EOS at the prefill token may finish without a decode replay. Graph execution
+does not by itself establish CPU/GPU arithmetic parity or a performance gain.
+
+CPU async and GPU three-level share the GPU compute implementation:
+
+| Component | Shared implementation |
+| --- | --- |
+| Expert controller configuration | `GPUExpertCache.from_engine`, including routing policy, audit, copy fences and prefetch quotas |
+| Scheduled Target forward | `CandidateRunner.forward`, including gap/copy-stream ordering before `QwenMTPRunner._execute` |
+| Candidate acceptance and commit | `CandidateRunner`, `QwenMTPRunner._accept/_commit_state` and the same GDN commit kernels |
+| Candidate result and error readback | `GPUExpertCache.read_control`; CPU async uses the non-inner form without GPU three-level window admission or candidate staging |
+| Attention, norm, linear and Native MTP | The same Target/Draft model layers and backend operators |
+| Routed experts | The same admission, expert copy and MoE compute dispatch |
+| GDN and greedy head | The same eligible multi-row verify, scratch, fused projection/argmax and last-valid-row selection |
+
+CPU async reuses these kernels at its actual operation widths. A short private
+window does not invoke the wide Tensor Core expert path merely because a GPU
+three-level Full Verify can reach that width. The experimental chunk GDN path
+retains its existing opt-in setting.
+
+The CPU Target uses its native CPU backend. Its authoritative commit, state
+installation, install-only recovery and recheck remain separate from GPU final
+verification. CPU async also retains its own Graph orchestration and EOS masks;
+the GPU three-level combined body/tail graphs, shared Graph pool and inner gap
+prefetch planning are not implied by sharing the compute kernels or quotas.
+
+### Fixed CPU prefix and Hybrid GPU suffix
+
+Set `cpu_async_prefix_layers=L` and `moe_strategy="hybrid"` to verify the first
+`L` Target layers on the independent CPU worker and the remaining layers on the
+GPU. This path currently requires the native Qwen3.5/3.6 MoE BF16 Target with
+`1 <= L < num_hidden_layers`. Omitting the prefix keeps full CPU verification.
+`speculative_graph="full"` captures GPU candidate generation and recovery.
+Exact Hybrid suffix verification runs eagerly; it is not part of those Graphs.
+
+CPU prefix weights are loaded once at worker initialization. Prefill transfers
+only the prefix layers' KV, recurrent and convolution state to that worker.
+During each window the CPU evaluates proposal A's prefix while the GPU generates
+B. A prefix result publishes the completed layer output, rather than treating
+it as a final prediction or committing provisional CPU state. GPU suffix
+verification starts from that activation and uses native exact routing. Its
+acceptance count commits both partitions at the same token boundary; the final
+prediction remains the next unconsumed anchor.
+
+CPU prefix results use `cpu_prefix_compact_replay_v1`. The worker publishes
+compact FP32 GDN replay inputs and raw convolution windows alongside the hidden
+activation and KV rows. It does not materialize a full recurrent snapshot for
+every candidate position. After suffix verification determines the accepted
+input count, the CPU commits that prefix and the GPU reconstructs its mirror
+from the same initial state and replay inputs. GPU reconstruction follows the
+selected CPU arithmetic profile; the ordinary GPU GDN fold is not a substitute
+for CPU-profile state equality. Canonical state advances only through accepted
+inputs, and the pending correction/bonus is not consumed.
+
+`cpu_async_kernel_profile="v1"` keeps the existing CPU arithmetic. Select
+`cpu_async_kernel_profile="ggml_v2"` and
+`cpu_async_kernel_components=("attention", "gdn")` to use the optional CPU
+Attention and GDN SIMD implementations. The profile alone defaults to Attention
+only. Components are explicit: they can change BF16 rounding and token choices,
+so comparisons and serial/block audits must use the same profile. A CPU prefix
+does not execute a CPU LM head. Packed CPU experts cannot repack the shared
+offload banks, and NUMA scheduling requires a compatible physical-core layout.
+These CPU profile options apply to the native BF16 Qwen3.5/3.6 Target; the
+existing Qwen3 GGUF path retains its own CPU implementation.
+
+Ahead prefetch is required in this mode. It uses A's route hints only for
+GPU-owned suffix layers; `cpu_async_suffix_prefetch_experts` defaults to four
+experts per suffix layer. Hints change residency and never prune exact verify
+routes. Prediction retains native top-8 routes before Pre-Verify pruning,
+including experts that the lossy pass did not execute. It filters layers by the
+GPU suffix boundary; predicted ranks do not determine final CPU/GPU ownership.
+Generic cross-layer, gap and verify prefetch quotas are zero. During
+suffix verification no speculative prefetch is launched; missing exact demand
+routes still use the Hybrid demand path. The freed transfer stream carries CPU
+prefix KV, compact GDN replay inputs and convolution windows to the GPU before
+accepted-state reconstruction, installation and recovery.
+The state stream reuses `fast_index_copy_multi` over registered shared slots,
+with a separate bank for each layer and state field. The GPU reads mapped host
+memory through PCIe; this is an SM copy kernel rather than copy-engine DMA.
+This avoids host packing of narrow cross-layer tensor views. Slot leases and
+completion events remain live until installation and MTP refresh finish.
+The CPU prefix executor and Hybrid MoE executor use disjoint physical cores.
+Exact suffix verification uses the existing vector expert kernel for every
+window width. Dense projections use rowwise arithmetic, and the fused greedy
+head uses a fixed 16-row tile, including one-row verification. This fixes the
+reduction order across short grouped and large TensorCore dispatch thresholds.
+Draft, Pre-Verify and GPU three-level dispatch
+retain their existing grouped optimizations. The temporary suffix batch flag
+is restored before the shared batch can be used for generation again.
+
+Exact suffix Hybrid uses fixed native routing ranks rather than moving experts
+between devices as cache residency changes. `cpu_async_suffix_gpu_experts=4`
+assigns native top-8 ranks 0..3 to GPU compute and ranks 4..7 to CPU compute;
+the setting must satisfy `1 <= gpu_experts < native_top_k`. Missing GPU-assigned
+experts are loaded on demand. This keeps BF16 CPU and GPU partial-sum rounding
+at the same route boundary on every verification. A residency-based partition
+could otherwise change a repeated Target prediction merely because the cache
+warmed. The fixed partition applies only to split suffix verification; ordinary
+GPU three-level Hybrid keeps its existing scheduling policy. This convention
+does not establish equality with a full GPU Target's arithmetic.
+
+The split stays fixed during requests. An offline profile can select it with
+`cpu_async_split_profile="/persistent/path/profile.json"`. The profile records
+actual context lengths and row counts for every tested split, plus CPU prefix,
+GPU generation, activation transfer, GPU suffix and recovery time. A candidate
+must meet the conservative `C(L,m) + H <= G` screen for every measured workload
+before selection minimizes the measured mean `max(C,G) + H + V_suffix + R`.
+Activation transfer H starts after GPU generation and CPU result receipt, so
+it remains on the handoff path. Calibration also records actual handoff wall
+time and its signed residual against this model. A close CPU/GPU duration alone
+does not establish the best cycle time. Every candidate must measure the same
+context and row workloads. Profile validation binds the checkpoint, runtime,
+hardware, CPU/Hybrid cores, CPU kernel profile/components, compact state protocol,
+depth, loops, capacity, backend and prefetch settings.
+A mismatch requires recalibration. An explicit `L` has no measured deadline or
+performance guarantee. Schema-1 profiles from the full-snapshot protocol are
+rejected and must be recalibrated.
+
+The benchmark accepts `--cpu-async-prefix-layers`, `--cpu-async-split-profile`,
+`--cpu-async-suffix-prefetch-experts`, `--cpu-async-suffix-gpu-experts`,
+`--cpu-kernel-profile` and `--cpu-kernel-components`
+alongside `--mode cpu_async --backend hybrid`. The offline calibrator exposes
+the same CPU kernel options and the fixed routing share as `--suffix-gpu-experts`;
+profile identity binds them. For example, append
+`--cpu-kernel-profile ggml_v2 --cpu-kernel-components attention gdn` to select
+the two optional CPU components in either benchmark. Resolved configuration and
+CPU worker metadata record the actual selection.
+This is a single-request engine feature; it does not add continuous batching or
+claim serial GPU AR parity across CPU/GPU numerical conventions.
+
+`benchmarks/bench_cpu_async_split.py` calibrates a fixed first window rather than
+comparing requests with different generated trajectories. It freezes one prompt
+and proposal A, replays that proposal outside the measured interval for each
+candidate split, and measures CPU A alongside GPU B, activation transfer, exact
+suffix verification and installation/recovery. Each split runs in a separate
+process and first completes one unmeasured window at the same L and actual row
+width, including Hybrid suffix, accepted-state commit and recovery. It then
+drains the request, prefills the same prompt under a new epoch and replays the
+frozen proposal before measurement. Warmup metrics are saved separately so
+first-use JIT compilation cannot select the split. For example, with the
+environment already configured for CUDA 13:
+
+```bash
+PYTHONPATH=python .venv/bin/python benchmarks/bench_cpu_async_split.py \
+  --model /data1/fanya/Qwen/Qwen3.6-35B-A3B --layers 1,4,8,12 \
+  --graph full --budget-gib 32 --max-input-tokens 512 --max-output-tokens 64 \
+  --output results/cpu_async_split_calibration
+```
+
+The command writes per-split logs, frozen proposal, measurements, configuration,
+identity and a selected `profile.json`. It uses persistent temporary directories
+inside its output. A profile from this one context and one row width is a local
+calibration; it does not establish deadline coverage for arbitrary requests.
+
+### Multi-row compute
+
+The kernels dispatch on the tensor width presented to each operation. With Draft
+depth `d` and at most `L` GPU Draft segments, the outer window has at most
+`L * (d + 1)` input rows, including its anchor and bounded by submit, output and
+context limits. The first `L-1` segments may each contribute `d+1` corrected
+tokens; the final raw Draft contributes at most `d`. Depth 3 and four segments
+therefore allow 16 rows; six segments allow 24. Earlier resource or EOS stops can
+submit the accumulated prefix without a raw tail. These are capacity limits,
+not required kernel sizes. Full graphs select the actual verification width and
+raw-tail length without a device-to-host width read. Changing loops or capacity
+requires rebuilding the idle runner and its graphs.
+
+Window records keep `loops` and `loop_count` for actual Pre-Verify calls. The
+separate `draft_tail` records the raw suffix's offset, length and survival;
+`draft_loop_count` includes that suffix. Inner acceptance excludes the raw tail,
+while outer `drafted` and `accepted` include all candidates. Tail and Pre-Verify
+survival use `min(accepted, returned)` so EOS or output truncation cannot count
+an unused suffix as surviving; outer `accepted` keeps the raw matching count.
+CPU async geometry
+and its private-state advancement remain independent of this GPU window rule.
+
+| Operation | BF16 GPU selection |
+| --- | --- |
+| Ordinary Linear | Existing batched `F.linear` |
+| Greedy LM head | Fused projection/argmax for eligible 2..64-row heads; otherwise the existing logits path |
+| GDN verify | Recurrent kernel with a smaller value tile for eligible multi-row windows; opt-in read-only chunk for 8..64 rows |
+| Offloaded MoE | Existing GEMV at one row and 5..15 rows, existing grouped kernel at 2..4 rows, sorted Tensor Core GEMM from 16 rows |
+
+The greedy head applies only to unquantized, contiguous BF16 weights and inputs,
+TP1, no bias or tied embedding, decode mode, and vocabularies from 32768 through
+262144. It preserves BF16 output rounding and the smallest-token-ID tie rule,
+and avoids materializing full logits. `forward()` and ordinary sampling still
+return logits. Set `FREETOKEN_FUSED_GREEDY=0` to use the existing greedy path.
+
+The default recurrent verify keeps its temporal update and reduction arithmetic,
+but uses a 16-value tile instead of 32 for multi-row BF16 windows with FP32 state
+and 128-dimensional key/value heads. Snapshot/reference arithmetic and other
+geometries retain the original tile. This reduces register work per program and
+increases value-axis parallelism without changing stored state or replay inputs.
+
+`FREETOKEN_GDN_CHUNK_VERIFY=1` enables the experimental chunk path in a new
+process. Local kernels passed state-commit checks, but a six-loop full-model
+control changed outputs and reduced acceptance/throughput. It therefore stays
+disabled by default rather than choosing a width limit from one passing prompt.
+Chunk GDN reads the canonical or private prefix state without updating it. It
+stores original k/v and FP32 gates in the existing replay buffers; the original
+commit kernel folds only `input_count` accepted input rows. Snapshot/reference
+arithmetic and other state dtypes retain the recurrent implementation. The static
+memory plan reserves chunk temporaries, using one peak for a shared graph pool
+and a conservative sum for independently retained width graphs.
+
+Wide MoE retains an independent output tensor so Hybrid's asynchronous CPU input
+copy can finish reading the original hidden states. It filters negative slots
+and zero-weight routes before grouped computation, and preserves each route's
+contribution and output position. The threshold uses the actual MoE sub-block
+width after slot-capacity splitting. A coarse padded graph instead dispatches
+on its physical width; device masks protect inactive rows without a host width
+query. Unsupported widths and formats keep their existing computation paths.
+
+These choices do not change the Draft, Pre-Verify or Target acceptance and state
+ownership rules. Tensor Core accumulation and chunk GDN can differ numerically
+from the previous kernels; local error tolerances and commit-state checks do not
+establish strict autoregressive token parity.
+
+Qwen3.5/3.6-35B-A3B GPU three-level runs default to Pre-Verify quota 1,
+Full Verify quota 2 and Draft-gap capacity 10 (at most 9 prefetched experts).
+The last Pre-Verify layer and first Full Verify layer have quota 0. With
+`speculative_prefetch_profile="auto"`, these fixed defaults do not load or require
+a calibration profile. Explicit scalar or per-layer quotas override the matching
+defaults, and an explicit profile path still loads that profile. The terminal
+Draft enters Full Verify directly, without a final Pre-Verify. CPU async uses
+its existing state machine and prefetch settings.
+
+Other three-level runs resolve prefetch quotas from a single-sample calibration.
+`speculative_prefetch_profile="auto"` loads a profile matching the checkpoint,
+Draft, hardware, runtime, memory budget and execution settings. A missing profile
+reports the matching calibration command. Calibration uses arithmetic mean times
+for Pre-Verify, full verification, Draft and one-expert IO; it does not run a
+candidate sweep or require a performance promotion matrix.
+
+The independent knobs are `speculative_prefetch_layer_experts`,
 `speculative_prefetch_gap_capacity`, and
-`speculative_verify_prefetch_layer_experts`. Unspecified values are `None` and
-come from the selected profile; an explicit zero remains zero. Pre-Verify and
-full-verify profiles can specify different quotas for every MoE layer. Verify
-quotas index the destination layer, so the first layer is always zero. The gap
-capacity preserves its existing meaning: capacity 12 permits at most 11 expert
-loads in total across all layout pools.
+`speculative_verify_prefetch_layer_experts`. Unspecified values come from the
+profile; an explicit zero stays zero. Providing all applicable quotas selects a
+manual run. An explicit profile path still checks its identity and geometry.
+`--no-prefetch`, baseline SD, fused execution and the default CPU async
+configuration do not need a profile. CPU async has no GPU full-verify prefetch.
 
-Explicit values for all three knobs select a manual run without requiring an
-auto profile. An explicit profile path still validates and fixes its cache
-geometry when quotas are overridden. `--no-prefetch`, baseline SD, CPU async's
-default configuration, and fused execution do not require a profile. CPU async
-has no GPU full-verify prefetch phase. A validated all-zero profile disables
-prefetch entirely, including its Graph forks, and records the no-gain reason.
-When explicitly enabling CPU async prefetch, specifying its Pre-Verify and gap
-quotas is sufficient; the inapplicable GPU full-verify quota resolves to zero.
-
-Profiles fix total expert slots and each pool's geometry. Startup checks the
-actual loaded bank dtypes, shapes, payload bytes and layer-to-pool mapping before
-Graph capture, then verifies the measured peak against the requested budget.
-It does not silently expand or shrink the calibrated cache. `prefetch_receipt.json`
-records the selected profile hash, explicit overrides, effective quotas and
-actual geometry separately from the performance completion receipt.
+Slots are calculated independently from the fixed input/output limits and memory
+budget. Loading a profile does not resize the cache. Its recorded bank layout and
+pool geometry must match the allocation; changed settings require recalibration.
+A zero profile disables prefetch. `prefetch_receipt.json` records the profile,
+explicit overrides and effective quotas; calibration does not establish speedup.
 
 Pre-Verify keeps native top-h routes plus already-ready GPU cache hits, with the
 original native route weights. Omitted routed contributions are zero; retained
@@ -87,12 +326,12 @@ Useful `EngineConfig` fields:
 | `speculative_depth` | Number of Draft proposals per small verification |
 | `speculative_draft_method` | `auto`, `mtp`, `eagle3` |
 | `speculative_draft_model` | EAGLE3 checkpoint directory; unset for native MTP |
-| `speculative_graph` | `full` or `eager`; CPU async currently requires eager |
+| `speculative_graph` | `full` or `eager`; CPU async defaults to eager, with full Graph for native 35B/offload |
 | `speculative_preverify_top_h` | Required native routes in Pre-Verify |
 | `speculative_prefetch` | Override prefetch for `three_level_gpu` or `cpu_async` Pre-Verify |
 | `speculative_prefetch_layer_experts` | Next-layer prefetch quota |
 | `speculative_prefetch_gap_capacity` | Gap prefetch quota |
-| `speculative_max_loops` | GPU three-level inner-loop cap |
+| `speculative_max_loops` | GPU three-level Draft-segment cap; final segment skips Pre-Verify |
 | `speculative_hybrid_phases` | GPU Target phases that may use Hybrid CPU experts |
 | `cpu_async_loops` | CPU async GPU window loop cap |
 | `cpu_async_recovery` | `fixed_replay` or `recheck` |
@@ -111,7 +350,7 @@ those remaining cores are split approximately 3:1 between the CPU Target and
 the Hybrid executor. Explicit lists must not overlap, including SMT siblings.
 These executors have separate work queues and completion signals.
 
-CPU async is currently a functional demo. The GGUF CPU Target's attention kernel
+CPU async is available through the single-request API above. The GGUF CPU Target's attention kernel
 parallelizes across KV heads, four for this 235B checkpoint. Increasing the CPU
 thread count therefore does not give attention the same parallelism as dense
 projections and routed experts. Long-context performance needs separate
@@ -142,7 +381,7 @@ config = EngineConfig(
     speculative_max_loops=4,
     moe_strategy="offload",
     gpu_memory_budget_bytes=40 * 2**30,
-    memory_ratio=1.0,
+    memory_ratio=0.9,
     speculative_max_input_tokens=4096,
     speculative_max_output_tokens=1024,
     mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))),
@@ -196,17 +435,15 @@ binary does not contain the grouped and GGUF dense entry points.
 
 Use `--mode sd`, or `--mode cpu_async --graph eager`, to select the other
 algorithms. Add `--draft-model /path/to/speculator.eagle3` for the 235B Target.
+For native Qwen3.6-35B-A3B, use `--mode cpu_async --backend offload --graph full`
+to enable CUDA Graph with either `--recovery fixed_replay` or `--recovery recheck`.
 `--backend hybrid`, `--cache-scope per-layer`, `--preverify-top-h 2`,
 `--no-prefetch`, `--cpu-cores 2,3,4,5` and `--hybrid-cores 6,7` are independent
 overrides. `--input-tokens 4096 --ignore-eos --tokens 1024` exercises an exact
 input/output capacity boundary with a repeated synthetic prompt.
-`--budget-gib` sets the GPU planning budget and sets `memory_ratio=1` so the CLI
-does not apply a second fractional reserve. The planner subtracts memory already
-in use at initialization and validates boundary warmup using the PyTorch peak
-plus observed external CUDA allocations. It also limits the PyTorch allocator;
-this is not a hard limit on later driver allocations or the process total shown
-by `nvidia-smi`. `memory_plan.json` distinguishes the initial measurement from
-the final boundary peak; each request records its allocated and reserved peaks.
+`--budget-gib` sets the GPU planning ceiling. `--memory-ratio` defaults to 0.9,
+leaving runtime headroom inside that ceiling. `memory_plan.json` records the
+static byte calculation; each request separately records allocator peaks.
 
 The run preserves configuration, source hashes, every warmup and measured
 request, token IDs, acceptance counts, Graph counts and expert-transfer bytes.
@@ -243,92 +480,82 @@ policy. Changing BF16 reduction order or CPU/GPU arithmetic can change
 tokens; the important state checks are the accepted-prefix boundary, canonical
 KV/SSM state, Draft reconciliation, cancellation and reader completion.
 
-## Offline prefetch calibration and promotion
+## Static memory allocation and single-sample prefetch calibration
 
-The persistent matrix runner waits for an existing run to finish before doing
-any tests or GPU work. A failed prior run stops the queue. It freezes Python,
-native libraries, benchmark code, tests, inputs and protocol, then uses the
-Python-only CPU interference policy before every subprocess. Non-Python CPU
-activity remains recorded without invalidating timing.
+With automatic slots, initialization reserves Target and Draft KV for
+`max_input_tokens + max_output_tokens` plus the padding page. It adds the model's
+persistent state and known verification/Hybrid workspace costs, then assigns the
+remaining static budget to expert slots:
 
-```bash
-.venv/bin/python benchmarks/run_prefetch_calibration_matrix.py \
-  --output /home/fanya/freetoken_benchmark_results/speculative_modes_v1/new_prefetch_calibration \
-  --wait-run /home/fanya/freetoken_benchmark_results/speculative_modes_v1/previous_run \
-  --python "$PWD/.venv/bin/python" \
-  --expected-source-manifest /path/to/frozen_expected_source_manifest.json
+```text
+static_budget = memory_ratio * min(physical_free, requested_budget - initial_used)
+expert_budget = static_budget - resident_weights - KV - states - fixed_workspaces
+slots = largest legal pool allocation whose byte cost fits expert_budget
 ```
 
-The optional expected manifest maps repository-relative paths to SHA-256 values
-and is checked before source freezing; a changed queued checkout stops the run.
-The default local checkpoints are the 35B BF16/MTP pair and 235B Q4_K_M/EAGLE3
-pair. Their default total GPU memory ceilings are 40 GiB for 35B and 80 GiB for
-235B. Both use GPU 0, offload, full Graph, top-h 4 and loop4.
-`--qwen36-budget-gib` and `--qwen235-budget-gib` override the budgets independently.
-The engine also caps allocations at the physical memory available on the selected GPU;
-an 80 GiB ceiling does not guarantee 80 GiB of usable memory.
-`--qwen36`, `--qwen235`, `--draft`, `--gpu` and `--data-dir` change those paths or
-device explicitly. The source datasets must contain the frozen 64 prompts.
+Uniform layouts reduce to integer division by bytes per expert. Mixed quantized
+layouts use their actual pool row sizes and padding in an arithmetic search.
+Prefill staging must still fit, including both buffers when overlap is enabled.
+The cache is allocated once. There is no trial inference, measured-peak fitting,
+automatic rebuild or overflow retry. An insufficient static budget is an error.
 
-Calibration uses zero-based prompts 16-23 from each dataset; development uses
-24-31; final measurements preserve the earlier first sixteen prompts. The
-calibrator reserves 2 GiB for instrumentation while finding initial slots.
-Native speculative auto-sizing starts at the smallest slot count whose actual
-per-bank byte capacities can hold the requested prefill staging buffers under
-the selected pool split. With prefill overlap enabled this means two buffers;
-mixed quantized layouts cannot use `2 * num_experts` as a sufficient slot count.
-The measured budget planner and overflow retries retain this minimum, so
-calibration does not silently turn off overlap while sizing the cache.
-Final automatic sizing estimates the slot count from that baseline measurement,
-leaving 1% of the available budget (at least 256 MiB) as headroom, limited by the
-minimum staging allocation. One final boundary measurement confirms the result.
-An overflow permits one coarse reduction covering the excess plus the headroom;
-if it still does not fit, initialization fails instead of repeatedly rebuilding
-CUDA Graphs to approach the memory ceiling. Explicit/profile-frozen slots stay fixed.
-The default initialization ceilings are therefore 38 GiB for 35B and 78 GiB for
-235B. Every candidate subsequently uses that same fixed pool geometry under its
-model's total budget. If a candidate does not fit, the matrix stops; it does not shrink
-only that candidate's cache or change its quotas to make the comparison pass.
+The default `memory_ratio=0.9` leaves 10% for activations, CUDA Graph storage and
+allocator overhead. `--budget-gib` sets the absolute planning ceiling;
+`--memory-ratio` applies within that ceiling. These estimates do not impose a
+driver-wide hard limit. Request metrics still record actual allocator peaks.
 
-Nsight captures the actual phase windows and production weight-copy paths using
-CUDA-profiler ranges, including Graph nodes. Its `.nsys-rep`, raw events, copy
-curves and shape/context coverage remain in the same experiment directory.
-These instrumented measurements are diagnostic and never become throughput
-results. Static per-layer quotas use conservative measured overlap windows and
-copy costs for each actual quantized layout, including the shared mixed-pool
-draft-gap budget.
+This follows SGLang's separation of fixed overhead and per-token storage in the
+pinned [pool configurator](https://github.com/sgl-project/sglang/blob/e9400c5a8f3a0d0312a37aecef694f5edfd69341/python/sglang/srt/model_executor/pool_configurator.py#L606-L616);
+the expert-slot split is FreeToken's own policy.
 
-Development compares no prefetch, historical `1/12/2`, the earlier migration's
-`4/0/0`, the calibrated profile and half of its quotas. Each dataset has three
-timing repeats. Promotion requires at least 1% median TPOT improvement, an
-improvement in every repeat, no complete-request throughput loss, no Graph
-fallback, complete accounting and resource/source eligibility. Among eligible
-profiles, pooled throughput wins; candidates within 1% use the one with fewer
-logical transfer bytes per returned token.
+For prefetch, run exactly one prompt with prefetch disabled:
 
-Final measurements run SD, three-level without prefetch, historical `1/12/2`
-and the selected profile, with two warmups and three measured repeats for each
-of 32 prompts. SD uses its own automatic cache allocation within the same
-model-specific total budget; the three-level variants share the calibrated pool sizes.
-Candidate profiles require an explicit path and
-`--allow-candidate-profile`; this permits formal A/B timing but does not make
-them eligible for automatic loading. If no positive gain is reproduced, a
-zero-prefetch profile can be published only with completed coverage, passing
-regressions, valid formal requests and an explicit no-gain receipt.
+```bash
+export TMPDIR=/home/fanya/freetoken_benchmark_results/speculative_modes_v1/tmp
+mkdir -p "$TMPDIR"
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=python .venv/bin/python benchmarks/bench_speculative_modes.py \
+  --model /path/to/Qwen3.6-35B-A3B \
+  --mode three_level_gpu --backend offload --graph full \
+  --budget-gib 40 --memory-ratio 0.9 \
+  --max-input-tokens 4096 --max-output-tokens 1024 \
+  --samples 1 --tokens 128 --calibrate-prefetch --purpose diagnostic \
+  --output /path/to/new_single_sample_calibration
+```
 
-Only validated profiles enter
-`$XDG_CACHE_HOME/freetoken/speculative_prefetch` (default `~/.cache/freetoken/speculative_prefetch`).
-Before publishing, each model loads its validated profile through `auto` in a
-private staging cache and completes two 32-token-cap smoke requests. The reload
-must reproduce the profile hash and fixed geometry without explicit quotas or
-slots. Its receipt is linked from publication metadata without changing the
-profile that was reloaded.
-The run retains every raw case, source hash and promotion decision, writes a
-summary with measured JSONL line selectors, and registers its own artifacts in
-the central catalog. Restarting the same command skips completed valid cases;
-an incomplete or failed case is preserved and stops resumption instead of being
-overwritten. `TMPDIR`, Torch extensions, Triton and CUDA caches all use persistent
-directories under the new run.
+Use the 235B GGUF Target and `--draft-model` for EAGLE3; choose its memory ceiling
+explicitly. The same method supports the configured depth and loop count.
+One supplied dataset contributes only its first sample; multiple datasets are
+rejected. Graph capture/JIT warmup is excluded from the recorded request.
+
+CUDA events measure each observed Pre-Verify and full-verify forward, its layers
+and demand copies, and Draft calls. Layer compute time is layer duration minus
+its demand-copy duration. For each expert layout, the production weight-copy
+path copies one complete expert, with one warmup and sixteen timed repetitions.
+These are repeated copies, not additional input samples. All reductions use
+arithmetic means:
+
+```text
+preverify_quota[layout] = max(1, floor(mean_preverify_layer_compute / mean_expert_IO[layout]))
+verify_quota[layout] = floor(mean_verify_layer_compute / mean_expert_IO[layout])
+gap_experts = floor(mean_Draft_work_between_PreVerify / slowest_layout_mean_expert_IO)
+gap_capacity = gap_experts + 1 if gap_experts > 0 else 0
+```
+
+Pre-Verify keeps at least one next-layer prefetch even when its mean compute
+window cannot fully hide one expert copy. Explicit manual zero still disables it.
+Layer quotas are capped at the number of experts per layer. The last Pre-Verify
+quota and first full-verify quota are zero. The gap has one shared quota across
+pools; if the sample contains no continuation gap, its quota is zero.
+No shape/context grid, concurrent-copy curves, percentile fitting, candidate
+ranking or formal A/B matrix is run.
+
+`calibration_measurements.json` retains the one prompt, returned tokens, raw
+times, arithmetic means and derived quotas. `prefetch_profile.json` is usable
+after normal shutdown and source/resource validation; it is also cached under
+`$XDG_CACHE_HOME/freetoken/speculative_prefetch` (default
+`~/.cache/freetoken/speculative_prefetch`). Schema 2 rejects the old matrix
+profiles. Status `calibrated` means mean-time parameters were measured, not that
+a throughput improvement or strict AR parity was established.
 
 ## State and execution ownership
 
@@ -365,7 +592,7 @@ MoE-only tiling; Hybrid can send overflow routes to its CPU executor. Each pool
 must hold at least one token's native top-k experts. For the 94-layer Qwen3-235B
 model with top-k 8, `per-layer` therefore needs at least 752 total slots, eight
 per layer. An explicit 512-slot configuration is rejected; automatic sizing
-starts at the valid minimum and expands within the measured memory budget.
+calculates a legal final slot count within the static memory budget.
 
 The worker/state separation follows the responsibilities in SGLang's
 [speculative workers](https://github.com/sgl-project/sglang/tree/e9400c5a8f3a0d0312a37aecef694f5edfd69341/python/sglang/srt/speculative).

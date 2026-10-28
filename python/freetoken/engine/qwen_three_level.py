@@ -88,32 +88,22 @@ class ThreeLevelCoordinator:
         self.inner_width, self.outer_width = self.budget.reachable_widths(engine.config.speculative_mtp_depth)
         if coarse and max(self.draft_width, self.budget.submit_rows) > engine.max_seq_len:
             raise ValueError("speculative graph width exceeds context capacity")
-        cache_type = SpeculativeExpertCache
-        extra = {}
-        if getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu":
-            from freetoken.moe.speculative_gpu import GPUExpertCache
-            cache_type = GPUExpertCache
-            extra = dict(max_loops=self.budget.max_loops, max_rows=self.outer_width,
-                         hybrid_phases=hybrid_phases,
-                         hybrid_max_fetch=engine.config.moe_hybrid_max_fetch,
-                         inner_rows=max(1, self.inner_width),
-                         layer_quotas=getattr(engine.config, "speculative_prefetch_layer_quotas", None),
-                         demand_fence=getattr(engine.config, "speculative_prefetch_demand_fence", False),
-                         verify_layer_quota=getattr(engine.config, "speculative_verify_prefetch_layer_experts", 0),
-                         verify_layer_quotas=getattr(engine.config, "speculative_verify_prefetch_layer_quotas", None),
-                         top_k=mc.num_experts_per_tok,
-                         compact_control=getattr(engine.config, "speculative_compact_control", True),
-                         implementation=getattr(engine.config, "speculative_execution_implementation", "reference"))
-            extra["preverify_policy"] = policy
         if resident:
-            self.experts = ResidentExpertController(engine, policy, audit=engine.config.speculative_audit)
+            self.experts = ResidentExpertController(engine, policy, audit=engine.config.speculative_audit,
+                                                     max_rows=self.outer_width)
+        elif getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu":
+            from freetoken.moe.speculative_gpu import GPUExpertCache
+            self.experts = GPUExpertCache.from_engine(engine,
+                max_loops=self.budget.max_loops, max_rows=self.outer_width,
+                inner_rows=max(1, self.inner_width), use_graph=runner.use_graph,
+                preverify_policy=policy)
         else:
-            if cache_type is SpeculativeExpertCache:
-                extra["preverify_policy"] = policy
-            self.experts = cache_type(cache, engine.stream, prefetch=engine.config.speculative_prefetch,
-                                               use_graph=runner.use_graph, audit=engine.config.speculative_audit,
-                                               layer_quota=engine.config.speculative_prefetch_layer_experts,
-                                               gap_capacity=engine.config.speculative_prefetch_gap_capacity, **extra)
+            self.experts = SpeculativeExpertCache(cache, engine.stream,
+                prefetch=engine.config.speculative_prefetch, use_graph=runner.use_graph,
+                audit=engine.config.speculative_audit,
+                layer_quota=engine.config.speculative_prefetch_layer_experts,
+                gap_capacity=engine.config.speculative_prefetch_gap_capacity,
+                preverify_policy=policy)
         recorder = getattr(engine.config, "_prefetch_calibration_recorder", None)
         if recorder is not None:
             self.experts.calibration_recorder = recorder
@@ -124,9 +114,6 @@ class ThreeLevelCoordinator:
             self.experts.execution_mode = (engine.config.speculative_graph_implementation
                                            if runner.use_graph else "eager")
             profile_path = engine.config.speculative_hybrid_profile
-            if engine.config.moe_cache_auto and (getattr(engine, "baseline_sd_memory_plan", None) is None
-                                                 or getattr(engine, "_sd_sizing", False)):
-                profile_path = None
             from freetoken.layers.moe import iter_moe_layers
             layouts = set()
             for layer in iter_moe_layers(engine.model):
@@ -152,46 +139,6 @@ class ThreeLevelCoordinator:
                                           pin_memory=device.type == "cuda")
         self.epoch = 0
 
-    def prepare_runtime(self):
-        runner, engine = self.runner, self.engine
-        with torch.cuda.stream(engine.stream):
-            try:
-                runner.eos_mask.zero_()
-                capacity = engine.max_seq_len
-                runner._reserve((capacity + engine.config.page_size - 1) // engine.config.page_size * engine.config.page_size)
-                engine.kv_cache._kv_buffer.zero_()
-                runner.state_adapter.reset(self.private_pool)
-                if runner.coarse_graphs is None:
-                    for phase, states in (("preverify", self.private_states), ("verify", runner.states)):
-                        for width, state in states.items():
-                            if phase == "verify" and width > self.outer_width:
-                                continue
-                            self.experts.begin(0)
-                            self.experts.set_phase(phase)
-                            ids = self.inputs[:width].zero_()
-                            tokens, hidden = self._forward(ids, capacity - width, state)
-                            commit = runner._accept(Proposal(ids[:1], ids[1:]), VerifyResult(tokens, hidden), width, ())
-                            if phase == "verify":
-                                runner._commit_state(state, commit.input_count)
-                            else:
-                                state.commit(commit.input_count)
-                            if phase == "preverify":
-                                self.experts.finish_loop(True)
-                            runner._execute("reconcile", runner._batch(ids, capacity - width), hidden,
-                                            count=commit.input_count)
-                            self.experts.close()
-                    runner._execute("chain", runner._batch(self.inputs[:1], capacity - 1), runner.seed_hidden.zero_())
-                runner._prefill(torch.zeros(engine.config.speculative_max_input_tokens, dtype=torch.int32), None)
-            finally:
-                self.experts.close()
-                engine.stream.synchronize()
-                runner.state_adapter.reset(self.private_pool)
-                if engine.moe_offload_cache is not None:
-                    engine.moe_offload_cache.reset()
-                engine.stream.synchronize()
-                runner._reserved_len = 0
-                runner.next_draft = runner.last_draft_hidden = None
-                runner.graph_replays, runner.graph_fallbacks = {}, {}
 
     def _verify_prefetch_signature(self):
         c = self.engine.config
@@ -214,21 +161,15 @@ class ThreeLevelCoordinator:
         if self._verify_prefetch_signature() != self.verify_prefetch_signature:
             raise RuntimeError("verify prefetch configuration changed; rebuild the idle runner")
         runner = self.runner
-        batch = runner._batch(inputs, start, state=state)
         if getattr(self.experts, "gpu_schedule", False):
-            if self.experts.cross_layer_prefetch:
-                self.experts.join_gap()
-            else:
-                self.engine.stream.wait_stream(self.experts.copy_stream)
             phase = f"three_level_{self.experts.phase}_{int(self.experts.prefetch)}"
             if self.compact_control:
                 phase += "_compact"
             phase += f"_{self.experts.implementation}_{id(self)}"
-            result = runner._execute(phase, batch)
-            if not self.compact_control:
-                self.experts.check_error()
-            return result
+            return self.candidate_runner.forward(inputs, start, state, experts=self.experts,
+                phase=phase, check_error=not self.compact_control)
         # Host route admission splits the target forward; only expert compute is graphed.
+        batch = runner._batch(inputs, start, state=state)
         runner.graph_fallbacks["target_host_schedule"] = runner.graph_fallbacks.get("target_host_schedule", 0) + 1
         profile = getattr(self.experts, "profiler", None)
         if profile is not None and self.experts.phase == "preverify":
@@ -267,14 +208,29 @@ class ThreeLevelCoordinator:
         graph_start = self.experts.graph_replays
         flush_reason = "output_or_submit_limit"
         cache_conflict = False
-        width = window.next_width(engine.config.speculative_mtp_depth, remaining)
+        depth = engine.config.speculative_mtp_depth
+        width = window.next_width(depth, remaining)
         capacity = (dict(protected_experts=0, blocked_slots=0, available_slots=self.budget.cache_slots)
                     if self.compact_control else self.experts.ledger.capacity())
-        stop_reason = self.budget.before_loop(0, capacity["protected_experts"], width, capacity["blocked_slots"])
+        stop_reason = (None if window.tail_count(depth, self.budget.max_loops) else
+                       self.budget.before_loop(0, capacity["protected_experts"], width, capacity["blocked_slots"]))
         initial_admission = {**capacity, "verify_rows": width, "required_slots": width * self.budget.routes_per_row,
                              "stop_reason": stop_reason}
         try:
             while width > 0 and not stop_reason and not cancelled():
+                tail_count = window.tail_count(depth, self.budget.max_loops)
+                if tail_count:
+                    window.append_tail(tail_count)
+                    flush_reason = ("loop_limit" if len(window.loops) == self.budget.max_loops - 1
+                                    else "output_or_submit_limit")
+                    if coarse is None:
+                        runner.frontier = private
+                        proposal = self.candidate_runner.prepare(current, tail_count + 1)
+                        offset = window.tail_draft["offset"]
+                        self.candidates[offset:offset + tail_count].copy_(proposal.tokens)
+                        private.in_flight = False
+                        private.check()
+                    break
                 if not window.loops:
                     runner.state_adapter.fork(self.private_pool)
                 previous_experts = capacity["protected_experts"]
@@ -357,9 +313,12 @@ class ThreeLevelCoordinator:
             runner.frontier = exact
             if cancelled():
                 return [], anchor, {"cancelled": True}
-            verify_rows = len(window.candidates) + 1
+            verify_rows = window.candidate_count + 1
             if coarse is None:
                 candidates = self._candidate_tokens(window.candidates, anchor)
+                if window.tail_draft is not None:
+                    self.candidates[:len(window.candidates)].copy_(candidates)
+                    candidates = self.candidates[:window.candidate_count]
                 proposal = Proposal(first_anchor, candidates)
                 inputs = self.inputs[:verify_rows]
                 inputs[:1].copy_(proposal.anchor)
@@ -376,8 +335,13 @@ class ThreeLevelCoordinator:
                 verified = VerifyResult(tokens, hidden)
                 commit = runner._accept(proposal, verified, remaining, eos_ids)
             else:
-                tokens, hidden, commit, control = coarse.body(first_anchor, inner=False,
-                    start=start, rows=verify_rows, remaining=remaining)
+                if window.tail_draft is not None:
+                    tokens, hidden, commit, control = coarse.draft_then_verify(first_anchor, current,
+                        start=start, prefix_rows=len(window.candidates),
+                        draft_count=window.tail_draft["drafted"], remaining=remaining)
+                else:
+                    tokens, hidden, commit, control = coarse.body(first_anchor, inner=False,
+                        start=start, rows=verify_rows, remaining=remaining)
             if self.compact_control:
                 if coarse is None:
                     control = self.experts.read_control(tokens, commit)
@@ -406,11 +370,13 @@ class ThreeLevelCoordinator:
             collect_stats = not self.compact_control or self.experts.audit
             if getattr(self.experts, "gpu_schedule", False) and collect_stats:
                 self.experts.export_records()
-            row = {"drafted": len(window.candidates), "accepted": accepted, "returned": count,
+            row = {"drafted": window.candidate_count, "accepted": accepted, "returned": count,
                    "submit_rows": verify_rows, "submit_row_limit": self.budget.submit_rows,
                    "max_loops": self.budget.max_loops, "cache_slots": self.budget.cache_slots,
                    "target_reserve_slots": 0, "initial_admission": initial_admission,
                    "loop_count": len(window.loops),
+                   "draft_loop_count": len(window.loops) + int(window.tail_draft is not None),
+                   "draft_tail": window.tail_survival(min(accepted, count)),
                    "cache_conflict": cache_conflict,
                    "loops": window.survival(min(accepted, count)), "epoch": self.epoch,
                    "flush_reason": "provisional_eos" if window.candidates and window.candidates[-1] in eos_ids else

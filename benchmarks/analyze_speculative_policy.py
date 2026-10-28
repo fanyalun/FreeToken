@@ -143,7 +143,8 @@ def analyze(timing, diagnostic):
         audits = read_rows(diagnostic / f"audit_{method}.jsonl")
         formal_audits = read_rows(timing / f"audit_{method}.jsonl")
         def trajectory(rows):
-            return [(r["token_ids"], [(w["drafted"], w["accepted"], w["returned"], w.get("loops"))
+            return [(r["token_ids"], [(w["drafted"], w["accepted"], w["returned"], w.get("loops"),
+                                     w.get("draft_tail"), w.get("draft_loop_count"))
                                      for w in r["rounds"]]) for r in rows]
         assert trajectory(formal_audits) == trajectory(audits), method
         phases = [row for row in phase_rows if row["mode"] == method]
@@ -163,6 +164,8 @@ def analyze(timing, diagnostic):
             inner_accepted=sum(l["accepted"] for l in loops),
             inner_drafted=sum(l["drafted"] for l in loops),
             loop_count=distribution([len(w.get("loops", [])) for w in windows]) if loops else None,
+            draft_loop_count=distribution([w.get("draft_loop_count", len(w.get("loops", [])))
+                                           for w in windows]) if loops else None,
             outer_accepted_length=distribution([w["accepted"] for w in windows]),
             outer_accepted_histogram=dict(sorted(Counter(w["accepted"] for w in windows).items())),
             fully_accepted_windows=sum(w["accepted"] == w["drafted"] for w in windows), phases={})

@@ -276,7 +276,8 @@ def main():
                 if args.three_level:
                     def trajectory(result):
                         return [(row['accepted'], row['returned'], row['submit_rows'],
-                                 [(loop['accepted'], loop['returned']) for loop in row['loops']])
+                                 [(loop['accepted'], loop['returned']) for loop in row['loops']],
+                                 row.get('draft_tail'), row.get('draft_loop_count'))
                                 for row in result.rounds]
                     assert trajectory(a) == trajectory(b)
                 for before_state, after_state in zip(state, snapshot()):
@@ -334,7 +335,7 @@ def main():
                 hybrid_window_policy=args.hybrid_window_policy, hybrid_cpu_backend=args.hybrid_cpu_backend,
                 request_outputs=request_outputs,
                 memory_plan=engine.baseline_sd_memory_plan.as_dict(),
-                final_peak=engine.baseline_sd_final_peak_bytes, graphs=len(graphs))))
+                graphs=len(graphs))))
         finally:
             engine.shutdown()
 

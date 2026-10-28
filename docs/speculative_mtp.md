@@ -19,7 +19,7 @@ the earlier Torch environment must not be copied into this runtime.
 
 The speculative controllers support the upstream layout-specific pools and
 per-layer pools. BF16 and Q4_K/Q6_K experts keep pool-local GEMM and copy indices.
-The measured-peak SD budget planner prices each bank's actual layout and padding.
+The static SD budget planner prices each bank's actual layout and padding.
 Small pools tile MoE rows while preserving the full model verification window.
 
 Qwen and MTP normalization now keep the checkpoint's raw zero-centered weights
@@ -199,10 +199,10 @@ cache slots, eager/Graph mode and source/binary hashes. They live in
 `~/.cache/freetoken/baseline_hybrid`, overridable with
 `FREETOKEN_BASELINE_HYBRID_PROFILE_CACHE`. An explicit
 `speculative_hybrid_profile` (`--hybrid-profile` in the benchmark) must exist
-and match the runtime; it is never silently replaced. With automatic memory
-planning, the minimum-cache probe uses automatic calibration first, and the
-explicit profile is validated against the final cache geometry. Calibration
-scratch is included in the startup peak; cache rebuild discards placement
+and match the runtime; it is never silently replaced. Automatic memory
+planning determines the cache geometry before validating or calibrating the
+hybrid profile. Persistent scratch is included in the static memory plan;
+temporary calibration allocations use the runtime reserve. Cache rebuild discards placement
 buffers and revalidates/recalibrates before recapture. Keep diagnostic profile
 caches separate when other CPU/GPU jobs are active.
 
@@ -223,8 +223,9 @@ Assess performance using complete requests, rather than acceptance rate alone.
 
 Graphs cover recursive MTP, Target verify, acceptance, GDN commit and MTP
 reconciliation, with verify/reconcile widths 1-4. Prompt prefill is eager. The
-result includes phase replay/fallback counts. Baseline initialization captures
-all configured SD widths and skips ordinary AR graphs. EOS values update one
+result includes phase replay/fallback counts. Full Graph baseline SD captures
+decode widths with a short context before serving requests and skips ordinary AR graphs.
+This preparation does not size the cache or run a maximum-length prefill. EOS values update one
 resident mask without creating new graph variants. Decode batches reuse
 width-specific request, input and FLA buffers plus shared fixed attention indices;
 each round updates only the small input, position and output-location buffers.
@@ -240,18 +241,15 @@ outer pass; explicit positive chunk sizes change scheduling, not allocation.
 The existing GDN kernel's chunk size remains 64; the old outer 128-token default
 has been removed for baseline SD. Three-level scheduling retains its prior default.
 
-Automatic baseline planning starts with the minimum expert cache, measures all
-SD graph widths and maximum full-prompt activation shape, then assigns the
-remaining budget to expert slots. It rebuilds and recaptures once at the selected
-size and checks the maximum-shape peak again. An insufficient budget fails
-initialization rather than silently enabling outer chunking. This adds startup
-work; formal performance must report initialization separately. Persistent GDN
-and one maximum-width replay/conv workspace are charged along with weights,
-KV and runtime storage. Smaller widths share scratch storage; graphs execute
-serially on the request stream. AR and MTP can therefore have
-different expert cache sizes under the same cap. Validate actual process memory
-on the intended hardware; the benchmark records sampled NVML process memory
-and allocator allocated/reserved peaks.
+Automatic planning calculates fixed Target/Draft KV, GDN state and verification
+workspace costs from the configured maximum input/output lengths. Resident
+weights and these fixed costs are subtracted from the static budget, and the
+remaining bytes determine expert slots before the cache is allocated.
+`memory_ratio` leaves runtime headroom (10% at the default 0.9).
+There is no boundary inference for memory sizing or automatic cache rebuild.
+Mixed quantized pools use actual row byte sizes and padding. See
+[single-request modes](speculative_modes.md#static-memory-allocation-and-single-sample-prefetch-calibration).
+Request benchmarks record actual allocator peaks separately.
 
 Baseline round metrics use version 2: `matched_drafts` is the raw matching prefix,
 `returned_drafts` counts drafts actually emitted after EOS/cap/cancellation,
@@ -340,7 +338,9 @@ config = SchedulerConfig(
 
 Import `SchedulerConfig` from `freetoken.scheduler.config`. `speculative_submit_tokens`
 counts actual Target input rows, including the pending anchor; zero applies no
-additional row cap. `speculative_max_loops` defaults to six and must be positive.
+additional row cap. `speculative_max_loops` defaults to six and bounds the number
+of Draft segments. The final planned segment skips Pre-Verify and goes directly
+to full Target verification; its Draft depth is unchanged.
 Both maximum token counts are required positive integers. Requests exceeding
 either bound fail before prefill. Target and MTP KV reserve the page-aligned sum;
 larger explicit page counts are preserved and charged. `prompt_chunk_size=None`
@@ -366,8 +366,11 @@ Native SD engines skip ordinary AR graph capture. A `reference_ar` runner on
 that engine uses eager AR; independent AR engines keep their normal graph policy.
 Startup and cache rebuild prepare SD captures before request timing.
 
-A loop appends its accepted draft prefix and one correction/bonus to a provisional window, then continues
-from that window's private state. Sparse verification keeps the four largest
+A continuing loop appends its accepted draft prefix and one correction/bonus to
+a provisional window, then continues from that window's private state. The final
+Draft appends its uncorrected candidates without advancing private Target state.
+Full Target verification corrects that raw suffix and commits only its accepted
+input prefix. Sparse verification keeps the four largest
 router weights, with stable original-order ties, plus ready GPU-resident experts;
 other route contributions are zeroed without renormalizing.
 
@@ -383,8 +386,11 @@ Reaching the loop limit also flushes before another loop can start. Cache pressu
 does not shorten a loop to make it fit; an explicit row cap or remaining output
 count can shorten it. Expert reuse
 therefore permits many more tokens than a total-token worst-case cache bound.
-The default workspace supports up to `6 * (3 + 1) + 1 = 25` Target input rows;
+The GPU default workspace supports up to `6 * (3 + 1) = 24` Target input rows;
 this allocation bound is independent of cache capacity.
+Window `loop_count` counts actual Pre-Verify calls; `draft_loop_count` also counts
+the raw tail, whose offset and survival are recorded separately in `draft_tail`.
+The CPU async candidate window keeps its separate Pre-Verify/state policy.
 Provisional EOS forces full verification; only
 verified EOS or the final output cap terminates generation.
 
@@ -443,20 +449,11 @@ discarded, without releasing accepted expert leases or cancelling submitted IO.
 No first-router deadline query, stream drain, or deadline-based wait is added.
 Slot lifetime checks and necessary demand dependencies remain in place.
 
-For one configured draft length `d`, `--calibrate-prefetch` measures only normal
-`d+1`-row lossy verification. It pools layer windows (demand complete to the next
-router's demand-ready point) and gaps (lossy forward end to the next lossy forward
-start), using medians to set one uniform layer quota and one gap capacity. A copy
-sweep uses complete expert banks and concurrent captured real expert compute.
-It records raw samples, validates copied weights and compute outputs, applies the
-one-expert gap margin, and frees calibration-only buffers before request timing.
-It does not create separate profiles for shortened widths or block types.
-Static calibration and the one-expert margin are empirical, not a hard deadline
-guarantee. Independent audit records first-router events for offline analysis;
-the generation path never branches or waits on a prefetch deadline check.
-`layer_prefetch_loads`, `gap_prefetch_loads` and `discarded_queued_prefetch` report
-the two quotas and dropped work. Defaults of four layer experts and zero gap
-capacity are manual settings, not a claimed measured optimum.
+The current calibration entry is `bench_speculative_modes.py --calibrate-prefetch`.
+It measures one sample's mean Pre-Verify, full-verify, Draft and expert IO times
+and derives fixed quotas directly. See the
+[single-sample calibration protocol](speculative_modes.md#static-memory-allocation-and-single-sample-prefetch-calibration).
+The legacy host-scheduled benchmark below accepts explicit quotas only.
 
 Routing admission runs on the host. With graphs enabled, expert compute and
 MTP/accept/Target-commit phases use captured graphs; the whole Target forward is
@@ -484,7 +481,7 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=python python benchmarks/bench_three_level_mtp
   --data /home/fanya/replayssm_build_artifacts/gsm8k_test.jsonl \
   --output /absolute/path/to/a/new/result/directory \
   --backend offload --budget-gib 40 --samples 1 --tokens 32 --purpose smoke \
-  --calibrate-prefetch
+  --layer-prefetch-experts 1 --gap-prefetch-capacity 12
 ```
 
 Use `--eager` for eager controls and `--backend hybrid` for the existing mixed

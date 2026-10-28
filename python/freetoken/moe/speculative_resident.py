@@ -17,7 +17,7 @@ class ResidentExpertController:
     optimize_admission = True
     graph_replays = 0
 
-    def __init__(self, engine, policy, *, audit=False):
+    def __init__(self, engine, policy, *, audit=False, max_rows=None):
         mc = engine.config.model_config
         config = engine.config
         self.policy, self.audit = policy, audit
@@ -28,8 +28,9 @@ class ResidentExpertController:
                                      banks=(), pool_sizes=(), pool_of_layer=(), reset=lambda: None)
         self.max_loops = config.speculative_max_loops
         self.inner_rows = config.speculative_mtp_depth + 1
-        self.max_rows = min(config.speculative_submit_tokens or config.speculative_max_output_tokens,
-                            self.max_loops * self.inner_rows + 1, config.speculative_max_output_tokens)
+        self.max_rows = (max_rows if max_rows is not None else
+                         min(config.speculative_submit_tokens or config.speculative_max_output_tokens,
+                             self.max_loops * self.inner_rows + 1, config.speculative_max_output_tokens))
         self.layer_quota = self.gap_capacity = 0
         self.keep_hits = self.renormalize = self.collect_signals = False
         self.verify_prefetch_enabled = False

@@ -1300,6 +1300,7 @@ void bind_speculative_bf16(pybind11::module_& m) {
   m.def("target_replay", &cpu_target::replay<false>, py::call_guard<py::gil_scoped_release>());
   m.def("target_replay_v2", &cpu_target::replay<true>, py::call_guard<py::gil_scoped_release>());
   m.def("target_attention", &cpu_target::attention, py::call_guard<py::gil_scoped_release>());
+  m.def("target_attention_grouped", &cpu_target::attention_grouped, py::call_guard<py::gil_scoped_release>());
   m.def("target_attention_v2", &cpu_target::attention_v2, py::call_guard<py::gil_scoped_release>());
   m.def("target_attention_v2_profiled", &cpu_target::attention_v2_profiled, py::call_guard<py::gil_scoped_release>());
   m.def("target_attention_workspace_v2", &cpu_target::attention_workspace_v2, py::call_guard<py::gil_scoped_release>());

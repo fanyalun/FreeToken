@@ -11,6 +11,12 @@ verification of Qwen3.6-35B-A3B. It exposes experimental primitives, a bounded
 measurement harness and an eager CPU/GPU handoff loop. The ordinary AR, native
 MTP, and existing three-level coordinators keep their current entry points.
 Serving scheduler and CUDA Graph integration are not enabled by this harness.
+The current single-request CPU async API and its opt-in native 35B/offload
+CUDA Graph path are documented in [Single-request speculative modes](speculative_modes.md).
+The opt-in fixed CPU-prefix/Hybrid-GPU-suffix verifier is documented there too.
+It partitions canonical state by layer and commits both partitions using the
+GPU suffix acceptance count; the historical full-CPU feasibility measurements
+below do not measure that pipeline or calibrate its layer split.
 
 ## Experiment status
 
@@ -236,11 +242,12 @@ epoch reinitialization, worker error propagation, and shutdown in real processes
 three-panel PNG/PDF/Markdown figure using an existing Matplotlib environment.
 It rejects missing or duplicate cells.
 
-If no overlap count fits, retain the negative feasibility result and stop before
-large scheduler/Graph integration. Do not expand the window automatically.
+If no overlap count fits, retain the negative feasibility result; this harness
+does not authorize expanding the window or establish a scheduling speedup.
 `milestone_complete` describes the full four-input, three-repeat feasibility
-matrix; `pipeline_complete` remains false. A passing estimate still requires
-real eager sliding correctness and complete-request timing before Graph work.
+matrix; `pipeline_complete` remains false for this historical experiment. The
+current API requires its own state audit and complete-request timing evidence;
+Graph support does not change the historical feasibility result.
 
 For an independent timeline diagnostic, add `--profile` and collect
 `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none
@@ -248,3 +255,90 @@ For an independent timeline diagnostic, add `--profile` and collect
 slot publication. Parent ranges identify ahead generation, CPU wait, state/MTP
 installation, and private replay. CUDA profiler calls and NVTX annotations are
 enabled only in that diagnostic; its timings are excluded from the main curve.
+
+## Algorithm-only rolling evidence
+
+`bench_cpu_async_algorithm.py` checks three mechanisms without measuring speed:
+four-loop correction versus an uncorrected eight-loop trajectory; generating C
+after fixed-token replay of old B versus an aligned CPU-confirmed B boundary;
+and repeated fixed-token rolling to a fixed output count. It supports the BF16
+Qwen3.6 Target and the Qwen3 GGUF Target with EAGLE3.
+
+Each sample first obtains a one-row-at-a-time CPU reference after GPU prefill.
+Every CPU block checks accepted tokens, hidden features, KV and recurrent state
+against that reference. Every GPU installation checks accepted KV and recurrent
+state. Paired branches cold-reset the expert cache and canonical and private
+recurrent state, repeat prefill, and require identical prefix hashes.
+
+The replay branch installs A, consumes `(B.anchor, *B.candidates[:-1])`, refreshes
+the Draft state, and generates C from the last pending B token. The exact-B
+control stops at the same pending token, avoiding a one-position offset. C's
+conditional acceptance includes first-token failures; B rejection counts all C
+candidates as wasted. Rolling records actual input ranges, retained tails,
+replay ranges, fallback reasons and consecutive successful handoffs. CPU output
+must equal the serial reference and consume exactly `tokens - 1` input rows.
+
+```bash
+TMPDIR=/absolute/persistent_tmp CUDA_HOME=/usr/local/cuda-13.0 \
+  PYTHONPATH=python .venv/bin/python benchmarks/bench_cpu_async_algorithm.py \
+  --model /path/to/Qwen3.6-35B-A3B --data /path/to/gsm8k_test.jsonl \
+  --samples 10 --tokens 256 --gpu 0 --output /absolute/new_run
+```
+
+For Qwen3 GGUF, pass the Target's first GGUF shard or its directory and add
+`--draft-model /path/to/speculator.eagle3`. The entry waits for its selected GPU
+to have zero allocated process memory and zero utilization for three seconds.
+It uses offload, eager, top-4 plus ready hits, no prefetch, the default 0.9 memory
+ratio and default CPU affinity. It does not modify production recovery modes.
+
+`sample_*/pairs.json` and `sample_*/rolling.json` preserve candidate IDs and all
+handoffs; `cpu_reference.pt` preserves the reference and prefix state. Skipped
+paired branches keep their reason and denominator. `complete.json` requires
+all requested samples, output checks, state checks and clean shutdown. These
+checks establish the selected CPU arithmetic contract, not GPU AR parity.
+
+For rolling recovery comparisons, pass `--rolling-only` and select
+`--recovery fixed_replay` or `--recovery recheck`. `--top-h 4` is the default;
+`--top-h 6` changes the sparse expert count while keeping four loops, ready
+hits, offload, eager execution and no prefetch. The resolved policy is saved
+and must match the requested count.
+
+Recheck starts at the installed CPU boundary and evaluates old B using the
+current sparse Pre-Verify. It preserves matching old tokens and emits the
+first correction, then stops without refill. Its capacity is capped at the
+original B length. The next CPU proposal is this checked B; C is generated
+from its actual pending token, including when B was shortened. CPU remains
+the authority for all returned tokens and states.
+
+`slide_cells` includes zero-cell failures and separates output-budget censoring
+from rejection. Only an unchanged complete old B counts as a cell. Partial
+matches restart that chain and are reported separately, so truncating B cannot
+inflate complete-block reuse. Each proposal also records which candidates
+came from the old ahead block and how many CPU actually accepted. Recheck
+records both old-B and checked-B quality against the serial CPU reference,
+including zero matches and modifications of CPU-correct tokens.
+
+`analyze_cpu_async_lookahead.py` measures the same traces in token units.
+Coverage counts unique returned candidates that were generated ahead and later
+accepted by CPU, divided by all returned tokens except the initial anchor.
+CPU bonus, recheck corrections and fresh regeneration do not count as reused
+ahead candidates.
+
+Continuous useful distance D sums those accepted old candidates until no old
+ahead prefix remains usable. A positive partial recheck continues the same
+episode; zero matches or CPU/bonus rejection restart it. The accepted prefix
+of a rejected CPU block contributes before that restart. An episode starts
+only if reusable-ahead observation was possible, so a final bonus-only tail
+does not create a spurious zero attempt.
+
+The analyzer reports D=0 and D>=16/32/64/80/96 token counts. A request ending
+at its output cap right-censors D. For each threshold, the lower bound counts
+confirmed reaches and the upper bound additionally includes censored episodes
+below it. These are observation bounds, not confidence intervals. The fixed
+token distances do not assume every GPU block has the same length.
+
+```bash
+python benchmarks/analyze_cpu_async_lookahead.py \
+  --manifest /absolute/persistent_run/analysis_inputs.json \
+  --output /absolute/persistent_run/metrics
+```

@@ -56,13 +56,14 @@ def test_gdn_workspace_views_are_contiguous_and_share_only_scratch():
         QwenGDNVerifyState(pool, [], 32, 1, workspace=workspace)
 
 
-@pytest.mark.parametrize("width,count", [(w, c) for w in range(1, 5) for c in range(w + 1)] + [(9, 3), (17, 0), (17, 11), (17, 17), (25, 0), (25, 13), (25, 25)])
+@pytest.mark.parametrize("width,count", [(w, c) for w in range(1, 5) for c in range(w + 1)] + [(8, 4), (9, 3), (12, 5), (16, 8), (17, 0), (17, 11), (17, 17), (25, 0), (25, 13), (25, 25), (64, 31), (65, 65)])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("head_ratio", [1, 2])
-def test_replay_matches_sequential_decode_and_snapshot(width, count, graph_mode, ssm_dtype, head_ratio):
+def test_replay_matches_sequential_decode_and_snapshot(width, count, graph_mode, ssm_dtype, head_ratio, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
+    monkeypatch.setattr(QwenGDNVerifyState, "chunk_enabled", True)
     torch.manual_seed(83)
     device = torch.device("cuda:0")
     heads, dim = 2, 128
@@ -82,9 +83,19 @@ def test_replay_matches_sequential_decode_and_snapshot(width, count, graph_mode,
     a, b = [torch.randn(width, value_heads, dtype=torch.bfloat16, device=device) for _ in range(2)]
     workspace = QwenGDNVerifyState(pool, [layer], 4, slot=1) if width < 4 else None
     state = QwenGDNVerifyState(pool, [layer], width, slot=1, workspace=workspace)
-    state.enable_snapshot_reference()
     before_rec, before_conv = rec.clone(), conv.clone()
+    optimized = state.verify_layer(layer, raw, a, b)
+    optimized_replay = tuple(t.clone() for t in state.replay_inputs)
+    state.chunk_enabled = False
+    recurrent = state.verify_layer(layer, raw, a, b)
+    torch.testing.assert_close(rec, before_rec, rtol=0, atol=0)
+    torch.testing.assert_close(conv, before_conv, rtol=0, atol=0)
+    state.enable_snapshot_reference()
     candidate = state.verify_layer(layer, raw, a, b)
+    torch.testing.assert_close(recurrent, candidate, rtol=0, atol=0)
+    torch.testing.assert_close(optimized, candidate, rtol=0.015, atol=0.0002)
+    for actual, expected in zip(optimized_replay, state.replay_inputs):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(rec, before_rec, rtol=0, atol=0)
     torch.testing.assert_close(conv, before_conv, rtol=0, atol=0)
     reference_rec = before_rec[0].clone()
@@ -159,14 +170,16 @@ def test_conv_window_matches_triton_fallback(width):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("cpu_prefix_layers", [0, 2])
 @torch.inference_mode()
-def test_multilayer_graph_replays_gpu_accept_counts_and_next_window():
+def test_multilayer_graph_replays_gpu_accept_counts_and_next_window(cpu_prefix_layers):
     torch.manual_seed(103)
     width, heads, value_heads, dim = 4, 2, 4, 128
     channels = (2 * heads + value_heads) * dim
-    rec = torch.randn(2, 2, value_heads, dim, dim, device="cuda") * 0.05
-    conv = torch.randn(2, 2, channels, 3, device="cuda", dtype=torch.bfloat16) * 0.05
-    pool = SimpleNamespace(conv_states=conv, recurrent_states=rec, num_slots=2, local_index=lambda i: {5: 0, 22: 1}[i])
+    rec = torch.randn(cpu_prefix_layers + 2, 2, value_heads, dim, dim, device="cuda") * 0.05
+    conv = torch.randn(cpu_prefix_layers + 2, 2, channels, 3, device="cuda", dtype=torch.bfloat16) * 0.05
+    pool = SimpleNamespace(conv_states=conv[cpu_prefix_layers:], recurrent_states=rec[cpu_prefix_layers:],
+                           num_slots=2, local_index=lambda i: {5: 0, 22: 1}[i])
     layers = []
     for layer_id in (5, 22):
         weight = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16) * 0.05
@@ -204,7 +217,8 @@ def test_multilayer_graph_replays_gpu_accept_counts_and_next_window():
             verify_graph.replay()
             references = []
             for li, (layer, (raw, a, b)) in enumerate(zip(layers, inputs)):
-                ref_rec, ref_conv = before_rec[li].clone(), before_conv[li].clone()
+                ref_rec = before_rec[cpu_prefix_layers + li].clone()
+                ref_conv = before_conv[cpu_prefix_layers + li].clone()
                 expected_out = []
                 committed_rec, committed_conv = ref_rec.clone(), ref_conv.clone()
                 for row in range(width):
@@ -226,7 +240,9 @@ def test_multilayer_graph_replays_gpu_accept_counts_and_next_window():
             commit_graph.replay()
             for li, (expected, expected_rec, expected_conv) in enumerate(references):
                 torch.testing.assert_close(outputs[li], expected, rtol=0, atol=0)
-                torch.testing.assert_close(rec[li], expected_rec, rtol=0, atol=0)
-                torch.testing.assert_close(conv[li], expected_conv, rtol=0, atol=0)
+                torch.testing.assert_close(rec[cpu_prefix_layers + li], expected_rec, rtol=0, atol=0)
+                torch.testing.assert_close(conv[cpu_prefix_layers + li], expected_conv, rtol=0, atol=0)
+            torch.testing.assert_close(rec[:cpu_prefix_layers], before_rec[:cpu_prefix_layers], rtol=0, atol=0)
+            torch.testing.assert_close(conv[:cpu_prefix_layers], before_conv[:cpu_prefix_layers], rtol=0, atol=0)
     stream.synchronize()
     assert state.snapshots is None

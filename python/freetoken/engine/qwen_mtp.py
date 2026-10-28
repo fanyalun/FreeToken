@@ -231,8 +231,8 @@ class QwenMTPRunner:
         return batch
 
     def reserve_eager_width(self, width):
-        if self.use_graph or self.active or self.graphs or not self.native_sd:
-            raise RuntimeError("extra decode width must be reserved on an idle eager native SD runner")
+        if self.active or self.graphs or not self.native_sd:
+            raise RuntimeError("extra decode width must be reserved before capture on an idle native SD runner")
         if type(width) is not int or width < self.draft_width:
             raise ValueError("extra decode width must cover the draft width")
         self.max_verify_width = width
@@ -342,7 +342,10 @@ class QwenMTPRunner:
             return output.next_tokens_gpu, output.next_tokens_gpu.new_empty(batch.size, 0)
         with self.engine.ctx.forward_batch(batch):
             hidden = self.engine.model.model.forward(batch.input_ids)
-            tokens = self.engine.model.lm_head.forward(hidden).argmax(-1).to(torch.int32) if need_logits else None
+            head = self.engine.model.lm_head
+            greedy = getattr(head, "greedy", None)
+            tokens = ((greedy(hidden) if greedy is not None else head.forward(hidden).argmax(-1))
+                      .to(torch.int32) if need_logits else None)
         features = getattr(self.engine.model.model, "last_aux_hidden", None)
         return tokens, hidden if features is None else features
 
@@ -359,7 +362,9 @@ class QwenMTPRunner:
                 recursive_hidden = recursive_hidden.index_select(0, indices)
             elif last_only:
                 logits_hidden, recursive_hidden = logits_hidden[-1:], recursive_hidden[-1:]
-            tokens = self.engine.mtp.logits(logits_hidden).argmax(-1).to(torch.int32) if need_logits else None
+            greedy = getattr(self.engine.mtp, "greedy", None)
+            tokens = ((greedy(logits_hidden) if greedy is not None else self.engine.mtp.logits(logits_hidden).argmax(-1))
+                      .to(torch.int32) if need_logits else None)
             if tokens is not None and hasattr(self.engine.mtp, "map_tokens"):
                 tokens = self.engine.mtp.map_tokens(tokens)
         if recorder is not None:
@@ -503,14 +508,16 @@ class QwenMTPRunner:
         graph.replay()
         self.graph_replays["commit"] = self.graph_replays.get("commit", 0) + 1
 
-    def _accept(self, proposal, verified, remaining, eos_ids):
-        mask = self.eos_mask if hasattr(self, "eos_mask") else None
+    def _accept(self, proposal, verified, remaining, eos_ids, *, eos_mask=None):
+        mask = eos_mask if eos_mask is not None else getattr(self, "eos_mask", None)
         eos_ids = () if mask is not None else eos_ids
         if not self.use_graph:
             self.graph_fallbacks["accept"] = self.graph_fallbacks.get("accept", 0) + 1
             return greedy_commit(proposal, verified, remaining=remaining, eos_ids=eos_ids, eos_mask=mask)
         width = verified.token_ids.numel()
         key = ("accept", width, eos_ids)
+        if eos_mask is not None:
+            key += (id(eos_mask),)
         if key not in self.graphs:
             if getattr(self, "full_graph", False) and self.active:
                 raise RuntimeError("full speculative Graph acceptance was not prepared")
@@ -562,37 +569,28 @@ class QwenMTPRunner:
                     self.last_draft_hidden = draft_hidden[-1:]
         return anchor
 
+
     @torch.inference_mode()
-    def prepare_runtime(self):
-        if not self.mtp_enabled or self.active:
-            raise RuntimeError("SD warmup requires an idle native runner")
-        if self.three_level is not None:
-            return self.three_level.prepare_runtime()
+    def prepare_graphs(self):
+        if not self.baseline or not self.full_graph:
+            return
+        if self.active:
+            raise RuntimeError("Graph preparation requires an idle runner")
         engine = self.engine
         with torch.cuda.stream(engine.stream):
             try:
                 self.eos_mask.zero_()
-                # Allocate decode graphs before prefill so their retained storage is included in the peak.
-                capacity = engine.max_seq_len
-                page_size = engine.config.page_size
-                self._reserve((capacity + page_size - 1) // page_size * page_size)
-                engine.kv_cache._kv_buffer.zero_()
+                self._reserve(self.draft_width)
                 self.state_adapter.reset()
+                # Capture each decode width with a short context, independently of memory sizing.
                 for width in range(1, self.draft_width + 1):
                     ids = torch.zeros(width, dtype=torch.int32, device=engine.device)
                     state = self.states[width]
-                    batch = self._batch(ids, capacity - width, state=state)
-                    predicted, hidden = self._execute("verify", batch)
+                    predicted, hidden = self._execute("verify", self._batch(ids, 0, state=state))
                     commit = self._accept(Proposal(ids[:1], ids[1:]), VerifyResult(predicted, hidden), width, ())
                     self._commit_state(state, commit.input_count)
-                    batch = self._batch(ids, capacity - width)
-                    self._execute("reconcile", batch, hidden, count=commit.input_count)
-                batch = self._batch(ids[:1], capacity - 1)
-                self._execute("chain", batch, self.seed_hidden.zero_())
-                self._prefill(torch.zeros(engine.config.speculative_max_input_tokens, dtype=torch.int32), None)
-                engine.stream.synchronize()
-                if engine.cpu_moe_executor is not None:
-                    engine.cpu_moe_executor.raise_if_unhealthy()
+                    self._execute("reconcile", self._batch(ids, 0), hidden, count=commit.input_count)
+                self._execute("chain", self._batch(ids[:1], 0), self.seed_hidden.zero_())
             finally:
                 engine.stream.synchronize()
                 self.state_adapter.reset()
@@ -600,7 +598,6 @@ class QwenMTPRunner:
                     engine.moe_offload_cache.reset()
                 engine.stream.synchronize()
                 self._reserved_len = 0
-                self.next_draft = self.last_draft_hidden = None
                 self.graph_replays, self.graph_fallbacks = {}, {}
 
     @torch.inference_mode()

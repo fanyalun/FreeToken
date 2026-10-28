@@ -104,14 +104,14 @@ def test_qwen3_cpu_rmsnorm_and_rope_use_ordinary_full_head_semantics():
         target.close()
 
 
-def tiny_target(backend="legacy"):
+def tiny_target(backend="legacy", linear_dim=4):
     components = (("attention", "dense", "head", "gdn", "experts") if backend == "ggml_v2_all" else None)
     kernel_profile = "ggml_v2" if backend.startswith("ggml_v2") else "v1"
     backend = "optimized" if kernel_profile == "ggml_v2" else backend
     torch.manual_seed(23)
     c = dict(layer_types=["linear_attention", "full_attention"], hidden_size=16, vocab_size=64,
-        linear_num_key_heads=1, linear_num_value_heads=2, linear_key_head_dim=4,
-        linear_value_head_dim=4, linear_conv_kernel_dim=4, rms_norm_eps=1e-6,
+        linear_num_key_heads=1, linear_num_value_heads=2, linear_key_head_dim=linear_dim,
+        linear_value_head_dim=linear_dim, linear_conv_kernel_dim=4, rms_norm_eps=1e-6,
         num_attention_heads=2, num_key_value_heads=1, head_dim=8, num_experts_per_tok=8,
         partial_rotary_factor=0.5)
     def weight(*shape):
@@ -128,10 +128,10 @@ def tiny_target(backend="legacy"):
                   p + "mlp.shared_expert.down_proj.weight": weight(16, 8),
                   p + "mlp.shared_expert_gate.weight": weight(1, 16)})
     p = "layers.0.linear_attn."
-    w.update({p + "in_proj_qkv.weight": weight(16, 16), p + "in_proj_z.weight": weight(8, 16),
+    w.update({p + "in_proj_qkv.weight": weight(4 * linear_dim, 16), p + "in_proj_z.weight": weight(2 * linear_dim, 16),
         p + "in_proj_a.weight": weight(2, 16), p + "in_proj_b.weight": weight(2, 16),
-        p + "out_proj.weight": weight(16, 8), p + "conv1d.weight": weight(16, 1, 4),
-        p + "A_log": weight(2), p + "dt_bias": weight(2), p + "norm.weight": torch.ones(4)})
+        p + "out_proj.weight": weight(16, 2 * linear_dim), p + "conv1d.weight": weight(4 * linear_dim, 1, 4),
+        p + "A_log": weight(2), p + "dt_bias": weight(2), p + "norm.weight": torch.ones(linear_dim)})
     p = "layers.1.self_attn."
     w.update({p + "q_proj.weight": weight(32, 16), p + "k_proj.weight": weight(8, 16),
         p + "v_proj.weight": weight(8, 16), p + "o_proj.weight": weight(16, 16),
@@ -145,11 +145,38 @@ def tiny_target(backend="legacy"):
             8, sorted(os.sched_getaffinity(0))[:2], 33, packed=True)
     # gate|up is [2I,H], with I=8.
     checkpoint = PrefixCheckpoint(2, 3, weight(1, 2, 1, 8).bfloat16(), weight(1, 2, 1, 8).bfloat16(),
-        weight(1, 2, 4, 4), weight(1, 16, 3).bfloat16())
+        weight(1, 2, linear_dim, linear_dim), weight(1, 4 * linear_dim, 3).bfloat16())
     target = QwenCpuTarget(c, w, experts, max_context=64, max_rows=33, backend=backend,
                            kernel_profile=kernel_profile, components=components)
     target.initialize(checkpoint, 7)
     return target, checkpoint
+
+
+def test_full_verify_forward_timing_includes_final_norm_and_head(monkeypatch):
+    import freetoken.engine.qwen_cpu_target as module
+
+    target, _ = tiny_target()
+    elapsed = [0.0]
+    norm, predict = target._norm, target._predict
+
+    def timed_norm(x, weight, eps):
+        if weight is target.weights["norm.weight"]:
+            elapsed[0] += 2.0
+        return norm(x, weight, eps)
+
+    def timed_predict(hidden):
+        elapsed[0] += 3.0
+        return predict(hidden)
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(perf_counter=lambda: elapsed[0]))
+    monkeypatch.setattr(target, "_norm", timed_norm)
+    monkeypatch.setattr(target, "_predict", timed_predict)
+    try:
+        target.verify(VerifyJob(7, 0, 2, 3, (), 20))
+        assert target.verify_timings["forward_seconds"] == 5.0
+        assert target.verify_timings["commit_seconds"] == 0.0
+    finally:
+        target.close()
 
 
 def serial(target, count):
@@ -158,6 +185,78 @@ def serial(target, count):
         s = target.state
         results.append(target.verify(VerifyJob(7, block, s.length, s.anchor, (), 100)))
     return results
+
+
+@pytest.mark.parametrize("backend,linear_dim", [("legacy", 4), ("optimized", 4), ("ggml_v2_all", 4),
+                                               ("optimized", 128), ("ggml_v2_all", 128)])
+@pytest.mark.parametrize("count,shared,layers", [(1, False, 1), (3, False, 1), (6, False, 1),
+                                               (3, True, 1), (6, True, 1), (1, True, 2),
+                                               (3, True, 2), (6, True, 2)])
+def test_prefix_acceptance_selects_serial_state_without_committing_unaccepted_rows(backend, linear_dim, count, shared, layers):
+    from freetoken.engine.qwen_cpu_target import PackedProjection
+    from freetoken.engine.qwen_cpu_worker import cpu_target_state_spec
+
+    full, checkpoint = tiny_target(backend, linear_dim)
+    prefix = None
+    try:
+        reference = serial(full, 7)
+        config = {**full.config, "cpu_prefix_layers": layers,
+                  "layer_types": [*full.layer_types, "full_attention"]}
+        weights = {name: value for name, value in full.weights.items()
+                   if name == "embed_tokens.weight" or (name.startswith("layers.")
+                       and int(name.split(".")[1]) < layers)}
+        weights = {name: (value.data.transpose(1, 2).contiguous().view(-1, value.inputs)[:value.outputs]
+                         if isinstance(value, PackedProjection) else value) for name, value in weights.items()}
+        prefix = QwenCpuTarget(config, weights, full.experts, max_context=64, max_rows=33,
+            backend=full.backend, kernel_profile=full.kernel_profile, components=full.components)
+        attention = layers - 1
+        initial = PrefixCheckpoint(checkpoint.length, checkpoint.anchor, checkpoint.keys[:attention],
+            checkpoint.values[:attention], checkpoint.recurrent.clone(), checkpoint.conv.clone())
+        prefix.initialize(initial, 7)
+        job = VerifyJob(7, 0, 2, 3, tuple(r.tokens[0] for r in reference[:5]), 100)
+        buffers = ({name: torch.empty(shape, dtype=dtype) for name, (shape, dtype) in
+                    cpu_target_state_spec(config, 64, 33).items()} if shared else None)
+        result = prefix.verify_prefix(job, buffers=buffers)
+        assert prefix.state.length == initial.length and prefix.next_block == 0
+        assert bitwise_equal(prefix.state.recurrent, initial.recurrent)
+        assert bitwise_equal(prefix.state.conv, initial.conv)
+        assert result.hidden.shape == (6, 16) and result.keys.shape == (attention, 6, 1, 8)
+        state = initial.recurrent.clone()
+        for row, expected in enumerate(reference[:6]):
+            update = result.replay[:, row]
+            key, value = update[..., :linear_dim], update[..., linear_dim:2 * linear_dim]
+            decay, beta = update[..., -2], update[..., -1]
+            state = state * decay[..., None, None]
+            delta = (value - (state * key[..., None, :]).sum(-1)) * beta[..., None]
+            state = state + delta[..., :, None] * key[..., None, :]
+            torch.testing.assert_close(state, expected.checkpoint.recurrent, rtol=1e-5, atol=1e-7)
+            assert bitwise_equal(result.conv[:, :, row + 1:row + 4], expected.checkpoint.conv)
+        if layers == 2:
+            normalized = full._norm(result.hidden, full.weights["norm.weight"], full.config["rms_norm_eps"])
+            assert bitwise_equal(normalized, torch.cat([expected.hidden for expected in reference[:6]]))
+        with pytest.raises(RuntimeError, match="awaits"):
+            prefix.verify_prefix(job)
+        with pytest.raises(ValueError, match="stale"):
+            prefix.commit_prefix(8, 0, count, reference[count - 1].tokens[-1])
+        prefix.commit_prefix(7, 0, count, reference[count - 1].tokens[-1])
+        assert prefix.state.length == 2 + count and prefix.next_block == 1
+        assert bitwise_equal(prefix.state.recurrent, reference[count - 1].checkpoint.recurrent)
+        assert bitwise_equal(prefix.state.conv, reference[count - 1].checkpoint.conv)
+        assert bitwise_equal(result.keys[:, :count], torch.cat(
+            [expected.checkpoint.keys[:attention] for expected in reference[:count]], 1))
+        assert bitwise_equal(result.values[:, :count], torch.cat(
+            [expected.checkpoint.values[:attention] for expected in reference[:count]], 1))
+        following = reference[count]
+        next_job = VerifyJob(7, 1, prefix.state.length, prefix.state.anchor, (), 100)
+        prefix.verify_prefix(next_job, buffers=buffers)
+        prefix.commit_prefix(7, 1, 1, following.tokens[-1])
+        assert prefix.state.length == following.checkpoint.length and prefix.next_block == 2
+        assert bitwise_equal(prefix.state.recurrent, following.checkpoint.recurrent)
+        assert bitwise_equal(prefix.state.conv, following.checkpoint.conv)
+    finally:
+        if prefix is not None:
+            prefix.close()
+        full.close()
 
 
 @pytest.mark.parametrize("backend", ["optimized", "ggml_v2_all"])
@@ -274,7 +373,7 @@ def test_optimized_long_attention_causal_tail_and_workspace_reuse(threads):
     try:
         torch.set_num_threads(threads)
         torch.manual_seed(19)
-        rows, qh, kvh, d, start = 33, 4, 2, 8, 512
+        rows, qh, kvh, d, start = 33, 10, 2, 8, 512
         q = torch.randn(rows, qh, d).bfloat16()
         k = torch.randn(2048, kvh, d).bfloat16()
         v = torch.randn_like(k)
@@ -291,6 +390,11 @@ def test_optimized_long_attention_causal_tail_and_workspace_reuse(threads):
         v[start + rows:] = float("nan")
         target.native.target_attention(q, k, v, temp, acc, out, start)
         assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
+        for heads_per_task in (1, 2, 3):
+            tasks = kvh * ((qh // kvh + heads_per_task - 1) // heads_per_task)
+            grouped_temp = torch.empty(tasks, 64, 2, d)
+            target.native.target_attention_grouped(q, k, v, grouped_temp, acc, out, start, heads_per_task)
+            assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
     finally:
         torch.set_num_threads(previous)
 

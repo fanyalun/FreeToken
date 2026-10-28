@@ -24,15 +24,14 @@ def test_prefetch_entry_preserves_profile_overrides_and_full_verify(quotas):
             config.speculative_verify_prefetch_layer_experts) == quotas
 
 
-def test_memory_report_distinguishes_initial_measurement_from_final_boundary():
+def test_memory_report_preserves_static_budget_accounting():
     from types import SimpleNamespace
 
-    plan = dict(measured_peak_bytes=900, final_cache_bytes=600, final_slots=12, budget_bytes=1000)
+    plan = dict(sizing="static", non_expert_bytes=300, final_cache_bytes=600, final_slots=12, budget_bytes=1000)
     engine = SimpleNamespace(baseline_sd_memory_plan=SimpleNamespace(as_dict=lambda: plan),
-        baseline_sd_final_peak_bytes=990, _budget_initial_used=100)
+        _budget_initial_used=100)
     report = memory_report(engine)
-    assert report["measured_peak_bytes"] == 900
-    assert report["final_boundary_peak_bytes"] == 990
+    assert report["sizing"] == "static" and report["non_expert_bytes"] == 300
     assert report["explicit_budget_initial_used_bytes"] == 100
     assert "final_boundary_peak_bytes" not in plan
 
@@ -47,6 +46,35 @@ def test_request_audit_distinguishes_output_cap_from_full_match():
     validate_request(request(), 3, (), "full")
     row = request()
     row["token_ids"][-1] = 99
+    validate_request(row, 20, (99,), "full")
+    row["ar_decode_graph"] = dict(replays=2, fallbacks=0)
+    row["graph_fallbacks"] = dict(accept=2)
+    validate_request(row, 20, (99,), "full")
+    row["ar_decode_graph"] = dict(replays=1, fallbacks=1)
+    with pytest.raises(RuntimeError, match="eager fallback"):
+        validate_request(row, 20, (99,), "full")
+    row["ar_decode_graph"] = dict(replays=1, fallbacks=0)
+    with pytest.raises(RuntimeError, match="AR decode accounting"):
+        validate_request(row, 20, (99,), "full")
+
+
+@pytest.mark.parametrize("replays", [None, {}, {"cpu_async_lossy": 0}, {"cpu_async_lossy": 1}])
+def test_cpu_async_full_graph_requires_decode_replay_evidence(replays):
+    row = request()
+    row["rounds"][0]["mode"] = "cpu_async"
+    if replays is not None:
+        row["graph_replays"] = replays
+    if replays and any(replays.values()):
+        validate_request(row, 3, (), "full")
+        row["graph_fallbacks"] = {"cpu_async_confirmed_mtp": 1}
+        with pytest.raises(RuntimeError, match="eager fallback"):
+            validate_request(row, 3, (), "full")
+    else:
+        with pytest.raises(RuntimeError, match="no decode replay"):
+            validate_request(row, 3, (), "full")
+    row.update(token_ids=[99], rounds=[], metrics=dict(canonical_target="cpu"))
+    row["graph_fallbacks"] = {}
+    validate_request(row, 1, (), "full")
     validate_request(row, 20, (99,), "full")
 
 
@@ -289,7 +317,7 @@ def test_formal_completion_keeps_raw_interference_and_checks_source_after_shutdo
     def engine(config):
         return SimpleNamespace(device="cpu", generate_speculative=lambda *a, **k: GenerationResult(**request()),
             shutdown=shutdown, baseline_sd_memory_plan=SimpleNamespace(as_dict=lambda: {}),
-            baseline_sd_final_peak_bytes=0, _budget_initial_used=0)
+            _budget_initial_used=0)
     monkeypatch.setattr(bench, "Engine", engine)
     for name in ("reset_peak_memory_stats", "max_memory_allocated", "max_memory_reserved"):
         monkeypatch.setattr(bench.torch.cuda, name, lambda *a: 0)

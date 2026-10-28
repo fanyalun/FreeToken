@@ -12,8 +12,12 @@ rules. Optimized GPU Hybrid uses the same slot reclamation as GPU offload; its
 cost model and CPU/GPU partition remain unchanged. Fused decode metadata can also be
 used by native two-level SD for a matched comparison.
 
-The default six-loop limit, ready-or-top-4 selection, submission/output limits,
-and complete top-8 final verification are unchanged. Optimized GPU scheduling
+The default six-Draft-segment limit, ready-or-top-4 selection, submission/output
+limits, and complete top-8 final verification remain in force. The planned last
+Draft segment skips Pre-Verify and is appended as a raw suffix for full Target
+verification. Earlier segments retain Pre-Verify and private-state updates so
+the next Draft can continue. Resource or EOS stops can submit an earlier prefix
+without an extra Draft. Optimized GPU scheduling
 admits loops at runtime instead of reserving their worst-case expert union.
 It first selects safe slots without prediction references, then safe slots with
 prediction references, ordered by `(usage, slot_id)` within each tier. Pending
@@ -31,8 +35,9 @@ graph implementation below changes the graph pools and workspace layout.
 ## Graphs for a fixed run configuration
 
 `speculative_graph_implementation="reference"` retains the width-specific graph
-path. Set it to `"coarse"` to capture four graphs for one fixed run configuration:
-inner body, inner commit/reconcile, outer body, and outer commit/reconcile. This
+path. Set it to `"coarse"` to capture body, commit-only and commit/reconcile
+graphs for each of the inner and outer phases. An additional outer graph combines
+the final Draft chain and full verification when the window can contain a raw tail. This
 requires optimized compact GPU scheduling, BF16, TP=1, one active request, and
 the Triton attention backend. It is an opt-in implementation; fewer graphs and
 lower memory usage alone do not qualify it for default use.
@@ -46,13 +51,15 @@ unless both correctness and fixed-slot complete-request performance gates pass.
 
 Native MTP accepts a positive integer `speculative_mtp_depth=D`; zero disables
 MTP. The inner graph width is `D+1`. With loop limit `L`, the outer width is
-`L*(D+1)+1`, capped by `speculative_submit_tokens` when that existing explicit
+`L*(D+1)`, capped by `speculative_submit_tokens` when that existing explicit
 limit is nonzero. This is the configured theoretical maximum, not an average
 window length. There is one outer bucket. EOS, output tails, and acceptance
 change the GPU effective-row parameter without adding graph keys.
 
 The body graphs include metadata preparation, forward, acceptance, and GPU
-control. Each body still has one control readback before state commit. Continuing
+control. The combined outer graph additionally writes its raw Draft suffix into
+the candidate buffer before full Target execution. It commits no private Target
+state for that suffix. Each body still has one control readback before state commit. Continuing
 execution uses the matching commit/reconcile graph; a terminating branch only
 commits state. Reconciliation preserves all effective rows and selects only the
 last committed hidden row for the LM head. Gap copies are launched outside the
@@ -69,12 +76,16 @@ updates. Masked Triton KV stores do not allocate or write padding pages; attenti
 uses empty KV intervals for those rows.
 
 Set `speculative_graph_implementation="full"` for exact physical shapes at every
-legal width. Outer graphs cover `1..L*(D+1)+1`, capped by the submission limit;
+legal width. Outer graphs cover `1..L*(D+1)`, capped by the submission limit;
 inner graphs cover `1..D+1`. This includes early window stops and request tails,
-not only windows that complete all L loops. Each width has a body and a matching
-commit/reconcile graph, so D=3 and L=6 capture 58 speculative graphs. Runtime
-selection uses the CPU-known effective width and adds no control readback or
-steady-state capture. No padding or eager fallback is needed for these widths.
+not only windows that complete all L segments. Each width has body, commit-only
+and commit/reconcile graphs. Combined outer bodies are captured for each pair
+`(W, t)`, where `W` is the full verification width and
+`1 <= t <= min(D, W-1)` is the raw Draft length. Graph reports expose these pairs
+as `draft_verify_shapes` and their count as `combined_graph_count`; graph totals
+include these bodies. Runtime selection uses CPU-known widths and adds no
+control readback or steady-state capture. No padding or eager fallback is needed
+for these widths.
 
 Full graphs preserve the coarse body/commit boundaries, external gap event,
 persistent outputs, and one shared maximum-sized GDN workspace. Each width keeps

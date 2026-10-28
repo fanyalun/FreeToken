@@ -52,6 +52,9 @@ class QwenNativeMTP(BaseOP):
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self._head.forward(hidden)
 
+    def greedy(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self._head.greedy(hidden)
+
     def load_checkpoint(self, model_path: str, config, device: torch.device) -> None:
         mapping = safetensors_weight_map(model_path)
         keys = [k for k in mapping if k.startswith("mtp.")]

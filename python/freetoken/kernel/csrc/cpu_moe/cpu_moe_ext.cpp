@@ -141,8 +141,8 @@ struct CpuMoeExecutor {
   std::atomic<int64_t> prt_next{0};  // intermediate-row prep phase (prep_inter)
   int64_t p1_total = 0, p2_total = 0, prt_total = 0;
   std::atomic<int> done_count{0};
-  std::atomic<int> bar_count{0};
-  std::atomic<int> bar_sense{0};
+  alignas(64) std::atomic<int> bar_count{0};
+  alignas(64) std::atomic<int> bar_sense{0};
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // The GPU rings the doorbell with a task word at submit; this coordinator thread busy-polls it, runs the task on the worker pool, and completes it, which the GPU waits on at sync.

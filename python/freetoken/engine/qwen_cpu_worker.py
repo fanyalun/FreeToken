@@ -12,7 +12,7 @@ import traceback
 
 import torch
 
-from .qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, bitwise_equal
+from .qwen_cpu_target import CpuPrefixResult, CpuVerifyResult, PrefixCheckpoint, QwenCpuTarget, VerifyJob, bitwise_equal
 from .prefix_transfer import PrefixAborted, PrefixTicket, prefix_shapes
 
 _failed_reader_workers = []
@@ -22,6 +22,7 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
               kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None,
               shared_banks=None, config_overrides=None):
     target = None
+    prefix_identity = None
     try:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         os.sched_setaffinity(0, core_ids)
@@ -37,7 +38,8 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
         target = QwenCpuTarget.from_checkpoint(model, core_ids=core_ids, max_context=max_context,
                                                max_rows=max_rows, grouped=grouped, backend=backend,
                                                kernel_profile=kernel_profile, components=components,
-                                               shared_banks=shared_banks, config_overrides=config_overrides)
+                                               shared_banks=shared_banks, config_overrides=config_overrides,
+                                               cpu_prefix_layers=(config_overrides or {}).get("cpu_prefix_layers"))
         if torch.cuda.is_initialized():
             raise RuntimeError("CPU worker created a CUDA context")
         import hashlib
@@ -46,6 +48,7 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
             extension_sha256 = hashlib.sha256(binary.read()).hexdigest()
         pipe.send({"kind": "ready", "pid": os.getpid(), "cuda_initialized": False,
                    "initialization_seconds": time.perf_counter() - initialization_start,
+                   "shared_slot_bytes": sum(t.numel() * t.element_size() for slot in slots for t in slot.values()),
                    **target.arithmetic_metadata(), "extension_sha256": extension_sha256,
                    "core_ids": core_ids, "main_thread_affinity": sorted(os.sched_getaffinity(0)),
                    "thread_affinity": {p.name: sorted(os.sched_getaffinity(int(p.name)))
@@ -60,6 +63,8 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
                 if hasattr(target, "release_prefix"):
                     target.release_prefix()
                 target.state = None
+                target.pending_prefix = None
+                prefix_identity = None
                 pipe.send({"kind": "cancelled", "epoch": command["epoch"]})
                 continue
             if kind == "initialize_streamed":
@@ -75,6 +80,19 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
                 report = audit_cpu_blocks(target, command["tokens"], slots[0]["audit_logits"])
                 pipe.send(dict(kind="audit", **report))
                 continue
+            if kind == "commit_prefix":
+                identity = (command["slot"], command["generation"], command["epoch"], command["block_id"])
+                if prefix_identity != identity:
+                    raise ValueError("CPU prefix slot acceptance generation mismatch")
+                commit_started = time.perf_counter()
+                target.commit_prefix(command["epoch"], command["block_id"], command["count"], command["anchor"])
+                commit_seconds = time.perf_counter() - commit_started
+                prefix_identity = None
+                pipe.send(dict(kind="prefix_committed", epoch=command["epoch"], block_id=command["block_id"],
+                               slot=command["slot"], generation=command["generation"],
+                               commit_seconds=commit_seconds,
+                               verify_phases=target.verify_timings))
+                continue
             slot = slots[command["slot"]]
             if kind == "initialize":
                 length = command["length"]
@@ -82,6 +100,22 @@ def _cpu_main(pipe, slots, model, core_ids, max_context, max_rows, grouped, back
                     slot["values"][:, :length], slot["recurrent"], slot["conv"])
                 target.initialize(checkpoint, command["epoch"])
                 pipe.send({"kind": "initialized", "epoch": command["epoch"]})
+                continue
+            if kind == "verify_prefix":
+                if prefix_identity is not None:
+                    raise RuntimeError("CPU prefix is still pending acceptance")
+                started = time.perf_counter()
+                result = target.verify_prefix(VerifyJob(**command["job"]), buffers=slot)
+                verified_at = time.perf_counter()
+                if torch.cuda.is_initialized():
+                    raise RuntimeError("CPU prefix verification created a CUDA context")
+                prefix_identity = (command["slot"], command["generation"], result.request_epoch, result.block_id)
+                pipe.send(dict(kind="prefix_result", slot=command["slot"], generation=command["generation"],
+                    request_epoch=result.request_epoch, block_id=result.block_id, start=result.start,
+                    width=result.width, job=command["job"], compute_seconds=verified_at - started,
+                    publish_seconds=time.perf_counter() - started, published_at=time.perf_counter(),
+                    cpu_started_at=started, cpu_compute_ended_at=verified_at,
+                    verify_phases=target.verify_timings, rss_kib=_rss_kib()))
                 continue
             if kind != "verify":
                 raise ValueError("unknown CPU command")
@@ -194,15 +228,34 @@ def audit_cpu_blocks(target, tokens, first_logits=None):
 
 
 def cpu_target_state_spec(config, max_context, max_rows):
-    return {**prefix_shapes(config, max_context),
+    shapes = {**prefix_shapes(config, max_context),
             "hidden": ((max_rows, config.get("draft_feature_size", config["hidden_size"])), torch.bfloat16),
             "predictions": ((max_rows,), torch.int64),
             "audit_logits": ((config["vocab_size"],), torch.float32)}
+    if config.get("cpu_prefix_layers") is not None:
+        shapes["hidden"] = ((max_rows, config["hidden_size"]), torch.bfloat16)
+        layers = shapes["recurrent"][0][0]
+        heads, key_dim, value_dim = (config[name] for name in
+            ("linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim"))
+        channels = 2 * config["linear_num_key_heads"] * key_dim + heads * value_dim
+        history = config["linear_conv_kernel_dim"] - 1
+        shapes["prefix_replay"] = ((layers, max_rows, heads, key_dim + value_dim + 2), torch.float32)
+        shapes["prefix_conv"] = ((layers, channels, history + max_rows), torch.bfloat16)
+        shapes.pop("audit_logits")
+    return shapes
 
 
 class CpuVerifierWorker:
     def __init__(self, model, config, core_ids, *, max_context=4096, max_rows=33, grouped=True, backend="optimized",
-                 kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None, shared_banks=None):
+                 kernel_profile="v1", components=None, bind_openmp=False, prefix_receiver=None, shared_banks=None,
+                 cpu_prefix_layers=None):
+        config = dict(config)
+        if cpu_prefix_layers is not None:
+            if type(cpu_prefix_layers) is not int or not 1 <= cpu_prefix_layers < len(config["layer_types"]):
+                raise ValueError("CPU prefix must leave at least one layer to the GPU")
+            config["cpu_prefix_layers"] = cpu_prefix_layers
+        self.cpu_prefix_layers = config.get("cpu_prefix_layers")
+        self.pending_prefix = None
         self.prefix_receiver = prefix_receiver
         if backend not in ("legacy", "optimized") or (backend == "optimized" and not grouped):
             raise ValueError("optimized backend requires grouped experts; ungrouped is legacy-only")
@@ -324,14 +377,38 @@ class CpuVerifierWorker:
         self.inflight = "initialize"
 
     def submit(self, job):
+        self._submit(job, "verify")
+
+    def submit_prefix(self, job):
+        if self.cpu_prefix_layers is None:
+            raise ValueError("CPU prefix submit requires a configured layer split")
+        self._submit(job, "verify_prefix")
+
+    def _submit(self, job, kind):
         if not self.ready or not self.initialized or self.inflight is not None or job.request_epoch != self.epoch:
             raise RuntimeError("CPU worker busy, uninitialized or stale epoch")
+        if getattr(self, "pending_prefix", None) is not None:
+            raise RuntimeError("CPU prefix still awaits acceptance")
         slot = self._free_slot()
         self.generations[slot] += 1
         identity = (job.request_epoch, job.block_id, self.generations[slot])
         self.owners[slot] = identity
         self.inflight = (slot, identity)
-        self.pipe.send(dict(kind="verify", slot=slot, generation=self.generations[slot], job=asdict(job)))
+        self.pipe.send(dict(kind=kind, slot=slot, generation=self.generations[slot], job=asdict(job)))
+
+    def commit_prefix(self, result, count, anchor):
+        pending = getattr(self, "pending_prefix", None)
+        if pending is None or pending[1] is not result or self.inflight is not None:
+            raise RuntimeError("CPU prefix acceptance is stale or worker is busy")
+        slot, _ = pending
+        identity = (result.request_epoch, result.block_id, self.generations[slot])
+        if self.epoch != result.request_epoch or self.owners[slot] != identity:
+            raise RuntimeError("CPU prefix acceptance slot generation mismatch")
+        if type(count) is not int or not 1 <= count <= min(result.width, result.job.remaining):
+            raise ValueError("CPU prefix acceptance exceeds submitted rows")
+        self.inflight = "commit_prefix"
+        self.pipe.send(dict(kind="commit_prefix", slot=slot, generation=identity[2], epoch=identity[0],
+                            block_id=identity[1], count=count, anchor=anchor))
 
     def poll(self):
         message = self._receive()
@@ -360,11 +437,21 @@ class CpuVerifierWorker:
             if message["epoch"] != self.latest_epoch or self.inflight != "cancel":
                 return None
             self.inflight, self.initialized = None, False
+            self.pending_prefix = None
+            return message
+        if kind == "prefix_committed":
+            if self.inflight == "cancel" and message["epoch"] == self.latest_epoch:
+                return None
+            identity = (message["epoch"], message["block_id"], message["generation"])
+            if (self.inflight != "commit_prefix" or self.pending_prefix is None
+                    or self.owners[message["slot"]] != identity or message["epoch"] != self.epoch):
+                raise RuntimeError("unexpected CPU prefix commit acknowledgement")
+            self.inflight = self.pending_prefix = None
             return message
         if kind == "audit":
             self.inflight = None
             return message
-        if kind != "result":
+        if kind not in ("result", "prefix_result"):
             raise RuntimeError("unexpected CPU worker response")
         slot_id = message["slot"]
         identity = (message["request_epoch"], message["block_id"], message["generation"])
@@ -374,6 +461,14 @@ class CpuVerifierWorker:
             self.owners[slot_id] = None
             return None
         self.inflight = None
+        if kind == "prefix_result":
+            width, slot = message["width"], self.slots[slot_id]
+            result = CpuPrefixResult(message["request_epoch"], message["block_id"], message["start"], width,
+                slot["hidden"][:width], slot["keys"][:, :width], slot["values"][:, :width],
+                slot["prefix_replay"][:, :width],
+                slot["prefix_conv"][:, :, :slot["conv"].shape[-1] + width], VerifyJob(**message["job"]))
+            self.pending_prefix = (slot_id, result)
+            return result, message
         n, slot = message["input_count"], self.slots[slot_id]
         checkpoint = PrefixCheckpoint(message["start"] + n, message["tokens"][-1],
             slot["keys"][:, :n], slot["values"][:, :n], slot["recurrent"], slot["conv"])
@@ -383,6 +478,8 @@ class CpuVerifierWorker:
         return result, message
 
     def release(self, result, last_reader=None):
+        if getattr(self, "pending_prefix", None) is not None and self.pending_prefix[1] is result:
+            raise RuntimeError("CPU prefix result must be committed before release")
         slot = next((i for i, owner in enumerate(self.owners)
                      if owner is not None and owner[:2] == (result.request_epoch, result.block_id)), None)
         if slot is None or self.readers[slot] is not None:

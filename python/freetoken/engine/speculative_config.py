@@ -12,6 +12,34 @@ def resolve_speculative_config(config) -> None:
     mode = config.speculative_mode
     if mode not in (None, "sd", "three_level_gpu", "cpu_async"):
         raise ValueError("speculative_mode must be sd, three_level_gpu or cpu_async")
+    profile, components = config.cpu_async_kernel_profile, config.cpu_async_kernel_components
+    if components is not None and (not isinstance(components, (tuple, list))
+                                   or any(not isinstance(item, str) for item in components)):
+        raise ValueError("cpu_async_kernel_components must contain CPU component names")
+    from .qwen_cpu_target import _kernel_components
+    selected = _kernel_components("optimized", profile, components)
+    if mode != "cpu_async" and (profile != "v1" or components is not None):
+        raise ValueError("CPU kernel selection requires speculative_mode=cpu_async")
+    if components is not None or profile != "v1":
+        put("cpu_async_kernel_components", selected)
+    split = config.cpu_async_prefix_layers is not None or config.cpu_async_split_profile is not None
+    if split:
+        if mode != "cpu_async":
+            raise ValueError("CPU prefix layer split requires speculative_mode=cpu_async")
+        if config.cpu_async_split_profile is not None:
+            from .cpu_async_split_profile import load_split_profile
+            data = load_split_profile(config.cpu_async_split_profile)
+            layers = data["selection"]["prefix_layers"]
+            if config.cpu_async_prefix_layers is not None and config.cpu_async_prefix_layers != layers:
+                raise ValueError("cpu_async_prefix_layers conflicts with split profile selection")
+            put("cpu_async_prefix_layers", layers)
+        layers = config.cpu_async_prefix_layers
+        if type(layers) is not int or layers < 1:
+            raise ValueError("cpu_async_prefix_layers must be a positive integer smaller than the Target layer count")
+        if config.speculative_draft_method == "eagle3" or config.speculative_draft_model:
+            raise ValueError("CPU prefix split currently requires native MTP")
+        if "head" in selected:
+            raise ValueError("CPU prefix split does not execute a CPU head")
     if config.speculative_draft_method not in ("auto", "mtp", "eagle3"):
         raise ValueError("speculative_draft_method must be auto, mtp or eagle3")
     depth = config.speculative_depth
@@ -41,7 +69,7 @@ def resolve_speculative_config(config) -> None:
     if config.max_running_req is None:
         put("max_running_req", 4 if legacy else 1)
     if config.speculative_prefetch is None:
-        put("speculative_prefetch", True if legacy else three)
+        put("speculative_prefetch", True if legacy else three or split)
     if config.speculative_prefetch_profile is not None and (
             not isinstance(config.speculative_prefetch_profile, str) or not config.speculative_prefetch_profile):
         raise ValueError("speculative_prefetch_profile must be auto or a profile path")
@@ -52,7 +80,7 @@ def resolve_speculative_config(config) -> None:
             if getattr(config, name) is None:
                 put(name, default)
     if config.speculative_hybrid_phases is None:
-        phases = ("verify",) if legacy or mode in (None, "sd") else (
+        phases = ("verify",) if legacy or split or mode in (None, "sd") else (
             ("preverify", "verify") if three else ("preverify",))
         put("speculative_hybrid_phases", phases)
     if config.speculative_graph not in (None, "eager", "full"):
@@ -68,6 +96,31 @@ def resolve_speculative_config(config) -> None:
         put("moe_backend", None)
     if config.moe_strategy not in ("offload", "hybrid", "fused") or config.moe_cpu_layers:
         raise ValueError("speculative modes require offload, hybrid or fused without moe_cpu_layers")
+    if mode == "cpu_async":
+        if "experts" in selected and config.moe_strategy != "fused":
+            raise ValueError("packed v2 CPU experts cannot repack shared banks")
+        if (profile != "v1" or selected) and (
+                config.speculative_draft_method == "eagle3" or config.speculative_draft_model):
+            raise ValueError("CPU kernel selection requires the native BF16 Qwen3.5/3.6 Target")
+    if split:
+        if config.moe_strategy != "hybrid":
+            raise ValueError("CPU prefix split requires Hybrid GPU suffix verification")
+        from .cpu_async_split_profile import validate_suffix_gpu_experts
+        validate_suffix_gpu_experts(config.cpu_async_suffix_gpu_experts)
+        if type(config.cpu_async_suffix_prefetch_experts) is not int or config.cpu_async_suffix_prefetch_experts < 1:
+            raise ValueError("CPU prefix split suffix prefetch experts must be a positive integer")
+        if not config.speculative_prefetch:
+            raise ValueError("CPU prefix split requires suffix-only ahead prefetch")
+        if tuple(config.speculative_hybrid_phases) != ("verify",):
+            raise ValueError("CPU prefix split uses Hybrid only during exact suffix verify")
+        for name in ("speculative_prefetch_layer_experts", "speculative_prefetch_gap_capacity",
+                     "speculative_verify_prefetch_layer_experts"):
+            if getattr(config, name) not in (None, 0):
+                raise ValueError("CPU prefix split owns suffix prefetch; generic prefetch quotas must be zero")
+            put(name, 0)
+        for name in ("speculative_prefetch_layer_quotas", "speculative_verify_prefetch_layer_quotas"):
+            if any(getattr(config, name) or ()):
+                raise ValueError("CPU prefix split owns suffix prefetch; generic layer quotas must be zero")
     if config.moe_strategy == "fused":
         put("speculative_prefetch", False)
     elif not (config.moe_cache_size or config.moe_cache_rate is not None or config.moe_cache_mem is not None):
@@ -89,8 +142,14 @@ def resolve_speculative_config(config) -> None:
     graph = config.speculative_graph
     if graph is None:
         graph = "eager" if mode == "cpu_async" or config.cuda_graph_max_bs == 0 or config.cuda_graph_bs == [] else "full"
-    if mode == "cpu_async" and graph != "eager":
-        raise ValueError("cpu_async currently supports eager execution only")
+    if mode == "cpu_async":
+        if config.speculative_graph_implementation == "coarse":
+            raise ValueError("cpu_async supports eager or full graphs, not coarse graphs")
+        if graph == "full" and config.moe_strategy != "offload" and not split:
+            raise ValueError("cpu_async full graphs currently require offload MoE")
+        if graph == "full" and (config.speculative_draft_method == "eagle3" or (
+                config.speculative_draft_method == "auto" and config.speculative_draft_model)):
+            raise ValueError("cpu_async full graphs currently require native MTP")
     if type(config.cpu_async_loops) is not int or config.cpu_async_loops < 1:
         raise ValueError("cpu_async_loops must be a positive integer")
     if (config.cpu_async_recovery not in ("fixed_replay", "recheck")

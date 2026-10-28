@@ -33,48 +33,48 @@ class BaselineSDMemoryPlan:
     capacity_tokens: int
     kv_pages: int
     budget_bytes: int
-    non_expert_peak_bytes: int
+    weights_bytes: int
+    kv_bytes: int
+    state_bytes: int
+    workspace_bytes: int
+    runtime_reserve_bytes: int
     expert_slot_bytes: int
-    initial_slots: int
     final_slots: int
-    measured_peak_bytes: int
-    routing_reserve_bytes: int
-    initial_cache_bytes: int = 0
     final_cache_bytes: int = 0
-    sizing_headroom_bytes: int = 0
+
+    @property
+    def non_expert_bytes(self):
+        return self.weights_bytes + self.kv_bytes + self.state_bytes + self.workspace_bytes
 
     def validate(self, slots: int, extra_bytes: int = 0, *, cache_bytes: int | None = None) -> None:
         experts = slots * self.expert_slot_bytes if cache_bytes is None else cache_bytes
-        required = self.non_expert_peak_bytes + experts + extra_bytes
+        required = self.non_expert_bytes + experts + extra_bytes
         if required > self.budget_bytes:
-            raise ValueError(f"baseline SD budget insufficient: runtime={self.non_expert_peak_bytes} B, "
+            raise ValueError(f"baseline SD budget insufficient: fixed={self.non_expert_bytes} B, "
                              f"experts={experts} B, extra={extra_bytes} B, "
                              f"budget={self.budget_bytes} B, shortfall={required - self.budget_bytes} B")
 
     def as_dict(self):
-        return asdict(self)
+        return dict(asdict(self), sizing="static", non_expert_bytes=self.non_expert_bytes)
 
 
-def plan_measured_memory(*, capacity_tokens, kv_pages, budget_bytes, measured_peak_bytes,
-                         initial_slots, expert_slot_bytes, minimum_slots, maximum_slots,
-                         automatic, routing_reserve_bytes=0, cache_bytes_for_slots=None, sizing_headroom_bytes=0):
+def plan_static_memory(*, capacity_tokens, kv_pages, budget_bytes, weights_bytes, kv_bytes,
+                       state_bytes, workspace_bytes, expert_slot_bytes, minimum_slots, maximum_slots,
+                       slots=0, runtime_reserve_bytes=0, cache_bytes_for_slots=None):
     cost = cache_bytes_for_slots or (lambda slots: slots * expert_slot_bytes)
-    initial_bytes = cost(initial_slots)
-    non_expert = max(0, measured_peak_bytes - initial_bytes) + routing_reserve_bytes
-    slots = initial_slots
-    headroom = 0
-    if automatic and expert_slot_bytes:
-        headroom = min(sizing_headroom_bytes, max(0, budget_bytes - non_expert - cost(minimum_slots)))
+    available = budget_bytes - weights_bytes - kv_bytes - state_bytes - workspace_bytes
+    if not slots and expert_slot_bytes:
+        # Search byte arithmetic only; GPU pools are allocated once after this plan.
         low, high = minimum_slots, maximum_slots
         while low < high:
             middle = (low + high + 1) // 2
-            if cost(middle) <= budget_bytes - non_expert - headroom:
+            if cost(middle) <= available:
                 low = middle
             else:
                 high = middle - 1
         slots = low
-    plan = BaselineSDMemoryPlan(capacity_tokens, kv_pages, budget_bytes, non_expert,
-                               expert_slot_bytes, initial_slots, slots, measured_peak_bytes, routing_reserve_bytes,
-                               initial_bytes, cost(slots), headroom)
+    plan = BaselineSDMemoryPlan(capacity_tokens, kv_pages, budget_bytes, weights_bytes, kv_bytes,
+                               state_bytes, workspace_bytes, runtime_reserve_bytes,
+                               expert_slot_bytes, slots, cost(slots))
     plan.validate(slots, cache_bytes=cost(slots))
     return plan

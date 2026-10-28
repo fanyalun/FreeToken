@@ -325,4 +325,57 @@ def moe_align_block_size(
     return sorted_token_ids, expert_ids, num_tokens_post_pad
 
 
-__all__ = ["moe_align_block_size"]
+@triton.jit
+def _maximum(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _align_decode_routes(ids, weights, sorted_ids, experts, padded_count,
+                         ROUTES: tl.constexpr, EXPERTS: tl.constexpr,
+                         BLOCK_M: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.arange(0, BLOCK)
+    expert = tl.load(ids + r, r < ROUTES, -1)
+    weight = tl.load(weights + r, r < ROUTES, 0)
+    valid = (r < ROUTES) & (expert >= 0) & (expert < EXPERTS) & (weight != 0)
+    sentinel = 9223372036854775807
+    key = tl.where(valid, expert.to(tl.int64) * ROUTES + r, sentinel)
+    key = tl.sort(key, descending=False)
+    valid = key != sentinel
+    expert = tl.where(valid, key // ROUTES, -1)
+    previous = tl.gather(expert, tl.maximum(r - 1, 0), 0)
+    following = tl.gather(expert, tl.minimum(r + 1, BLOCK - 1), 0)
+    first = valid & ((r == 0) | (expert != previous))
+    last = valid & ((r == BLOCK - 1) | (expert != following))
+    start = tl.associative_scan(tl.where(first, r, 0), 0, _maximum)
+    count = r + 1 - start
+    padding = tl.where(last, tl.cdiv(count, BLOCK_M) * BLOCK_M - count, 0)
+    destination = r + tl.cumsum(padding) - padding
+    fill = tl.arange(0, 1024)
+    for base in range(tl.cdiv(ROUTES * BLOCK_M, 1024)):
+        offset = base * 1024 + fill
+        tl.store(sorted_ids + offset, ROUTES, offset < ROUTES * BLOCK_M)
+    tl.debug_barrier()
+    tl.store(sorted_ids + destination, (key % ROUTES).to(tl.int32), valid)
+    block_first = valid & ((r - start) % BLOCK_M == 0)
+    tl.store(experts + destination // BLOCK_M, expert.to(tl.int32), block_first)
+    tl.store(padded_count, tl.sum(valid.to(tl.int32)) + tl.sum(padding))
+
+
+def moe_align_decode_routes(topk_ids, topk_weights, block_size, num_experts):
+    routes = topk_ids.numel()
+    if routes > _SMALL_CAP:
+        active = (topk_ids >= 0) & (topk_ids < num_experts) & (topk_weights != 0)
+        ids = torch.where(active, topk_ids, -1).contiguous()
+        return moe_align_block_size(ids, block_size, num_experts)
+    sorted_ids = torch.empty(routes * block_size, dtype=torch.int32, device=topk_ids.device)
+    experts = torch.empty(routes, dtype=torch.int32, device=topk_ids.device)
+    padded_count = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    # Sorting the active routes keeps metadata independent of the global slot-bank size.
+    _align_decode_routes[(1,)](topk_ids, topk_weights, sorted_ids, experts, padded_count,
+        ROUTES=routes, EXPERTS=num_experts, BLOCK_M=block_size,
+        BLOCK=triton.next_power_of_2(routes), num_warps=4 if routes <= 256 else 8)
+    return sorted_ids, experts, padded_count
+
+
+__all__ = ["moe_align_block_size", "moe_align_decode_routes"]

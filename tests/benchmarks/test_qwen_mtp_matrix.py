@@ -205,7 +205,14 @@ def test_graph_timing_journal_keeps_requests_before_later_validation_failure(tmp
 def test_graph_comparison_requires_fixed_slot_performance_and_parity(
         tmp_path, monkeypatch, tpot, throughput, eligible, repeat):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "benchmarks"))
-    from analyze_speculative_graph import compare
+    from analyze_speculative_graph import compare, trajectory
+    window = dict(drafted=6, accepted=4, returned=5, submit_rows=7, loop_count=1,
+                  flush_reason="loop_limit", loops=[], draft_loop_count=2,
+                  draft_tail=dict(offset=3, drafted=3, survived=1, reached=True))
+    original = dict(token_ids=[1, 2], rounds=[window])
+    changed = dict(token_ids=[1, 2], rounds=[dict(window,
+        draft_tail=dict(offset=4, drafted=2, survived=0, reached=True))])
+    assert trajectory([original]) != trajectory([changed])
     roots = [tmp_path / "reference", tmp_path / "coarse"]
     for root, mode in zip(roots, ("reference", "coarse")):
         root.mkdir()

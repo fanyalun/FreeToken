@@ -112,6 +112,65 @@ def conv_verify(raw, weight, state, windows, slot, *, fp32_products=True):
     return out
 
 
+@triton.jit
+def _prepare_chunk_verify_kernel(
+    mixed, a, b, a_log, dt_bias, q_normalized, k_normalized,
+    raw_k, raw_v, decay, beta,
+    MIXED_STRIDE: tl.constexpr, A_STRIDE: tl.constexpr, B_STRIDE: tl.constexpr,
+    H: tl.constexpr, HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BK: tl.constexpr, BV: tl.constexpr,
+):
+    row, hv = tl.program_id(0), tl.program_id(1)
+    kh = hv // (HV // H)
+    if hv % (HV // H) == 0:
+        key_offsets = tl.arange(0, BK)
+        query = tl.load(mixed + row * MIXED_STRIDE + kh * K + key_offsets,
+                        key_offsets < K, 0).to(tl.float32)
+        key = tl.load(mixed + row * MIXED_STRIDE + H * K + kh * K + key_offsets,
+                      key_offsets < K, 0).to(tl.float32)
+        base = (row * H + kh) * K + key_offsets
+        tl.store(raw_k + base, key, key_offsets < K)
+        query /= tl.sqrt(tl.sum(query * query) + 1e-6)
+        key /= tl.sqrt(tl.sum(key * key) + 1e-6)
+        tl.store(q_normalized + base, query, key_offsets < K)
+        tl.store(k_normalized + base, key, key_offsets < K)
+    value_offsets = tl.arange(0, BV)
+    value = tl.load(mixed + row * MIXED_STRIDE + 2 * H * K + hv * V + value_offsets,
+                    value_offsets < V, 0)
+    tl.store(raw_v + (row * HV + hv) * V + value_offsets, value, value_offsets < V)
+    av = tl.load(a + row * A_STRIDE + hv).to(tl.float32)
+    bv = tl.load(b + row * B_STRIDE + hv).to(tl.float32)
+    log = tl.load(a_log + hv).to(tl.float32)
+    bias = tl.load(dt_bias + hv).to(tl.float32)
+    x = av + bias
+    softplus = tl.where(x <= 20.0, tl.log(1.0 + tl.exp(x)), x)
+    tl.store(decay + row * HV + hv, -tl.exp(log) * softplus)
+    tl.store(beta + row * HV + hv, 1.0 / (1.0 + tl.exp(-bv)))
+
+
+def chunk_verify(mixed, a, b, layer, state_source, indices, replay_inputs):
+    from freetoken.kernel.fla.chunk import chunk_gated_delta_rule_fwd
+
+    width = mixed.shape[0]
+    h, hv, k, v = layer.num_k_heads, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim
+    q_normalized = torch.empty((1, width, h, k), device=mixed.device, dtype=mixed.dtype)
+    k_normalized = torch.empty_like(q_normalized)
+    raw_k, raw_v, decay, beta = replay_inputs
+    _prepare_chunk_verify_kernel[(width, hv)](
+        mixed, a, b, layer.A_log, layer.dt_bias, q_normalized, k_normalized,
+        raw_k, raw_v, decay, beta,
+        MIXED_STRIDE=mixed.stride(0), A_STRIDE=a.stride(0), B_STRIDE=b.stride(0),
+        H=h, HV=hv, K=k, V=v, BK=triton.next_power_of_2(k), BV=triton.next_power_of_2(v),
+        num_warps=4,
+    )
+    # Equal-length single-sequence metadata avoids host chunk-index construction in capture.
+    return chunk_gated_delta_rule_fwd(
+        q=q_normalized, k=k_normalized, v=raw_v.unsqueeze(0),
+        g=decay.unsqueeze(0), beta=beta.unsqueeze(0), scale=k ** -0.5,
+        initial_state=state_source, initial_state_indices=indices, inplace_update=False,
+    )[1][0]
+
+
 def commit_gdn(state, conv, inputs, windows, count, slot, width):
     if count.numel() != 1 or count.dtype != torch.int32 or count.device != state.device:
         raise ValueError("GDN commit requires one device int32 input count")
@@ -130,3 +189,126 @@ def commit_gdn(state, conv, inputs, windows, count, slot, width):
         WIDTH=width, HISTORY=conv.shape[-1], SLOT=slot, BLOCK=128,
         num_warps=4,
     )
+
+
+@triton.jit
+def _copy_cpu_conv_windows_kernel(
+    sources, destination,
+    destination_layer: tl.constexpr, destination_channel: tl.constexpr,
+    CHANNELS: tl.constexpr, CAPACITY: tl.constexpr, WIDTH: tl.constexpr, BLOCK: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    channel, position = offset // CAPACITY, offset % CAPACITY
+    valid = (channel < CHANNELS) & (position < WIDTH)
+    source = tl.load(sources + layer).to(tl.pointer_type(tl.bfloat16))
+    value = tl.load(source + offset, valid, other=0)
+    tl.store(destination + layer * destination_layer + channel * destination_channel + position, value, valid)
+
+
+def copy_cpu_conv_windows(destination, sources, width):
+    if (destination.dtype != torch.bfloat16 or destination.ndim != 3
+            or sources.dtype != torch.int64 or sources.shape != destination.shape[:1]
+            or not 1 <= width <= destination.shape[-1]):
+        raise ValueError("invalid mapped CPU convolution windows")
+    layers, channels, capacity = destination.shape
+    if layers:
+        _copy_cpu_conv_windows_kernel[(layers, triton.cdiv(channels * capacity, 1024))](
+            sources, destination, *destination.stride()[:2], CHANNELS=channels,
+            CAPACITY=capacity, WIDTH=width, BLOCK=1024, num_warps=4)
+
+
+@triton.jit
+def _cpu_ssm_fold_kernel(
+    state, replay, count,
+    state_layer: tl.constexpr, state_slot: tl.constexpr,
+    replay_layer: tl.constexpr, replay_row: tl.constexpr,
+    HV: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    SLOT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, V2: tl.constexpr,
+):
+    layer = (tl.program_id(1) // HV).to(tl.int64)
+    head = tl.program_id(1) % HV
+    k = tl.arange(0, BK)
+    v = tl.program_id(0) * BV + tl.arange(0, BV)
+    mask = (k[:, None] < K) & (v[None, :] < V)
+    address = state + layer * state_layer + SLOT * state_slot + head * V * K + v[None, :] * K + k[:, None]
+    s = tl.load(address, mask, other=0)
+    for row in range(count):
+        item = replay + layer * replay_layer + row * replay_row + head * (K + V + 2)
+        key = tl.load(item + k, k < K, other=0)
+        value = tl.load(item + K + v, v < V, other=0)
+        decay = tl.load(item + K + V)
+        beta = tl.load(item + K + V + 1)
+        s = s * decay
+        if V2:
+            # Match the CPU's 16-lane FMA accumulation and AVX-512 horizontal reduction.
+            lane = tl.arange(0, 16)
+            partial = tl.full((16, BV), 0, tl.float32)
+            for block in tl.static_range(K // 16):
+                positions = (block * 16 + lane)[:, None] + tl.full((1, BV), 0, tl.int32)
+                sv = tl.gather(s, positions, 0)
+                kv = tl.load(item + block * 16 + lane)
+                partial = tl.fma(sv, kv[:, None], partial)
+            half = tl.arange(0, 8)[:, None] + tl.full((1, BV), 0, tl.int32)
+            partial = tl.gather(partial, half + 8, 0) + tl.gather(partial, half, 0)
+            quarter = tl.arange(0, 4)[:, None] + tl.full((1, BV), 0, tl.int32)
+            partial = tl.gather(partial, quarter + 4, 0) + tl.gather(partial, quarter, 0)
+            pair = tl.arange(0, 2)[:, None] + tl.full((1, BV), 0, tl.int32)
+            partial = tl.gather(partial, pair + 2, 0) + tl.gather(partial, pair, 0)
+            first = tl.full((1, BV), 0, tl.int32)
+            dot = tl.reshape(tl.gather(partial, first, 0) + tl.gather(partial, first + 1, 0), (BV,))
+            for index in tl.static_range((K // 16) * 16, K):
+                sv = tl.reshape(tl.gather(s, tl.full((1, BV), index, tl.int32), 0), (BV,))
+                kv = tl.load(item + index)
+                dot = tl.fma(sv, kv, dot)
+        else:
+            # v1 adds products in key order; a tree reduction changes accepted CPU state.
+            dot = tl.full((BV,), 0, tl.float32)
+            product = s * key[:, None]
+            for index in tl.static_range(K):
+                term = tl.reshape(tl.gather(product, tl.full((1, BV), index, tl.int32), 0), (BV,))
+                dot = dot + term
+        delta = (value - dot) * beta
+        if V2:
+            s = tl.fma(key[:, None], delta[None, :], s)
+        else:
+            s = s + key[:, None] * delta[None, :]
+    tl.store(address, s, mask)
+
+
+@triton.jit
+def _cpu_conv_commit_kernel(
+    conv, windows, count,
+    conv_layer: tl.constexpr, conv_slot: tl.constexpr,
+    window_layer: tl.constexpr, window_channel: tl.constexpr,
+    CHANNELS: tl.constexpr, HISTORY: tl.constexpr, SLOT: tl.constexpr, BLOCK: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    for time in tl.static_range(HISTORY):
+        value = tl.load(windows + layer * window_layer + channel * window_channel + count + time,
+                        channel < CHANNELS, other=0)
+        tl.store(conv + layer * conv_layer + SLOT * conv_slot + channel * HISTORY + time,
+                 value, channel < CHANNELS)
+
+
+def commit_cpu_gdn(state, conv, replay, windows, count, slot, *, v2=False):
+    if (state.ndim != 5 or conv.ndim != 4 or replay.ndim != 4 or windows.ndim != 3
+            or state.dtype != torch.float32 or replay.dtype != torch.float32
+            or conv.dtype != torch.bfloat16 or windows.dtype != torch.bfloat16):
+        raise ValueError("CPU GDN fold requires FP32 state/replay and BF16 convolution windows")
+    layers, slots, heads, key_dim, value_dim = state.shape
+    if (replay.shape[0] != layers or replay.shape[2:] != (heads, key_dim + value_dim + 2)
+            or conv.shape[:2] != (layers, slots) or windows.shape[:2] != (layers, conv.shape[2])
+            or type(count) is not int or not 1 <= count <= replay.shape[1]
+            or not 0 <= slot < slots or windows.shape[-1] < conv.shape[-1] + count):
+        raise ValueError("CPU GDN fold geometry or accepted input count mismatch")
+    if layers:
+        _cpu_ssm_fold_kernel[(triton.cdiv(value_dim, 16), layers * heads)](
+            state, replay, count, *state.stride()[:2], *replay.stride()[:2],
+            HV=heads, K=key_dim, V=value_dim, SLOT=slot,
+            BK=max(16, triton.next_power_of_2(key_dim)), BV=16, V2=v2,
+            num_warps=4, enable_fp_fusion=False)
+        _cpu_conv_commit_kernel[(layers, triton.cdiv(conv.shape[2], 128))](
+            conv, windows, count, *conv.stride()[:2], *windows.stride()[:2],
+            CHANNELS=conv.shape[2], HISTORY=conv.shape[-1], SLOT=slot, BLOCK=128, num_warps=4)

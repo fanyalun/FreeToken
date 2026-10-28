@@ -48,6 +48,8 @@ def summarize(rows, tokens, audit_rows=None):
             "inner_proposed": inner_proposed,
             "inner_acceptance": sum(item["accepted"] for item in inner) / inner_proposed if inner_proposed else None,
             "loops_per_submission": dict(Counter(str(item["loop_count"]) for item in rounds if "loop_count" in item)),
+            "draft_loops_per_submission": dict(Counter(str(item["draft_loop_count"])
+                for item in rounds if "draft_loop_count" in item)),
             "cache_stats": {**cache, **peaks},
             "graph_replays": dict(sum((Counter(row["graph_replays"]) for row in rows), Counter())),
             "graph_fallbacks": dict(sum((Counter(row["graph_fallbacks"]) for row in rows), Counter()))}
@@ -76,7 +78,16 @@ def analyze(root):
                 assert 0 <= item["accepted"] <= item["drafted"]
                 if "loops" in item:
                     assert item["loop_count"] == len(item["loops"])
-                    assert sum(loop["returned"] for loop in item["loops"]) == item["drafted"]
+                    prefix = sum(loop["returned"] for loop in item["loops"])
+                    tail = item.get("draft_tail")
+                    if tail is not None:
+                        assert tail["offset"] == prefix and tail["drafted"] > 0
+                        effective = min(item["accepted"], item["returned"])
+                        assert tail["survived"] == min(tail["drafted"], max(0, effective - prefix))
+                        assert tail["reached"] == (effective >= prefix)
+                    assert prefix + (tail["drafted"] if tail else 0) == item["drafted"]
+                    if "draft_loop_count" in item:
+                        assert item["draft_loop_count"] == item["loop_count"] + int(tail is not None)
                     assert item["submit_rows"] == item["drafted"] + 1 <= item["submit_row_limit"]
     manifest = json.loads((root / "source_manifest.json").read_text())
     for relative, digest in manifest.items():

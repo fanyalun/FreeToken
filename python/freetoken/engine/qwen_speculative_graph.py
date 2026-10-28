@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import time
 
 import torch
 import triton
@@ -66,6 +67,15 @@ def _assemble(anchor, candidates, inputs, context, WIDTH: tl.constexpr, BLOCK: t
 
 
 @triton.jit
+def _append_draft(inputs, candidates, context, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.arange(0, BLOCK)
+    count = tl.load(context + 1) - 1
+    offset = tl.load(context + 3)
+    value = tl.load(inputs + row + 1, row < count, 0)
+    tl.store(candidates + offset + row, value, row < count)
+
+
+@triton.jit
 def _accept(inputs, predictions, tokens, accepted, consumed, terminal, eos, context,
             WIDTH: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.arange(0, BLOCK)
@@ -102,6 +112,10 @@ class QwenSpeculativeGraphSet:
         # start, valid rows, loop, candidate offset, candidate limit, remaining, accept cap
         self.context = torch.zeros(7, dtype=torch.int32, device=self.engine.device)
         self.anchor = torch.zeros(1, dtype=torch.int32, device=self.engine.device)
+        self.draft_context = torch.zeros_like(self.context)
+        self.draft_anchor = torch.zeros_like(self.anchor)
+        self.tail_width = min(self.engine.config.speculative_mtp_depth + 1, self.outer_width)
+        self.draft_inputs = torch.zeros(self.tail_width, dtype=torch.int32, device=self.engine.device)
         hidden_size = getattr(self.engine, "draft_feature_size", self.engine.config.model_config.hidden_size)
         self.seed = torch.zeros_like(self.anchor)
         self.seed_hidden = torch.zeros_like(self.runner.seed_hidden)
@@ -131,11 +145,17 @@ class QwenSpeculativeGraphSet:
         self.captures = 0
         self.replays = {}
         self.capture_memory = []
+        self.draft_verify_shapes = [(rows, count)
+            for rows in (range(2, self.outer_width + 1) if self.exact else (self.outer_width,))
+            for count in (range(1, min(self.tail_width - 1, rows - 1) + 1)
+                          if self.exact else (min(self.tail_width - 1, rows - 1),))
+            if count > 0]
         self.signature = self._signature()
 
     def _signature(self):
         c, cache = self.engine.config, self.experts.cache
         return (c.speculative_mtp_depth, c.speculative_max_loops, c.speculative_submit_tokens,
+                getattr(c, "speculative_reference_math", False),
                 c.speculative_graph_implementation, c.speculative_execution_implementation,
                 c.speculative_prefetch, c.speculative_prefetch_layer_experts,
                 c.speculative_prefetch_gap_capacity, self.engine.max_seq_len, cache.cache_size,
@@ -169,6 +189,7 @@ class QwenSpeculativeGraphSet:
         batch.out_loc = torch.zeros_like(batch.input_ids)
         batch.linear_table_idx = torch.ones_like(batch.input_ids)
         batch.rowwise_linear, batch.gdn_verify_state = True, state
+        batch.speculative_reference_math = getattr(self.engine.config, "speculative_reference_math", False)
         batch.speculative_valid_rows = torch.zeros(1, dtype=torch.int32, device=device)
         offsets = torch.arange(width + 1, dtype=torch.int32, device=device)
         batch.fla_metadata = FLAMetadata(offsets, batch.linear_table_idx)
@@ -187,36 +208,59 @@ class QwenSpeculativeGraphSet:
             hidden=torch.zeros(width, hidden_size, dtype=torch.bfloat16, device=self.engine.device),
             commit=Commit(tokens, scalar(), scalar(), scalar()))
 
-    def metadata(self, batch, inputs, step=-1):
+    def metadata(self, batch, inputs, step=-1, *, context=None):
         _metadata[(1, batch.size)](
             inputs, self.engine.page_table, batch.input_ids, batch.positions, batch.out_loc,
             batch.attn_metadata.indptr, batch.attn_metadata.indices, batch.speculative_valid_rows,
-            self.context, batch.size, step, 256, True, batch.attn_metadata.q_positions)
+            self.context if context is None else context,
+            batch.size, step, 256, True, batch.attn_metadata.q_positions)
+
+    def _propose(self, inputs, anchor, width, context):
+        inputs[:1].copy_(anchor)
+        seed, hidden = self.seed, self.seed_hidden
+        for row in range(width - 1):
+            inputs[row + 1:row + 2].copy_(seed)
+            if row < width - 2:
+                self.metadata(self.chain, seed, row, context=context)
+                seed, hidden = self.runner._draft(self.chain, hidden)
 
     def _body(self, inner):
         lane = self.inner if inner else self.outer
         if self.calibration is not None:
             self.calibration.begin("preverify" if inner else "verify", lane.width, "body")
         if inner:
-            lane.inputs[:1].copy_(self.anchor)
-            seed, hidden = self.seed, self.seed_hidden
-            for row in range(lane.width - 1):
-                lane.inputs[row + 1:row + 2].copy_(seed)
-                if row < lane.width - 2:
-                    self.metadata(self.chain, seed, row)
-                    seed, hidden = self.runner._draft(self.chain, hidden)
+            self._propose(lane.inputs, self.anchor, lane.width, self.context)
         else:
             _assemble[(1,)](self.anchor, self.experts.candidate_buffer, lane.inputs, self.context,
                             lane.width, triton.next_power_of_2(lane.width))
-        # The external event is re-recorded by gap copies between graph replays.
+        self._target_body(lane, inner)
+
+    def _draft_verify_body(self, draft_count):
+        lane = self.outer
         if self.calibration is not None:
-            self.calibration.mark("gap_join")
+            self.calibration.begin("verify", lane.width, f"draft_verify_{draft_count}")
+            self.calibration.mark("proposal_start")
+        self._propose(self.draft_inputs, self.draft_anchor, draft_count + 1, self.draft_context)
+        _append_draft[(1,)](self.draft_inputs, self.experts.candidate_buffer, self.draft_context,
+                           self.tail_width, triton.next_power_of_2(self.tail_width))
+        if self.calibration is not None:
+            self.calibration.mark("proposal_end")
+        _assemble[(1,)](self.anchor, self.experts.candidate_buffer, lane.inputs, self.context,
+                        lane.width, triton.next_power_of_2(lane.width))
+        self._target_body(lane, False)
+
+    def _target_body(self, lane, inner):
+        # The external event is re-recorded by gap copies between graph replays.
         self.engine.stream.wait_event(self.gap_ready)
         self.experts.retire_gap()
         self.metadata(lane.batch, lane.inputs)
         self.experts.valid_rows = lane.batch.speculative_valid_rows
+        if self.calibration is not None:
+            self.calibration.mark("target_start")
         with self.engine.model.forward_host_ctx(lane.batch, True):
             tokens, hidden = self.runner._target(lane.batch)
+        if self.calibration is not None:
+            self.calibration.mark("target_end")
         lane.hidden.copy_(hidden)
         _accept[(1,)](lane.inputs, tokens, lane.tokens, lane.commit.accepted_drafts,
             lane.commit.input_count, lane.commit.terminal, self.eos, self.context,
@@ -258,6 +302,7 @@ class QwenSpeculativeGraphSet:
         saved_table = engine.page_table[0].clone()
         saved_state = self.runner.state_adapter.snapshot()
         before = torch.cuda.memory_reserved(engine.device)
+        capture_started = time.perf_counter()
         try:
             self.runner._reserve(max(self.width, self.outer_width))
             # Outer warmup runs before inner proposals exist; its token IDs must be valid.
@@ -329,6 +374,54 @@ class QwenSpeculativeGraphSet:
                     reserved_bytes=torch.cuda.memory_reserved(engine.device),
                     allocated_delta_bytes=torch.cuda.memory_allocated(engine.device) - allocated_before,
                     reserved_delta_bytes=torch.cuda.memory_reserved(engine.device) - reserved_before))
+            for rows, count in self.draft_verify_shapes:
+                self.outer = self.outer_lanes[rows]
+                allocated_before = torch.cuda.memory_allocated(engine.device)
+                reserved_before = torch.cuda.memory_reserved(engine.device)
+                started = time.perf_counter()
+                experts.begin(0)
+                experts.set_phase("verify")
+                self.stage(0, rows, 0, rows - count - 1, self.outer_width - 1, rows, rows)
+                _stage[(1,)](self.draft_context, rows - count - 1, count + 1, 0,
+                             rows - count - 1, self.outer_width - 1, rows, count + 1)
+                self._draft_verify_body(count)
+                experts.join_gap()
+                engine.stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph, pool=self.pool, stream=engine.stream):
+                        fork = experts.verify_prefetch_enabled
+                        if fork:
+                            experts.copy_stream.wait_stream(engine.stream)
+                        try:
+                            self._draft_verify_body(count)
+                        except BaseException:
+                            if (experts.cpu_stream is not None
+                                    and _can_join_capture_branch(experts.cpu_stream)):
+                                engine.stream.wait_stream(experts.cpu_stream)
+                            if fork:
+                                experts.retire_layers()
+                                experts.retire_verify()
+                            raise
+                        finally:
+                            if fork:
+                                engine.stream.wait_stream(experts.copy_stream)
+                except BaseException:
+                    experts.close(abort=True)
+                    raise
+                if self.pool is None:
+                    self.pool = graph.pool()
+                self.graphs[self._draft_verify_key(rows, count)] = graph
+                self.captures += 1
+                phase = f"{self.implementation}_outer_draft_verify"
+                self.runner.graph_captures[phase] = self.runner.graph_captures.get(phase, 0) + 1
+                experts.close(abort=True)
+                self.capture_memory.append(dict(inner=False, rows=rows, suffix="draft_verify",
+                    draft_count=count, capture_seconds=time.perf_counter() - started,
+                    allocated_bytes=torch.cuda.memory_allocated(engine.device),
+                    reserved_bytes=torch.cuda.memory_reserved(engine.device),
+                    allocated_delta_bytes=torch.cuda.memory_allocated(engine.device) - allocated_before,
+                    reserved_delta_bytes=torch.cuda.memory_reserved(engine.device) - reserved_before))
             self.inner, self.outer = self.inner_lanes[self.width], self.outer_lanes[self.outer_width]
             self.ready = True
         except BaseException:
@@ -344,6 +437,7 @@ class QwenSpeculativeGraphSet:
             experts.valid_rows = None
             self.runner._reserved_len = 0
         self.reserved_capture_bytes = torch.cuda.memory_reserved(engine.device) - before
+        self.capture_seconds = time.perf_counter() - capture_started
 
     def stage(self, start, rows, loop, candidates, limit, remaining, accept_remaining):
         _stage[(1,)](self.context, start, rows, loop, candidates, limit, remaining, accept_remaining)
@@ -366,14 +460,46 @@ class QwenSpeculativeGraphSet:
         self.experts.gap_planned = inner and self.experts.prefetch and self.experts.gap_capacity > 1
         control = self.experts.drain_control(lane.width)
         if self.calibration is not None:
-            self.calibration.body_finished("preverify" if inner else "verify", rows, start + rows)
+            self.calibration.body_finished("preverify" if inner else "verify", rows, start + rows,
+                                           capture_rows=lane.width)
+        return lane.tokens, lane.hidden, lane.commit, control
+
+    def draft_then_verify(self, first_anchor, tail_anchor, *, start, prefix_rows, draft_count, remaining):
+        if not self.ready or self.closed:
+            raise RuntimeError("speculative graphs are not ready")
+        if self._signature() != self.signature:
+            raise RuntimeError("speculative graph configuration changed; rebuild the idle runner")
+        rows = prefix_rows + draft_count + 1
+        if (prefix_rows < 0 or not 1 <= draft_count < self.tail_width
+                or not 1 <= rows <= self.outer_width
+                or not 0 <= start <= self.engine.max_seq_len - rows):
+            raise ValueError("invalid combined Draft/Full Verify geometry")
+        lane = self.outer_lanes[rows if self.exact else self.outer_width]
+        physical_count = draft_count if self.exact else self.tail_width - 1
+        self.active_lanes[False] = lane
+        self.anchor.copy_(first_anchor)
+        self.draft_anchor.copy_(tail_anchor)
+        self.stage(start, rows, 0, prefix_rows, self.outer_width - 1, remaining, remaining)
+        _stage[(1,)](self.draft_context, start + prefix_rows, draft_count + 1, 0,
+                     prefix_rows, self.outer_width - 1, remaining, draft_count + 1)
+        self.experts.valid_rows = lane.batch.speculative_valid_rows
+        with torch.cuda.nvtx.range("SPEC_GRAPH/outer/draft_verify"):
+            self.graphs[self._draft_verify_key(lane.width, physical_count)].replay()
+        key = f"{self.implementation}_outer_draft_verify"
+        if self.exact:
+            key += f"_{lane.width}_{draft_count}"
+        self.replays[key] = self.replays.get(key, 0) + 1
+        self.runner.graph_replays[key] = self.runner.graph_replays.get(key, 0) + 1
+        self.experts.gap_active = self.experts.gap_planned = False
+        control = self.experts.drain_control(lane.width)
+        if self.calibration is not None:
+            self.calibration.body_finished("verify", rows, start + rows, capture_rows=lane.width,
+                suffix=f"draft_verify_{physical_count}", draft_tail_count=draft_count)
         return lane.tokens, lane.hidden, lane.commit, control
 
     def tail(self, inner, continuing):
         lane = self.active_lanes.pop(inner)
         if inner:
-            if self.calibration is not None:
-                self.calibration.fork_gap(continuing)
             self.experts.finish_loop(continuing)
             self.gap_ready.record(self.experts.copy_stream)
         if continuing:
@@ -386,6 +512,9 @@ class QwenSpeculativeGraphSet:
 
     def _key(self, inner, suffix, width):
         return (inner, suffix, width) if self.exact else (inner, suffix)
+
+    def _draft_verify_key(self, width, count):
+        return (False, "draft_verify", width, count) if self.exact else (False, "draft_verify")
 
     def _replay(self, inner, suffix, width):
         with torch.cuda.nvtx.range(f"SPEC_GRAPH/{'inner' if inner else 'outer'}/{suffix}"):
@@ -410,6 +539,9 @@ class QwenSpeculativeGraphSet:
                     outer_rows=self.outer_width, graph_count=len(self.graphs), captures=self.captures,
                     inner_sizes=sorted(self.inner_lanes) if self.coordinator.inner_width else [], outer_sizes=sorted(self.outer_lanes),
                     exact_shapes=self.exact, capture_memory=list(self.capture_memory),
+                    combined_graph_count=len(self.draft_verify_shapes),
+                    draft_verify_shapes=[dict(rows=rows, draft_count=count) for rows, count in self.draft_verify_shapes],
+                    capture_seconds=getattr(self, "capture_seconds", 0.),
                     ready=self.ready, pool=self.pool, replays=dict(self.replays),
                     reserved_capture_bytes=getattr(self, "reserved_capture_bytes", 0),
                     scratch_workspace_bytes=sum(scratch.values()))
@@ -421,6 +553,7 @@ class QwenSpeculativeGraphSet:
         self.pool = None
         self.experts.valid_rows = None
         self.inner = self.outer = self.chain = None
+        self.draft_context = self.draft_anchor = self.draft_inputs = None
         self.inner_lanes.clear()
         self.outer_lanes.clear()
         self.active_lanes.clear()

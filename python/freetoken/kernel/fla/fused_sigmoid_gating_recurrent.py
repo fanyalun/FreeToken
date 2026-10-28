@@ -287,6 +287,7 @@ def fused_sigmoid_gating_delta_rule_update(
     retrieve_parent_token: Optional[torch.Tensor] = None,
     replay_inputs: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     round_state_each_step: bool = False,
+    small_value_tile: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -309,7 +310,7 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 16 if small_value_tile else 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3

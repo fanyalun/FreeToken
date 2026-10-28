@@ -44,7 +44,6 @@ def main():
     parser.add_argument("--max-loops", type=int, default=6)
     parser.add_argument("--layer-prefetch-experts", type=int, default=4)
     parser.add_argument("--gap-prefetch-capacity", type=int, default=0)
-    parser.add_argument("--calibrate-prefetch", action="store_true")
     parser.add_argument("--slots", type=int, default=0)
     parser.add_argument("--kv-pages", type=int, default=0)
     parser.add_argument("--eager", action="store_true")
@@ -52,7 +51,7 @@ def main():
     parser.add_argument("--legacy-control", action="store_true")
     parser.add_argument("--purpose", choices=("smoke", "diagnostic", "formal"), default="smoke")
     args = parser.parse_args()
-    if args.expert_scheduler == "gpu" and (args.backend != "offload" or args.calibrate_prefetch):
+    if args.expert_scheduler == "gpu" and args.backend != "offload":
         parser.error("GPU expert scheduling requires offload and explicit prefetch quotas")
     if min(args.samples, args.tokens, args.budget_gib, args.max_loops) < 1 or min(
             args.slots, args.kv_pages, args.submit_tokens, args.layer_prefetch_experts, args.gap_prefetch_capacity) < 0:
@@ -72,7 +71,7 @@ def main():
     source = out / "source"
     manifest = {}
     for path in sorted((repo / "python/freetoken").rglob("*.py")) + [Path(__file__).resolve(),
-            repo / "benchmarks/qwen_mtp_config.py", repo / "benchmarks/three_level_prefetch_calibration.py"]:
+            repo / "benchmarks/qwen_mtp_config.py"]:
         target = source / path.relative_to(repo)
         target.parent.mkdir(parents=True, exist_ok=True)
         data = path.read_bytes()
@@ -100,14 +99,6 @@ def main():
     ))
     runner = engine.speculative_runner
     coordinator = runner.three_level
-    if args.calibrate_prefetch:
-        from three_level_prefetch_calibration import calibrate_prefetch
-        calibration = calibrate_prefetch(runner, prompts[0], args.tokens)
-        write("prefetch_calibration.json", calibration)
-        coordinator.experts.layer_quota = calibration["layer_experts"]
-        coordinator.experts.gap_capacity = calibration["k_gap"]
-        object.__setattr__(engine.config, "speculative_prefetch_layer_experts", calibration["layer_experts"])
-        object.__setattr__(engine.config, "speculative_prefetch_gap_capacity", calibration["k_gap"])
     reference = QwenMTPRunner(engine, reference_ar=True)
     config.update(gpu=torch.cuda.get_device_name(engine.device), moe_slots=engine.moe_offload_cache.cache_size,
                   kv_pages=engine.num_pages, budget=dataclasses.asdict(coordinator.budget),
@@ -163,7 +154,9 @@ def main():
                              "wall_seconds": wall, "tokens_per_second": args.tokens * len(rows) / wall,
                              "ar_token_parity": all(row["ar_first_difference"] is None for row in rows),
                              "timing_audit_parity": all(replay_equal),
-                             "loops_per_window": [r.get("loop_count", 0) for row in rows for r in row["rounds"]]}
+                             "loops_per_window": [r.get("loop_count", 0) for row in rows for r in row["rounds"]],
+                             "draft_loops_per_window": [r.get("draft_loop_count", r.get("loop_count", 0))
+                                                        for row in rows for r in row["rounds"]]}
             windows = [window for row in rows for window in row["rounds"]]
             inner = [loop for window in windows for loop in window.get("loops", [])]
             inner_drafted = sum(loop["drafted"] for loop in inner)

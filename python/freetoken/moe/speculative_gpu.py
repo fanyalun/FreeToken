@@ -45,7 +45,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
           COLLECT_SIGNALS: tl.constexpr, INNER_ROWS: tl.constexpr = 4, valid_rows=None,
           verify_prefetched=None, POLICY: tl.constexpr = False, RETAIN_TOPK: tl.constexpr = 4,
           importance=None, TAU: tl.constexpr = 0.0, RETAIN_ROUTES: tl.constexpr = True,
-          selected_mask=None, transfer_bytes=None, EXPERT_BYTES: tl.constexpr = 0, layer_transfer_bytes=None):
+          selected_mask=None, transfer_bytes=None, EXPERT_BYTES: tl.constexpr = 0, layer_transfer_bytes=None,
+          prediction_hints=None):
     k = tl.arange(0, N)
     rows = ROWS if valid_rows is None else tl.load(valid_rows)
     valid = k < rows * TOPK
@@ -65,6 +66,8 @@ def _plan(ids, weights, mapping, pending, refs, history, ready_history, widths, 
         old = tl.load(history + base + k, k < INNER_ROWS * TOPK, -1)
         old_count = tl.histogram(old, E, mask=old >= 0)
         new_count = tl.histogram(e, E, mask=valid)
+        if prediction_hints is not None:
+            tl.atomic_add(prediction_hints + LAYER * EXPERTS + experts, new_count, experts < EXPERTS)
         value = tl.load(refs + LAYER * EXPERTS + experts, experts < EXPERTS, 0)
         tl.store(refs + LAYER * EXPERTS + experts,
                  value + new_count - old_count if RETAIN_ROUTES else 0, experts < EXPERTS)
@@ -148,6 +151,38 @@ def _tile_demand(ids, keep, demand, SIZE: tl.constexpr, EXPERTS: tl.constexpr,
     counts = tl.histogram(e, E, mask=(k < SIZE) & active)
     experts = tl.arange(0, E)
     tl.store(demand + experts, counts, experts < EXPERTS)
+
+
+@triton.jit
+def _fixed_hybrid_partition(ids, weights, cpu_ids, cpu_weights, demand, stats,
+                            ROWS: tl.constexpr, TOPK: tl.constexpr, GPU_ROUTES: tl.constexpr,
+                            EXPERTS: tl.constexpr, R: tl.constexpr, K: tl.constexpr, E: tl.constexpr):
+    row = tl.arange(0, R)
+    route = tl.arange(0, K)
+    offset = row[:, None] * TOPK + route[None, :]
+    valid = (row[:, None] < ROWS) & (route[None, :] < TOPK)
+    expert = tl.load(ids + offset, valid, 0)
+    weight = tl.load(weights + offset, valid, 0)
+    better = (weight[:, None, :] > weight[:, :, None]) | (
+        (weight[:, None, :] == weight[:, :, None]) & (expert[:, None, :] < expert[:, :, None]))
+    rank = tl.sum((better & valid[:, None, :]).to(tl.int32), 2)
+    gpu = valid & (rank < GPU_ROUTES) & (weight != 0)
+    cpu = valid & ~gpu & (weight != 0)
+    tl.store(cpu_ids + offset, tl.where(cpu, expert, -1), valid)
+    tl.store(cpu_weights + offset, tl.where(cpu, weight, 0), valid)
+    tl.store(weights + offset, tl.where(gpu, weight, 0), valid)
+    flat = tl.reshape(expert, (R * K,))
+    gpu_count = tl.histogram(flat, E, mask=tl.reshape(gpu, (R * K,)))
+    cpu_count = tl.histogram(flat, E, mask=tl.reshape(cpu, (R * K,)))
+    experts = tl.arange(0, E)
+    tl.store(demand + experts, gpu_count, experts < EXPERTS)
+    routes = tl.sum(cpu_count, 0)
+    unique = tl.sum((cpu_count > 0).to(tl.int32), 0)
+    tl.atomic_add(stats + 17, routes)
+    tl.atomic_add(stats + 18, unique)
+    tl.atomic_add(stats + 19, tl.sum(gpu_count, 0))
+    tl.atomic_add(stats + 21, routes)
+    tl.atomic_add(stats + 23, unique)
 
 
 @triton.jit
@@ -541,6 +576,32 @@ def _gap_control(cache_conflict, output):
 class GPUExpertCache:
     gpu_schedule = True
 
+    @classmethod
+    def from_engine(cls, engine, *, max_loops, max_rows, inner_rows, use_graph,
+                    preverify_policy, **overrides):
+        config = engine.config
+        hybrid = (getattr(config, "moe_strategy", "offload") == "hybrid"
+                  and getattr(config, "speculative_expert_scheduler", "gpu") == "gpu")
+        options = dict(
+            max_loops=max_loops, max_rows=max_rows, inner_rows=inner_rows,
+            use_graph=use_graph, preverify_policy=preverify_policy,
+            top_k=config.model_config.num_experts_per_tok,
+            prefetch=getattr(config, "speculative_prefetch", True),
+            audit=getattr(config, "speculative_audit", False),
+            layer_quota=getattr(config, "speculative_prefetch_layer_experts", 4),
+            layer_quotas=getattr(config, "speculative_prefetch_layer_quotas", None),
+            gap_capacity=getattr(config, "speculative_prefetch_gap_capacity", 0),
+            demand_fence=getattr(config, "speculative_prefetch_demand_fence", False),
+            verify_layer_quota=getattr(config, "speculative_verify_prefetch_layer_experts", 0),
+            verify_layer_quotas=getattr(config, "speculative_verify_prefetch_layer_quotas", None),
+            compact_control=getattr(config, "speculative_compact_control", True),
+            implementation=getattr(config, "speculative_execution_implementation", "reference"),
+            hybrid_phases=tuple(config.speculative_hybrid_phases) if hybrid else (),
+            hybrid_max_fetch=getattr(config, "moe_hybrid_max_fetch", -1),
+        )
+        options.update(overrides)
+        return cls(engine.moe_offload_cache, engine.stream, **options)
+
     def __init__(self, cache, stream, *, max_loops, max_rows, top_k=8, prefetch=True,
                  use_graph=False, audit=False, layer_quota=4, gap_capacity=0, compact_control=False,
                  implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
@@ -669,6 +730,9 @@ class GPUExpertCache:
         self.graph_replays, self.input_offset, self.profiler = 0, 0, None
         self.ledger = self
         self.active = False
+        self.prediction_hints = None
+        self.external_prefetch_layer = None
+        self.fixed_gpu_routes = None
         self.src_ptrs = torch.stack(cache._copy_src_ptrs) if getattr(cache, "_copy_fused_ok", False) else torch.tensor(
             [[sources[li].data_ptr() for sources, _ in cache.banks] for li in range(cache.num_layers)],
             dtype=torch.int64, device=cache.device)
@@ -712,9 +776,91 @@ class GPUExpertCache:
             if hasattr(executor._ext, "set_profile_workers"):
                 executor._ext.set_profile_workers(self.profile_hybrid_workers)
 
+    def prepare_fixed_hybrid(self, gpu_routes):
+        if type(gpu_routes) is not int or not 1 <= gpu_routes < self.top_k:
+            raise ValueError("fixed Hybrid GPU routes must leave work for both executors")
+        executor = self.cache.cpu_executor
+        maximum = max(self.max_rows, self.inner_rows)
+        if not executor._flag_sync or max(executor.grouped_widths, default=0) < maximum:
+            raise RuntimeError("fixed Hybrid requires registered grouped tasks for every width")
+        with torch.cuda.stream(self.stream):
+            if self.fixed_gpu_routes is None:
+                executor.validate_grouped_graph(self.stream)
+            self.fixed_gpu_routes = gpu_routes
+            for rows in range(1, maximum + 1):
+                if rows not in self.hybrid_outputs:
+                    self.hybrid_outputs[rows] = (
+                        torch.empty((rows, self.top_k), dtype=torch.int32, device=self.cache.device),
+                        torch.empty((rows, self.top_k), dtype=torch.float32, device=self.cache.device))
+            self.profile_hybrid = os.getenv("FREETOKEN_SPECULATIVE_HYBRID_TRACE", "0") == "1"
+            if hasattr(executor._ext, "set_profile_workers"):
+                executor._ext.set_profile_workers(self.profile_hybrid)
+
     def _new_plan(self):
         arrays = [torch.empty(self.plan_capacity, dtype=torch.int32, device=self.cache.device) for _ in range(3)]
         return (*arrays, torch.zeros(1, dtype=torch.int64, device=self.cache.device))
+
+    def reserve_verify_rows(self, rows):
+        if self.active or self.graphs:
+            raise RuntimeError("verify capacity must be reserved before active requests or capture")
+        if type(rows) is not int or rows < 1:
+            raise ValueError("verify rows must be positive")
+        if rows <= self.max_rows:
+            return
+        self.max_rows = rows
+        device = self.cache.device
+        self.control_device = torch.empty(max(rows, self.inner_rows) + 8, dtype=torch.int64, device=device)
+        self.control_host = torch.empty_like(self.control_device, device="cpu", pin_memory=True)
+        self.candidate_buffer = torch.empty(rows, dtype=torch.int32, device=device)
+        self.final_history = torch.full((self.cache.num_layers, rows, self.top_k), -1,
+                                        dtype=torch.int32, device=device)
+
+    def configure_external_prefetch(self, first_layer):
+        if self.active or self.graphs or not 0 < first_layer < self.cache.num_layers:
+            raise ValueError("suffix prefetch must be configured on an idle cache before capture")
+        self.external_prefetch_layer = first_layer
+        self.prediction_hints = torch.zeros_like(self.refs)
+        self.external_plan_arrays = [torch.empty_like(a) for a in self.layer_plan_arrays]
+        self.external_plan_counts = torch.zeros_like(self.layer_plan_counts)
+        self.external_plans = [(*(a[li] for a in self.external_plan_arrays),
+                                self.external_plan_counts[li:li + 1]) for li in range(self.cache.num_layers)]
+        # An external event remains a real wait node when a Draft target is captured.
+        self.external_prefetch_done = torch.cuda.Event(external=True)
+        self.external_prefetch_done.record(self.stream)
+
+    def capture_prefetch_hints(self):
+        if self.prediction_hints is None:
+            raise RuntimeError("suffix prefetch was not configured")
+        hints = self.prediction_hints.clone()
+        hints[:self.external_prefetch_layer].zero_()
+        self.prediction_hints.zero_()
+        return hints
+
+    def prefetch_suffix(self, hints, quota):
+        if not self.active or self.external_prefetch_layer is None:
+            raise RuntimeError("suffix prefetch requires an active configured cache")
+        if hints.shape != self.refs.shape or hints.device != self.refs.device or quota < 0:
+            raise ValueError("invalid suffix prefetch hints or quota")
+        self.join_external_prefetch()
+        queue = torch.where(hints > 0, -hints, 2147483647).to(torch.int32)
+        queue[:self.external_prefetch_layer].fill_(2147483647)
+        self.external_plan_counts.zero_()
+        for li in range(self.external_prefetch_layer, self.cache.num_layers):
+            self._allocate(li, self.external_plans[li], prefetch=True, quota=quota, queue=queue)
+        self.copy_stream.wait_stream(self.stream)
+        with torch.cuda.stream(self.copy_stream):
+            for li in range(self.external_prefetch_layer, self.cache.num_layers):
+                self._copy(li, self.external_plans[li], retire=False, kind="layer")
+            self.external_prefetch_done.record(self.copy_stream)
+        queue.record_stream(self.stream)
+
+    def join_external_prefetch(self):
+        if self.external_prefetch_layer is None:
+            return
+        self.stream.wait_event(self.external_prefetch_done)
+        _ready_layers[(self.cache.num_layers,)](self.pending, self.external_plan_arrays[1],
+            self.external_plan_counts, self.plan_capacity, triton.next_power_of_2(self.plan_capacity),
+            self.layer_offsets)
 
     @property
     def layer_prefetch_enabled(self):
@@ -727,6 +873,9 @@ class GPUExpertCache:
         self.refs.zero_()
         self.pending.zero_()
         self.layer_plan_counts.zero_()
+        if self.prediction_hints is not None:
+            self.prediction_hints.zero_()
+            self.external_plan_counts.zero_()
         if self.verify_prefetch_enabled:
             for plan in self.verify_plans:
                 plan[3].zero_()
@@ -760,7 +909,7 @@ class GPUExpertCache:
         self.cursor.fill_(loop)
 
     def _allocate(self, layer, plan, *, prefetch=False, gap=False, quota=0, verify_prefetch=False,
-                  control=None, pool=None, quota_remaining=None):
+                  control=None, pool=None, quota_remaining=None, queue=None):
         c = self.cache
         pool = c.pool_of_layer[layer] if pool is None else pool
         size = c.pool_sizes[pool]
@@ -771,7 +920,7 @@ class GPUExpertCache:
                      control=control) if self.optimize_admission else {}
         kernel[(1,)](c.slot_for_id, c._pool_id_of_slot[pool], c._pool_usage[pool], c.step,
             self.refs, self.pool_pending[pool],
-            self.demand, self.queue, *plan, self.error, self.counters, self.prefetched_device,
+            self.demand, self.queue if queue is None else queue, *plan, self.error, self.counters, self.prefetched_device,
             layer, c.num_experts, size, c.num_experts * c.num_layers,
             prefetch, quota, gap, triton.next_power_of_2(size),
             triton.next_power_of_2(c.num_experts * c.num_layers if layer < 0 else c.num_experts),
@@ -783,6 +932,9 @@ class GPUExpertCache:
         c = self.cache
         pool = c.pool_of_layer[layer]
         owners, slots, src, count = plan
+        recorder = getattr(self, "calibration_recorder", None)
+        if recorder is not None and recorder.current is not None and kind is None:
+            recorder.copy_begin(layer)
         index = (0 if getattr(self, "phase", "verify") == "preverify" else 1) if kind is None else {"layer": 2, "verify": 4}[kind]
         _count_copy_bytes[(1,)](count, self.transfer_bytes, index, self.expert_bytes[layer], self.layer_transfer_bytes[layer])
         if getattr(c, "_copy_fused_ok", False):
@@ -792,12 +944,10 @@ class GPUExpertCache:
         else:
             _copy_global[(8, len(c.banks))](self.src_ptrs, self.pool_dst_ptrs[pool], self.pool_feature_bytes[pool],
                 owners, slots, count, c.num_experts, len(c.banks), 256)
+        if recorder is not None and recorder.current is not None and kind is None:
+            recorder.copy_end(layer)
         if retire:
             _ready[(1,)](self.pool_pending[pool], slots, count, triton.next_power_of_2(self.plan_capacity))
-        recorder = getattr(self, "calibration_recorder", None)
-        if recorder is not None and kind in ("layer", "verify"):
-            recorder.mark("prefetch_copy_done", layer if kind == "layer" else layer - 1,
-                          stream=self.copy_stream)
 
     def _plan_gap(self, control=None):
         self.gap_remaining.fill_(max(0, self.gap_capacity - 1))
@@ -843,6 +993,8 @@ class GPUExpertCache:
 
     def route(self, layer, hidden, weights, ids):
         c, li, rows = self.cache, layer.layer_id, hidden.shape[0]
+        if li == self.external_prefetch_layer:
+            self.join_external_prefetch()
         pool = c.pool_of_layer[li]
         pending = self.pool_pending[pool]
         pool_size = c.pool_sizes[pool]
@@ -851,9 +1003,6 @@ class GPUExpertCache:
         if ids.shape != (rows, self.top_k) or weights.shape != ids.shape:
             raise ValueError("GPU speculative route shape mismatch")
         ids, weights = ids.contiguous(), weights.contiguous()
-        recorder = getattr(self, "calibration_recorder", None)
-        if recorder is not None:
-            recorder.mark("route_ready", li)
         if self.phase == "verify" and self.verify_prefetch_enabled and self.verify_layer_quotas[li]:
             self.join_verify(li)
         # Batch fences replace per-expert host polling and join every captured fork.
@@ -876,7 +1025,7 @@ class GPUExpertCache:
             self.preverify_policy.kind == "modes", self.preverify_top_k,
             self.importance, self.preverify_policy.tau, RETAIN_ROUTES=self.retain_routes,
             selected_mask=self.route_masks[key], transfer_bytes=self.transfer_bytes, EXPERT_BYTES=self.expert_bytes[li],
-            layer_transfer_bytes=self.layer_transfer_bytes[li])
+            layer_transfer_bytes=self.layer_transfer_bytes[li], prediction_hints=self.prediction_hints)
         identity = None
         if self.phase == "preverify" and self.preverify_policy.replacement == "identity":
             # Snapshot the contribution before Hybrid rewrites selected weights or GEMM overwrites hidden.
@@ -916,22 +1065,28 @@ class GPUExpertCache:
         if hybrid:
             from .speculative_hybrid import _partition
 
-            if self.hybrid_tables is None:
+            fixed = self.fixed_gpu_routes if self.phase == "verify" else None
+            if fixed is None and self.hybrid_tables is None:
                 raise RuntimeError("speculative Hybrid must be calibrated before capture")
             cpu_ids, cpu_weights = self.hybrid_outputs[rows]
-            tables = (self.hybrid_tables_by_layout[c.layer_layout[li]]
-                      if self.hybrid_tables_by_layout else self.hybrid_tables)
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_push(f"HYBRID/PLAN/{self.phase}/layer={li}/rows={rows}")
-            _partition[(1,)](c.slot_for_id, c._pool_id_of_slot[pool], c._pool_usage[pool], c.step, self.refs, pending,
-                ids, selected, cpu_ids, cpu_weights, slots, self.demand, *self.plans[0],
-                tables["cpu"], tables["gpu"], tables["fixed"], tables["dispatch"], tables["gpu_fixed"], tables["io"], tables["dram"], self.counters,
-                li, c.num_experts, pool_size, rows, self.top_k,
-                max(self.max_rows, self.inner_rows) * self.top_k, self.hybrid_max_fetch,
-                triton.next_power_of_2(c.num_experts), triton.next_power_of_2(pool_size),
-                triton.next_power_of_2(max(self.max_rows, self.inner_rows) * self.top_k), triton.next_power_of_2(c.num_experts + 1),
-                self.phase == "preverify", valid_rows, cache_conflict=self.cache_conflict,
-                num_warps=8 if pool_size >= 2048 else 4)
+            if fixed is not None:
+                _fixed_hybrid_partition[(1,)](ids, selected, cpu_ids, cpu_weights, self.demand, self.counters,
+                    rows, self.top_k, fixed, c.num_experts, triton.next_power_of_2(rows),
+                    triton.next_power_of_2(self.top_k), triton.next_power_of_2(c.num_experts))
+            else:
+                tables = (self.hybrid_tables_by_layout[c.layer_layout[li]]
+                          if self.hybrid_tables_by_layout else self.hybrid_tables)
+                _partition[(1,)](c.slot_for_id, c._pool_id_of_slot[pool], c._pool_usage[pool], c.step, self.refs, pending,
+                    ids, selected, cpu_ids, cpu_weights, slots, self.demand, *self.plans[0],
+                    tables["cpu"], tables["gpu"], tables["fixed"], tables["dispatch"], tables["gpu_fixed"], tables["io"], tables["dram"], self.counters,
+                    li, c.num_experts, pool_size, rows, self.top_k,
+                    max(self.max_rows, self.inner_rows) * self.top_k, self.hybrid_max_fetch,
+                    triton.next_power_of_2(c.num_experts), triton.next_power_of_2(pool_size),
+                    triton.next_power_of_2(max(self.max_rows, self.inner_rows) * self.top_k), triton.next_power_of_2(c.num_experts + 1),
+                    self.phase == "preverify", valid_rows, cache_conflict=self.cache_conflict,
+                    num_warps=8 if pool_size >= 2048 else 4)
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("HYBRID/CPU_D2H_READY")
@@ -942,7 +1097,12 @@ class GPUExpertCache:
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_pop()
                 torch.cuda.nvtx.range_push("HYBRID/GPU_WEIGHT_IO")
+            if fixed is not None:
+                self._allocate(li, self.plans[0])
             self._copy(li, self.plans[0])
+            if fixed is not None:
+                _resolve[(1,)](c.slot_for_id, pending, ids, slots, selected, *self.plans[0][1::2],
+                    li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()), valid_rows, self.top_k)
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_pop()
         else:
@@ -950,10 +1110,6 @@ class GPUExpertCache:
             self._copy(li, self.plans[0])
             _resolve[(1,)](c.slot_for_id, pending, ids, slots, selected, *self.plans[0][1::2],
                 li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()), valid_rows, self.top_k)
-        recorder = getattr(self, "calibration_recorder", None)
-        if last and recorder is not None:
-            recorder.record_compute(layer, hidden, selected, slots, ids)
-            recorder.mark("fork_ready", li)
         quota = self.layer_quotas[li] if self.layer_quotas is not None else self.layer_quota
         if last and self.phase == "preverify" and self.prefetch and quota:
             plan = self.layer_plans[li] if self.cross_layer_prefetch else self.plans[1]
@@ -974,8 +1130,6 @@ class GPUExpertCache:
             torch.cuda.nvtx.range_push("HYBRID/GPU_EXPERT_COMPUTE")
         result = layer._expert_gemm(c, hidden, selected, slots, views=c.pool_bank_views(li), n=None,
                                     alphas=c.alphas_for_slots(li), is_prefill=False)
-        if last and recorder is not None:
-            recorder.mark("compute_done", li)
         if hybrid and self.profile_hybrid:
             torch.cuda.nvtx.range_pop()
         if hybrid:
@@ -1068,9 +1222,6 @@ class GPUExpertCache:
                         _ready[(1,)](self.pool_pending[pool], plan[1], plan[3],
                                       triton.next_power_of_2(self.plan_capacity))
             self.gap_active = self.cross_layer_prefetch
-            recorder = getattr(self, "calibration_recorder", None)
-            if recorder is not None:
-                recorder.gap_copied(self.copy_stream)
             self.gap_planned = False
         self.queue.fill_(2147483647)
 
@@ -1113,6 +1264,7 @@ class GPUExpertCache:
         if self.gap_planned:
             self.finish_loop(False)
         self.stream.wait_stream(self.copy_stream)
+        self.join_external_prefetch()
         if self.cpu_stream is not None:
             with torch.cuda.stream(self.cpu_stream):
                 self.cache.cpu_executor.drain_pending()

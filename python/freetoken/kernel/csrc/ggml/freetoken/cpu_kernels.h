@@ -28,14 +28,20 @@ int ft_ggml_cpu_row_kernel(int type, int64_t k, struct ft_ggml_row_kernel * out)
 
 const char * ft_ggml_type_name(int type);
 
+// One packed weight row against two quantized activation rows; out has two floats.
+int ft_ggml_cpu_dot2(int type, int n, float * out, const void * weight,
+                    const void * activation0, const void * activation1);
+
 // One variant's functions, as its module's api() hands them to _cpu_moe.set_ggml_cpu.
-#define FT_GGML_CPU_ABI 1
+#define FT_GGML_CPU_ABI 2
 struct ft_ggml_cpu_api {
     int abi;           // FT_GGML_CPU_ABI of the module that built it
     const char * name; // the variant, e.g. "haswell"
     void (*init)(void);
     int (*row_kernel)(int type, int64_t k, struct ft_ggml_row_kernel * out);
     const char * (*type_name)(int type);
+    int (*dot2)(int type, int n, float * out, const void * weight,
+                const void * activation0, const void * activation1);
 };
 
 #ifdef __cplusplus

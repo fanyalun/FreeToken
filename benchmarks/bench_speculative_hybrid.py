@@ -210,7 +210,6 @@ def main():
         config["initialization_seconds"] = time.perf_counter() - initialization_started
         plan = getattr(engine, "baseline_sd_memory_plan", None)
         config["memory_plan"] = plan.as_dict() if plan is not None else None
-        config["final_warmup_peak_bytes"] = getattr(engine, "baseline_sd_final_peak_bytes", None)
         executor = engine.cpu_moe_executor
         experts = runner.three_level.experts if runner.three_level is not None else None
         if args.profile and executor is not None:

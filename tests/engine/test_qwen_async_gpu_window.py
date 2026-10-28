@@ -7,7 +7,9 @@ import torch
 
 from freetoken.engine.qwen_async_three_level import GpuCandidateBlock, QwenAsyncGpuWindow
 from freetoken.engine.qwen_cpu_target import CpuVerifyResult, PrefixCheckpoint
-from freetoken.engine.speculative import SpeculativeFrontier
+from freetoken.engine.speculative import SpeculativeFrontier, greedy_commit
+from freetoken.engine.speculative_state import TargetStateAdapter
+from freetoken.moe.preverify_policy import PreverifyPolicy
 
 
 def window(monkeypatch):
@@ -15,14 +17,16 @@ def window(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda _: None))
     calls = []
     r = SimpleNamespace(frontier=SpeculativeFrontier(1, 5, 5, 64), _reserved_len=64,
-        next_draft=None, last_draft_hidden=None, seed_token=torch.empty(1, dtype=torch.int32),
+        next_draft=None, last_draft_hidden=None, use_graph=False, seed_token=torch.empty(1, dtype=torch.int32),
         seed_hidden=torch.empty(1, 4))
     r._reserve = lambda end: calls.append(("reserve", end))
-    r._batch = lambda ids, start: SimpleNamespace(input_ids=ids, start=start)
-    def execute(phase, batch, hidden, *, need_logits=True, last_only=False):
+    r._batch = lambda ids, start, **kwargs: SimpleNamespace(input_ids=ids, start=start)
+    def execute(phase, batch, hidden, *, count=None, need_logits=True, last_only=False):
         calls.append((phase, batch.start, batch.input_ids.clone(), hidden.clone(), need_logits, last_only))
         tokens = batch.input_ids + 1000 if need_logits else None
         output = hidden + 1000
+        if count is not None:
+            return tokens[count - 1:count], output[count - 1:count]
         return (tokens[-1:], output[-1:]) if last_only else (tokens, output)
     r._execute = execute
     keys, values = torch.zeros(64, 1, 1, 4), torch.zeros(64, 1, 1, 4)
@@ -31,7 +35,8 @@ def window(monkeypatch):
             model_config=SimpleNamespace(num_layers=2, is_linear_layer=lambda i: i == 0)),
         kv_cache=SimpleNamespace(k_cache=lambda _: keys, v_cache=lambda _: values),
         linear_state_pool=SimpleNamespace(recurrent_states=torch.zeros(1, 2, 2, 4, 4),
-                                         conv_states=torch.zeros(1, 2, 16, 3)))
+                                         conv_states=torch.zeros(1, 2, 16, 3)),
+        model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[]))))
     w = QwenAsyncGpuWindow.__new__(QwenAsyncGpuWindow)
     w.runner, w.engine, w.active = r, e, True
     w.instrument_components = True
@@ -40,10 +45,16 @@ def window(monkeypatch):
     w.output_end = 64
     w.private_pool = SimpleNamespace(recurrent_states=torch.zeros(1, 1, 2, 4, 4),
                                      conv_states=torch.zeros(1, 1, 16, 3))
+    w.state_adapter = TargetStateAdapter(e)
+    w.replay_rows = 8
+    w.policy = PreverifyPolicy(top_k=6)
     w.states = {i: SimpleNamespace(commit=lambda count, width=i: calls.append(("commit", width, int(count))))
                 for i in range(1, 9)}
-    w.experts = SimpleNamespace(check_error=lambda: None, preverify_top_k=6, keep_hits=False)
+    r._commit_state = lambda state, count: state.commit(count)
+    w.experts = SimpleNamespace(check_error=lambda: None, preverify_top_k=6, keep_hits=False,
+                                reset_request_metrics=lambda: None, demand_fence=False, audit=False)
     w.token_buffer = torch.empty(8, dtype=torch.int32)
+    w.current = torch.empty(1, dtype=torch.int32)
     w.shift_buffer = torch.empty_like(w.token_buffer)
     w.hidden_buffer = torch.empty(8, 4)
     w.count_buffer = torch.empty((), dtype=torch.int32)
@@ -245,10 +256,10 @@ def test_recheck_clips_physical_output_capacity(monkeypatch):
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_recheck_forces_top4_and_ready_hits_then_restores_generation_policy(monkeypatch, fail):
+def test_recheck_preserves_configured_generation_policy(monkeypatch, fail):
     w, _, _, _ = window(monkeypatch)
     def forward(ids, start):
-        assert (w.experts.preverify_top_k, w.experts.keep_hits) == (4, True)
+        assert (w.experts.preverify_top_k, w.experts.keep_hits) == (6, False)
         if fail:
             raise RuntimeError("forward failed")
         return ids + 1, ids.float().unsqueeze(1).repeat(1, 4)
@@ -379,53 +390,257 @@ def test_common_execute_skips_target_head_and_projects_one_mtp_row():
     assert calls == [("mtp", 1)] and final.shape == (1, 4) and tokens.shape == (1,)
 
 
-def test_gpu_window_widths_share_scratch_and_keep_formal_state_independent(monkeypatch):
+@pytest.mark.parametrize("max_seq_len", [4, 64])
+def test_gpu_window_widths_share_scratch_and_keep_formal_state_independent(monkeypatch, max_seq_len):
     import freetoken.engine.qwen_async_three_level as module
 
     cache = object()
-    monkeypatch.setattr(module, "GPUExpertCache", lambda *args, **kwargs: SimpleNamespace(cache=cache))
+    monkeypatch.setattr(module, "GPUExpertCache", SimpleNamespace(
+        from_engine=lambda *args, **kwargs: SimpleNamespace(cache=cache)))
     monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: object())
     pool = SimpleNamespace(recurrent_states=torch.zeros(1, 2, 2, 4, 4),
         conv_states=torch.zeros(1, 2, 16, 3, dtype=torch.bfloat16), local_index=lambda _: 0, num_slots=2)
     config = SimpleNamespace(tp_info=SimpleNamespace(size=1), dtype=torch.bfloat16,
         page_size=1, cache_type="naive", max_running_req=1, moe_strategy="offload",
-        speculative_mtp_depth=3,
-        model_config=SimpleNamespace(num_layers=40, hidden_size=2048, num_experts_per_tok=8))
+        speculative_mtp_depth=3, model_path="unused", speculative_prefetch=False,
+        speculative_prefetch_layer_experts=0, speculative_prefetch_layer_quotas=None,
+        speculative_prefetch_gap_capacity=0, moe_hybrid_max_fetch=-1,
+        model_config=SimpleNamespace(num_layers=40, num_moe_layers=40, hidden_size=2048,
+                                    num_experts_per_tok=8))
     engine = SimpleNamespace(config=config, moe_offload_cache=cache, stream=None,
-        linear_state_pool=pool, device=torch.device("cpu"),
+        linear_state_pool=pool, device=torch.device("cpu"), max_seq_len=max_seq_len,
         model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[]))))
     reservations = []
     runner = SimpleNamespace(engine=engine, mtp_enabled=True, three_level=None, use_graph=False,
                              reserve_eager_width=reservations.append)
     w = QwenAsyncGpuWindow(runner)
-    assert reservations == [8]
+    rows = min(8, max_seq_len)
+    assert reservations == [rows]
     assert w.private_pool.recurrent_states.data_ptr() != pool.recurrent_states[:, 1:2].data_ptr()
     assert w.private_pool.conv_states.data_ptr() != pool.conv_states[:, 1:2].data_ptr()
     for state in w.states.values():
         assert state.pool is w.private_pool
-        assert state.conv_windows.data_ptr() == w.states[8].conv_windows.data_ptr()
-        assert [t.data_ptr() for t in state.replay_inputs] == [t.data_ptr() for t in w.states[8].replay_inputs]
-    assert len(w.reader_events) == 2 and w.token_buffer.shape == (8,)
+        assert state.conv_windows.data_ptr() == w.states[rows].conv_windows.data_ptr()
+        assert [t.data_ptr() for t in state.replay_inputs] == [t.data_ptr() for t in w.states[rows].replay_inputs]
+    assert len(w.reader_events) == 2 and w.token_buffer.shape == (rows,)
 
 
-def test_budget_rejects_peak_overflow_and_changed_cache_without_shrinking(monkeypatch):
+def test_shared_expert_factory_keeps_decode_policy_overrides(monkeypatch):
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    monkeypatch.setattr(GPUExpertCache, "__init__", lambda self, cache, stream, **options:
+                        self.__dict__.update(cache=cache, stream=stream, options=options))
+    config = SimpleNamespace(model_config=SimpleNamespace(num_experts_per_tok=8),
+        moe_strategy="hybrid", speculative_expert_scheduler="gpu",
+        speculative_prefetch=True, speculative_audit=True,
+        speculative_prefetch_layer_experts=2, speculative_prefetch_layer_quotas=(2, 0),
+        speculative_verify_prefetch_layer_experts=3,
+        speculative_verify_prefetch_layer_quotas=(0, 3),
+        speculative_prefetch_gap_capacity=5, speculative_prefetch_demand_fence=True,
+        speculative_compact_control=False, speculative_execution_implementation="reference",
+        speculative_hybrid_phases=("verify",), moe_hybrid_max_fetch=1)
+    engine = SimpleNamespace(config=config, moe_offload_cache=object(), stream=object())
+    policy = PreverifyPolicy(top_k=6)
+    controller = GPUExpertCache.from_engine(engine, max_loops=1, max_rows=8, inner_rows=8,
+        use_graph=True, preverify_policy=policy, compact_control=True,
+        implementation="optimized", hybrid_phases=("preverify",))
+    assert controller.cache is engine.moe_offload_cache and controller.stream is engine.stream
+    assert controller.options == dict(max_loops=1, max_rows=8, inner_rows=8,
+        use_graph=True, preverify_policy=policy, top_k=8, prefetch=True, audit=True,
+        layer_quota=2, layer_quotas=(2, 0), gap_capacity=5, demand_fence=True,
+        verify_layer_quota=3, verify_layer_quotas=(0, 3), compact_control=True,
+        implementation="optimized", hybrid_phases=("preverify",), hybrid_max_fetch=1)
+
+
+@pytest.mark.parametrize("reserve,initial,explicit,capacity", [
+    (0, 0, 600, 550), (100, 0, 600, 600), (100, 70, 600, 530), (100, 0, None, 650)])
+def test_budget_rejects_peak_overflow_and_changed_cache_without_shrinking(
+        monkeypatch, reserve, initial, explicit, capacity):
     cache = SimpleNamespace(cache_size=4907)
     w = QwenAsyncGpuWindow.__new__(QwenAsyncGpuWindow)
     w.experts = SimpleNamespace(cache=cache)
     w.engine = SimpleNamespace(device="cuda:0", moe_offload_cache=cache,
-        _baseline_allocated=0, _physical_baseline_free=1000,
-        config=SimpleNamespace(gpu_memory_budget_bytes=600),
-        baseline_sd_memory_plan=SimpleNamespace(budget_bytes=550))
+        _baseline_allocated=0, _physical_baseline_free=1000, _budget_initial_used=initial,
+        config=SimpleNamespace(gpu_memory_budget_bytes=explicit),
+        baseline_sd_memory_plan=SimpleNamespace(budget_bytes=550, runtime_reserve_bytes=reserve))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: 400)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (600, 1000))
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: 500)
     w.validate_budget()
     assert w.gpu_peak_bytes == 500
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: 551)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: capacity)
+    w.validate_budget()
+    assert w.gpu_peak_bytes == capacity
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: capacity + 1)
     with pytest.raises(ValueError, match="exceeds fixed budget"):
         w.validate_budget()
     assert cache.cache_size == 4907
     w.engine.moe_offload_cache = object()
     with pytest.raises(RuntimeError, match="runtime cache rebuild"):
         w.validate_budget()
+
+
+def test_graph_preparation_covers_partial_windows_and_rejects_replaced_private_state(monkeypatch):
+    w, calls, _, _ = window(monkeypatch)
+    r, e = w.runner, w.engine
+    w.active = r.active = False
+    r.use_graph = True
+    r.graphs = {}
+    r.draft_width = 4
+    r.eos_mask = torch.zeros(64, dtype=torch.bool)
+    r._shared_indices = torch.arange(64)
+    w.recheck_eos_mask = torch.zeros_like(r.eos_mask)
+    w.graph_signature = None
+    e.mtp = object()
+    e.page_table = torch.arange(64).reshape(1, 64)
+    e.num_pages = e.max_seq_len = 64
+    e.config.speculative_graph_implementation = "full"
+    e.config.speculative_execution_implementation = "optimized"
+    e.config.speculative_prefetch = False
+    e.moe_offload_cache = SimpleNamespace(banks=(("weights", torch.zeros(4)),),
+        pool_sizes=(4,), pool_of_layer=(0,), reset=lambda: None)
+    w.experts.begin = lambda _: None
+    w.experts.set_phase = lambda *args: None
+    w.experts.finish_loop = lambda _: None
+    w.experts.close = lambda **kwargs: None
+    w.experts.read_control = lambda tokens, commit: [
+        int(commit.input_count), int(commit.accepted_drafts), int(commit.terminal),
+        0, 0, 0, 0, 0, *tokens.tolist()]
+    w.validate_budget = lambda: None
+    w._lossy = lambda ids, start: (ids + 1, ids.float().unsqueeze(1).repeat(1, 4))
+    acceptance = []
+
+    def accept(proposal, verified, remaining, eos_ids, *, eos_mask=None):
+        acceptance.append((verified.token_ids.numel(), eos_mask is w.recheck_eos_mask))
+        return greedy_commit(proposal, verified, remaining=remaining, eos_ids=eos_ids, eos_mask=eos_mask)
+
+    r._accept = accept
+    w.prepare_graphs()
+    commits = [c for c in calls if c[0] == "commit"]
+    assert {c[1] for c in commits} == set(range(1, 9))
+    assert all(c[2] == 0 for c in commits)
+    assert set(acceptance) == {(n, True) for n in range(1, 9)} | {(n, False) for n in range(1, 5)}
+    refreshes = [c for c in calls if c[0] == "cpu_async_refresh"]
+    assert {(len(c[2]), *c[4:]) for c in refreshes} == {
+        (n, final, final) for n in range(1, 9) for final in (False, True)}
+    assert {len(c[2]) for c in calls if c[0] == "reconcile"} == set(range(1, 5))
+    assert [len(c[2]) for c in calls if c[0] == "chain"] == [1]
+    before = len(calls)
+    w.prepare_graphs()
+    assert len(calls) == before
+    r.active = True
+    with pytest.raises(RuntimeError, match="idle runner"):
+        w.prepare_graphs()
+    r.active = False
+    w.private_pool.recurrent_states = w.private_pool.recurrent_states.clone()
+    with pytest.raises(RuntimeError, match="storage or configuration changed"):
+        w.prepare_graphs()
+    assert len(calls) == before
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA prefix compact-state roundtrip")
+@pytest.mark.parametrize("key_dim", [4, 128])
+@pytest.mark.parametrize("v2", [False, True])
+def test_split_prefix_dma_installs_accepted_row_and_preserves_suffix_state(key_dim, v2):
+    from freetoken.engine.cpu_async_split import PrefixStateTransfer
+    from freetoken.engine.qwen_cpu_target import CpuPrefixResult, VerifyJob
+    from freetoken.engine.qwen_split_verify import SplitVerifyResult
+    from freetoken.kernel import _cpu_moe
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.Stream(device=device)
+    rows, history, heads = 4, 3, 2
+    channels = 4 * key_dim
+    generator = torch.Generator().manual_seed(41)
+    slots = []
+    for _ in range(2):
+        slots.append({name: torch.zeros(shape, dtype=dtype).share_memory_()
+            for name, shape, dtype in (
+                ("hidden", (rows, 4), torch.bfloat16),
+                ("keys", (2, 8, 1, 8), torch.bfloat16),
+                ("values", (2, 8, 1, 8), torch.bfloat16),
+                ("prefix_replay", (2, rows, heads, 2 * key_dim + 2), torch.float32),
+                ("prefix_conv", (2, channels, history + rows), torch.bfloat16))})
+    keys = {layer: torch.full((10, 1, 1, 8), -7, device=device, dtype=torch.bfloat16)
+            for layer in (1, 3, 5)}
+    values = {layer: torch.full_like(tensor, -8) for layer, tensor in keys.items()}
+    expected_keys = {layer: tensor.clone() for layer, tensor in keys.items()}
+    expected_values = {layer: tensor.clone() for layer, tensor in values.items()}
+    initial = torch.randn(2, heads, key_dim, key_dim, generator=generator)
+    expected_recurrent = initial.clone()
+    pool = SimpleNamespace(recurrent_states=torch.full((3, 2, heads, key_dim, key_dim), 91., device=device),
+        conv_states=torch.full((3, 2, channels, history), 92., device=device, dtype=torch.bfloat16),
+        local_index=lambda layer: layer // 2, num_slots=2)
+    pool.recurrent_states[:2, 1].copy_(initial.to(device))
+    engine = SimpleNamespace(device=device, stream=stream, linear_state_pool=pool,
+        config=SimpleNamespace(cpu_async_loops=1, speculative_mtp_depth=2, cpu_async_prefix_layers=4,
+            cpu_async_kernel_profile="ggml_v2" if v2 else "v1",
+            cpu_async_kernel_components=("gdn",) if v2 else (),
+            model_config=SimpleNamespace(is_linear_layer=lambda layer: layer in (0, 2, 4))),
+        model=SimpleNamespace(model=SimpleNamespace(layers=SimpleNamespace(op_list=[]))),
+        kv_cache=SimpleNamespace(k_cache=keys.__getitem__, v_cache=values.__getitem__))
+    adapter = TargetStateAdapter(engine)
+    refreshed = []
+    runner = SimpleNamespace(_reserve=lambda end: None, _reserved_len=10)
+    window = SimpleNamespace(epoch=7, canonical_length=2, canonical_anchor=20, output_end=10,
+        runner=runner, state_adapter=adapter, private_pool=adapter.private_pool(), replay_rows=8,
+        reader_events=[torch.cuda.Event(), torch.cuda.Event()], reader_generation=0,
+        _refresh=lambda phase, tokens, hidden, begin, final: refreshed.append(
+            (tuple(tokens), hidden.clone(), begin, final)))
+    transfer = PrefixStateTransfer(engine, SimpleNamespace(slots=slots))
+    try:
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            for tensor in transfer.buffers.values():
+                tensor.fill_(-99)
+        for generation, (slot_id, width, count) in enumerate(((0, 3, 2), (1, 4, 4), (0, 2, 1))):
+            slot, start = slots[slot_id], window.canonical_length
+            for field_index, field in enumerate(("keys", "values")):
+                for layer in range(2):
+                    for row in range(width):
+                        slot[field][layer, row].fill_(64 * generation + 10 * (field_index + 1) + 8 * layer + 2 * row)
+            replay = slot["prefix_replay"][:, :width]
+            replay.copy_(torch.randn(replay.shape, generator=generator))
+            replay[..., :key_dim].div_(replay[..., :key_dim].norm(dim=-1, keepdim=True))
+            replay[..., -2].sigmoid_()
+            replay[..., -1].sigmoid_()
+            slot["prefix_conv"].copy_(torch.randn(slot["prefix_conv"].shape, generator=generator))
+            native_replay = _cpu_moe.target_replay_v2 if v2 else _cpu_moe.target_replay
+            for layer in range(2):
+                native_replay(expected_recurrent[layer], replay[layer], count)
+            expected_conv = slot["prefix_conv"][:, :, count:count + history].clone()
+            tokens = tuple(range(50, 50 + count))
+            hidden = torch.arange(count * 4, device=device, dtype=torch.bfloat16).reshape(count, 4)
+            job = VerifyJob(7, generation, start, window.canonical_anchor, tuple(range(21, 21 + width - 1)), 8)
+            prefix = CpuPrefixResult(7, generation, start, width, slot["hidden"][:width], slot["keys"][:, :width],
+                slot["values"][:, :width], replay, slot["prefix_conv"][:, :, :history + width], job)
+            verified = SplitVerifyResult(7, generation, start, count - 1, count, tokens, False, hidden,
+                torch.arange(50, 50 + width, device=device, dtype=torch.int32))
+            stream.wait_stream(torch.cuda.current_stream(device))
+            transfer.stage(prefix)
+            result, reader = transfer.install(window, prefix, verified)
+            reader.synchronize()
+            for name, tensor in transfer.buffers.items():
+                if name == "conv":
+                    assert torch.equal(tensor[:, :, :history + width].cpu(), prefix.conv)
+                else:
+                    assert torch.equal(tensor[:, :width].cpu(), getattr(prefix, name))
+            for bank, layer in enumerate((1, 3)):
+                expected_keys[layer][start:start + count, 0].copy_(slot["keys"][bank, :count].to(device))
+                expected_values[layer][start:start + count, 0].copy_(slot["values"][bank, :count].to(device))
+            assert all(torch.equal(keys[layer], expected_keys[layer]) for layer in keys)
+            assert all(torch.equal(values[layer], expected_values[layer]) for layer in values)
+            assert torch.equal(pool.recurrent_states[:2, 1].cpu().view(torch.int32),
+                               expected_recurrent.view(torch.int32))
+            assert torch.equal(pool.conv_states[:2, 1].cpu(), expected_conv)
+            assert torch.equal(pool.recurrent_states[2, 1], torch.full_like(pool.recurrent_states[2, 1], 91))
+            assert torch.equal(pool.conv_states[2, 1], torch.full_like(pool.conv_states[2, 1], 92))
+            assert torch.equal(window.private_pool.recurrent_states, pool.recurrent_states[:, 1:2])
+            assert torch.equal(window.private_pool.conv_states, pool.conv_states[:, 1:2])
+            assert (result.checkpoint.length, result.tokens, window.canonical_length) == (start + count, tokens, start + count)
+            assert refreshed[-1][0] == tokens and refreshed[-1][2:] == (start, True)
+            assert torch.equal(refreshed[-1][1], hidden)
+    finally:
+        transfer.close()
+    assert transfer.registered == [] and transfer.closed

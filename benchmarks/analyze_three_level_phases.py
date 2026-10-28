@@ -59,7 +59,8 @@ def analyze_phases(root):
         def trajectory(row):
             return [(window["drafted"], window["accepted"], window["returned"],
                      [(loop["drafted"], loop["accepted"], loop["returned"])
-                      for loop in window.get("loops", [])]) for window in row["rounds"]]
+                      for loop in window.get("loops", [])], window.get("draft_tail"),
+                     window.get("draft_loop_count")) for window in row["rounds"]]
         windows = [window for row in timings for window in row["rounds"]]
         loops = [window["loop_count"] for window in windows if "loop_count" in window]
         normal_windows = []

@@ -87,7 +87,8 @@ def summarize(root):
             directions = [v < b for v, b in zip(value["repeat_tpot_ms"], base["repeat_tpot_ms"])]
             left, right = audit_rows[base_name], audit_rows[name]
             route_trace = lambda requests: [[w.get("routes") for w in r["rounds"]] for r in requests]
-            accept_trace = lambda requests: [[(w["accepted"], w["drafted"], w.get("loops"))
+            accept_trace = lambda requests: [[(w["accepted"], w["drafted"], w.get("loops"),
+                                               w.get("draft_tail"), w.get("draft_loop_count"))
                                               for w in r["rounds"]] for r in requests]
             comparisons[name] = dict(baseline=base_name, tpot_reduction_percent=100 * gain,
                 all_three_rounds_improve=all(directions), throughput_nondecreasing=value["throughput"] >= base["throughput"],

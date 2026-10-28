@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,7 @@
 
 #include "../format.h"
 #include "cpu_kernels.h"
+#include "../../ggml/include/ggml.h"
 
 namespace freetoken::cpu_moe {
 namespace {
@@ -20,11 +22,28 @@ const ft_ggml_cpu_api& ggml_api() {
   return *api;
 }
 
+using Dot2 = decltype(ft_ggml_cpu_api::dot2);
+
+Dot2 paired_dot(const ft_ggml_cpu_api& api, int type) {
+  static const bool enabled = [] {
+    const char* value = std::getenv("FREETOKEN_CPU_GGUF_DOT2");
+    return value == nullptr || std::string(value) != "0";
+  }();
+  return enabled && type == GGML_TYPE_Q4_K && api.abi >= 2 ? api.dot2 : nullptr;
+}
+
+void dot_pair(Dot2 dot2, const ft_ggml_row_kernel& kernel, int type, int n,
+              float* out, const void* weight, const void* x0, const void* x1) {
+  if (dot2(type, n, out, weight, x0, x1) == FT_GGML_OK) return;
+  kernel.vec_dot(n, out, 0, weight, 0, x0, 0, 1);
+  kernel.vec_dot(n, out + 1, 0, weight, 0, x1, 0, 1);
+}
+
 }  // namespace
 
 void set_ggml_cpu(uintptr_t addr) {
   const auto* api = reinterpret_cast<const ft_ggml_cpu_api*>(addr);
-  if (api == nullptr || api->abi != FT_GGML_CPU_ABI) throw std::invalid_argument("set_ggml_cpu: not a ggml-cpu kernel table of this build");
+  if (api == nullptr || (api->abi != 1 && api->abi != FT_GGML_CPU_ABI)) throw std::invalid_argument("set_ggml_cpu: not a ggml-cpu kernel table of this build");
   const ft_ggml_cpu_api* prev = nullptr;
   if (!g_ggml.compare_exchange_strong(prev, api) && prev != api)
     throw std::invalid_argument(std::string("set_ggml_cpu: this process already uses the ") + prev->name + " ggml-cpu variant");
@@ -38,6 +57,7 @@ torch::Tensor gguf_linear(torch::Tensor x, torch::Tensor weight, int type, int i
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && weight.dim() == 2 && x.size(1) == inputs,
               "GGUF CPU linear input geometry");
   const auto& api = ggml_api();
+  const auto dot2 = paired_dot(api, type);
   ft_ggml_row_kernel kernel{};
   TORCH_CHECK(api.row_kernel(type, inputs, &kernel) == FT_GGML_OK, "unsupported GGUF CPU linear type or row width");
   TORCH_CHECK(static_cast<size_t>(weight.size(1) * weight.element_size()) == kernel.row_bytes,
@@ -61,18 +81,23 @@ torch::Tensor gguf_linear(torch::Tensor x, torch::Tensor weight, int type, int i
     for (int b = first; b < last; ++b) {
       if (argmax) for (int r = 0; r < rows; ++r) indices[b * rows + r] = b * tile;
       for (int o = b * tile; o < std::min(outputs, (b + 1) * tile); ++o)
-        for (int r = 0; r < rows; ++r) {
-          float value;
-          kernel.vec_dot(inputs, &value, 0, wp + (size_t)o * kernel.row_bytes, 0,
-                         quant.data() + (size_t)r * kernel.act_row_bytes, 0, 1);
-          const bf16_t rounded = f32_to_bf16(value);
-          if (yp) yp[(size_t)r * outputs + o] = rounded;
-          else {
-            const float v = bf16_to_f32(rounded);
-            const int i = b * rows + r;
-            if (v > maxima[i] || (std::isnan(v) && !std::isnan(maxima[i]))) {
-              maxima[i] = v;
-              indices[i] = o;
+        for (int r = 0; r < rows;) {
+          float values[2];
+          const int count = dot2 && r + 1 < rows ? 2 : 1;
+          const auto* weight_row = wp + (size_t)o * kernel.row_bytes;
+          const auto* input = quant.data() + (size_t)r * kernel.act_row_bytes;
+          if (count == 2) dot_pair(dot2, kernel, type, inputs, values, weight_row, input, input + kernel.act_row_bytes);
+          else kernel.vec_dot(inputs, values, 0, weight_row, 0, input, 0, 1);
+          for (int j = 0; j < count; ++j, ++r) {
+            const bf16_t rounded = f32_to_bf16(values[j]);
+            if (yp) yp[(size_t)r * outputs + o] = rounded;
+            else {
+              const float v = bf16_to_f32(rounded);
+              const int i = b * rows + r;
+              if (v > maxima[i] || (std::isnan(v) && !std::isnan(maxima[i]))) {
+                maxima[i] = v;
+                indices[i] = o;
+              }
             }
           }
         }
@@ -99,6 +124,7 @@ void bind_gguf_cpu(pybind11::module_& m) {
   namespace py = pybind11;
   m.def("gguf_linear", &gguf_linear, py::arg("x"), py::arg("weight"), py::arg("ggml_type"),
         py::arg("inputs"), py::arg("argmax") = false, py::call_guard<py::gil_scoped_release>());
+  m.def("gguf_dot2_enabled", [] { return paired_dot(ggml_api(), GGML_TYPE_Q4_K) != nullptr; });
 }
 
 namespace {
@@ -111,8 +137,12 @@ class GgufFormat final : public MoeFormat {
       : MoeFormat(p), ggml_(ggml_api()), gate_up_(a.banks.count("gate_up") ? a.bank("gate_up") : nullptr),
         gate_(gate_up_ ? nullptr : a.bank("gate")), up_(gate_up_ ? nullptr : a.bank("up")),
         down_(a.bank("down")), scales_(scaled ? a.bank("global") : nullptr) {
-    gu_ = kernel(static_cast<int>(a.option("gate_up_type")), p.H, "gate_up");
-    dn_ = kernel(static_cast<int>(a.option("down_type")), p.I, "down");
+    gu_type_ = static_cast<int>(a.option("gate_up_type"));
+    dn_type_ = static_cast<int>(a.option("down_type"));
+    gu_ = kernel(gu_type_, p.H, "gate_up");
+    dn_ = kernel(dn_type_, p.I, "down");
+    gu_dot2_ = paired_dot(ggml_, gu_type_);
+    dn_dot2_ = paired_dot(ggml_, dn_type_);
     xf_.resize(p.H);
     xq_.resize(static_cast<size_t>(p.max_tokens) * gu_.act_row_bytes);
     gq_.resize(static_cast<size_t>(p.max_tokens) * p.top_k * dn_.act_row_bytes);
@@ -151,9 +181,20 @@ class GgufFormat final : public MoeFormat {
   void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const override {
     const uint8_t* w = static_cast<const uint8_t*>(tbl_at(down_, layer));
     for (int h = h0; h < h1; ++h)
-      for (int j = 0; j < n; ++j)
-        dn_.vec_dot(p.I, &out[j * kRowBlock + h - h0], 0, w + (static_cast<size_t>(routes[j].e) * p.H + h) * dn_.row_bytes, 0,
-                    gq_.data() + static_cast<size_t>(routes[j].r) * dn_.act_row_bytes, 0, 1);
+      for (int j = 0; j < n;) {
+        const auto* row = w + (static_cast<size_t>(routes[j].e) * p.H + h) * dn_.row_bytes;
+        const auto* x0 = gq_.data() + static_cast<size_t>(routes[j].r) * dn_.act_row_bytes;
+        if (dn_dot2_ && j + 1 < n && routes[j].e == routes[j + 1].e) {
+          float values[2];
+          dot_pair(dn_dot2_, dn_, dn_type_, p.I, values, row, x0,
+                   gq_.data() + static_cast<size_t>(routes[j + 1].r) * dn_.act_row_bytes);
+          for (int k = 0; k < 2; ++k) out[(j + k) * kRowBlock + h - h0] = values[k];
+          j += 2;
+        } else {
+          dn_.vec_dot(p.I, &out[j * kRowBlock + h - h0], 0, row, 0, x0, 0, 1);
+          ++j;
+        }
+      }
     if (scales_ == nullptr) return;
     for (int j = 0; j < n; ++j) {
       const float s = expert_scales(layer, routes[j].e)[2];
@@ -173,7 +214,22 @@ class GgufFormat final : public MoeFormat {
     for (int i = i0; i < i1; ++i) {
       const uint8_t* gate_row = gate + static_cast<size_t>(i) * gu_.row_bytes;
       const uint8_t* up_row = up + static_cast<size_t>(i) * gu_.row_bytes;
-      for (int j = 0; j < n; ++j) {
+      int j = 0;
+      for (; gu_dot2_ && j + 1 < n; j += 2) {
+        float gates[2], ups[2];
+        const auto* x0 = xq_.data() + static_cast<size_t>(routes[j].tok) * gu_.act_row_bytes;
+        const auto* x1 = xq_.data() + static_cast<size_t>(routes[j + 1].tok) * gu_.act_row_bytes;
+        dot_pair(gu_dot2_, gu_, gu_type_, p.H, gates, gate_row, x0, x1);
+        dot_pair(gu_dot2_, gu_, gu_type_, p.H, ups, up_row, x0, x1);
+        for (int k = 0; k < 2; ++k) {
+          const auto& route = routes[j + k];
+          gated_rows(p, i, i + 1, route.w_in, route.g, [&](int row) {
+            const float value = row < p.I ? gates[k] : ups[k];
+            return scales ? value * scales[row < p.I ? 0 : 1] : value;
+          });
+        }
+      }
+      for (; j < n; ++j) {
         const auto& route = routes[j];
         const uint8_t* xq = xq_.data() + static_cast<size_t>(route.tok) * gu_.act_row_bytes;
         gated_rows(p, i, i + 1, route.w_in, route.g, [&](int row) {
@@ -208,6 +264,8 @@ class GgufFormat final : public MoeFormat {
   const uint64_t* down_;
   const uint64_t* scales_;
   ft_ggml_row_kernel gu_{}, dn_{};
+  int gu_type_, dn_type_;
+  Dot2 gu_dot2_, dn_dot2_;
   std::vector<float> xf_;
   // the activation in the vec_dot input type: x per token, g per route
   AlignedVector<uint8_t> xq_, gq_;

@@ -13,169 +13,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmarks"))
 from analyze_three_level_demo import MODES, analyze
 from analyze_speculative_policy import analyze_stopping, evaluate_threshold
 from analyze_speculative_io_budget import make_budget, io_summary
-from three_level_prefetch_calibration import (build_prefetch_profile, evaluate_prefetch_promotion,
-    gap_capacity_for_experts, gap_experts_for_capacity, mixed_pool_gap_costs, monotone_copy_curves)
 
 
-@pytest.mark.parametrize("phase", ["preverify", "verify", "draft_gap"])
-@pytest.mark.parametrize("count", [0, 1, 2])
-@pytest.mark.parametrize("mixed", [False, True])
-def test_prefetch_receipts_survive_retirement_without_instrumenting_timing(phase, count, mixed):
-    import torch
-    from freetoken.moe.offload_cache import OffloadMoeCache
-    from speculative_prefetch_measurement import ComputeWorkload, _OperationProbe, _measure_shared_retire, _sample
+@pytest.mark.parametrize("preverify_times, expected", [((2., 8.), [2, 1, 0]), ((0., 1.), [1, 1, 0])])
+def test_single_sample_prefetch_uses_arithmetic_means_and_layout_io(preverify_times, expected):
+    from three_level_prefetch_calibration import select_quotas
 
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    device = torch.device("cuda")
-    cache = OffloadMoeCache(2, 16, 32, device,
-        pool_of_layer=[0, 1] if mixed else [0, 0], pool_sizes=[16, 16] if mixed else [32])
-    sources = {name: [torch.arange(16 * size, dtype=torch.float32).reshape(16, size).pin_memory()
-        for size in ([8, 16] if mixed else [8, 8])] for name in ("gate_up", "down")}
-    cache.set_bank_sources(sources)
-    parent = SimpleNamespace(cache=cache, active=False, max_loops=4, max_rows=17,
-        top_k=4, inner_rows=4, preverify_policy=None)
-    value = torch.ones(1, device=device)
-    workload = ComputeWorkload(phase, 0, 1, lambda: value.mul_(1),
-        lambda: torch.testing.assert_close(value, torch.ones_like(value)), enqueue=lambda: value.mul_(1))
-    allocation = {0: count // 2, 1: count - count // 2} if mixed and phase == "draft_gap" else None
-    probe = _OperationProbe(parent, 1 if phase == "verify" else 0, count, phase, workload,
-        torch.cuda.mem_get_info()[1], pool_counts=allocation)
-    try:
-        for mode in ("copy_only", "concurrent"):
-            for _ in range(2):
-                probe.prepare()
-                with torch.cuda.stream(probe.stream):
-                    for receipt in probe.validation_plans.values():
-                        receipt[3].fill_(-7)
-                    probe.graphs[mode].replay()
-                probe.events[mode]["end"].synchronize()
-                probe.validate_completion()
-                assert all(receipt[3].item() == -7 for receipt in probe.validation_plans.values())
-                probe.prepare()
-                with torch.cuda.stream(probe.stream):
-                    probe.graphs["validate_" + mode].replay()
-                probe.events["validate_" + mode]["end"].synchronize()
-                probe.validate(weights=True)
-                assert sum(receipt[3].item() for receipt in probe.validation_plans.values()) == count
-                if phase != "draft_gap":
-                    assert all(plan[3].item() == 0 for plan in probe._plans().values())
-        if count:
-            probe.prepare()
-            with torch.cuda.stream(probe.stream):
-                if phase == "verify":
-                    probe.controller.refs.zero_()
-                else:
-                    probe.controller.queue.fill_(2147483647)
-                probe.graphs["validate_concurrent"].replay()
-            probe.events["validate_concurrent"]["end"].synchronize()
-            with pytest.raises(RuntimeError, match="prefetch plan admitted 0"):
-                probe.validate()
-        samples = _sample(probe, workload, warmups=1, samples=2)
-        assert set(samples) == {"copy_only", "compute_only", "concurrent"}
-        assert all(len(series) == 2 for series in samples.values())
-    finally:
-        probe.close()
-    assert cache.speculative_controller is None
-    if phase == "preverify" and count:
-        shared = _measure_shared_retire(parent, count, torch.cuda.mem_get_info()[1], samples=8, warmups=2)
-        assert len(shared["preverify_retire_ms_samples"]) == 8
-        assert shared["layer_counts"] == [count, count]
-
-
-def offline_calibration_samples():
-    coverage = dict(contexts=["short", "long"], preverify_rows=list(range(1, 5)),
-                    verify_rows=list(range(1, 18)), draft_gap_rows=list(range(1, 5)))
-    windows = [dict(phase=phase, layer=layer, rows=rows, context=context, duration_ms=1.)
-               for phase, layer in (("preverify", 0), ("verify", 1), ("draft_gap", None))
-               for rows in coverage[phase + "_rows"] for context in coverage["contexts"] for _ in range(8)]
-    copies = [dict(phase=phase, pool=pool, experts=count, samples_ms=[max(.01, count * cost)] * 8)
-              for phase in ("preverify", "draft_gap", "verify") for pool, cost in (("bf16", .1), ("q4", .15))
-              for count in range(5)]
-    return windows, copies, dict(identity={"checkpoint": "fixture"}, coverage=coverage, layer_pools=["bf16", "q4"])
-
-
-def test_offline_prefetch_uses_worst_shape_context_and_preserves_terminal_layers():
-    windows, copies, options = offline_calibration_samples()
-    for row in windows:
-        if row["phase"] == "preverify" and row["rows"] == 1 and row["context"] == "long":
-            row["duration_ms"] = .2
-    result = build_prefetch_profile(windows, copies, **options)
-    assert result["quotas"] == dict(preverify=[1, 0], verify=[0, 4], gap_capacity=5)
-    assert result["candidates"]["half"] == dict(preverify=[0, 0], verify=[0, 2], gap_experts=2, gap_capacity=3)
-    assert result["coverage_complete"] and not result["automatic_publishable"]
-    reduced = build_prefetch_profile(windows, copies, shared_preverify_retire_ms=.1, **options)
-    assert reduced["quotas"]["preverify"] == [0, 0]
-    assert reduced["quotas"]["verify"] == result["quotas"]["verify"]
-
-
-def test_offline_prefetch_missing_shape_or_copy_pool_fails_closed():
-    windows, copies, options = offline_calibration_samples()
-    with pytest.raises(ValueError, match="coverage"):
-        build_prefetch_profile([row for row in windows if not (row["phase"] == "verify" and row["rows"] == 17)],
-                               copies, **options)
-    with pytest.raises(ValueError, match="missing production copy"):
-        build_prefetch_profile(windows, [row for row in copies if not (row["phase"] == "verify" and row["pool"] == "q4")],
-                               **options)
-    windows[0]["capture"] = True
-    with pytest.raises(ValueError, match="coverage"):
-        build_prefetch_profile(windows, copies, **options)
-
-
-def test_offline_copy_p90_is_monotone_and_gap_uses_worst_pool_composition():
-    samples = [dict(phase="draft_gap", pool="q4", experts=1, samples_ms=[.1] * 7 + [.5]),
-               dict(phase="draft_gap", pool="q4", experts=2, samples_ms=[.2] * 8)]
-    curve = monotone_copy_curves(samples)["draft_gap"]["q4"]["cost_ms"]
-    assert curve == {0: 0., 1: .5, 2: .5}
-    mixed = mixed_pool_gap_costs({"a": {0: 0., 1: .5, 2: .6}, "b": {0: 0., 1: .4, 2: .5}})
-    assert mixed == {0: 0., 1: .5, 2: .9}
-    costs, witness = mixed_pool_gap_costs(
-        {"a": {0: 0., 1: .5, 2: .6}, "b": {0: 0., 1: .4, 2: .5}}, return_allocations=True)
-    assert costs == mixed and witness[2] == {"a": 1, "b": 1}
-    fixed = mixed_pool_gap_costs({"a": {0: .05, 1: .5, 2: .6}, "b": {0: .06, 1: .4, 2: .5}})
-    assert fixed[0] == 0 and fixed[1] == pytest.approx(.56)
-    with pytest.raises(ValueError, match="coverage"):
-        mixed_pool_gap_costs({"a": curve}, max_experts=3)
-
-
-def test_offline_copy_does_not_hide_rare_slow_context_in_pooled_percentile():
-    rows = [dict(phase="verify", pool="q4", experts=1, rows=1, context="short", samples_ms=[.1] * 80),
-            dict(phase="verify", pool="q4", experts=1, rows=17, context="long", samples_ms=[.9] * 8)]
-    assert monotone_copy_curves(rows)["verify"]["q4"]["cost_ms"][1] == .9
-
-
-@pytest.mark.parametrize("capacity,experts", [(0, 0), (1, 0), (12, 11)])
-def test_offline_gap_capacity_preserves_legacy_reserved_entry(capacity, experts):
-    assert gap_experts_for_capacity(capacity) == experts
-    assert gap_capacity_for_experts(experts) == (capacity if experts else 0)
-
-
-def promotion_requests(tpot_ms):
-    return [dict(dataset="fixture.jsonl", sample=sample, repeat=repeat, returned_tokens=11,
-                 wall_seconds=1. + value / 100., ttft_seconds=1., graph_fallbacks={}, warmup=False)
-            for repeat, value in enumerate(tpot_ms) for sample in range(2)]
-
-
-def test_prefetch_promotion_requires_complete_paired_requests_and_all_repeat_gains():
-    audit = dict.fromkeys(("same_protocol", "same_source", "coverage_complete", "cleanup_valid", "accounting_valid",
-                          "baseline_complete", "candidate_complete", "baseline_formal_eligible", "candidate_formal_eligible"), True)
-    result = evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]), promotion_requests([9., 9., 9.]), audit=audit)
-    assert result["eligible"] and result["tpot_reduction_fraction"] == pytest.approx(.1)
-    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]),
-        promotion_requests([9., 10.1, 9.]), audit=audit)["eligible"]
-    bad = promotion_requests([9., 9., 9.])
-    bad[0]["graph_fallbacks"] = {"draft": 1}
-    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]), bad, audit=audit)["eligible"]
-    audit["same_source"] = False
-    assert not evaluate_prefetch_promotion(promotion_requests([10., 10., 10.]),
-        promotion_requests([9., 9., 9.]), audit=audit)["eligible"]
-
-
-def test_prefetch_promotion_rejects_missing_shapes_and_profiled_timing():
-    rows = promotion_requests([9., 9., 9.])
-    rows[0]["profiled"] = True
-    with pytest.raises(ValueError, match="profiled"):
-        evaluate_prefetch_promotion(rows, rows, audit={})
+    windows = [dict(phase=phase, layer=layer, compute_ms=time, duration_ms=time + 1)
+               for phase, time in (("preverify", preverify_times[0]), ("preverify", preverify_times[1]), ("verify", 12.))
+               for layer in range(3)]
+    stages = [dict(phase=phase, duration_ms=time) for phase, time in
+              (("preverify", 9.), ("preverify", 27.), ("verify", 39.), ("draft", 10.),
+               ("draft", 20.), ("draft_gap", 20.), ("draft_gap", 40.))]
+    copies = [dict(layout=0, samples_ms=[1., 3.]), dict(layout=1, samples_ms=[2., 4.])]
+    result = select_quotas(windows, stages, copies, layer_layouts=[0, 1, 0], num_experts=16)
+    assert result["quotas"] == dict(preverify=expected, verify=[0, 4, 6], gap_capacity=11)
+    assert result["means"] == dict(preverify_layer_ms=sum(preverify_times) / 2, preverify_ms=18.,
+        verify_layer_ms=12., verify_ms=39., draft_ms=15., draft_gap_ms=30.)
+    assert result["calls"] == dict(preverify=2, verify=1, draft=2, draft_gap=2)
+    with pytest.raises(ValueError, match="IO measurements"):
+        select_quotas(windows, stages, copies[:1], layer_layouts=[0, 1, 0], num_experts=16)
+    with pytest.raises(ValueError, match="every verify layer"):
+        select_quotas(windows[:-1], stages, copies, layer_layouts=[0, 1, 0], num_experts=16)
 
 
 def test_io_budget_uses_only_no_prefetch_calibration_and_zeroes_last_layer():
@@ -314,7 +173,21 @@ def replace_tokens(root, mode, variant, values):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
-def test_complete_requests_define_throughput_and_peaks_are_not_summed(measured_run):
+@pytest.mark.parametrize("raw_tail", [False, True])
+def test_complete_requests_define_throughput_and_peaks_are_not_summed(measured_run, raw_tail):
+    if raw_tail:
+        for mode in MODES:
+            if not mode.startswith("three_level"):
+                continue
+            for variant in ("timing", "audit"):
+                path = measured_run / f"{mode}_{variant}.jsonl"
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                for row in rows:
+                    window = row["rounds"][0]
+                    window["loops"] = window["loops"][:1]
+                    window.update(loop_count=1, draft_loop_count=2,
+                        draft_tail=dict(offset=2, drafted=1, survived=0, reached=True))
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     result = analyze(measured_run)
     assert result["strict_parity_for_measured_requests"]
     value = result["modes"]["three_level"]
@@ -323,7 +196,7 @@ def test_complete_requests_define_throughput_and_peaks_are_not_summed(measured_r
     assert value["cache_stats"]["demand_loads"] == 4
     assert value["cache_stats"]["protected_peak"] == 10
     assert value["cache_stats"]["expert_bytes"] == 6291456
-    assert value["loops_per_submission"] == {"2": 2}
+    assert value["loops_per_submission"] == {"1" if raw_tail else "2": 2}
 
 
 def test_compact_timing_uses_audit_cache_counters_without_audit_wall_time(measured_run):

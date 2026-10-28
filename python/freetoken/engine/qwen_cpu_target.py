@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.moe.cpu_target import CpuTargetExperts, pack_target_bank
+from .cpu_async_split_profile import CPU_PREFIX_PROTOCOL
 from .prefix_transfer import prefix_shapes, prefix_range
 
 
@@ -56,6 +57,20 @@ class CpuVerifyResult:
     hidden: torch.Tensor
     predictions: torch.Tensor
     target_hidden: torch.Tensor | None = None
+
+
+@dataclass
+class CpuPrefixResult:
+    request_epoch: int
+    block_id: int
+    start: int
+    width: int
+    hidden: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+    replay: torch.Tensor
+    conv: torch.Tensor
+    job: VerifyJob
 
 
 def _rows(fn, x):
@@ -130,7 +145,14 @@ class QwenCpuTarget:
             if kernel_profile == "ggml_v2" and (not hasattr(_cpu_moe, "target_attention_v2")
                                                 or _cpu_moe.target_isa() != "avx512f"):
                 raise RuntimeError("ggml_v2 requires the rebuilt extension and AVX-512F")
+        config = dict(config)
+        self.cpu_prefix_layers = config.get("cpu_prefix_layers")
+        if self.cpu_prefix_layers is not None:
+            if type(self.cpu_prefix_layers) is not int or not 1 <= self.cpu_prefix_layers < len(config["layer_types"]):
+                raise ValueError("CPU prefix must leave at least one layer to the GPU")
+            config["layer_types"] = config["layer_types"][:self.cpu_prefix_layers]
         self.config, self.weights, self.experts = config, weights, experts
+        self.pending_prefix = None
         self.expert_storage = "private_bf16"
         for component, entry in (("dense", "target_linear_v2"), ("head", "target_linear_v2"),
                                  ("gdn", "target_gdn_v2")):
@@ -215,6 +237,9 @@ class QwenCpuTarget:
 
     def arithmetic_metadata(self):
         return dict(backend=self.backend, kernel_profile=self.kernel_profile, v2_components=self.components,
+                    cpu_prefix_layers=getattr(self, "cpu_prefix_layers", None),
+                    prefix_protocol=CPU_PREFIX_PROTOCOL if self.cpu_prefix_layers is not None else None,
+                    loaded_target_layers=len(self.layer_types),
                     arithmetic_version=("cpu_target_ggml_v2:" + ",".join(self.components)
                         if self.kernel_profile == "ggml_v2" else "cpu_target_v1" if self.native else "legacy_e2fdbbc"),
                     attention_v2=(dict(query_tile=4, kv_block=64, segment=256, head_group=2,
@@ -234,7 +259,8 @@ class QwenCpuTarget:
                     dense_storage="private_fp32_or_packed_fp32",
                     expert_worker_nodes=getattr(self.experts, "worker_nodes", []),
                     components=dict(dense=bool(self.native), gdn=bool(self.native),
-                                    attention=bool(self.native), streaming_head=bool(self.native)))
+                                    attention=bool(self.native), streaming_head=bool(self.native)
+                                    and getattr(self, "cpu_prefix_layers", None) is None))
 
     def enable_attention_diagnostics(self):
         if "attention" not in self.components:
@@ -268,10 +294,13 @@ class QwenCpuTarget:
 
     @classmethod
     def from_checkpoint(cls, path, *, core_ids, max_context=4096, max_rows=33, grouped=True, backend="optimized",
-                        kernel_profile="v1", components=None, shared_banks=None, config_overrides=None):
+                        kernel_profile="v1", components=None, shared_banks=None, config_overrides=None,
+                        cpu_prefix_layers=None):
         from safetensors import safe_open
 
         if str(path).endswith(".gguf") or (Path(path).is_dir() and any(Path(path).glob("*.gguf"))):
+            if cpu_prefix_layers is not None:
+                raise ValueError("CPU prefix split currently requires Qwen3.6 BF16")
             from .qwen3_cpu_target import Qwen3CpuTarget
 
             return Qwen3CpuTarget.from_checkpoint(path, core_ids=core_ids, max_context=max_context,
@@ -286,14 +315,26 @@ class QwenCpuTarget:
                 or config.get("hidden_act") != "silu" or config.get("quantization_config")
                 or config.get("linear_key_head_dim") != config.get("linear_value_head_dim")):
             raise ValueError("CPU Target first milestone supports Qwen3.6-35B-A3B BF16 only")
+        if cpu_prefix_layers is None and config_overrides is not None:
+            cpu_prefix_layers = config_overrides.get("cpu_prefix_layers")
+        layers = config["num_hidden_layers"]
+        if cpu_prefix_layers is not None:
+            if type(cpu_prefix_layers) is not int or not 1 <= cpu_prefix_layers < layers:
+                raise ValueError("CPU prefix must leave at least one layer to the GPU")
+            config["cpu_prefix_layers"] = cpu_prefix_layers
+            layers = cpu_prefix_layers
         index = json.loads((path / "model.safetensors.index.json").read_text())["weight_map"]
-        weights, gate_up, down = {}, [None] * 40, [None] * 40
+        weights, gate_up, down = {}, [None] * layers, [None] * layers
         for shard in sorted(set(index.values())):
             with safe_open(path / shard, framework="pt", device="cpu") as reader:
                 for name in reader.keys():
                     if not (name.startswith("model.language_model.") or name == "lm_head.weight"):
                         continue
                     key = name.removeprefix("model.language_model.")
+                    if cpu_prefix_layers is not None and (
+                            key in ("lm_head.weight", "norm.weight") or (
+                                key.startswith("layers.") and int(key.split(".")[1]) >= layers)):
+                        continue
                     if ".experts." in key and shared_banks is not None:
                         continue
                     tensor = reader.get_tensor(name)
@@ -309,12 +350,12 @@ class QwenCpuTarget:
         if shared_banks is not None:
             if "experts" in components:
                 raise ValueError("packed v2 CPU experts cannot repack shared banks")
-            if shared_banks["layer_formats"] != [("bf16", {})] * 40:
+            if shared_banks["layer_formats"][:layers] != [("bf16", {})] * layers:
                 raise ValueError("Qwen3.6 CPU Target requires BF16 shared expert banks")
             from freetoken.moe.legacy_format import canonical_role
 
             sources = {canonical_role(role): tensors for role, tensors in shared_banks["bank_sources"].items()}
-            gate_up, down = sources["gate_up"], sources["down"]
+            gate_up, down = sources["gate_up"][:layers], sources["down"][:layers]
         experts = CpuTargetExperts(gate_up, down, 8, core_ids, max_rows, grouped=grouped, backend=backend,
                                    packed=bool(components and "experts" in components),
                                    schedule=("expert_numa" if components and "expert_numa" in components else
@@ -337,6 +378,7 @@ class QwenCpuTarget:
                 any(t.dtype != torch.bfloat16 for t in (checkpoint.keys, checkpoint.values, checkpoint.conv))):
             raise ValueError("CPU checkpoint requires BF16 KV/conv and FP32 recurrent state")
         self.release_prefix()
+        self.pending_prefix = None
         self.prefix_receiver = None
         self.prefix_timings = []
         self.state = PrefixCheckpoint(checkpoint.length, checkpoint.anchor,
@@ -365,6 +407,7 @@ class QwenCpuTarget:
                     or tensor.shape[2:] != expected.shape[2:] or tensor.shape[1] < ticket.length):
                 raise ValueError("streamed prefix KV mismatch")
         self.release_prefix()
+        self.pending_prefix = None
         receiver.acquire(ticket)
         self.prefix_receiver, self.prefix_held = receiver, True
         self.prefix_barrier_pending = wait_all
@@ -548,9 +591,11 @@ class QwenCpuTarget:
         return routed + shared
 
     @torch.inference_mode()
-    def verify(self, job):
+    def _forward_job(self, job):
         verify_started = time.perf_counter()
         imports_before = len(self.prefix_timings)
+        if getattr(self, "pending_prefix", None) is not None:
+            raise RuntimeError("CPU prefix awaits the GPU acceptance decision")
         if self.state is None or job.request_epoch != self.epoch or job.block_id != self.next_block:
             raise ValueError("uninitialized, stale epoch or out-of-order CPU verify job")
         state = self.state
@@ -586,6 +631,87 @@ class QwenCpuTarget:
             x = x + self._moe(layer, norm)
             if layer + 1 in getattr(self, "aux_boundaries", ()):
                 auxiliary.append(x)
+        self.verify_timings = dict(prefix_barrier_seconds=barrier_seconds,
+            forward_seconds=time.perf_counter() - verify_started - barrier_seconds - sum(
+                item["wait_seconds"] + item["import_seconds"] for item in self.prefix_timings[imports_before:]),
+            commit_seconds=None)
+        return x, auxiliary, replay, windows
+
+    @torch.inference_mode()
+    def verify_prefix(self, job, *, buffers=None):
+        if self.cpu_prefix_layers is None:
+            raise ValueError("CPU prefix verification requires a configured layer split")
+        x, _, replay, windows = self._forward_job(job)
+        publication_started = time.perf_counter()
+        width = len(job.candidates) + 1
+        state = self.state
+        layers, heads, value_dim, key_dim = state.recurrent.shape
+        channels, history = state.conv.shape[1:]
+        if buffers is None:
+            compact = torch.empty((layers, width, heads, key_dim + value_dim + 2), dtype=torch.float32)
+            conv = torch.empty((layers, channels, history + width), dtype=torch.bfloat16)
+            hidden = x.clone()
+            keys = self.keys[:, job.start:job.start + width].clone()
+            values = self.values[:, job.start:job.start + width].clone()
+        else:
+            compact = buffers["prefix_replay"][:, :width]
+            conv = buffers["prefix_conv"][:, :, :history + width]
+            hidden, keys, values = buffers["hidden"][:width], buffers["keys"][:, :width], buffers["values"][:, :width]
+            hidden.copy_(x)
+            keys.copy_(self.keys[:, job.start:job.start + width])
+            values.copy_(self.values[:, job.start:job.start + width])
+        for layer in range(len(self.linear_layers)):
+            if self.native:
+                compact[layer].copy_(replay[layer][:width])
+            else:
+                compact[layer].copy_(torch.stack([torch.cat((key, value, decay[:, None], beta[:, None]), -1)
+                    for key, value, decay, beta in replay[layer]]))
+            conv[layer].copy_(windows[layer][:, :history + width])
+        result = CpuPrefixResult(job.request_epoch, job.block_id, job.start, width, hidden,
+                                 keys, values, compact, conv, job)
+        self.pending_prefix = result
+        self.verify_timings["publication_seconds"] = time.perf_counter() - publication_started
+        return result
+
+    @torch.inference_mode()
+    def commit_prefix(self, request_epoch, block_id, count, anchor):
+        result = self.pending_prefix
+        if result is None or (request_epoch, block_id) != (result.request_epoch, result.block_id):
+            raise ValueError("stale CPU prefix acceptance decision")
+        if type(count) is not int or not 1 <= count <= min(result.width, result.job.remaining):
+            raise ValueError("CPU prefix acceptance exceeds the submitted window")
+        if type(anchor) is not int or not 0 <= anchor < self.config["vocab_size"]:
+            raise ValueError("CPU prefix acceptance anchor is outside vocabulary")
+        commit_started = time.perf_counter()
+        key_dim, value_dim = self.config["linear_key_head_dim"], self.config["linear_value_head_dim"]
+        for layer in range(len(self.linear_layers)):
+            rec = self.state.recurrent[layer]
+            if self.native:
+                if count == result.width:
+                    rec.copy_(self.gdn_work[layer]["state"])
+                else:
+                    kernel = self.native.target_replay_v2 if "gdn" in self.components else self.native.target_replay
+                    kernel(rec, result.replay[layer], count)
+            else:
+                for row in result.replay[layer, :count]:
+                    rec = _advance(rec, (row[:, :key_dim], row[:, key_dim:key_dim + value_dim],
+                                         row[:, -2], row[:, -1]))
+                self.state.recurrent[layer].copy_(rec)
+        self.state.conv.copy_(result.conv[:, :, count:count + self.state.conv.shape[-1]])
+        self.state.length += count
+        self.state.anchor = anchor
+        self.next_block += 1
+        self.pending_prefix = None
+        self.verify_timings["commit_seconds"] = time.perf_counter() - commit_started
+
+    @torch.inference_mode()
+    def verify(self, job):
+        if getattr(self, "cpu_prefix_layers", None) is not None:
+            raise ValueError("CPU prefix verification needs an explicit GPU acceptance decision")
+        state = self.state
+        width = len(job.candidates) + 1
+        x, auxiliary, replay, windows = self._forward_job(job)
+        head_started = time.perf_counter()
         hidden = self._norm(x, self.weights["norm.weight"], self.config["rms_norm_eps"])
         features = torch.cat(auxiliary, -1) if auxiliary else hidden
         predictions = self._predict(hidden)
@@ -625,9 +751,8 @@ class QwenCpuTarget:
             state.recurrent.clone(), state.conv.clone())
         self.next_block += 1
         self.verify_timings = dict(
-            prefix_barrier_seconds=barrier_seconds,
-            forward_seconds=commit_started - verify_started - barrier_seconds - sum(
-                item["wait_seconds"] + item["import_seconds"] for item in self.prefix_timings[imports_before:]),
+            prefix_barrier_seconds=self.verify_timings["prefix_barrier_seconds"],
+            forward_seconds=self.verify_timings["forward_seconds"] + (commit_started - head_started),
             commit_seconds=time.perf_counter() - commit_started)
         return CpuVerifyResult(job.request_epoch, job.block_id, old, accepted, count, tuple(tokens),
                                terminal, delta, features[:count].clone(), predictions, hidden[:count].clone())

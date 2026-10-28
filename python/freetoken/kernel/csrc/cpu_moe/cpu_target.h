@@ -314,25 +314,33 @@ inline void gdn(torch::Tensor raw, torch::Tensor z, torch::Tensor a, torch::Tens
   });
 }
 
-inline void attention(torch::Tensor query, torch::Tensor keys, torch::Tensor values,
-                      torch::Tensor kv_tmp, torch::Tensor accum, torch::Tensor output, int start) {
+inline void attention_grouped(torch::Tensor query, torch::Tensor keys, torch::Tensor values,
+                              torch::Tensor kv_tmp, torch::Tensor accum, torch::Tensor output,
+                              int start, int heads_per_task) {
   for (auto& t : {query, keys, values, output}) check(t, at::kBFloat16);
   check(kv_tmp, at::kFloat); check(accum, at::kFloat);
   TORCH_CHECK(query.dim() == 3 && keys.dim() == 3 && keys.sizes() == values.sizes(), "attention dimensions");
   const int rows = query.size(0), qh = query.size(1), d = query.size(2), kvh = keys.size(1), block = 64;
   TORCH_CHECK(kvh > 0 && qh % kvh == 0 && d > 0 && keys.size(2) == d && start >= 0
       && start + rows <= keys.size(0) && output.sizes() == query.sizes()
-      && kv_tmp.numel() >= kvh * block * 2 * d && accum.numel() >= rows * qh * (d + 2), "attention geometry");
+      && heads_per_task > 0 && accum.numel() >= rows * qh * (d + 2), "attention geometry");
+  const int groups = (qh / kvh + heads_per_task - 1) / heads_per_task;
+  const int tasks = kvh * groups;
+  TORCH_CHECK(kv_tmp.numel() >= tasks * block * 2 * d, "attention workspace geometry");
   auto* qp = reinterpret_cast<const bf16_t*>(query.data_ptr());
   auto* kp = reinterpret_cast<const bf16_t*>(keys.data_ptr());
   auto* vp = reinterpret_cast<const bf16_t*>(values.data_ptr());
   auto* op = reinterpret_cast<bf16_t*>(output.data_ptr());
   auto* tmp = kv_tmp.data_ptr<float>(); auto* ac = accum.data_ptr<float>();
-  at::parallel_for(0, kvh, 1, [&](int64_t begin, int64_t end) {
-    for (int h = begin; h < end; ++h) {
-      float* tk = tmp + h * block * 2 * d; float* tv = tk + block * d;
+  at::parallel_for(0, tasks, 1, [&](int64_t begin, int64_t end) {
+    for (int task = begin; task < end; ++task) {
+      const int h = task / groups;
+      const int g0 = h * qh / kvh + (task % groups) * heads_per_task;
+      const int g1 = std::min((h + 1) * qh / kvh, g0 + heads_per_task);
+      // Independent query heads retain their original reduction order.
+      float* tk = tmp + task * block * 2 * d; float* tv = tk + block * d;
       for (int r = 0; r < rows; ++r)
-        for (int g = h * qh / kvh; g < (h + 1) * qh / kvh; ++g) {
+        for (int g = g0; g < g1; ++g) {
           float* a = ac + (r * qh + g) * (d + 2);
           std::fill(a, a + d + 2, 0); a[d] = -INFINITY;
         }
@@ -344,7 +352,7 @@ inline void attention(torch::Tensor query, torch::Tensor keys, torch::Tensor val
             tv[t * d + j] = bf16_to_f32(vp[((base + t) * kvh + h) * d + j]);
           }
         for (int r = 0; r < rows; ++r)
-          for (int g = h * qh / kvh; g < (h + 1) * qh / kvh; ++g) {
+          for (int g = g0; g < g1; ++g) {
             float* a = ac + (r * qh + g) * (d + 2);
             for (int t = 0; t < std::min(size, start + r + 1 - base); ++t) {
               float score = 0;
@@ -357,12 +365,18 @@ inline void attention(torch::Tensor query, torch::Tensor keys, torch::Tensor val
           }
       }
       for (int r = 0; r < rows; ++r)
-        for (int g = h * qh / kvh; g < (h + 1) * qh / kvh; ++g) {
+        for (int g = g0; g < g1; ++g) {
           float* a = ac + (r * qh + g) * (d + 2);
           for (int j = 0; j < d; ++j) op[(r * qh + g) * d + j] = f32_to_bf16(a[j] / a[d + 1]);
         }
     }
   });
+}
+
+inline void attention(torch::Tensor query, torch::Tensor keys, torch::Tensor values,
+                      torch::Tensor kv_tmp, torch::Tensor accum, torch::Tensor output, int start) {
+  TORCH_CHECK(query.dim() == 3 && keys.dim() == 3 && keys.size(1) > 0, "attention dimensions");
+  attention_grouped(query, keys, values, kv_tmp, accum, output, start, query.size(1) / keys.size(1));
 }
 
 }  // namespace cpu_target

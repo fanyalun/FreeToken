@@ -12,7 +12,7 @@ import sys
 import time
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 QUOTA_FIELDS = ("speculative_prefetch_layer_experts", "speculative_prefetch_gap_capacity",
                 "speculative_verify_prefetch_layer_experts")
 
@@ -129,7 +129,7 @@ def _nonnegative(value):
     return type(value) is int and value >= 0
 
 
-def validate_profile_data(data, identity=None, *, allow_candidate=False):
+def validate_profile_data(data, identity=None):
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported speculative prefetch profile schema")
     if not isinstance(data.get("identity"), dict):
@@ -137,16 +137,14 @@ def validate_profile_data(data, identity=None, *, allow_candidate=False):
     if identity is not None and data["identity"] != identity:
         raise ValueError("prefetch profile identity mismatch; recalibrate for the current configuration")
     evidence = data.get("evidence", {})
-    statuses = ("validated", "candidate") if allow_candidate else ("validated",)
-    if evidence.get("status") not in statuses:
-        raise ValueError("prefetch profile must be validated; candidate profiles require explicit opt-in")
-    if evidence["status"] == "validated":
-        artifacts = evidence.get("artifact_sha256")
-        if (not isinstance(artifacts, dict) or not artifacts
-                or any(not isinstance(name, str) or not isinstance(digest, str) or len(digest) != 64
-                       or any(c not in "0123456789abcdef" for c in digest) for name, digest in artifacts.items())
-                or evidence.get("promotion", {}).get("passed") is not True):
-            raise ValueError("validated prefetch profile requires artifact hashes and a passed promotion receipt")
+    if (evidence.get("status") != "calibrated" or evidence.get("samples") != 1
+            or evidence.get("method") != "single_sample_mean"):
+        raise ValueError("prefetch profile requires single-sample mean calibration")
+    artifacts = evidence.get("artifact_sha256")
+    if (not isinstance(artifacts, dict) or not artifacts
+            or any(not isinstance(name, str) or not isinstance(digest, str) or len(digest) != 64
+                   or any(c not in "0123456789abcdef" for c in digest) for name, digest in artifacts.items())):
+        raise ValueError("calibrated prefetch profile requires measurement hashes")
     quotas, geometry = data.get("quotas", {}), data.get("geometry", {})
     preverify, verify = quotas.get("preverify"), quotas.get("verify")
     if (not isinstance(preverify, list) or not preverify or not all(map(_nonnegative, preverify))
@@ -174,7 +172,7 @@ def validate_profile_data(data, identity=None, *, allow_candidate=False):
 def build_prefetch_profile(identity, quotas, geometry, evidence):
     data = dict(schema_version=SCHEMA_VERSION, identity=copy.deepcopy(identity), quotas=copy.deepcopy(quotas),
                 geometry=copy.deepcopy(geometry), evidence=copy.deepcopy(evidence))
-    return validate_profile_data(data, allow_candidate=True)
+    return validate_profile_data(data)
 
 
 def _requested(config):
@@ -212,14 +210,20 @@ def _calibration_hint(config):
     root = Path.home() / "freetoken_benchmark_results/speculative_modes_v1"
     output = root / f"prefetch_calibration_{time.time_ns()}"
     command = [sys.executable, str(repo / "benchmarks/bench_speculative_modes.py"), "--model", config.model_path,
-        "--mode", "three_level_gpu", "--backend", "offload", "--graph", "full", "--budget-gib", "40",
-        "--max-loops", "4", "--depth", "3", "--preverify-top-h", "4", "--max-input-tokens", "4096",
-        "--max-output-tokens", "1024", "--calibrate-prefetch", "--purpose", "diagnostic", "--output", str(output)]
+        "--mode", "three_level_gpu", "--backend", "offload", "--graph", "full",
+        "--max-loops", str(config.speculative_max_loops), "--depth", str(config.speculative_depth),
+        "--preverify-top-h", str(config.speculative_preverify_top_h),
+        "--max-input-tokens", str(config.speculative_max_input_tokens),
+        "--max-output-tokens", str(config.speculative_max_output_tokens),
+        "--tokens", str(min(128, config.speculative_max_output_tokens)),
+        "--memory-ratio", str(config.memory_ratio), "--samples", "1",
+        "--calibrate-prefetch", "--purpose", "diagnostic", "--output", str(output)]
+    if config.gpu_memory_budget_bytes is not None:
+        command += ["--budget-gib", str(config.gpu_memory_budget_bytes / 2**30)]
     if config.speculative_draft_model:
         command += ["--draft-model", config.speculative_draft_model]
     temporary = root / "tmp"
-    return ("Generate a diagnostic candidate for the supported 40 GiB/loop4/depth3/top-h4 configuration, "
-            "then validate/promote it before automatic reuse with those same settings: "
+    return ("Calibrate one sample with matching settings, then reuse its mean-time quotas: "
             f"mkdir -p {shlex.quote(str(temporary))} && TMPDIR={shlex.quote(str(temporary))} {shlex.join(command)}")
 
 
@@ -240,11 +244,27 @@ def prepare_prefetch_profile(config, device):
                 and requested["gap_capacity"] is not None
                 and (requested["verify"] is not None or requested["verify_layers"] is not None))
     selection = config.speculative_prefetch_profile
+    model_default = False
+    if not complete and selection in (None, "auto") and config.speculative_mode == "three_level_gpu":
+        model = config.model_config
+        shape = tuple(getattr(model, name, None) for name in
+                      ("hidden_size", "moe_intermediate_size", "num_experts", "num_moe_layers"))
+        if (getattr(model, "model_type", None) in ("qwen3_5_moe", "qwen3_5_moe_text")
+                and shape == (2048, 512, 256, 40)):
+            if requested["preverify"] is None and requested["preverify_layers"] is None:
+                put("speculative_prefetch_layer_experts", 1)
+                put("speculative_prefetch_layer_quotas", [1] * 39 + [0])
+            if requested["verify"] is None and requested["verify_layers"] is None:
+                put("speculative_verify_prefetch_layer_experts", 2)
+            if requested["gap_capacity"] is None:
+                put("speculative_prefetch_gap_capacity", 10)
+            complete, model_default = True, True
     if complete and selection in (None, "auto"):
         for name in QUOTA_FIELDS:
             if getattr(config, name) is None:
                 put(name, 0)
-        receipt = dict(source="manual", requested=requested, validated=True, geometry=None)
+        receipt = dict(source="model_default" if model_default else "manual", requested=requested,
+                       validated=True, geometry=None)
         put("_speculative_prefetch_receipt", receipt)
         return receipt
     if selection is None:
@@ -255,8 +275,7 @@ def prepare_prefetch_profile(config, device):
         raise ValueError(f"prefetch profile missing: {path}. " + _calibration_hint(config))
     raw = path.read_bytes()
     try:
-        data = validate_profile_data(json.loads(raw), identity,
-            allow_candidate=selection != "auto" and config._speculative_prefetch_allow_candidate)
+        data = validate_profile_data(json.loads(raw), identity)
     except ValueError as exc:
         raise ValueError(f"{exc}. {_calibration_hint(config)}") from exc
     geometry, quotas = data["geometry"], data["quotas"]
@@ -276,8 +295,6 @@ def prepare_prefetch_profile(config, device):
     for name in QUOTA_FIELDS:
         if getattr(config, name) is None:
             put(name, 0)
-    put("moe_cache_size", geometry["total_slots"])
-    put("moe_cache_auto", False)
     overridden = any(value is not None for value in requested.values())
     effective = _effective(config, layers)
     zero_profile = not any(effective["preverify"]) and not any(effective["verify"]) and not effective["max_gap_expert_loads"]

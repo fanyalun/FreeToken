@@ -23,7 +23,8 @@ from freetoken.mm.config import MultimodalConfig
 
 def trajectory(rows):
     return [(r["token_ids"], [(w["drafted"], w["accepted"], w["returned"],
-        w.get("loop_count"), w.get("flush_reason"), w.get("loops")) for w in r["rounds"]]) for r in rows]
+        w.get("loop_count"), w.get("flush_reason"), w.get("loops"),
+        w.get("draft_tail"), w.get("draft_loop_count")) for w in r["rounds"]]) for r in rows]
 
 
 def profile_ranges():

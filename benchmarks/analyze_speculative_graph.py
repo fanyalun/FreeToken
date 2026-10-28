@@ -8,7 +8,8 @@ from pathlib import Path
 def trajectory(requests):
     return [(row["token_ids"], [(window["drafted"], window["accepted"], window["returned"],
         window["submit_rows"], window["loop_count"], window["flush_reason"], window["loops"],
-        window.get("routes")) for window in row["rounds"]]) for row in requests]
+        window.get("routes"), window.get("draft_tail"), window.get("draft_loop_count"))
+        for window in row["rounds"]]) for row in requests]
 
 
 def compare(reference, coarse):

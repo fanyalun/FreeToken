@@ -13,7 +13,7 @@
 
 namespace {
 
-const ft_ggml_cpu_api kApi = {FT_GGML_CPU_ABI, FT_STR(FT_GGML_VARIANT), ft_ggml_cpu_init, ft_ggml_cpu_row_kernel, ft_ggml_type_name};
+const ft_ggml_cpu_api kApi = {FT_GGML_CPU_ABI, FT_STR(FT_GGML_VARIANT), ft_ggml_cpu_init, ft_ggml_cpu_row_kernel, ft_ggml_type_name, ft_ggml_cpu_dot2};
 
 PyObject* score(PyObject*, PyObject*) { return PyLong_FromLong(ggml_backend_cpu_x86_score()); }
 

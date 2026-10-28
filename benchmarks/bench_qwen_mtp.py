@@ -268,7 +268,6 @@ def main():
         config["gdn_replay_bytes"] = sum(storages.values())
         plan = getattr(engine, "baseline_sd_memory_plan", None)
         config["baseline_sd_memory_plan"] = plan.as_dict() if plan is not None else None
-        config["baseline_sd_final_peak_bytes"] = getattr(engine, "baseline_sd_final_peak_bytes", None)
         config["resident_mtp_bytes"] = sum(t.numel() * t.element_size() for t in engine.mtp.state_dict().values()) if engine.mtp else 0
         config["ssm_dtype"] = str(engine.linear_state_pool.recurrent_states.dtype)
         config["conv_dtype"] = str(engine.linear_state_pool.conv_states.dtype)

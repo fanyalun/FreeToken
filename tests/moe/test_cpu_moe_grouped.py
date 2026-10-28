@@ -91,14 +91,15 @@ def _packed_k_rows(rows, kind, seed=12):
 
 
 @pytest.mark.parametrize("kind", [0, 12, 14])
-def test_cpu_gguf_projection_and_streamed_argmax_against_dequantized_rows(kind):
+@pytest.mark.parametrize("rows", [2, 5, 13])
+def test_cpu_gguf_projection_and_streamed_argmax_against_dequantized_rows(kind, rows):
     from freetoken.kernel import _cpu_moe, ggml_cpu
     from freetoken.engine.qwen3_cpu_target import PackedCpuWeight
     from freetoken.third_party.gguf import GGMLQuantizationType as QType
 
     _cpu_moe.set_ggml_cpu(ggml_cpu.select().api)
     torch.manual_seed(170)
-    x = torch.randint(-100, 100, (5, 256)).bfloat16()
+    x = torch.randint(-100, 100, (rows, 256)).bfloat16()
     x[:, 0] = -127
     if kind == 0:
         weight = torch.randn(67, 256) * 0.01

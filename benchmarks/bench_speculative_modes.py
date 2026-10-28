@@ -28,6 +28,7 @@ from bench_cpu_verify_feasibility import resource_interference as _resource_inte
 @dataclass(frozen=True)
 class BenchmarkConfig(EngineConfig):
     rendezvous_file: str = ""
+    cache_type: str = "naive"
 
     @property
     def distributed_addr(self):
@@ -78,9 +79,14 @@ def repository_identity(root):
 
 
 def memory_report(engine):
+    if engine.baseline_sd_memory_plan is None:
+        cache = engine.moe_offload_cache
+        return dict(sizing="static_ar", capacity_tokens=engine.max_seq_len, kv_pages=engine.num_pages,
+            budget_bytes=int(engine.config.memory_ratio * engine._baseline_free),
+            weights_bytes=engine._weights_bytes, final_slots=cache.cache_size if cache is not None else 0,
+            final_cache_bytes=engine._speculative_cache_bytes(cache.cache_size) if cache is not None else 0,
+            explicit_budget_initial_used_bytes=engine._budget_initial_used)
     return dict(engine.baseline_sd_memory_plan.as_dict(),
-        final_boundary_peak_bytes=engine.baseline_sd_final_peak_bytes,
-        peak_scope="boundary warmup: PyTorch peak plus observed external CUDA allocation",
         explicit_budget_initial_used_bytes=engine._budget_initial_used)
 
 
@@ -223,8 +229,15 @@ def validate_request(record, tokens, eos, graph):
         raise RuntimeError("request emitted tokens after EOS")
     if not 0 <= record["ttft_seconds"] <= record["wall_seconds"]:
         raise RuntimeError("invalid complete-request timing")
-    if graph == "full" and any(record["graph_fallbacks"].values()):
+    ar = record.get("ar_decode_graph")
+    if ar is not None and ar["replays"] + ar["fallbacks"] != len(output) - 1:
+        raise RuntimeError("AR decode accounting does not cover the returned request")
+    if graph == "full" and (ar["fallbacks"] if ar is not None else any(record["graph_fallbacks"].values())):
         raise RuntimeError("full Graph request used an eager fallback")
+    cpu_async = (record.get("metrics", {}).get("canonical_target") == "cpu"
+                 or any(row.get("mode") == "cpu_async" for row in record["rounds"]))
+    if graph == "full" and cpu_async and len(output) > 1 and not any(record.get("graph_replays", {}).values()):
+        raise RuntimeError("full Graph CPU async request has no decode replay evidence")
     committed = 0
     for row in record["rounds"]:
         drafted = row.get("drafted", row.get("candidates"))
@@ -282,7 +295,7 @@ def main():
     parser = argparse.ArgumentParser(description="Single-request speculative decoding across MoE backends")
     parser.add_argument("--model", required=True)
     parser.add_argument("--draft-model")
-    parser.add_argument("--mode", choices=("sd", "three_level_gpu", "cpu_async"), required=True)
+    parser.add_argument("--mode", choices=("ar", "sd", "three_level_gpu", "cpu_async"), required=True)
     parser.add_argument("--backend", choices=("offload", "hybrid", "fused"), default="offload")
     parser.add_argument("--graph", choices=("eager", "full"))
     parser.add_argument("--cache-scope", choices=("unified", "per-layer"), default="unified")
@@ -293,21 +306,29 @@ def main():
     parser.add_argument("--gap-prefetch-capacity", type=int)
     parser.add_argument("--verify-prefetch-experts", type=int)
     parser.add_argument("--prefetch-profile", default="auto")
-    parser.add_argument("--allow-candidate-profile", action="store_true",
-                        help="Explicit benchmark opt-in; candidate profiles are never loaded automatically")
     parser.add_argument("--calibrate-prefetch", action="store_true")
     parser.add_argument("--profile-prefetch", action="store_true",
                         help="Diagnostic graph timing and residual waits; never formal timing")
-    parser.add_argument("--calibration-max-experts", type=int, default=64)
     parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
     parser.add_argument("--max-loops", type=int, default=6)
     parser.add_argument("--cpu-async-loops", type=int, default=4)
+    parser.add_argument("--cpu-kernel-profile", choices=("v1", "ggml_v2"), default="v1",
+                        help="CPU Target arithmetic profile; ggml_v2 defaults to attention only")
+    parser.add_argument("--cpu-kernel-components", nargs="+",
+                        choices=("attention", "dense", "head", "experts", "gdn", "expert_reuse", "expert_numa"),
+                        help="Explicit ggml_v2 components, for example: attention gdn")
+    parser.add_argument("--cpu-async-prefix-layers", type=int,
+                        help="Fixed CPU Target prefix; remaining layers verify on GPU with Hybrid")
+    parser.add_argument("--cpu-async-split-profile", help="Matching offline CPU/GPU layer split profile")
+    parser.add_argument("--cpu-async-suffix-prefetch-experts", type=int, default=4)
+    parser.add_argument("--cpu-async-suffix-gpu-experts", type=int, default=4)
     parser.add_argument("--recovery", choices=("fixed_replay", "recheck"), default="fixed_replay")
     parser.add_argument("--cpu-cores", help="CPU Target physical CPU ids, comma separated")
     parser.add_argument("--hybrid-cores", help="Hybrid physical CPU ids, comma separated")
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--slots", type=int, default=0)
     parser.add_argument("--budget-gib", type=float)
+    parser.add_argument("--memory-ratio", type=float, default=0.9)
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument("--max-output-tokens", type=int, default=1024)
     parser.add_argument("--tokens", type=int, default=1024)
@@ -328,19 +349,16 @@ def main():
     if args.profile_prefetch and (args.purpose == "formal" or args.calibrate_prefetch
                                  or args.mode != "three_level_gpu" or args.graph not in (None, "full")):
         parser.error("--profile-prefetch requires a separate three_level_gpu/full diagnostic run")
-    if args.allow_candidate_profile and args.prefetch_profile == "auto":
-        parser.error("candidate opt-in requires an explicit --prefetch-profile path")
     if args.calibrate_prefetch:
         if args.mode != "three_level_gpu" or args.backend != "offload" or args.graph not in (None, "full"):
             parser.error("prefetch calibration currently requires three_level_gpu/offload/full")
-        if args.budget_gib is None or args.budget_gib <= 2 or args.slots:
-            parser.error("calibration requires a total --budget-gib > 2 and automatic bootstrap slots")
-        if not 1 <= args.calibration_max_experts <= 64:
-            parser.error("calibration search cap must be in [1, 64]")
         if args.purpose == "formal":
             parser.error("profiled calibration is diagnostic; use --purpose diagnostic")
-        if args.prefetch_profile != "auto" or args.allow_candidate_profile:
+        if args.prefetch_profile != "auto":
             parser.error("calibration produces a new profile rather than consuming an existing profile")
+        args.samples = 1
+        if args.data and len(args.data) != 1:
+            parser.error("single-sample calibration accepts at most one dataset")
     out = args.output.resolve()
     if out == Path("/tmp") or Path("/tmp") in out.parents:
         parser.error("use a persistent output directory outside /tmp")
@@ -363,29 +381,44 @@ def main():
         if args.budget_gib is not None and (not math.isfinite(args.budget_gib) or args.budget_gib <= 0):
             raise ValueError("budget_gib must be finite and positive")
         model = resolve_model(args.model)
+        if args.mode == "ar" and args.draft_model:
+            raise ValueError("AR does not load a Draft; omit --draft-model")
         checkpoints = dict(target=checkpoint_identity(model),
-            draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp")
+            draft=checkpoint_identity(args.draft_model) if args.draft_model else None if args.mode == "ar" else "native_mtp")
         write("checkpoints.json", checkpoints)
-        config = BenchmarkConfig(model_path=model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
-            rendezvous_file=str(out / "rendezvous"), speculative_mode=args.mode,
+        mode_config = dict(speculative_mode=args.mode,
             speculative_depth=args.depth, speculative_draft_model=args.draft_model,
             speculative_graph=args.graph, speculative_preverify_top_h=args.preverify_top_h,
-            speculative_max_loops=args.max_loops,
-            **prefetch_config_kwargs(args),
+            speculative_max_loops=args.max_loops, **prefetch_config_kwargs(args))
+        if args.mode == "ar":
+            capacity = args.max_input_tokens + args.max_output_tokens
+            mode_config = dict(speculative_mtp_depth=0, speculative_prefetch=False,
+                max_running_req=1, attention_backend="triton", cache_type="naive",
+                max_seq_len_override=capacity, num_page_override=capacity, kv_reserve_tokens=capacity,
+                moe_cache_auto=not args.slots and args.backend != "fused",
+                cuda_graph_bs=[] if args.graph == "eager" else [1],
+                cuda_graph_max_bs=0 if args.graph == "eager" else 1)
+        config = BenchmarkConfig(model_path=model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+            rendezvous_file=str(out / "rendezvous"), **mode_config,
             cpu_async_loops=args.cpu_async_loops, cpu_async_recovery=args.recovery,
+            cpu_async_kernel_profile=args.cpu_kernel_profile,
+            cpu_async_kernel_components=tuple(args.cpu_kernel_components) if args.cpu_kernel_components is not None else None,
+            cpu_async_prefix_layers=args.cpu_async_prefix_layers,
+            cpu_async_split_profile=args.cpu_async_split_profile,
+            cpu_async_suffix_prefetch_experts=args.cpu_async_suffix_prefetch_experts,
+            cpu_async_suffix_gpu_experts=args.cpu_async_suffix_gpu_experts,
             cpu_async_core_ids=tuple(map(int, args.cpu_cores.split(","))) if args.cpu_cores else None,
             moe_cpu_core_ids=tuple(map(int, args.hybrid_cores.split(","))) if args.hybrid_cores else None,
             moe_strategy=args.backend, moe_cache_scope=args.cache_scope, moe_cache_size=args.slots,
             moe_collect_stats=True,
             moe_cpu_threads=args.cpu_threads,
             moe_hybrid_max_fetch=args.hybrid_max_fetch,
-            memory_ratio=1.0 if args.budget_gib is not None else 0.9,
-            gpu_memory_budget_bytes=(int((args.budget_gib - (2 if args.calibrate_prefetch else 0)) * 2**30)
+            memory_ratio=args.memory_ratio,
+            gpu_memory_budget_bytes=(int(args.budget_gib * 2**30)
                                      if args.budget_gib else None),
             speculative_max_input_tokens=args.max_input_tokens,
             speculative_max_output_tokens=args.max_output_tokens,
             mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))))
-        object.__setattr__(config, "_speculative_prefetch_allow_candidate", args.allow_candidate_profile)
         if args.calibrate_prefetch or args.profile_prefetch:
             from speculative_prefetch_recorder import PrefetchWindowRecorder
             object.__setattr__(config, "_prefetch_calibration_recorder", PrefetchWindowRecorder())
@@ -409,6 +442,18 @@ def main():
         monitor = ResourceMonitor(out / "resources.jsonl", initial, cpu_policy=args.cpu_interference_policy,
                                   initial_interference=interference)
         engine = Engine(config)
+        ar_counts = None
+        if args.mode == "ar":
+            from freetoken.engine.qwen_mtp import QwenMTPRunner
+            engine.speculative_runner = QwenMTPRunner(engine, reference_ar=True)
+            ar_counts = dict(replays=0, fallbacks=0)
+            forward_batch = engine.forward_batch
+            def ar_forward(batch, sampling):
+                if batch.is_decode:
+                    key = "replays" if engine.graph_runner.can_use_cuda_graph(batch) else "fallbacks"
+                    ar_counts[key] += 1
+                return forward_batch(batch, sampling)
+            engine.forward_batch = ar_forward
         write("resolved_config.json", asdict(config))
         write("memory_plan.json", memory_report(engine))
         from freetoken.engine.speculative_prefetch_profile import prefetch_receipt
@@ -417,20 +462,24 @@ def main():
             raise RuntimeError("expected capacity rejection but the model initialized")
         if args.calibrate_prefetch:
             from speculative_prefetch_driver import run_calibration_entry
-            run_calibration_entry(engine, prompts, out, tokens=args.tokens,
-                max_experts=args.calibration_max_experts, total_budget_bytes=int(args.budget_gib * 2**30))
+            profile = run_calibration_entry(engine, prompts, out, tokens=args.tokens,
+                prompt_chunk_size=args.prompt_chunk_size)
             engine.shutdown()
             engine = None
             resources = monitor.close()
             monitor = None
             write("resource_validation.json", resources)
             changed = frozen != source_identity(root)
-            write("complete.json", dict(status="complete", valid=not changed,
-                formal_eligible=False, purpose="diagnostic", source_changed=changed,
-                resource_eligible=resources["resource_eligible"], shutdown_complete=True,
-                calibration_status="candidate", automatic_publishable=False))
             if changed or not resources["resource_eligible"]:
-                raise RuntimeError("calibration source or resource validation failed; candidate must not be published")
+                raise RuntimeError("calibration source or resource validation failed; profile was not cached")
+            from freetoken.engine.speculative_prefetch_profile import profile_directory, profile_key
+            cache_path = profile_directory() / (profile_key(profile["identity"]) + ".json")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(profile, indent=2) + "\n")
+            write("complete.json", dict(status="complete", valid=True,
+                formal_eligible=False, purpose="diagnostic", source_changed=False,
+                resource_eligible=True, shutdown_complete=True, calibration_status="calibrated",
+                samples=1, profile_path=str(cache_path), performance_gain="not_measured"))
             return
         if args.mode == "cpu_async":
             from freetoken.engine.cpu_async import CpuAsyncRuntime
@@ -438,6 +487,8 @@ def main():
                 engine.cpu_async_runtime = CpuAsyncRuntime(engine)
             engine.cpu_async_runtime._prepare_worker()
             write("cpu_target_runtime.json", engine.cpu_async_runtime.worker.metadata)
+            if config.cpu_async_prefix_layers is not None:
+                write("cpu_async_split_receipt.json", config._cpu_async_split_receipt)
         rows = []
         recorder = getattr(config, "_prefetch_calibration_recorder", None)
         if args.profile_prefetch:
@@ -447,12 +498,17 @@ def main():
             if args.profile_prefetch:
                 recorder.enabled = repeat >= 0
             for prompt in prompts:
+                if ar_counts is not None:
+                    ar_counts.update(replays=0, fallbacks=0)
                 torch.cuda.reset_peak_memory_stats(engine.device)
                 result = engine.generate_speculative(prompt["input_ids"], max_tokens=args.tokens,
                     eos_ids=eos, prompt_chunk_size=args.prompt_chunk_size)
                 record = dict(repeat=repeat, warmup=repeat < 0, dataset=prompt["dataset"], sample=prompt["sample"],
                     input_tokens=len(prompt["input_ids"]), profiled=args.profile_prefetch, **asdict(result))
-                validate_request(record, args.tokens, eos, config.speculative_graph)
+                if ar_counts is not None:
+                    record["ar_decode_graph"] = dict(ar_counts)
+                graph = (args.graph or "full") if ar_counts is not None else config.speculative_graph
+                validate_request(record, args.tokens, eos, graph)
                 record["returned_tokens"] = len(result.token_ids)
                 record["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(engine.device)
                 record["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(engine.device)
@@ -470,7 +526,7 @@ def main():
             write("prefetch_diagnostics.json", dict(windows=recorder.windows, stages=recorder.stages,
                 scope="instrumented Graph replay; residual copy completion beyond join-ready; not formal timing"))
         if checkpoints != dict(target=checkpoint_identity(model),
-                draft=checkpoint_identity(args.draft_model) if args.draft_model else "native_mtp"):
+                draft=checkpoint_identity(args.draft_model) if args.draft_model else None if args.mode == "ar" else "native_mtp"):
             raise RuntimeError("checkpoint files changed during the run")
         engine.shutdown()
         engine = None

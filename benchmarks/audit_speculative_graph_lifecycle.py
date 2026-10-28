@@ -132,9 +132,14 @@ def main():
     assert generate() == expected
     clean()
     checks["capture_failure_joins_layer_copy_forks"] = True
-    expected_graphs = 2 * (graphs.width + graphs.outer_width) if graphs.exact else 4
+    report = graphs.report()
+    combined = report["draft_verify_shapes"]
+    assert report["combined_graph_count"] == len(combined)
+    assert all(1 <= item["draft_count"] <= min(engine.config.speculative_mtp_depth, item["rows"] - 1)
+               for item in combined)
+    expected_graphs = (3 * (graphs.width + graphs.outer_width) if graphs.exact else 6) + len(combined)
     assert len(graphs.graphs) == graphs.captures == expected_graphs
-    write("validation.json", dict(checks=checks, graph=graphs.report(), recovery_tokens=expected))
+    write("validation.json", dict(checks=checks, graph=report, recovery_tokens=expected))
     for name, digest in identity["source_sha256"].items():
         if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
             raise AssertionError(f"source changed during audit: {name}")

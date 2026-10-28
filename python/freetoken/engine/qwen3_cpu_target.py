@@ -81,7 +81,9 @@ class Qwen3CpuTarget(QwenCpuTarget):
                                for name, (shape, dtype) in prefix_shapes(config, max_context).items()}
         self.keys, self.values = self.prefix_storage["keys"], self.prefix_storage["values"]
         qh, kvh, d = (config[key] for key in ("num_attention_heads", "num_key_value_heads", "head_dim"))
-        self.kv_tmp = torch.empty(kvh, 64, 2, d)
+        self.attention_heads_per_task = 2 if hasattr(self.native, "target_attention_grouped") else qh // kvh
+        attention_tasks = kvh * ((qh // kvh + self.attention_heads_per_task - 1) // self.attention_heads_per_task)
+        self.kv_tmp = torch.empty(attention_tasks, 64, 2, d)
         self.attn_accum = torch.empty(max_rows, qh, d + 2)
         self.attn_output = torch.empty(max_rows, qh, d, dtype=torch.bfloat16)
         inv = config["rope_theta"] ** (-torch.arange(0, d, 2).float() / d)
@@ -204,8 +206,12 @@ class Qwen3CpuTarget(QwenCpuTarget):
             self.keys[ai, pos].copy_(self._rope(self._norm(key[row], w("k_norm"), eps), pos))
         self.values[ai, start:start + x.shape[0]].copy_(value)
         output = self.attn_output[:x.shape[0]]
-        self.native.target_attention(torch.stack(queries), self.keys[ai], self.values[ai],
-                                     self.kv_tmp, self.attn_accum, output, start)
+        args = (torch.stack(queries), self.keys[ai], self.values[ai],
+                self.kv_tmp, self.attn_accum, output, start)
+        if hasattr(self.native, "target_attention_grouped"):
+            self.native.target_attention_grouped(*args, self.attention_heads_per_task)
+        else:
+            self.native.target_attention(*args)
         return self._linear(output.view(x.shape[0], -1), w("o_proj"))
 
     def _moe(self, layer, x):
@@ -220,6 +226,8 @@ class Qwen3CpuTarget(QwenCpuTarget):
         return dict(backend="optimized", kernel_profile="gguf", arithmetic_version="cpu_qwen3_gguf_v1",
                     expert_schedule="grouped", projection_isa=self.experts.ext.isa_name(),
                     torch_threads=torch.get_num_threads(), packed_experts=True,
+                    attention_heads_per_task=self.attention_heads_per_task,
+                    gguf_dot2=bool(hasattr(self.native, "gguf_dot2_enabled") and self.native.gguf_dot2_enabled()),
                     weight_storage=self.weight_storage,
                     expert_storage=self.expert_storage, dense_storage="gguf_file_mmap",
                     auxiliary_layer_boundaries=self.aux_boundaries,

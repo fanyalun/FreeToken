@@ -32,7 +32,7 @@ from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, r
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .baseline_sd import is_baseline_sd, is_native_sd, resolve_capacity, plan_measured_memory
+from .baseline_sd import is_baseline_sd, is_native_sd, resolve_capacity, plan_static_memory
 from .graph import GraphRunner, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
@@ -386,6 +386,8 @@ class Engine:
         if config.speculative_mode == "cpu_async":
             from .cpu_async import configure_cpu_resources
             configure_cpu_resources(config)
+            from .cpu_async_split_profile import prepare_split_profile
+            prepare_split_profile(config, self.device)
         from .speculative_prefetch_profile import prepare_prefetch_profile
         prepare_prefetch_profile(config, self.device)
         # KV pool family fixed at construction from the model config: its classmethods own the
@@ -473,6 +475,8 @@ class Engine:
             from freetoken.moe.host_banks import shared_bank_allocations
             with shared_bank_allocations(config.speculative_mode == "cpu_async"):
                 self._init_offload_moe_cache(config)
+        elif is_native_sd(config):
+            self._plan_speculative_memory()
         from .speculative_prefetch_profile import validate_prefetch_profile
         validate_prefetch_profile(self)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -512,9 +516,8 @@ class Engine:
         available_memory -= speculative_hybrid_workspace_bytes(config, include_cpu_partials=False)
         if is_native_sd(config):
             per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
-            required = (config.num_page_override + 1) * per_page + fixed
-            if required > available_memory:
-                raise ValueError(f"baseline SD KV/state allocation needs {required} B > available {available_memory} B")
+            # The static plan already reserved KV; allocator slack uses the runtime reserve.
+            available_memory = (config.num_page_override + 1) * per_page + fixed
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kv_pool(
@@ -598,8 +601,9 @@ class Engine:
         if config.speculative_mtp_depth:
             from .qwen_mtp import QwenMTPRunner
             self.speculative_runner = QwenMTPRunner(self)
-            if is_native_sd(config):
-                self._initialize_baseline_sd_budget()
+            if is_baseline_sd(config):
+                self._prepare_baseline_hybrid()
+                self.speculative_runner.prepare_graphs()
 
     def generate_speculative(self, input_ids, *, max_tokens: int, eos_ids=(), cancel=None, prompt_chunk_size=None):
         if self.speculative_runner is None:
@@ -613,37 +617,13 @@ class Engine:
             cancel=cancel, prompt_chunk_size=prompt_chunk_size,
         )
 
-    def _measure_baseline_sd_peak(self):
-        if (getattr(self, "cpu_async_runtime", None) is not None
-                and self.cpu_async_runtime.runner is not self.speculative_runner):
-            self.cpu_async_runtime.close()
-            self.cpu_async_runtime = None
-            gc.collect()
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        if is_baseline_sd(self.config):
-            self._prepare_baseline_hybrid()
-        self.speculative_runner.prepare_runtime()
-        if self.config.speculative_mode == "cpu_async":
-            from .cpu_async import CpuAsyncRuntime
-            if getattr(self, "cpu_async_runtime", None) is None:
-                self.cpu_async_runtime = CpuAsyncRuntime(self)
-            self.cpu_async_runtime.window.prepare_runtime()
-        allocated = torch.cuda.memory_allocated(self.device) - self._baseline_allocated
-        # mem_get_info also accounts for runtime allocations outside the PyTorch allocator.
-        torch.cuda.empty_cache()
-        external = max(0, self._physical_baseline_free - torch.cuda.mem_get_info(self.device)[0] - allocated)
-        return torch.cuda.max_memory_allocated(self.device) - self._baseline_allocated + external
-
     def _prepare_baseline_hybrid(self):
         cache, config = self.moe_offload_cache, self.config
         if (cache is None or cache.decode_target != "hybrid"
                 or config.speculative_hybrid_window_policy != "balanced"):
             return
         from freetoken.layers.moe import _HYBRID_WINDOW
-        profile_path = (config.speculative_hybrid_profile if not config.moe_cache_auto
-                        or self.baseline_sd_memory_plan is not None else None)
+        profile_path = config.speculative_hybrid_profile
         if not _HYBRID_WINDOW:
             return
         if cache.baseline_hybrid is not None and cache.baseline_hybrid.profile_path == profile_path:
@@ -668,75 +648,25 @@ class Engine:
         planner.profile_path = profile_path
         cache.baseline_hybrid = planner
 
-    def _initialize_baseline_sd_budget(self):
+    def _plan_speculative_memory(self, *, minimum=0, maximum=0, slot_bytes=0, cache_cost=None):
         config = self.config
-        cache = self.moe_offload_cache
-        slots, slot_bytes = self._target_moe_and_expert_bytes(None, None)
-        if cache is not None:
-            # Reverse IDs, usage counters, eviction slots and source indices scale with slot count.
-            slot_bytes += sum(t.element_size() for t in
-                              (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
-        minimum = config.model_config.num_experts * (2 if config.moe_prefill_overlap else 1) if cache else 0
-        if cache is not None:
-            minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
-            minimum = max(minimum, getattr(self, "_baseline_sd_minimum_slots", 0))
-        maximum = min(cache.num_layers * cache.num_experts, cache.max_slots or cache.num_layers * cache.num_experts) if cache else 0
-        peak = self._measure_baseline_sd_peak()
-        self._baseline_sd_initial_state_bytes = state_pool_bytes(
-            config, self.linear_state_pool.num_slots if self.linear_state_pool is not None else None)
-        # BF16 fused routing allocates its worst-case padded arrays from shape, not route IDs.
-        routing_reserve = 0
+        from .cache_budget import (speculative_gdn_workspace_bytes, speculative_hybrid_workspace_bytes,
+                                   speculative_split_workspace_bytes)
+        capacity, pages = resolve_capacity(config)
+        per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
         budget = int(config.memory_ratio * self._baseline_free)
-        plan = plan_measured_memory(
-            capacity_tokens=self.max_seq_len, kv_pages=self.num_pages,
-            budget_bytes=budget, measured_peak_bytes=peak,
-            initial_slots=slots, expert_slot_bytes=slot_bytes, minimum_slots=minimum,
-            maximum_slots=maximum, automatic=config.moe_cache_auto, routing_reserve_bytes=routing_reserve,
-            cache_bytes_for_slots=self._speculative_cache_bytes if cache is not None else None,
-            sizing_headroom_bytes=max(256 << 20, budget // 100) if config.moe_cache_auto else 0,
-        )
+        plan = plan_static_memory(capacity_tokens=capacity, kv_pages=pages, budget_bytes=budget,
+            weights_bytes=self._weights_bytes, kv_bytes=(pages + 1) * per_page,
+            state_bytes=state_pool_bytes(config),
+            workspace_bytes=(fixed + speculative_hybrid_workspace_bytes(config)
+                             + speculative_gdn_workspace_bytes(config) + speculative_split_workspace_bytes(config)),
+            runtime_reserve_bytes=self._baseline_free - budget,
+            expert_slot_bytes=slot_bytes, minimum_slots=minimum, maximum_slots=maximum,
+            slots=0 if config.moe_cache_auto or not slot_bytes else config.moe_cache_size,
+            cache_bytes_for_slots=cache_cost)
         self.baseline_sd_memory_plan = plan
-        self._sd_sizing = config.moe_cache_auto
-        self._sd_sizing_retries = 0
-        try:
-            if cache is not None and (plan.final_slots != slots or config.moe_cache_auto):
-                self.rebuild_runtime_cache(moe_cache_size=plan.final_slots)
-            else:
-                self._validate_baseline_sd_peak()
-        finally:
-            self._sd_sizing = False
-        if config.moe_cache_auto and config.speculative_three_level and config.speculative_hybrid_profile:
-            self.rebuild_runtime_cache(moe_cache_size=self.baseline_sd_memory_plan.final_slots)
-        logger.info_rank0(f"native SD memory plan: {self.baseline_sd_memory_plan.as_dict()}")
-
-    def _validate_baseline_sd_peak(self):
-        peak = self._measure_baseline_sd_peak()
-        plan = self.baseline_sd_memory_plan
-        if peak + plan.routing_reserve_bytes > plan.budget_bytes:
-            cache = self.moe_offload_cache
-            if (getattr(self, "_sd_sizing", False) and cache is not None
-                    and getattr(self, "_sd_sizing_retries", 0) == 0):
-                from dataclasses import replace
-                minimum = self.config.model_config.num_experts * (2 if self.config.moe_prefill_overlap else 1)
-                minimum = max(minimum, sum(pool.min_num_slots for pool in self._moe_pools(1)))
-                minimum = max(minimum, getattr(self, "_baseline_sd_minimum_slots", 0))
-                overflow = peak + plan.routing_reserve_bytes - plan.budget_bytes
-                reduction = max(1, (overflow + plan.sizing_headroom_bytes + plan.expert_slot_bytes - 1)
-                                // plan.expert_slot_bytes)
-                slots = max(minimum, cache.cache_size - reduction)
-                if slots < cache.cache_size:
-                    self._sd_sizing_retries = 1
-                    cache_bytes = self._speculative_cache_bytes(slots)
-                    self.baseline_sd_memory_plan = replace(plan, final_slots=slots, final_cache_bytes=cache_bytes)
-                    logger.info_rank0(
-                        f"native SD auto-sizing retry: slots={cache.cache_size}->{slots}, overflow={overflow} B, "
-                        f"cache_bytes={plan.final_cache_bytes}->{cache_bytes}"
-                    )
-                    self.rebuild_runtime_cache(moe_cache_size=slots)
-                    return
-            raise ValueError(f"baseline SD final boundary warmup needs {peak + plan.routing_reserve_bytes} B "
-                             f"> budget {plan.budget_bytes} B; reduce input/output limits or expert slots")
-        self.baseline_sd_final_peak_bytes = peak
+        logger.info_rank0(f"native SD static memory plan: {plan.as_dict()}")
+        return plan.final_slots
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -969,11 +899,14 @@ class Engine:
         pools = self._moe_pools(1)
         size_cap = sum(p.max_num_slots for p in pools)
         if config.moe_cache_auto and is_native_sd(config):
-            from .cache_budget import minimum_staging_slots
-            size = minimum_staging_slots(banks.sources, pools, config.model_config.num_experts,
+            from .cache_budget import minimum_staging_slots, expert_pool_bytes
+            minimum = minimum_staging_slots(banks.sources, pools, config.model_config.num_experts,
                 buffers=2 if config.moe_prefill_overlap else 1, counts=self._moe_expert_counts,
                 row_tail_bytes=banks.row_tail_bytes, layer_tags=layer_tags)
-            self._baseline_sd_minimum_slots = size
+            cost = lambda slots: expert_pool_bytes(banks.sources, pools,
+                split_slots(slots, pools, self._moe_expert_counts), banks.row_tail_bytes, layer_tags) + slots * 20
+            size = self._plan_speculative_memory(minimum=minimum, maximum=size_cap,
+                slot_bytes=expert_bytes_per_slot(banks.sources) + 20, cache_cost=cost)
             object.__setattr__(config, "moe_cache_size", size)
         elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
@@ -1005,6 +938,11 @@ class Engine:
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
+        if is_native_sd(config) and self.baseline_sd_memory_plan is None:
+            from .cache_budget import expert_pool_bytes
+            cost = lambda slots: expert_pool_bytes(banks.sources, pools,
+                split_slots(slots, pools, self._moe_expert_counts), banks.row_tail_bytes, layer_tags) + slots * 20
+            self._plan_speculative_memory(slot_bytes=expert_bytes_per_slot(banks.sources) + 20, cache_cost=cost)
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         if len(pools) > 1:
@@ -1231,9 +1169,18 @@ class Engine:
             grouped_widths = tuple(range(1, min(config.speculative_mtp_depth + 1,
                                                config.speculative_max_output_tokens) + 1))
         if config.moe_strategy == "hybrid" and (config.speculative_three_level or config.speculative_mode == "cpu_async"):
-            maximum = config.speculative_submit_tokens or config.speculative_max_loops * (config.speculative_mtp_depth + 1) + 1
-            maximum = min(maximum, config.speculative_max_loops * (config.speculative_mtp_depth + 1) + 1,
+            loops = config.cpu_async_loops if config.speculative_mode == "cpu_async" else config.speculative_max_loops
+            maximum = loops * (config.speculative_mtp_depth + 1) + 1
+            if config.speculative_three_level and config.speculative_mode != "cpu_async":
+                from .speculative_window import three_level_max_rows
+
+                maximum = three_level_max_rows(config.speculative_mtp_depth, config.speculative_max_loops)
+            maximum = min(config.speculative_submit_tokens or maximum, maximum,
                           config.speculative_max_output_tokens)
+            if config.speculative_mode == "cpu_async":
+                from .cache_budget import CPU_ASYNC_REPLAY_ROWS
+
+                maximum = max(maximum, CPU_ASYNC_REPLAY_ROWS, loops * (config.speculative_mtp_depth + 1) + 1)
             max_tokens = max(max_tokens, maximum)
             if config.speculative_expert_scheduler == "gpu" and config.speculative_hybrid_phases:
                 grouped_widths = tuple(range(1, maximum + 1))
@@ -1425,9 +1372,9 @@ class Engine:
                 raise CacheRebuildRejected("KV rebuild would violate baseline SD input/output limits")
             per_page = self._pool_cls.kv_cost(config)[0]
             extra = (target_pages - plan.kv_pages) * per_page
-            extra += state_pool_bytes(config, target_mamba) - self._baseline_sd_initial_state_bytes
+            extra += state_pool_bytes(config, target_mamba) - plan.state_bytes
             try:
-                exact_bytes = self._speculative_cache_bytes(target_moe) if plan.initial_cache_bytes else None
+                exact_bytes = self._speculative_cache_bytes(target_moe) if self.moe_offload_cache is not None else 0
                 plan.validate(target_moe, extra, cache_bytes=exact_bytes)
             except ValueError as exc:
                 raise CacheRebuildRejected(str(exc)) from exc
@@ -1514,8 +1461,9 @@ class Engine:
             from .speculative_prefetch_profile import validate_prefetch_profile
             validate_prefetch_profile(self)
             self.speculative_runner = QwenMTPRunner(self)
-            if is_native_sd(config):
-                self._validate_baseline_sd_peak()
+            if is_baseline_sd(config):
+                self._prepare_baseline_hybrid()
+                self.speculative_runner.prepare_graphs()
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream

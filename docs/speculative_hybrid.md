@@ -135,7 +135,7 @@ workspace as B; use the same benchmark driver and record its hash separately.
 budget. `--prompt-chunk-size N` fixes the external chunk for storage/scheduling
 parity audits; omitting it uses whole-prompt prefill. `--graphs eager|reference|full`
 selects execution without changing the default full-Graph benchmark setting.
-The config records initialization time, measured startup peak, memory plan and
+The config records initialization time, the static memory plan and
 actual slots, alongside complete-request TTFT, TPOT, throughput, loops and audit
 load counters. The explicitly chunked teacher-forced diagnostic records its
 128-token chunk separately. None of these preparation changes establish speedup.

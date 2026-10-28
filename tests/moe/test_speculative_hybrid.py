@@ -551,6 +551,68 @@ def test_partition_with_more_slots_than_experts():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_fixed_hybrid_route_ranks_are_cache_independent(graph_mode):
+    from freetoken.moe.fused import fused_experts_decode_impl
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    stream = torch.cuda.Stream()
+    torch.manual_seed(203)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        cache = make_cache(stream, slots=16)
+        control = GPUExpertCache(cache, stream, max_loops=1, max_rows=15,
+            compact_control=True, implementation="optimized", prefetch=False, hybrid_phases=("verify",))
+        control.prepare_fixed_hybrid(4)
+        ids = ((torch.arange(15, device="cuda") % 2)[:, None] * 8
+               + torch.tensor([5, 1, 3, 7, 2, 6, 0, 4], device="cuda")[None, :]).int()
+        weights = torch.tensor([4., 4., 3., 3., 3., 3., 1., 1.], device="cuda").expand(15, 8).contiguous() / 22
+        hidden = torch.randn(15, 64, device="cuda", dtype=torch.bfloat16)
+        def gemm(cache, x, weights, slots, **kwargs):
+            return fused_experts_decode_impl(x, *cache.bank_views(), weights, slots, "silu", False)
+        layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+        control.begin(1)
+        control.set_phase("verify")
+        try:
+            output = control.route(layer, hidden, weights, ids)
+            stream.synchronize()
+            if graph_mode:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = control.route(layer, hidden, weights, ids)
+            reference = None
+            for resident in ([], [4, 5, 6, 7, 12, 13, 14, 15], list(range(16)), []):
+                cache.slot_for_id.fill_(-1)
+                cache.id_of_slot.fill_(-1)
+                cache.banks[0][1].fill_(float("nan"))
+                cache.banks[1][1].fill_(float("nan"))
+                for slot, expert in enumerate(resident):
+                    cache.slot_for_id[0, expert] = slot
+                    cache.id_of_slot[slot] = expert
+                    for source, bank in cache.banks:
+                        bank[slot].copy_(source[0][expert])
+                if graph_mode:
+                    graph.replay()
+                else:
+                    output = control.route(layer, hidden, weights, ids)
+                stream.synchronize()
+                actual = output.clone()
+                if reference is None:
+                    reference = actual
+                torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                cpu_ids, cpu_weights = control.hybrid_outputs[15]
+                gpu_slots, gpu_weights = control.outputs[(0, 15)]
+                keep = torch.tensor([True, True, True, False, True, False, False, False], device="cuda")
+                expected_cpu = torch.where(keep[None, :], -1, ids)
+                torch.testing.assert_close(cpu_ids, expected_cpu, rtol=0, atol=0)
+                torch.testing.assert_close(cpu_weights + gpu_weights, weights, rtol=0, atol=0)
+                assert not control.pending.any() and control.error.item() == 0
+        finally:
+            control.close(abort=True)
+            cache.cpu_executor.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("phase", ["verify", "preverify"])
 @pytest.mark.parametrize("cap,prefer_gpu", [(0, True), (1, True), (-1, False), (-1, True)])
 @pytest.mark.parametrize("cache_state", ["empty", "protected", "hits"])

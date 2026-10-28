@@ -110,13 +110,12 @@ def main():
     if bool(args.sqlite) == bool(args.offline_calibration):
         parser.error("provide either a legacy SQLite trace or --offline-calibration")
     if args.offline_calibration:
-        if args.copy_cost or args.policy != "conservative":
-            parser.error("offline calibration includes production copy samples and uses conservative bounds")
-        from three_level_prefetch_calibration import build_prefetch_profile
+        if args.copy_cost:
+            parser.error("single-sample calibration already includes expert IO measurements")
+        from three_level_prefetch_calibration import select_quotas
         source = json.loads(args.offline_calibration.read_text())
-        result = build_prefetch_profile(source["window_samples"], source["copy_samples"],
-            identity=source["identity"], coverage=source["coverage"], layer_pools=source["layer_pools"],
-            **source.get("policy", {}))
+        result = select_quotas(source["windows"], source["stages"], source["expert_io"],
+            layer_layouts=source["geometry"]["layer_layout"], num_experts=source["num_experts"])
         result["calibration_source"] = dict(path=str(args.offline_calibration.resolve()),
             sha256=hashlib.sha256(args.offline_calibration.read_bytes()).hexdigest())
         args.output.write_text(json.dumps(result, indent=2) + "\n")

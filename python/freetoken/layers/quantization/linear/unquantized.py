@@ -23,7 +23,9 @@ class TorchLinearKernel(LinearKernel):
             b = b.to(x.dtype) if b is not None else None
         from freetoken.core import get_active_batch
         batch = get_active_batch()
-        if (getattr(batch, "speculative_reference_math", False) and x.ndim == 2 and x.shape[0] > 1):
+        stable = (getattr(batch, "speculative_reference_math", False)
+                  or getattr(batch, "stable_target_linear", False))
+        if stable and x.ndim == 2 and x.shape[0] > 1:
             return torch.cat([F.linear(row, w, b) for row in x.split(1)], dim=0)
         return F.linear(x, w, b)
 

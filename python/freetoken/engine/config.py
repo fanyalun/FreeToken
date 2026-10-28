@@ -99,6 +99,13 @@ class EngineConfig:
     cpu_async_recovery: str = "fixed_replay"
     cpu_async_timeout: float = 600.0
     cpu_async_core_ids: tuple[int, ...] | None = None
+    cpu_async_kernel_profile: str = "v1"
+    cpu_async_kernel_components: tuple[str, ...] | None = None
+    cpu_async_prefix_layers: int | None = None
+    cpu_async_split_profile: str | None = None
+    cpu_async_suffix_prefetch_experts: int = 4
+    cpu_async_suffix_gpu_experts: int = 4
+    _cpu_async_split_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
     moe_cpu_core_ids: tuple[int, ...] | None = None
     _cpu_moe_coordinator_core: int | None = field(default=None, init=False, repr=False)
     _speculative_legacy: bool | None = field(default=None, repr=False)
@@ -116,7 +123,6 @@ class EngineConfig:
     speculative_overlap_loops: int = 3
     speculative_prefetch: bool | None = None
     speculative_prefetch_profile: str | None = "auto"
-    _speculative_prefetch_allow_candidate: bool = field(default=False, init=False, repr=False)
     _speculative_prefetch_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
     speculative_prefetch_layer_experts: int | None = None
     speculative_prefetch_layer_quotas: List[int] | None = None

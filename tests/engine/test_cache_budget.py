@@ -28,40 +28,38 @@ def test_baseline_capacity_is_bounded_independently_of_chunk(page_size, pages):
         resolve_capacity(config)
 
 
-@pytest.mark.parametrize("automatic,headroom,expected", [(True, 0, 8), (False, 250, 2),
-                                                       (True, 250, 5), (True, 2000, 2)])
-def test_baseline_measured_budget_preserves_runtime_and_caps_experts(automatic, headroom, expected):
-    from freetoken.engine.baseline_sd import plan_measured_memory
-    plan = plan_measured_memory(capacity_tokens=10, kv_pages=3, budget_bytes=1200,
-        measured_peak_bytes=600, initial_slots=2, expert_slot_bytes=100, minimum_slots=2,
-        maximum_slots=20, automatic=automatic, sizing_headroom_bytes=headroom)
-    assert plan.non_expert_peak_bytes == 400 and plan.final_slots == expected
-    assert plan.sizing_headroom_bytes == (min(headroom, 600) if automatic else 0)
+@pytest.mark.parametrize("slots,expected", [(0, 8), (2, 2)])
+def test_static_budget_reserves_fixed_memory_before_experts(slots, expected):
+    from freetoken.engine.baseline_sd import plan_static_memory
+
+    plan = plan_static_memory(capacity_tokens=10, kv_pages=3, budget_bytes=1200,
+        weights_bytes=100, kv_bytes=100, state_bytes=100, workspace_bytes=100,
+        expert_slot_bytes=100, minimum_slots=2, maximum_slots=20, slots=slots)
+    assert plan.non_expert_bytes == 400 and plan.final_slots == expected
     plan.validate(expected)
     with pytest.raises(ValueError, match="shortfall"):
         plan.validate(9)
 
 
 def test_baseline_budget_rejects_minimum_and_fused_overcommit():
-    from freetoken.engine.baseline_sd import plan_measured_memory
+    from freetoken.engine.baseline_sd import plan_static_memory
+
     for slots, unit in ((2, 100), (0, 0)):
         with pytest.raises(ValueError, match="shortfall"):
-            plan_measured_memory(capacity_tokens=10, kv_pages=3, budget_bytes=500,
-                measured_peak_bytes=600, initial_slots=slots, expert_slot_bytes=unit,
-                minimum_slots=slots, maximum_slots=20, automatic=True)
+            plan_static_memory(capacity_tokens=10, kv_pages=3, budget_bytes=500,
+                weights_bytes=600, kv_bytes=0, state_bytes=0, workspace_bytes=0,
+                slots=slots, expert_slot_bytes=unit, minimum_slots=slots, maximum_slots=20)
 
 
-def test_measured_budget_uses_mixed_pool_allocations():
-    from freetoken.engine.baseline_sd import plan_measured_memory
-    # Each pair of slots allocates one 100-byte and one 160-byte layout row.
+def test_static_budget_uses_mixed_pool_allocations():
+    from freetoken.engine.baseline_sd import plan_static_memory
+
     sizes = [0, 160, 260, 420, 520, 680, 780, 940, 1040]
-    plan = plan_measured_memory(capacity_tokens=10, kv_pages=10, budget_bytes=1200,
-        measured_peak_bytes=660, initial_slots=2, expert_slot_bytes=160,
-        minimum_slots=2, maximum_slots=8, automatic=True,
-        cache_bytes_for_slots=sizes.__getitem__)
-    assert plan.non_expert_peak_bytes == 400
-    assert plan.final_slots == 6
-    assert plan.initial_cache_bytes == 260 and plan.final_cache_bytes == 780
+    plan = plan_static_memory(capacity_tokens=10, kv_pages=10, budget_bytes=1200,
+        weights_bytes=200, kv_bytes=100, state_bytes=100, workspace_bytes=0, expert_slot_bytes=160,
+        minimum_slots=2, maximum_slots=8, cache_bytes_for_slots=sizes.__getitem__)
+    assert plan.non_expert_bytes == 400
+    assert plan.final_slots == 6 and plan.final_cache_bytes == 780
     plan.validate(6, cache_bytes=sizes[6])
     with pytest.raises(ValueError, match="shortfall"):
         plan.validate(7, cache_bytes=sizes[7])
@@ -69,7 +67,7 @@ def test_measured_budget_uses_mixed_pool_allocations():
 
 @pytest.mark.parametrize("case", ["uniform", "mixed", "padded", "hot", "per_layer"])
 def test_staging_minimum_preserves_overlap_and_is_minimal(case):
-    from freetoken.engine.cache_budget import minimum_staging_slots, layer_slot_bytes
+    from freetoken.engine.cache_budget import minimum_staging_slots, layer_slot_bytes, expert_pool_bytes
     from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
     from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, split_slots
 
@@ -88,6 +86,8 @@ def test_staging_minimum_preserves_overlap_and_is_minimal(case):
             device=torch.device("cpu"), prefill_overlap=True, pool_of_layer=pool_of_layer(pools, 4),
             pool_sizes=split_slots(slots, pools, counts))
         cache.set_bank_sources(sources, row_tail_bytes=tails)
+        assert expert_pool_bytes(sources, pools, cache.pool_sizes, tails) == sum(
+            bank.numel() * bank.element_size() for _, bank in cache.banks)
         assert cache.prefill_overlap is (slots == minimum)
         assert cache._stage_fits(2) is (slots == minimum)
     constrained = make_pools(groups, experts, 1, 1)
@@ -95,60 +95,22 @@ def test_staging_minimum_preserves_overlap_and_is_minimal(case):
         minimum_staging_slots(sources, constrained, experts, buffers=2, counts=counts, row_tail_bytes=tails)
 
 
-@pytest.mark.parametrize("automatic,minimum,headroom,final_peak,expected_slots", [
-    (False, 0, 0, 900, 8), (True, 0, 0, 900, 6), (True, 7, 0, 900, 7),
-    (True, 0, 100, 900, 5), (True, 0, 100, 1100, 5)])
-def test_native_final_peak_only_shrinks_automatic_initialization(automatic, minimum, headroom, final_peak, expected_slots):
-    from freetoken.engine.engine import Engine
-    from freetoken.engine.baseline_sd import BaselineSDMemoryPlan
-    from freetoken.moe.offload_cache import OffloadMoeCache
-
-    engine = object.__new__(Engine)
-    engine.config = SimpleNamespace(model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
-                                    moe_prefill_overlap=False)
-    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
-                           pool_of_layer=[0, 1], pool_sizes=[4, 4])
-    cache.set_bank_sources({name: [torch.zeros(4, 8), torch.zeros(4, 4)] for name in ("gate_up", "down")},
-                           row_tail_bytes={"gate_up": [16, 0], "down": [0, 0]})
-    engine.moe_offload_cache = cache
-    engine._moe_pool_groups = [[0], [1]]
-    engine._moe_slot_limit = engine._moe_expert_counts = None
-    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 3, 1000, 200, 100, 8, 8, 776, 0, 576, 576, headroom)
-    engine._sd_sizing = automatic
-    engine._baseline_sd_minimum_slots = minimum
-    peaks = iter((1200, final_peak))
-    engine._measure_baseline_sd_peak = lambda: next(peaks)
-    rebuilt = []
-    def rebuild(*, moe_cache_size):
-        rebuilt.append(moe_cache_size)
-        cache.rebuild(moe_cache_size, pool_sizes=[(moe_cache_size + 1) // 2, moe_cache_size // 2])
-        engine._validate_baseline_sd_peak()
-    engine.rebuild_runtime_cache = rebuild
-    if automatic and final_peak <= 1000:
-        engine._validate_baseline_sd_peak()
-        assert rebuilt == [expected_slots]
-        assert engine.baseline_sd_memory_plan.final_slots == expected_slots
-        allocated = sum(bank.numel() * bank.element_size() for _, bank in cache.banks)
-        allocated += sum(t.numel() * t.element_size() for t in
-                         (cache.id_of_slot, cache.usage, cache.evict_slots, cache.src_indices))
-        assert engine.baseline_sd_memory_plan.final_cache_bytes == allocated == {5: 388, 6: 440, 7: 524}[expected_slots]
-        assert engine.baseline_sd_memory_plan.initial_cache_bytes == 576
-        assert engine.baseline_sd_final_peak_bytes == 900
-    else:
-        with pytest.raises(ValueError, match="final boundary warmup"):
-            engine._validate_baseline_sd_peak()
-        assert rebuilt == ([expected_slots] if automatic else [])
 
 
-def test_hybrid_partial_reservation_does_not_charge_preallocated_storage_twice():
+@pytest.mark.parametrize("mode", ["three_level_gpu", "cpu_async"])
+@pytest.mark.parametrize("limit", [3, 64])
+@pytest.mark.parametrize("loops", [1, 2])
+def test_hybrid_partial_reservation_does_not_charge_preallocated_storage_twice(mode, limit, loops):
     from freetoken.engine.cache_budget import speculative_hybrid_workspace_bytes
     config = SimpleNamespace(moe_strategy="hybrid", speculative_expert_scheduler="gpu",
         speculative_hybrid_phases=("preverify", "verify"), speculative_mtp_depth=3,
-        speculative_submit_tokens=0, speculative_max_loops=6, speculative_max_output_tokens=3,
+        speculative_submit_tokens=0, speculative_max_loops=6, cpu_async_loops=loops, speculative_max_output_tokens=limit,
+        speculative_three_level=True, speculative_mode=mode,
         model_config=SimpleNamespace(num_experts_per_tok=8, hidden_size=64))
     full = speculative_hybrid_workspace_bytes(config)
     pending = speculative_hybrid_workspace_bytes(config, include_cpu_partials=False)
-    assert full - pending == 2 * (1 + 2 + 3) * 64
+    maximum = max(8, loops * 4 + 1) if mode == "cpu_async" else min(limit, 24)
+    assert full - pending == 2 * sum(range(1, maximum + 1)) * 64
 
 
 def test_cache_teardown_releases_async_private_storage_before_reallocation():
@@ -192,8 +154,8 @@ def test_baseline_rebuild_accounts_for_previously_expanded_state_pool(monkeypatc
     engine.num_pages = 10
     engine._pool_cls = SimpleNamespace(kv_cost=lambda config: (10, 0, 1, 0))
     engine._target_moe_and_expert_bytes = lambda slots, pools: (slots, 100)
-    engine._baseline_sd_initial_state_bytes = 200
-    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 10, 500, 200, 100, 2, 2, 400, 0)
+    engine._speculative_cache_bytes = lambda slots: slots * 100
+    engine.baseline_sd_memory_plan = BaselineSDMemoryPlan(10, 10, 500, 0, 0, 200, 0, 0, 100, 2, 200)
     monkeypatch.setattr("freetoken.engine.engine.state_pool_bytes", lambda config, slots: slots * 100)
     with pytest.raises(CacheRebuildRejected, match="shortfall=100"):
         engine.rebuild_runtime_cache(moe_cache_size=2)

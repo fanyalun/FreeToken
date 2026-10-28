@@ -76,6 +76,11 @@ class CpuAsyncRuntime:
         self.engine = engine
         self.runner = engine.speculative_runner
         self.window = QwenAsyncGpuWindow(self.runner, instrument_components=False)
+        self.split = None
+        self.prefix_transfer = None
+        if engine.config.cpu_async_prefix_layers is not None:
+            from .qwen_split_verify import QwenSplitVerifier
+            self.split = QwenSplitVerifier(self.window, engine.config.cpu_async_prefix_layers)
         self.worker = None
         self.lock = threading.Lock()
 
@@ -102,15 +107,30 @@ class CpuAsyncRuntime:
             from freetoken.moe.shared_banks import export_cpu_banks
             layers = sorted(iter_moe_layers(e.model), key=lambda layer: layer.layer_id)
             cache = e.moe_offload_cache
-            shared = export_cpu_banks(cache.bank_sources, [layer.quant_method.cpu_spec() for layer in layers],
+            prefix = c.cpu_async_prefix_layers
+            sources = ({name: banks[:prefix] for name, banks in cache.bank_sources.items()}
+                       if prefix is not None else cache.bank_sources)
+            formats = [layer.quant_method.cpu_spec() for layer in layers[:prefix]]
+            shared = export_cpu_banks(sources, formats,
                                       cache.num_experts)
         worker = CpuVerifierWorker(c.model_path, config, c.cpu_async_core_ids,
             max_context=e.max_seq_len, max_rows=c.cpu_async_loops * (c.speculative_mtp_depth + 1) + 1,
-            grouped=True, backend="optimized", bind_openmp=True, shared_banks=shared)
+            grouped=True, backend="optimized", bind_openmp=True, shared_banks=shared,
+            kernel_profile=c.cpu_async_kernel_profile, components=c.cpu_async_kernel_components,
+            cpu_prefix_layers=c.cpu_async_prefix_layers)
         try:
             worker.wait_ready(c.cpu_async_timeout)
+            if self.split is not None:
+                from .cpu_async_split import PrefixStateTransfer
+                self.prefix_transfer = PrefixStateTransfer(e, worker)
+                self.window.validate_budget()
         except BaseException:
-            worker.close()
+            try:
+                if self.prefix_transfer is not None:
+                    self.prefix_transfer.close()
+                    self.prefix_transfer = None
+            finally:
+                worker.close()
             raise
         self.worker = worker
 
@@ -145,12 +165,17 @@ class CpuAsyncRuntime:
         first = None
         prefilled = False
         failed = False
+        self.runner.graph_replays, self.runner.graph_fallbacks = {}, {}
         try:
+            if cancel():
+                raise _Cancelled()
+            self.window.prepare_graphs()
+            self.runner.graph_replays, self.runner.graph_fallbacks = {}, {}
             self._prepare_worker()
             started = time.perf_counter()
             if cancel():
                 raise _Cancelled()
-            checkpoint = window.initialize(input_ids, chunk_size=prompt_chunk_size)
+            checkpoint = window.initialize(input_ids, chunk_size=prompt_chunk_size, eos_ids=eos_ids)
             prefilled = True
             outputs.append(checkpoint.anchor)
             first = time.perf_counter()
@@ -167,30 +192,73 @@ class CpuAsyncRuntime:
                 remaining = max_tokens - len(outputs)
                 block = GpuCandidateBlock(block.start, block.anchor, block.candidates[:max(0, remaining - 1)])
                 submitted = time.perf_counter()
-                self.worker.submit(VerifyJob(window.epoch, block_id, block.start, block.anchor,
-                                              block.candidates, remaining, tuple(eos_ids)))
+                job = VerifyJob(window.epoch, block_id, block.start, block.anchor,
+                                block.candidates, remaining, tuple(eos_ids))
+                hints = self.split.capture_hints() if self.split is not None else None
+                if self.split is None:
+                    self.worker.submit(job)
+                else:
+                    self.worker.submit_prefix(job)
+                    self.split.begin_prefetch(hints)
                 ahead_cap = max(0, min(c.cpu_async_loops * (c.speculative_mtp_depth + 1),
                     checkpoint.length + max_tokens - 1 - self.runner.frontier.target_valid_len))
+                ahead_started = time.perf_counter()
                 ahead, ahead_inner = window.generate_ahead(block, c.cpu_async_loops, candidate_cap=ahead_cap)
                 e.stream.synchronize()
+                generation_seconds = time.perf_counter() - ahead_started
                 waiting = time.perf_counter()
                 result, timing = self._wait("result", cancel)
                 wait_seconds = time.perf_counter() - waiting
                 if result.start != window.canonical_length or result.block_id != block_id:
                     raise RuntimeError("CPU result does not belong to the submitted canonical window")
-                reader = window.install(result)
-                self.worker.release(result, reader)
+                split_timing = {}
+                install_started = time.perf_counter()
+                if self.split is None:
+                    reader = window.install(result)
+                    self.worker.release(result, reader)
+                else:
+                    prefix = result
+                    hidden = self.split.stage_hidden(prefix)
+                    self.prefix_transfer.stage(prefix)
+                    suffix_started = time.perf_counter()
+                    verified = self.split.verify(prefix, job, hidden=hidden)
+                    suffix_seconds = time.perf_counter() - suffix_started
+                    self.worker.commit_prefix(prefix, verified.input_count, verified.tokens[-1])
+                    result, reader = self.prefix_transfer.install(window, prefix, verified)
+                    split_timing = dict(cpu_prefix_layers=c.cpu_async_prefix_layers,
+                        gpu_generation_seconds=generation_seconds,
+                        gpu_suffix_host_seconds=suffix_seconds,
+                        prefix_state_transfer_bytes=sum(getattr(prefix, name).numel()
+                            * getattr(prefix, name).element_size() for name in ("keys", "values", "replay", "conv")),
+                        suffix_prefetch_only=True, verify_prefetch=False)
                 outputs.extend(result.tokens)
                 continuing = not result.terminal and len(outputs) < max_tokens
+                recovery_started = time.perf_counter()
                 next_block, recovery = window.recover(result, ahead, c.cpu_async_recovery, c.cpu_async_loops,
                     refill=continuing, candidate_cap=max(0, max_tokens - len(outputs) - 1), eos_ids=eos_ids)
+                recovery_enqueued = time.perf_counter()
+                if self.split is not None:
+                    commit_reply = self._wait("prefix_committed", cancel)
+                    self.worker.release(prefix, reader)
+                    split_timing.update(cpu_commit_seconds=commit_reply.get("commit_seconds"),
+                                        cpu_commit_wait_seconds=time.perf_counter() - recovery_enqueued)
                 rounds.append(dict(mode="cpu_async", block_id=block_id, start=result.start,
                     candidates=len(block.candidates), matched_drafts=result.accepted,
                     returned_drafts=min(result.accepted, len(result.tokens)),
                     committed_input_rows=result.input_count, returned_tokens=len(result.tokens),
                     terminal=result.terminal, inner=inner, ahead_inner=ahead_inner, recovery=recovery,
                     cpu_wait_seconds=wait_seconds, handoff_seconds=time.perf_counter() - submitted,
-                    cpu_compute_seconds=timing["compute_seconds"], cpu_publish_seconds=timing["publish_seconds"]))
+                    cpu_compute_seconds=timing["compute_seconds"], cpu_publish_seconds=timing["publish_seconds"],
+                    cpu_verify_phases=timing.get("verify_phases"),
+                    timestamps=dict(submit=submitted, cpu_start=timing.get("cpu_started_at"),
+                        cpu_compute_end=timing.get("cpu_compute_ended_at"), cpu_publish=timing.get("published_at"),
+                        gpu_start=ahead_started, gpu_end=waiting, result_received=install_started,
+                        install_start=install_started, recovery_start=recovery_started,
+                        recovery_enqueued=recovery_enqueued, handoff_end=time.perf_counter()),
+                    ahead_start=ahead.start, ahead_candidates=list(ahead.candidates),
+                    proposed_candidates=list(block.candidates), next_proposal_start=next_block.start if next_block else None,
+                    next_proposal_candidates=list(next_block.candidates) if next_block else [],
+                    **split_timing))
                 if not continuing:
                     break
                 if next_block is None:
@@ -200,6 +268,7 @@ class CpuAsyncRuntime:
         except _Finished:
             pass
         except _Cancelled:
+            failed = getattr(self, "split", None) is not None
             if self.worker is not None and self.worker.epoch is not None:
                 self.worker.cancel(self.worker.epoch)
                 try:
@@ -221,16 +290,32 @@ class CpuAsyncRuntime:
         metrics.update(cpu_target_core_ids=list(c.cpu_async_core_ids),
                        hybrid_core_ids=list(c.moe_cpu_core_ids or ()),
                        hybrid_coordinator_core=c._cpu_moe_coordinator_core,
-                       recovery=c.cpu_async_recovery, canonical_target="cpu",
+                       recovery=c.cpu_async_recovery,
+                       canonical_target="cpu_prefix_gpu_suffix" if getattr(self, "split", None) is not None else "cpu",
+                       cpu_prefix_layers=getattr(c, "cpu_async_prefix_layers", None),
+                       gpu_suffix_execution="eager_hybrid" if getattr(self, "split", None) is not None else None,
+                       gpu_suffix_partition="fixed_route_rank" if getattr(self, "split", None) is not None else None,
+                       gpu_suffix_gpu_experts=(c.cpu_async_suffix_gpu_experts
+                           if getattr(self, "split", None) is not None else None),
+                       graph_scope="gpu_generation_and_recovery" if getattr(self, "split", None) is not None else "gpu_window",
+                       split_state_pinned_bytes=self.prefix_transfer.pinned_bytes if getattr(self, "prefix_transfer", None) else 0,
+                       split_state_device_bytes=self.prefix_transfer.device_bytes if getattr(self, "prefix_transfer", None) else 0,
                        expert_io_scope="decode_after_prefill")
         wall = time.perf_counter() - started
         return GenerationResult(outputs, wall,
-            (first - started) if first is not None else wall, rounds, metrics=metrics)
+            (first - started) if first is not None else wall, rounds,
+            graph_replays=dict(self.runner.graph_replays), graph_fallbacks=dict(self.runner.graph_fallbacks),
+            graph_captures=dict(self.runner.graph_captures), metrics=metrics)
 
     def _close_worker(self):
         worker, self.worker = self.worker, None
-        if worker is not None:
-            worker.close()
+        try:
+            if getattr(self, "prefix_transfer", None) is not None:
+                self.prefix_transfer.close()
+                self.prefix_transfer = None
+        finally:
+            if worker is not None:
+                worker.close()
 
     def _finish_request(self, failed):
         try:
@@ -250,7 +335,7 @@ class CpuAsyncRuntime:
 
     def close(self):
         try:
-            self.window.close_request()
+            self.window.close()
         finally:
             self._close_worker()
 

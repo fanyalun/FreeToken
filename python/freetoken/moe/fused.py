@@ -212,8 +212,9 @@ def fused_experts_impl(
     act_limit: float = float("inf"),
     *,
     skip_invalid_routes: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
+    """Overwrites ``hidden_states`` unless a distinct ``out`` buffer is supplied. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
     not shared; the resident bf16 path routes decode through here too."""
@@ -226,8 +227,8 @@ def fused_experts_impl(
         for row in range(hidden_states.shape[0]):
             fused_experts_impl(hidden_states[row:row+1], w1, w2, topk_weights[row:row+1],
                 topk_ids[row:row+1], activation, apply_router_weight_on_input, act_alpha, act_limit,
-                skip_invalid_routes=skip_invalid_routes)
-        return hidden_states
+                skip_invalid_routes=skip_invalid_routes, out=None if out is None else out[row:row+1])
+        return hidden_states if out is None else out
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -236,6 +237,9 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+    if out is not None:
+        assert out.shape == hidden_states.shape and out.dtype == hidden_states.dtype
+        assert out.device == hidden_states.device and out.is_contiguous()
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -265,7 +269,7 @@ def fused_experts_impl(
     )
     compute_type = hidden_states.dtype
 
-    out_hidden_states = hidden_states
+    out_hidden_states = hidden_states if out is None else out
     curr_hidden_states = hidden_states
     tokens_num, _ = curr_hidden_states.shape
     begin_token_idx, end_token_idx = 0, num_tokens
@@ -278,12 +282,14 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
-    align = moe_align_block_size
     if skip_invalid_routes:
-        from freetoken.kernel.triton.moe_align import moe_align_block_size as align
-    sorted_token_ids, expert_ids, num_tokens_post_padded = align(
-        curr_topk_ids, config["BLOCK_SIZE_M"], E
-    )
+        from freetoken.kernel.triton.moe_align import moe_align_decode_routes
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_decode_routes(
+            curr_topk_ids, curr_topk_weights, config["BLOCK_SIZE_M"], E)
+        intermediate_cache1.zero_()
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            curr_topk_ids, config["BLOCK_SIZE_M"], E)
 
     fused_moe_kernel_triton(
         curr_hidden_states,
@@ -326,6 +332,7 @@ def fused_experts_impl(
 
 
 _GROUPED_DECODE = os.getenv("FREETOKEN_MOE_GROUPED_DECODE", "1") != "0"
+_SORTED_DECODE_MIN_ROWS = 16
 
 
 def prepare_decode_groups(topk_ids, topk_weights):
@@ -373,6 +380,14 @@ def fused_experts_decode_impl(
     assert topk_weights.dtype == torch.float32
     assert topk_ids.dtype == torch.int32
     M, _ = hidden_states.shape
+    from freetoken.core import get_active_batch
+    # A split Target must preserve per-route rounding when candidate window widths change.
+    stable_decode = getattr(get_active_batch(), "stable_moe_decode", False)
+    if _GROUPED_DECODE and not stable_decode and M >= _SORTED_DECODE_MIN_ROWS:
+        # Hybrid's asynchronous CPU input copy may still read hidden_states.
+        return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
+            activation, apply_router_weight_on_input, act_alpha, act_limit,
+            skip_invalid_routes=True, out=torch.empty_like(hidden_states))
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
     intermediate_size = gate_up_dim // 2
@@ -382,7 +397,7 @@ def fused_experts_decode_impl(
         "num_warps": 8,
     }
     route_groups = None
-    if _GROUPED_DECODE and 2 <= M <= 4 and M * top_k <= 32:
+    if _GROUPED_DECODE and not stable_decode and 2 <= M <= 4 and M * top_k <= 32:
         route_groups = prepare_decode_groups(topk_ids, topk_weights)
 
     intermediate_cache1 = torch.empty(

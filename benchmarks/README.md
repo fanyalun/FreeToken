@@ -3,11 +3,28 @@
 Run from the repo root with `PYTHONPATH=python:.`, pinned to one GPU
 (`CUDA_VISIBLE_DEVICES=0`). Each script's `--help` / docstring has the details.
 
-**`bench_speculative_modes.py`** runs the single-request `sd`, `three_level_gpu`
+**`bench_speculative_modes.py`** runs the single-request `ar`, `sd`, `three_level_gpu`
 and `cpu_async` modes independently of the `offload`, `hybrid` and `fused` MoE
 backends. It supports native Qwen3.6 MTP and Qwen3 GGUF with EAGLE3. See
 [speculative modes](../docs/speculative_modes.md) for capacity limits, full Graph
 coverage, CPU state ownership and persistent result-directory examples.
+AR loads only the Target and uses its ordinary decode CUDA Graph, with separate
+decode replay/fallback accounting from the speculative host control operations.
+
+**`bench_cpu_async_algorithm.py`** checks four-loop versus eight-loop candidate
+survival, fixed-token B replay before generating C, and rolling output/state
+agreement with serial CPU Target. It waits for an idle GPU and records algorithm
+evidence without measuring speed. See [algorithm-only rolling evidence](../docs/cpu_verify_feasibility.md#algorithm-only-rolling-evidence).
+Use `--rolling-only --recovery recheck` to recheck B after installing the CPU
+result, or `--rolling-only --top-h 6` for top-6 fixed-token replay. A partial
+recheck match does not count as a complete sliding cell; accepted reused tokens
+and zero-cell attempts are recorded separately.
+
+**`analyze_cpu_async_lookahead.py`** recomputes useful ahead-token coverage and
+continuous useful token distance from saved rolling traces. Partial rechecks
+continue when an old prefix remains; output-budget stops are censored. Its
+input manifest lists each case's path, model, variant, samples and tokens. It
+does not load a model or use a GPU.
 
 **`bench_decode_moe.py`** — bs=1 decode tok/s of a served MoE model. Spawns `ft serve`
 per backend and times token arrivals over streamed `/v1/chat/completions`, so numbers
