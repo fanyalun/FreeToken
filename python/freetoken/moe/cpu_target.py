@@ -63,7 +63,7 @@ class CpuTargetExperts:
             raise ValueError("inconsistent CPU expert geometry")
         self.hidden, self.top_k, self.max_rows = hidden, top_k, max_rows
         self.executor = None
-        if not packed and schedule != "expert_numa":
+        if not packed and schedule == "tile":
             from .cpu_executor import CpuMoeExecutor
 
             self.executor = CpuMoeExecutor.from_banks(

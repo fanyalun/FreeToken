@@ -19,6 +19,8 @@ def test_grouped_experts_equal_original_row_dots(rows, threads, schedule):
     serial = CpuTargetExperts(gate_up, down, 8, cores, rows, grouped=False, backend="legacy")
     grouped = CpuTargetExperts(gate_up, down, 8, cores, rows, grouped=True, schedule=schedule)
     try:
+        if schedule == "expert":
+            assert grouped.executor is None
         x = torch.randn(rows, 64).bfloat16()
         ids = torch.stack([torch.randperm(16)[:8] for _ in range(rows)])
         weights = torch.rand(rows, 8)
