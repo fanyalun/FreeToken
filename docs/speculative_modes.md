@@ -349,6 +349,19 @@ defaults, and an explicit profile path still loads that profile. The terminal
 Draft enters Full Verify directly, without a final Pre-Verify. CPU async uses
 its existing state machine and prefetch settings.
 
+Qwen3-235B-A22B GGUF Q4_K_M three-level runs at an explicit 80-GiB cap,
+depth 5, top-h 1, four loops and Full Graph use separate fixed defaults for
+Offload and Hybrid. Pre-Verify quota is 1 (last layer 0), and Draft-gap capacity
+is 8 (at most 7 prefetched experts). Offload uses Full Verify quota 1. Hybrid
+with both Pre and Full phases enabled uses quota 2 for layers with Q4_K gate/up
+and Q6_K down weights, and quota 3 for layers with Q4_K gate/up/down weights.
+The first Full Verify layer has quota 0. The GGUF tensor metadata determines
+each target layer's format; expert IDs and layer-number patterns do not select
+the quota. These defaults come from single-sample calibration and do not
+establish an optimal configuration or a complete-request speedup.
+`speculative_prefetch_profile="auto"` selects these defaults without an external
+profile file. Explicit quotas or a profile path retain their precedence.
+
 Other three-level runs resolve prefetch quotas from a single-sample calibration.
 `speculative_prefetch_profile="auto"` loads a profile matching the checkpoint,
 Draft, hardware, runtime, memory budget and execution settings. A missing profile

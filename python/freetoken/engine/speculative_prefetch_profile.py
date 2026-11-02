@@ -227,6 +227,38 @@ def _calibration_hint(config):
             f"mkdir -p {shlex.quote(str(temporary))} && TMPDIR={shlex.quote(str(temporary))} {shlex.join(command)}")
 
 
+def _qwen235_verify_defaults(config, model):
+    shape = tuple(getattr(model, name, None) for name in
+                  ("hidden_size", "moe_intermediate_size", "num_experts", "num_moe_layers"))
+    if (getattr(model, "model_type", None) != "qwen3_moe" or shape != (4096, 1536, 128, 94)
+            or getattr(model, "expert_quant", None) != "gguf"
+            or config.gpu_memory_budget_bytes != 80 * 2**30
+            or (config.speculative_depth, config.speculative_preverify_top_h, config.speculative_max_loops) != (5, 1, 4)
+            or config.speculative_graph != "full" or config.speculative_preverify_policy != "fixed_topk"
+            or config.speculative_preverify_replacement != "zero"):
+        return None
+    if config.moe_strategy == "hybrid" and tuple(config.speculative_hybrid_phases) != ("preverify", "verify"):
+        return None
+    from freetoken.models.gguf.reader import gguf_tensor_index, is_gguf_path
+    from freetoken.third_party.gguf.constants import GGMLQuantizationType
+
+    if not is_gguf_path(config.model_path):
+        return None
+    index = gguf_tensor_index(config.model_path)
+    verify = []
+    for layer in range(94):
+        gate, up, down = (index.get(f"blk.{layer}.ffn_{role}_exps.weight") for role in ("gate", "up", "down"))
+        if (gate is None or up is None or down is None
+                or gate.ggml_type != GGMLQuantizationType.Q4_K or up.ggml_type != GGMLQuantizationType.Q4_K
+                or down.ggml_type not in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q6_K)):
+            return None
+        # Mixed Q4_K_M checkpoints choose the down-weight format separately for each layer.
+        verify.append(1 if config.moe_strategy == "offload" else
+                      2 if down.ggml_type == GGMLQuantizationType.Q6_K else 3)
+    verify[0] = 0
+    return verify
+
+
 def prepare_prefetch_profile(config, device):
     put = lambda name, value: object.__setattr__(config, name, value)
     requested = _requested(config)
@@ -259,6 +291,18 @@ def prepare_prefetch_profile(config, device):
             if requested["gap_capacity"] is None:
                 put("speculative_prefetch_gap_capacity", 10)
             complete, model_default = True, True
+        else:
+            verify = _qwen235_verify_defaults(config, model)
+            if verify is not None:
+                if requested["preverify"] is None and requested["preverify_layers"] is None:
+                    put("speculative_prefetch_layer_experts", 1)
+                    put("speculative_prefetch_layer_quotas", [1] * 93 + [0])
+                if requested["verify"] is None and requested["verify_layers"] is None:
+                    put("speculative_verify_prefetch_layer_experts", 1 if config.moe_strategy == "offload" else 2)
+                    put("speculative_verify_prefetch_layer_quotas", verify)
+                if requested["gap_capacity"] is None:
+                    put("speculative_prefetch_gap_capacity", 8)
+                complete, model_default = True, True
     if complete and selection in (None, "auto"):
         for name in QUOTA_FIELDS:
             if getattr(config, name) is None:
