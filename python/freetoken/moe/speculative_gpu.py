@@ -815,10 +815,13 @@ class GPUExpertCache:
         self.final_history = torch.full((self.cache.num_layers, rows, self.top_k), -1,
                                         dtype=torch.int32, device=device)
 
-    def configure_external_prefetch(self, first_layer):
+    def configure_external_prefetch(self, first_layer, *, wait_mode="all"):
         if self.active or self.graphs or not 0 < first_layer < self.cache.num_layers:
             raise ValueError("suffix prefetch must be configured on an idle cache before capture")
+        if wait_mode not in ("all", "layer") or (wait_mode == "layer" and self.retain_routes):
+            raise ValueError("layer suffix prefetch requires ephemeral generation routes")
         self.external_prefetch_layer = first_layer
+        self.external_prefetch_wait = wait_mode
         self.prediction_hints = torch.zeros_like(self.refs)
         self.external_plan_arrays = [torch.empty_like(a) for a in self.layer_plan_arrays]
         self.external_plan_counts = torch.zeros_like(self.layer_plan_counts)
@@ -827,6 +830,12 @@ class GPUExpertCache:
         # An external event remains a real wait node when a Draft target is captured.
         self.external_prefetch_done = torch.cuda.Event(external=True)
         self.external_prefetch_done.record(self.stream)
+        self.external_layer_events = {}
+        if wait_mode == "layer":
+            for layer in range(first_layer, self.cache.num_layers):
+                event = torch.cuda.Event(external=True)
+                event.record(self.stream)
+                self.external_layer_events[layer] = event
 
     def capture_prefetch_hints(self):
         if self.prediction_hints is None:
@@ -841,6 +850,13 @@ class GPUExpertCache:
             raise RuntimeError("suffix prefetch requires an active configured cache")
         if hints.shape != self.refs.shape or hints.device != self.refs.device or quota < 0:
             raise ValueError("invalid suffix prefetch hints or quota")
+        if self.external_prefetch_wait == "layer":
+            demand = min(self.cache.num_experts, max(self.max_rows, self.inner_rows) * self.top_k)
+            for pool, size in enumerate(self.cache.pool_sizes):
+                reserved = sum(self.cache.pool_of_layer[li] == pool for li in
+                               range(self.external_prefetch_layer, self.cache.num_layers)) * quota
+                if reserved + demand > size:
+                    raise ValueError("layer suffix prefetch needs capacity for pending experts and demand")
         self.join_external_prefetch()
         queue = torch.where(hints > 0, -hints, 2147483647).to(torch.int32)
         queue[:self.external_prefetch_layer].fill_(2147483647)
@@ -851,11 +867,19 @@ class GPUExpertCache:
         with torch.cuda.stream(self.copy_stream):
             for li in range(self.external_prefetch_layer, self.cache.num_layers):
                 self._copy(li, self.external_plans[li], retire=False, kind="layer")
+                if li in self.external_layer_events:
+                    self.external_layer_events[li].record(self.copy_stream)
             self.external_prefetch_done.record(self.copy_stream)
         queue.record_stream(self.stream)
 
-    def join_external_prefetch(self):
+    def join_external_prefetch(self, layer=None):
         if self.external_prefetch_layer is None:
+            return
+        if layer is not None and self.external_prefetch_wait == "layer":
+            self.stream.wait_event(self.external_layer_events[layer])
+            plan = self.external_plans[layer]
+            _retire_verify[(1,)](self.pool_pending[self.cache.pool_of_layer[layer]], plan[1], plan[3],
+                         triton.next_power_of_2(self.plan_capacity))
             return
         self.stream.wait_event(self.external_prefetch_done)
         _ready_layers[(self.cache.num_layers,)](self.pending, self.external_plan_arrays[1],
@@ -993,8 +1017,9 @@ class GPUExpertCache:
 
     def route(self, layer, hidden, weights, ids):
         c, li, rows = self.cache, layer.layer_id, hidden.shape[0]
-        if li == self.external_prefetch_layer:
-            self.join_external_prefetch()
+        if (self.external_prefetch_layer is not None and li >= self.external_prefetch_layer
+                and (li == self.external_prefetch_layer or self.external_prefetch_wait == "layer")):
+            self.join_external_prefetch(li)
         pool = c.pool_of_layer[li]
         pending = self.pool_pending[pool]
         pool_size = c.pool_sizes[pool]

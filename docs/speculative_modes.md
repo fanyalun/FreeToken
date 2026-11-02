@@ -165,21 +165,49 @@ GPU three-level Hybrid keeps its existing scheduling policy. This convention
 does not establish equality with a full GPU Target's arithmetic.
 
 The split stays fixed during requests. An offline profile can select it with
-`cpu_async_split_profile="/persistent/path/profile.json"`. The profile records
-actual context lengths and row counts for every tested split, plus CPU prefix,
-GPU generation, activation transfer, GPU suffix and recovery time. A candidate
-must meet the conservative `C(L,m) + H <= G` screen for every measured workload
-before selection minimizes the measured mean `max(C,G) + H + V_suffix + R`.
-Activation transfer H starts after GPU generation and CPU result receipt, so
-it remains on the handoff path. Calibration also records actual handoff wall
-time and its signed residual against this model. A close CPU/GPU duration alone
-does not establish the best cycle time. Every candidate must measure the same
-context and row workloads. Profile validation binds the checkpoint, runtime,
-hardware, CPU/Hybrid cores, CPU kernel profile/components, compact state protocol,
-depth, loops, capacity, backend and prefetch settings.
-A mismatch requires recalibration. An explicit `L` has no measured deadline or
-performance guarantee. Schema-1 profiles from the full-snapshot protocol are
-rejected and must be recalibrated.
+`cpu_async_split_profile="/persistent/path/profile.json"`. Calibration uses the
+first three questions from a GSM8K JSONL file, the question chat template with
+thinking disabled, and at most 64 output tokens per request with normal EOS.
+Each split runs three warmup requests followed by three measured requests.
+All request windows are retained; windows without GPU ahead generation are
+recorded separately and do not count as evidence of overlap.
+
+A candidate must satisfy `mean GPU generation > mean CPU prefix compute + margin`.
+Both means pool all measured overlap windows across the three requests, with
+one vote per window. CPU time is the worker's compute duration; GPU time is the
+actual ahead generation duration. Publication/queue delay, activation transfer,
+suffix verification and recovery do not enter this screen. Individual windows
+may miss coverage; their count and the minimum gap are diagnostics only.
+Selection takes the largest prefix passing this mean-time screen, without
+optimizing total cycle time. Equal means do not pass. No eligible candidate is
+an error, not a reason to choose an uncovered prefix. `--layers` restricts the
+search explicitly; the matrix driver uses coarse steps of four then fine search
+inside the boundary interval. This establishes a measured boundary, not an
+exhaustive global maximum when timing is nonmonotonic.
+
+```bash
+python benchmarks/bench_cpu_async_split.py \
+  --model /path/to/model --data /path/to/gsm8k_test.jsonl \
+  --graph full --budget-gib 32 --loops 4 --depth 3 \
+  --samples 3 --max-output-tokens 64 --output /persistent/path/new_split_calibration
+```
+
+`frozen_inputs.json` records source and token hashes for the same three inputs
+at every split. Requests follow the runtime's normal recovery and EOS behavior;
+window counts, positions and widths can differ across splits. `requests.jsonl`
+and `measurements.json` retain request and window identities, including terminal
+windows with actual ahead generation. Each sample must provide at least one
+overlap window. Warmups are written separately and excluded from selection.
+Activation transfer is recorded separately and does not affect selection.
+
+Profile validation binds the checkpoint, runtime, hardware, CPU/Hybrid cores,
+CPU kernel profile/components, compact state protocol, depth, loops, capacity,
+backend and prefetch settings. A mismatch requires recalibration. Schema 4
+profiles use maximum mean-covered prefix selection. Older selectors are rejected;
+existing raw requests can be reanalyzed with the new compute/generation timing
+fields without changing their measured runtime identity. An explicit `L` has no measured deadline guarantee,
+and calibration coverage on these samples does not establish future coverage
+or a complete-request speedup.
 
 The benchmark accepts `--cpu-async-prefix-layers`, `--cpu-async-split-profile`,
 `--cpu-async-suffix-prefetch-experts`, `--cpu-async-suffix-gpu-experts`,
@@ -190,6 +218,36 @@ profile identity binds them. For example, append
 `--cpu-kernel-profile ggml_v2 --cpu-kernel-components attention gdn` to select
 the two optional CPU components in either benchmark. Resolved configuration and
 CPU worker metadata record the actual selection.
+`--cpu-async-recovery-loops 1` seeds a smaller next proposal after rejection;
+the default retains the configured ahead loop count. This changes proposal
+widths and must be compared using complete requests, including discarded ahead
+tokens. It does not change the number of ahead loops.
+`--cpu-async-stop-when-ready` also checks for a published CPU result after each
+complete ahead loop and may finish before the configured maximum loop count.
+It preserves the already committed private loop and hands the same CPU reply to
+verification; it does not interrupt a CUDA Graph or discard the received reply.
+This is experimental: changed verification widths and cache trajectories require
+complete-request output auditing before its timing can establish a speedup.
+
+`--recovery fixed_replay` retains the existing install-only behavior when an
+ahead tail survives. `--recovery replay` instead rebuilds private GPU state from
+the retained token sequence and then generates beyond it. Full Graph prepares
+a hidden-only Target path for this replay, and replay errors are drained at the
+next GPU control boundary. Replaying the retained tokens is enqueued before the
+next CPU proposal, allowing GPU replay and CPU verification to overlap. Neither
+mode commits the old approximate private state as confirmed Target state.
+
+`--cpu-async-suffix-prefetch-wait layer` waits for each suffix layer's copy event
+when that layer is consumed; `all` retains the existing whole-suffix fence.
+Pending plans are retired once per layer. Layer waits require enough cache slots
+for all pending suffix prefetches plus a demand batch; use the existing all-layer
+wait or reduce prefetch quota when the capacity check rejects this option.
+
+`--cpu-async-profile` records diagnostic GPU intervals for state installation,
+GDN fold, private-state fork, confirmed MTP refresh and candidate recovery. Events
+are read after the request drains, without adding a per-stage synchronization.
+CPU commit and host enqueue/wait times are recorded separately; overlapping
+intervals must not be summed. Profiling cannot be used for formal timing.
 This is a single-request engine feature; it does not add continuous batching or
 claim serial GPU AR parity across CPU/GPU numerical conventions.
 

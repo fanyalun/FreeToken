@@ -97,6 +97,9 @@ class EngineConfig:
     speculative_preverify_top_h: int | None = None
     cpu_async_loops: int = 4
     cpu_async_recovery: str = "fixed_replay"
+    cpu_async_recovery_loops: int | None = None
+    cpu_async_profile: bool = False
+    cpu_async_stop_when_ready: bool = False
     cpu_async_timeout: float = 600.0
     cpu_async_core_ids: tuple[int, ...] | None = None
     cpu_async_kernel_profile: str = "v1"
@@ -105,6 +108,7 @@ class EngineConfig:
     cpu_async_split_profile: str | None = None
     cpu_async_suffix_prefetch_experts: int = 4
     cpu_async_suffix_gpu_experts: int = 4
+    cpu_async_suffix_prefetch_wait: str = "all"
     _cpu_async_split_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
     moe_cpu_core_ids: tuple[int, ...] | None = None
     _cpu_moe_coordinator_core: int | None = field(default=None, init=False, repr=False)

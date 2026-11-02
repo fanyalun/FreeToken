@@ -152,7 +152,16 @@ def resolve_speculative_config(config) -> None:
             raise ValueError("cpu_async full graphs currently require native MTP")
     if type(config.cpu_async_loops) is not int or config.cpu_async_loops < 1:
         raise ValueError("cpu_async_loops must be a positive integer")
-    if (config.cpu_async_recovery not in ("fixed_replay", "recheck")
+    if config.cpu_async_recovery_loops is not None and (
+            type(config.cpu_async_recovery_loops) is not int or not 1 <= config.cpu_async_recovery_loops <= config.cpu_async_loops):
+        raise ValueError("cpu_async_recovery_loops must be between 1 and cpu_async_loops")
+    if config.cpu_async_suffix_prefetch_wait not in ("all", "layer"):
+        raise ValueError("cpu_async_suffix_prefetch_wait must be all or layer")
+    if type(config.cpu_async_profile) is not bool:
+        raise ValueError("cpu_async_profile must be boolean")
+    if type(config.cpu_async_stop_when_ready) is not bool:
+        raise ValueError("cpu_async_stop_when_ready must be boolean")
+    if (config.cpu_async_recovery not in ("fixed_replay", "recheck", "replay")
             or not math.isfinite(config.cpu_async_timeout) or config.cpu_async_timeout <= 0):
         raise ValueError("invalid CPU async recovery mode or timeout")
     put("speculative_graph", graph)

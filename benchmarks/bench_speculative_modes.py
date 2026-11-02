@@ -312,6 +312,11 @@ def main():
     parser.add_argument("--hybrid-max-fetch", type=int, default=-1)
     parser.add_argument("--max-loops", type=int, default=6)
     parser.add_argument("--cpu-async-loops", type=int, default=4)
+    parser.add_argument("--cpu-async-recovery-loops", type=int,
+                        help="Loops used to seed a new proposal after rejection; default follows ahead loops")
+    parser.add_argument("--cpu-async-profile", action="store_true", help="Diagnostic recovery CUDA events")
+    parser.add_argument("--cpu-async-stop-when-ready", action="store_true",
+                        help="End ahead at an inner-loop boundary when the CPU result is ready")
     parser.add_argument("--cpu-kernel-profile", choices=("v1", "ggml_v2"), default="v1",
                         help="CPU Target arithmetic profile; ggml_v2 defaults to attention only")
     parser.add_argument("--cpu-kernel-components", nargs="+",
@@ -322,7 +327,8 @@ def main():
     parser.add_argument("--cpu-async-split-profile", help="Matching offline CPU/GPU layer split profile")
     parser.add_argument("--cpu-async-suffix-prefetch-experts", type=int, default=4)
     parser.add_argument("--cpu-async-suffix-gpu-experts", type=int, default=4)
-    parser.add_argument("--recovery", choices=("fixed_replay", "recheck"), default="fixed_replay")
+    parser.add_argument("--cpu-async-suffix-prefetch-wait", choices=("all", "layer"), default="all")
+    parser.add_argument("--recovery", choices=("fixed_replay", "recheck", "replay"), default="fixed_replay")
     parser.add_argument("--cpu-cores", help="CPU Target physical CPU ids, comma separated")
     parser.add_argument("--hybrid-cores", help="Hybrid physical CPU ids, comma separated")
     parser.add_argument("--cpu-threads", type=int, default=0)
@@ -346,6 +352,8 @@ def main():
     parser.add_argument("--expect-capacity-rejection", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.cpu_async_profile and args.purpose == "formal":
+        parser.error("CPU recovery profiling is diagnostic; use --purpose diagnostic")
     if args.profile_prefetch and (args.purpose == "formal" or args.calibrate_prefetch
                                  or args.mode != "three_level_gpu" or args.graph not in (None, "full")):
         parser.error("--profile-prefetch requires a separate three_level_gpu/full diagnostic run")
@@ -401,12 +409,15 @@ def main():
         config = BenchmarkConfig(model_path=model, tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
             rendezvous_file=str(out / "rendezvous"), **mode_config,
             cpu_async_loops=args.cpu_async_loops, cpu_async_recovery=args.recovery,
+            cpu_async_recovery_loops=args.cpu_async_recovery_loops, cpu_async_profile=args.cpu_async_profile,
+            cpu_async_stop_when_ready=args.cpu_async_stop_when_ready,
             cpu_async_kernel_profile=args.cpu_kernel_profile,
             cpu_async_kernel_components=tuple(args.cpu_kernel_components) if args.cpu_kernel_components is not None else None,
             cpu_async_prefix_layers=args.cpu_async_prefix_layers,
             cpu_async_split_profile=args.cpu_async_split_profile,
             cpu_async_suffix_prefetch_experts=args.cpu_async_suffix_prefetch_experts,
             cpu_async_suffix_gpu_experts=args.cpu_async_suffix_gpu_experts,
+            cpu_async_suffix_prefetch_wait=args.cpu_async_suffix_prefetch_wait,
             cpu_async_core_ids=tuple(map(int, args.cpu_cores.split(","))) if args.cpu_cores else None,
             moe_cpu_core_ids=tuple(map(int, args.hybrid_cores.split(","))) if args.hybrid_cores else None,
             moe_strategy=args.backend, moe_cache_scope=args.cache_scope, moe_cache_size=args.slots,

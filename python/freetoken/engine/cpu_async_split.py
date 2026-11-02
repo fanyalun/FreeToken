@@ -126,6 +126,7 @@ class PrefixStateTransfer:
         if end > window.output_end:
             raise ValueError("split acceptance exceeds request capacity")
         with torch.cuda.stream(e.stream):
+            window._record_timing("install")
             e.stream.wait_event(self.events[1])
             r._reserve(end)
             layers = e.config.cpu_async_prefix_layers
@@ -135,6 +136,7 @@ class PrefixStateTransfer:
                 e.kv_cache.v_cache(layer)[prefix.start:end, 0].copy_(self.buffers["values"][index, :count])
             pool = e.linear_state_pool
             linear = self.buffers["replay"].shape[0]
+            window._record_timing("fold_start")
             if pool is not None and linear:
                 from freetoken.kernel.fla.gdn_speculative import commit_cpu_gdn
 
@@ -142,12 +144,15 @@ class PrefixStateTransfer:
                       and "gdn" in (getattr(e.config, "cpu_async_kernel_components", None) or ()))
                 commit_cpu_gdn(pool.recurrent_states[:linear], pool.conv_states[:linear],
                                self.buffers["replay"], self.buffers["conv"], count, 1, v2=v2)
+            window._record_timing("fold_end")
             window.state_adapter.fork(window.private_pool)
+            window._record_timing("state")
             for offset in range(0, count, window.replay_rows):
                 width = min(window.replay_rows, count - offset)
                 window._refresh("cpu_async_confirmed_mtp", verified.tokens[offset:offset + width],
                                 verified.hidden[offset:offset + width], prefix.start + offset,
                                 offset + width == count)
+            window._record_timing("refresh")
             window.canonical_length, window.canonical_anchor = end, verified.tokens[-1]
             r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
             checkpoint = PrefixCheckpoint(end, verified.tokens[-1], self.buffers["keys"][:, :count],

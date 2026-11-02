@@ -47,6 +47,9 @@ def test_mode_and_moe_backend_resolve_independently(backend, mode, requested_gra
     (dict(speculative_mode="cpu_async", speculative_graph="full", speculative_draft_method="eagle3"), "native MTP"),
     (dict(speculative_mode="cpu_async", speculative_graph="full", speculative_draft_model="draft"), "native MTP"),
     (dict(speculative_mode="cpu_async", cpu_async_loops=0), "positive"),
+    (dict(speculative_mode="cpu_async", cpu_async_recovery_loops=0), "recovery_loops"),
+    (dict(speculative_mode="cpu_async", cpu_async_recovery_loops=5), "recovery_loops"),
+    (dict(speculative_mode="cpu_async", cpu_async_suffix_prefetch_wait="bad"), "prefetch_wait"),
     (dict(speculative_mode="cpu_async", cpu_async_timeout=float("nan")), "timeout"),
     (dict(speculative_mode="cpu_async", cpu_async_timeout=float("inf")), "timeout"),
     (dict(speculative_mode="cpu_async", cpu_async_kernel_profile="unknown"), "ggml_v2 requires"),
@@ -91,22 +94,33 @@ def test_explicit_prefetch_and_preverify_policy_override_mode_defaults():
     assert c.cpu_async_recovery == "recheck"
 
 
-def test_split_profile_selection_respects_deadlines_and_total_period(tmp_path):
+@pytest.mark.parametrize("request_mode", [False, True])
+def test_split_profile_selection_respects_deadlines_and_maximum_layers(tmp_path, request_mode):
     import json
     from freetoken.engine.cpu_async_split_profile import build_split_profile, load_split_profile
 
     measurements = []
     for layers, cpu, hidden, suffix in ((2, 0.2, 0.1, 1.1), (3, 0.4, 0.4, 0.25),
-                                       (4, 0.7, 0.1, 0.3), (5, 0.85, 0.1, 0.6), (6, 1.1, 0.1, 0.1)):
-        for context, rows in ((128, 4), (512, 8)):
+                                       (4, 0.7, 0.1, 0.3), (5, 0.85, 0.1, 0.6),
+                                       (6, 1.1, 10.0, 0.1), (7, 1.0, 0.1, 0.1)):
+        for sample, (context, rows) in enumerate(((128, 4), (512, 8))):
             measurements.append(dict(prefix_layers=layers, context_tokens=context, rows=rows,
-                cpu_prefix_seconds=cpu, gpu_generation_seconds=1.0, hidden_transfer_seconds=hidden,
+                cpu_prefix_seconds=0.1 if layers == 6 and sample == 0 else cpu,
+                gpu_generation_seconds=1.0, hidden_transfer_seconds=hidden,
                 gpu_suffix_seconds=suffix, recovery_seconds=0.05))
+            if request_mode:
+                measurements[-1].update(sample_id=str(sample), input_sha256=f"input-{sample}",
+                                        context_tokens=context + layers, rows=rows + layers)
+        if request_mode:
+            measurements.append(dict(measurements[-1], context_tokens=context + layers + 8))
     profile = build_split_profile({"frozen": "model/core/kernel identity"}, measurements, 40)
-    assert profile["selection"]["prefix_layers"] == 4
-    periods = {row["prefix_layers"]: row["mean_period_seconds"] for row in profile["selection"]["candidates"]}
-    assert periods[3] == pytest.approx(1.0 + 0.4 + 0.25 + 0.05)
-    assert periods[4] == pytest.approx(1.0 + 0.1 + 0.3 + 0.05)
+    assert profile["selection"]["prefix_layers"] == 6
+    assert profile["selection"]["objective"] == "maximum_mean_covered_prefix_layers"
+    conservative = build_split_profile(profile["identity"], measurements, 40, margin_seconds=0.5)
+    assert conservative["selection"]["prefix_layers"] == 3
+    assert profile["selection"]["candidates"][-2]["uncovered_windows"] > 0
+    assert profile["selection"]["candidates"][-2]["covered"]
+    assert not profile["selection"]["candidates"][-1]["covered"]
     path = tmp_path / "profile.json"
     path.write_text(json.dumps(profile))
     assert load_split_profile(path, profile["identity"])["selection"] == profile["selection"]
@@ -123,19 +137,24 @@ def test_split_profile_selection_respects_deadlines_and_total_period(tmp_path):
     with pytest.raises(ValueError, match="schema.*recalibrate"):
         load_split_profile(path)
     profile["schema_version"] = SCHEMA_VERSION
-    profile["selection"]["prefix_layers"] = 6
+    profile["selection"]["prefix_layers"] = 7
     path.write_text(json.dumps(profile))
     with pytest.raises(ValueError, match="does not match"):
         load_split_profile(path)
 
 
-def test_split_profile_cannot_compare_different_row_workloads():
+@pytest.mark.parametrize("mismatch", ["workload", "sample", "input_hash"])
+def test_split_profile_cannot_compare_different_row_workloads(mismatch):
     from freetoken.engine.cpu_async_split_profile import select_split
 
     measurements = [dict(prefix_layers=layers, context_tokens=128, rows=width,
         cpu_prefix_seconds=0.1, gpu_generation_seconds=1.0, hidden_transfer_seconds=0.01,
         gpu_suffix_seconds=0.2, recovery_seconds=0.05) for layers, width in ((2, 4), (4, 8))]
-    with pytest.raises(ValueError, match="same context and row workloads"):
+    if mismatch != "workload":
+        for row in measurements:
+            row.update(sample_id="0", input_sha256="input-0")
+        measurements[-1]["sample_id" if mismatch == "sample" else "input_sha256"] = "different"
+    with pytest.raises(ValueError, match="same samples or same context and row workloads"):
         select_split(measurements, 40)
 
 

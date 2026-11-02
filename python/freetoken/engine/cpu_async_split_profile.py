@@ -8,10 +8,9 @@ import math
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 CPU_PREFIX_PROTOCOL = "cpu_prefix_compact_replay_v1"
-TIMINGS = ("cpu_prefix_seconds", "gpu_generation_seconds", "hidden_transfer_seconds",
-           "gpu_suffix_seconds", "recovery_seconds")
+TIMINGS = ("cpu_prefix_seconds", "gpu_generation_seconds")
 
 
 def validate_suffix_gpu_experts(value, native_top_k=None):
@@ -43,28 +42,38 @@ def select_split(measurements, num_layers, *, margin_seconds=0.0):
         if row["gpu_generation_seconds"] == 0:
             raise ValueError("GPU generation measurement must be positive")
         grouped.setdefault(layers, []).append(row)
-    workloads = Counter((row["context_tokens"], row["rows"]) for row in next(iter(grouped.values())))
+    request_mode = any("sample_id" in row for row in measurements)
+    if request_mode and any(not isinstance(row.get("sample_id"), str) or not row.get("input_sha256")
+                            for row in measurements):
+        raise ValueError("request calibration requires sample IDs and frozen input hashes")
+    workloads = ({(row["sample_id"], row["input_sha256"]) for row in next(iter(grouped.values()))}
+                 if request_mode else Counter((row["context_tokens"], row["rows"])
+                                              for row in next(iter(grouped.values()))))
     summaries = []
     for layers, rows in sorted(grouped.items()):
-        if Counter((row["context_tokens"], row["rows"]) for row in rows) != workloads:
-            raise ValueError("every candidate split must measure the same context and row workloads")
-        periods, gaps = [], []
+        actual = ({(row["sample_id"], row["input_sha256"]) for row in rows} if request_mode
+                  else Counter((row["context_tokens"], row["rows"]) for row in rows))
+        if actual != workloads:
+            raise ValueError("every candidate split must measure the same samples or same context and row workloads")
+        gaps = []
         for row in rows:
             cpu = row["cpu_prefix_seconds"]
-            hidden = row["hidden_transfer_seconds"]
             gpu = row["gpu_generation_seconds"]
-            periods.append(max(cpu, gpu) + hidden + row["gpu_suffix_seconds"] + row["recovery_seconds"])
-            gaps.append(gpu - cpu - hidden - margin_seconds)
-        summaries.append(dict(prefix_layers=layers, windows=len(rows), covered=min(gaps) >= 0,
+            gaps.append(gpu - cpu - margin_seconds)
+        mean_cpu = sum(row["cpu_prefix_seconds"] for row in rows) / len(rows)
+        mean_gpu = sum(row["gpu_generation_seconds"] for row in rows) / len(rows)
+        summaries.append(dict(prefix_layers=layers, windows=len(rows), covered=mean_gpu > mean_cpu + margin_seconds,
+                              mean_cpu_prefix_seconds=mean_cpu, mean_gpu_generation_seconds=mean_gpu,
                               minimum_coverage_margin_seconds=min(gaps),
-                              mean_period_seconds=sum(periods) / len(periods),
+                              uncovered_windows=sum(gap < 0 for gap in gaps),
                               mean_coverage_gap_seconds=sum(gaps) / len(gaps)))
     covered = [row for row in summaries if row["covered"]]
     if not covered:
         raise ValueError("no measured CPU prefix fits GPU generation; measure a smaller prefix")
-    selected = min(covered, key=lambda row: (row["mean_period_seconds"], row["mean_coverage_gap_seconds"]))
+    selected = max(covered, key=lambda row: row["prefix_layers"])
     return dict(prefix_layers=selected["prefix_layers"], margin_seconds=margin_seconds,
-                objective="covered_minimum_mean_period", candidates=summaries)
+                objective="maximum_mean_covered_prefix_layers", aggregation="pooled_window_arithmetic_mean",
+                candidates=summaries)
 
 
 def build_split_identity(config, device=None, *, hardware=None):
@@ -76,6 +85,8 @@ def build_split_identity(config, device=None, *, hardware=None):
     fields = ("dtype", "moe_strategy", "attention_backend", "gpu_memory_budget_bytes", "memory_ratio",
               "moe_cache_auto", "moe_cache_scope", "speculative_depth", "speculative_graph",
               "cpu_async_loops", "cpu_async_recovery", "cpu_async_core_ids", "moe_cpu_core_ids",
+              "cpu_async_recovery_loops", "cpu_async_suffix_prefetch_wait",
+              "cpu_async_stop_when_ready",
               "cpu_async_kernel_profile", "cpu_async_kernel_components",
               "speculative_preverify_top_h", "speculative_max_input_tokens", "speculative_max_output_tokens",
               "cpu_async_suffix_prefetch_experts", "cpu_async_suffix_gpu_experts", "moe_hybrid_max_fetch")
@@ -106,7 +117,7 @@ def load_split_profile(path, identity=None):
         raise ValueError("CPU split profile must be an existing JSON file")
     data = json.loads(Path(path).expanduser().read_bytes())
     if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported CPU split profile schema; recalibrate for compact replay")
+        raise ValueError("unsupported CPU split profile schema; recalibrate for maximum covered prefix")
     if data.get("state_protocol") != CPU_PREFIX_PROTOCOL:
         raise ValueError("CPU split profile state protocol mismatch; recalibrate for compact replay")
     if not isinstance(data.get("identity"), dict) or not data["identity"]:

@@ -354,6 +354,8 @@ def test_cpu_recheck_routes_use_dynamic_top_k_without_prediction_leases(monkeypa
     control.renormalize, control.collect_signals = False, False
     control.preverify_policy = PreverifyPolicy(top_k=6)
     control.outputs, control.route_masks = {}, {}
+    control.external_prefetch_layer = None
+    control.prediction_hints = None
     monkeypatch.setattr(speculative_gpu, "_plan", PlanProbe())
     for top_k, keep_hits in ((6, False), (4, True)):
         control.preverify_top_k, control.keep_hits = top_k, keep_hits
@@ -1667,22 +1669,25 @@ def test_optimized_prefetch_joins_and_retires_on_compute_stream(graph_mode):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("fixed_gpu_routes", [None, 4])
-def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_mode, fixed_gpu_routes):
+@pytest.mark.parametrize("wait_mode", ["all", "layer"])
+@pytest.mark.parametrize("layers", [2, 3])
+def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_mode, fixed_gpu_routes, wait_mode, layers):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        cache = toy_cache(torch.device("cuda"), layers=2, slots=32)
+        cache = toy_cache(torch.device("cuda"), layers=layers, slots=64)
         control = GPUExpertCache(cache, stream, max_loops=1, max_rows=4,
             layer_quota=0, compact_control=True, implementation="optimized")
-        control.configure_external_prefetch(1)
+        control.retain_routes = False
+        control.configure_external_prefetch(1, wait_mode=wait_mode)
         control.fixed_gpu_routes = fixed_gpu_routes
         control.begin(1)
         ids = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
         weights = torch.arange(8, 0, -1, device="cuda").float().reshape(1, 8)
         hidden = torch.zeros(1, 1, device="cuda")
-        for li in range(2):
+        for li in range(layers):
             control.route(toy_layer(li), hidden, weights, ids)
         control.finish_loop(False)
         hints = control.capture_prefetch_hints()
@@ -1716,8 +1721,13 @@ def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
         torch.testing.assert_close(cache.slot_for_id[0], prefix_mapping, rtol=0, atol=0)
         assert (cache.slot_for_id[1, :hinted] >= 0).all()
+        if wait_mode == "layer" and layers == 3:
+            assert control.external_plan_counts[1].item() == 0
+            assert control.external_plan_counts[2].item() == 4
+        control.join_external_prefetch()
+        stream.synchronize()
         assert not control.pending.any() and control.error.item() == 0
-        assert control.counters[9].item() == 4
+        assert control.counters[9].item() == 4 * (layers - 1)
         control.close()
 
 

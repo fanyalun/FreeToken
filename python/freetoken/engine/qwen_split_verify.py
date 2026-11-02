@@ -33,7 +33,7 @@ class QwenSplitVerifier:
         self.max_rows = c.cpu_async_loops * (c.speculative_mtp_depth + 1) + 1
         self.experts = window.experts
         self.experts.reserve_verify_rows(self.max_rows)
-        self.experts.configure_external_prefetch(prefix_layers)
+        self.experts.configure_external_prefetch(prefix_layers, wait_mode=c.cpu_async_suffix_prefetch_wait)
         self.experts.hybrid_phases = ("verify",)
         self.experts.prepare_fixed_hybrid(c.cpu_async_suffix_gpu_experts)
         pool = e.linear_state_pool
@@ -99,7 +99,7 @@ class QwenSplitVerifier:
             r._reserve(job.start + rows)
             state = self.states[rows]
             batch = r._batch(inputs, job.start, state=state)
-            experts.join_external_prefetch()
+            experts.join_external_prefetch(self.prefix_layers)
             experts.set_phase("verify")
             had_stable_decode = hasattr(batch, "stable_moe_decode")
             previous_stable_decode = getattr(batch, "stable_moe_decode", None)

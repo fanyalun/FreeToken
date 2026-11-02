@@ -75,7 +75,7 @@ class CpuAsyncRuntime:
     def __init__(self, engine):
         self.engine = engine
         self.runner = engine.speculative_runner
-        self.window = QwenAsyncGpuWindow(self.runner, instrument_components=False)
+        self.window = QwenAsyncGpuWindow(self.runner, instrument_components=engine.config.cpu_async_profile)
         self.split = None
         self.prefix_transfer = None
         if engine.config.cpu_async_prefix_layers is not None:
@@ -160,7 +160,7 @@ class CpuAsyncRuntime:
         if not self.lock.acquire(blocking=False):
             raise RuntimeError("CPU async supports one request at a time")
         cancel = cancel.is_set if hasattr(cancel, "is_set") else cancel or (lambda: False)
-        outputs, rounds = [], []
+        outputs, rounds, profile_events = [], [], []
         started = time.perf_counter()
         first = None
         prefilled = False
@@ -189,6 +189,9 @@ class CpuAsyncRuntime:
             while len(outputs) < max_tokens:
                 if cancel():
                     raise _Cancelled()
+                if getattr(c, "cpu_async_profile", False):
+                    window.timing_events = {name: torch.cuda.Event(enable_timing=True)
+                                            for name in window.timing_events}
                 remaining = max_tokens - len(outputs)
                 block = GpuCandidateBlock(block.start, block.anchor, block.candidates[:max(0, remaining - 1)])
                 submitted = time.perf_counter()
@@ -203,11 +206,24 @@ class CpuAsyncRuntime:
                 ahead_cap = max(0, min(c.cpu_async_loops * (c.speculative_mtp_depth + 1),
                     checkpoint.length + max_tokens - 1 - self.runner.frontier.target_valid_len))
                 ahead_started = time.perf_counter()
-                ahead, ahead_inner = window.generate_ahead(block, c.cpu_async_loops, candidate_cap=ahead_cap)
+                ready_result = None
+                def stop_when_ready():
+                    nonlocal ready_result
+                    if cancel():
+                        raise _Cancelled()
+                    ready_result = self.worker.poll()
+                    if ready_result is not None and not isinstance(ready_result, tuple):
+                        raise RuntimeError("unexpected CPU reply at ahead loop boundary")
+                    return ready_result is not None
+                if getattr(c, "cpu_async_stop_when_ready", False):
+                    ahead, ahead_inner = window.generate_ahead(block, c.cpu_async_loops,
+                        candidate_cap=ahead_cap, stop=stop_when_ready)
+                else:
+                    ahead, ahead_inner = window.generate_ahead(block, c.cpu_async_loops, candidate_cap=ahead_cap)
                 e.stream.synchronize()
                 generation_seconds = time.perf_counter() - ahead_started
                 waiting = time.perf_counter()
-                result, timing = self._wait("result", cancel)
+                result, timing = ready_result if ready_result is not None else self._wait("result", cancel)
                 wait_seconds = time.perf_counter() - waiting
                 if result.start != window.canonical_length or result.block_id != block_id:
                     raise RuntimeError("CPU result does not belong to the submitted canonical window")
@@ -234,6 +250,7 @@ class CpuAsyncRuntime:
                 outputs.extend(result.tokens)
                 continuing = not result.terminal and len(outputs) < max_tokens
                 recovery_started = time.perf_counter()
+                state_install_host_seconds = recovery_started - install_started
                 next_block, recovery = window.recover(result, ahead, c.cpu_async_recovery, c.cpu_async_loops,
                     refill=continuing, candidate_cap=max(0, max_tokens - len(outputs) - 1), eos_ids=eos_ids)
                 recovery_enqueued = time.perf_counter()
@@ -250,6 +267,8 @@ class CpuAsyncRuntime:
                     cpu_wait_seconds=wait_seconds, handoff_seconds=time.perf_counter() - submitted,
                     cpu_compute_seconds=timing["compute_seconds"], cpu_publish_seconds=timing["publish_seconds"],
                     cpu_verify_phases=timing.get("verify_phases"),
+                    verification_install_host_seconds=state_install_host_seconds,
+                    candidate_recovery_host_seconds=recovery_enqueued - recovery_started,
                     timestamps=dict(submit=submitted, cpu_start=timing.get("cpu_started_at"),
                         cpu_compute_end=timing.get("cpu_compute_ended_at"), cpu_publish=timing.get("published_at"),
                         gpu_start=ahead_started, gpu_end=waiting, result_received=install_started,
@@ -259,6 +278,8 @@ class CpuAsyncRuntime:
                     proposed_candidates=list(block.candidates), next_proposal_start=next_block.start if next_block else None,
                     next_proposal_candidates=list(next_block.candidates) if next_block else [],
                     **split_timing))
+                if getattr(c, "cpu_async_profile", False):
+                    profile_events.append((rounds[-1], window.timing_events))
                 if not continuing:
                     break
                 if next_block is None:
@@ -284,6 +305,8 @@ class CpuAsyncRuntime:
                 self._finish_request(failed)
             finally:
                 self.lock.release()
+        for record, events in profile_events:
+            record["gpu_recovery_phases"] = window.component_timings(events)
         metrics = (window.experts.request_metrics() if prefilled else
                    dict(available=True, scope="gpu_decode", cancelled_before_prefill=True,
                         logical_total_loads=0, logical_total_bytes=0))
@@ -291,6 +314,9 @@ class CpuAsyncRuntime:
                        hybrid_core_ids=list(c.moe_cpu_core_ids or ()),
                        hybrid_coordinator_core=c._cpu_moe_coordinator_core,
                        recovery=c.cpu_async_recovery,
+                       recovery_loops=getattr(c, "cpu_async_recovery_loops", None),
+                       recovery_profile=getattr(c, "cpu_async_profile", False),
+                       ahead_stop_when_ready=getattr(c, "cpu_async_stop_when_ready", False),
                        canonical_target="cpu_prefix_gpu_suffix" if getattr(self, "split", None) is not None else "cpu",
                        cpu_prefix_layers=getattr(c, "cpu_async_prefix_layers", None),
                        gpu_suffix_execution="eager_hybrid" if getattr(self, "split", None) is not None else None,

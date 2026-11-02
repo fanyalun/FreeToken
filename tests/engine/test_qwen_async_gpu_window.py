@@ -62,7 +62,7 @@ def window(monkeypatch):
     w.reader_generation = 0
     w.timing_events = {name: torch.cuda.Event() for name in
                        ("install", "state", "refresh", "replay_start", "replay_end")}
-    def lossy(ids, start, *, need_logits=True):
+    def lossy(ids, start, *, need_logits=True, check_error=True):
         calls.append(("lossy", start, ids.clone(), need_logits))
         hidden = ids.float().unsqueeze(1).repeat(1, 4)
         return torch.full_like(ids, -100), hidden
@@ -277,19 +277,25 @@ def installed_result():
         checkpoint=SimpleNamespace(length=5), tokens=(17, 18, 19, 20), predictions=torch.zeros(4))
 
 
-def test_fixed_recovery_preserves_candidates_without_running_or_advancing_gpu(monkeypatch):
+@pytest.mark.parametrize("mode", ["fixed_replay", "replay"])
+def test_fixed_recovery_preserves_candidates_without_running_or_advancing_gpu(monkeypatch, mode):
     w, calls, _, _ = window(monkeypatch)
     before = w.private_pool.recurrent_states.clone()
     tail, trace = w.recover(installed_result(), GpuCandidateBlock(4, 19, (20, 21, 22)),
-        "fixed_replay", 2)
+        mode, 2)
     assert tail == GpuCandidateBlock(5, 20, (21, 22))
-    assert trace["reason"] == "install_only" and not calls
-    assert w.runner.frontier.target_valid_len == w.canonical_length == 5
+    assert trace["reason"] == ("install_only" if mode == "fixed_replay" else "replayed")
+    assert w.canonical_length == 5
+    assert w.runner.frontier.target_valid_len == (5 if mode == "fixed_replay" else 7)
+    if mode == "fixed_replay":
+        assert not calls
+    else:
+        assert [(c[1], c[3]) for c in calls if c[0] == "lossy"] == [(5, False)]
     assert torch.equal(before, w.private_pool.recurrent_states)
     generated = []
     w.generate_block = lambda anchor, loops, **kw: generated.append((anchor, loops, kw))
     w.generate_ahead(tail, 2)
-    assert generated == [(20, 2, dict(candidate_cap=None))]
+    assert generated == [(20 if mode == "fixed_replay" else 22, 2, dict(candidate_cap=None))]
 
 
 @pytest.mark.parametrize("matched", [0, 1])
@@ -337,19 +343,48 @@ def test_recovery_does_not_refill_terminal_eos_or_full_candidate_capacity(monkey
         assert block.candidates == (999,) and w.runner.frontier.target_valid_len == 6
 
 
-@pytest.mark.parametrize("mode", ["fixed_replay", "recheck"])
-def test_partial_cpu_acceptance_discards_old_tail_and_generates_from_correction(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["fixed_replay", "recheck", "replay"])
+@pytest.mark.parametrize("recovery_loops", [None, 1])
+def test_partial_cpu_acceptance_discards_old_tail_and_generates_from_correction(monkeypatch, mode, recovery_loops):
     w, _, _, _ = window(monkeypatch)
     result = installed_result()
     result.accepted = 1
+    w.engine.config.cpu_async_recovery_loops = recovery_loops
     generated = []
     def generate(anchor, loops, **kwargs):
         generated.append((anchor, loops))
         return GpuCandidateBlock(5, anchor, (21,)), []
     w.generate_block = generate
     block, trace = w.recover(result, GpuCandidateBlock(4, 19, (20, 21, 22)), mode, 3)
-    assert generated == [(20, 3)] and not trace["retained"]
+    assert generated == [(20, recovery_loops or 3)] and not trace["retained"]
+    assert trace["generation_loops"] == (recovery_loops or 3)
     assert block == GpuCandidateBlock(5, 20, (21,))
+
+
+@pytest.mark.parametrize("ready_after", [None, 1, 2])
+def test_ahead_stop_preserves_a_complete_private_loop_and_canonical_boundary(monkeypatch, ready_after):
+    w, _, _, _ = window(monkeypatch)
+    order = []
+    def step(anchor, width, **kwargs):
+        assert width == 4
+        token = int(anchor.item()) + 1
+        w.runner.frontier.target_valid_len += 1
+        w.runner.frontier.draft_valid_len += 1
+        order.append("step")
+        return SimpleNamespace(terminal=False, returned=[token], accepted=0, count=1,
+                               tokens=torch.tensor([token], dtype=torch.int32))
+    w.candidates = SimpleNamespace(step=step)
+    w.experts.finish_loop = lambda continuing: order.append("finish")
+    w.experts.read_control = lambda *args: None
+    def stop():
+        assert order[-1] == "finish"
+        order.append("poll")
+        return ready_after is not None and order.count("step") >= ready_after
+    block, inner = w.generate_ahead(GpuCandidateBlock(5, 20, (21, 22)), 3, stop=stop)
+    count = ready_after or 3
+    assert block == GpuCandidateBlock(5, 20, tuple(range(21, 21 + count)))
+    assert len(inner) == count and w.runner.frontier.target_valid_len == 5 + count
+    assert w.canonical_length == 5
 
 
 def test_recovery_rejects_uninstalled_result_and_ahead_rejects_wrong_frontier(monkeypatch):
@@ -584,6 +619,7 @@ def test_split_prefix_dma_installs_accepted_row_and_preserves_suffix_state(key_d
     refreshed = []
     runner = SimpleNamespace(_reserve=lambda end: None, _reserved_len=10)
     window = SimpleNamespace(epoch=7, canonical_length=2, canonical_anchor=20, output_end=10,
+        _record_timing=lambda name: None,
         runner=runner, state_adapter=adapter, private_pool=adapter.private_pool(), replay_rows=8,
         reader_events=[torch.cuda.Event(), torch.cuda.Event()], reader_generation=0,
         _refresh=lambda phase, tokens, hidden, begin, final: refreshed.append(

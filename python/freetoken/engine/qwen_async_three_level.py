@@ -99,7 +99,7 @@ class QwenAsyncGpuWindow:
         self.reader_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.reader_generation = 0
         self.timing_events = {name: torch.cuda.Event(enable_timing=True) for name in
-                              ("install", "state", "refresh", "replay_start", "replay_end",
+                              ("install", "fold_start", "fold_end", "state", "refresh", "replay_start", "replay_end",
                                "prefill_start", "prefill_end")}
         runner.reserve_eager_width(self.replay_rows)
         self.epoch, self.active = 0, False
@@ -117,6 +117,9 @@ class QwenAsyncGpuWindow:
                 self.experts.demand_fence, self.experts.audit,
                 getattr(c, "cpu_async_prefix_layers", None),
                 getattr(c, "cpu_async_suffix_gpu_experts", None),
+                getattr(c, "cpu_async_recovery", "fixed_replay"),
+                getattr(self.experts, "external_prefetch_wait", None),
+                tuple((li, id(event)) for li, event in getattr(self.experts, "external_layer_events", {}).items()),
                 getattr(self.experts, "fixed_gpu_routes", None),
                 getattr(self.experts, "external_prefetch_layer", None),
                 tuple(t.data_ptr() for t in getattr(self.experts, "external_plan_arrays", ())),
@@ -132,6 +135,7 @@ class QwenAsyncGpuWindow:
     @torch.inference_mode()
     def prepare_graphs(self):
         r, e = self.runner, self.engine
+        c = e.config
         if not r.use_graph:
             return
         if self.active or r.active:
@@ -158,6 +162,9 @@ class QwenAsyncGpuWindow:
                     predicted, hidden = self._lossy(ids, 0)
                     zero = self.count_buffer.zero_()
                     r._commit_state(state, zero)
+                    if getattr(c, "cpu_async_recovery", "fixed_replay") == "replay":
+                        self._lossy(ids, 0, need_logits=False)
+                        r._commit_state(state, zero)
                     commit = r._accept(Proposal(ids[:1], ids[1:]), VerifyResult(predicted, hidden),
                                        width, (), eos_mask=self.recheck_eos_mask)
                     self.experts.read_control(predicted, commit)
@@ -263,8 +270,10 @@ class QwenAsyncGpuWindow:
     def _lossy(self, inputs, start, *, need_logits=True, check_error=True):
         r = self.runner
         # Reuse the captured Target body for fixed replay as well as generation.
+        hidden_only = not need_logits and getattr(self.engine.config, "cpu_async_recovery", "fixed_replay") == "replay"
         return self.candidates.forward(inputs, start, self.states[inputs.numel()],
-            experts=self.experts, phase="cpu_async_lossy", need_logits=need_logits or r.use_graph,
+            experts=self.experts, phase="cpu_async_replay" if hidden_only else "cpu_async_lossy",
+            need_logits=False if hidden_only else need_logits or r.use_graph,
             check_error=check_error)
 
     def audit_gpu_anchor(self, anchor):
@@ -348,15 +357,19 @@ class QwenAsyncGpuWindow:
         if self.instrument_components or (name.startswith("prefill_") and getattr(self, "measure_prefill", False)):
             self.timing_events[name].record(self.engine.stream)
 
-    def component_timings(self):
+    def component_timings(self, events=None):
         if not self.instrument_components:
             return {}
-        events = self.timing_events
-        return dict(state_install_seconds=events["install"].elapsed_time(events["state"]) / 1000,
+        events = self.timing_events if events is None else events
+        result = dict(state_install_seconds=events["install"].elapsed_time(events["state"]) / 1000,
                     confirmed_mtp_refresh_seconds=events["state"].elapsed_time(events["refresh"]) / 1000,
-                    fixed_replay_seconds=events["replay_start"].elapsed_time(events["replay_end"]) / 1000)
+                    candidate_recovery_seconds=events["replay_start"].elapsed_time(events["replay_end"]) / 1000)
+        if getattr(self.engine.config, "cpu_async_prefix_layers", None) is not None:
+            result.update(gdn_fold_seconds=events["fold_start"].elapsed_time(events["fold_end"]) / 1000,
+                          private_fork_seconds=events["fold_end"].elapsed_time(events["state"]) / 1000)
+        return result
 
-    def generate_block(self, anchor, loops, *, candidate_cap=None):
+    def generate_block(self, anchor, loops, *, candidate_cap=None, stop=None):
         if not self.active or loops < 1:
             raise RuntimeError("active GPU window and positive loops required")
         r, e = self.runner, self.engine
@@ -380,7 +393,7 @@ class QwenAsyncGpuWindow:
                 candidates.extend(step.returned)
                 records.append(dict(drafted=width - 1, accepted=step.accepted, returned=step.count))
                 current.copy_(step.tokens[step.count - 1:step.count])
-                if step.terminal:
+                if step.terminal or (stop is not None and stop()):
                     break
         return GpuCandidateBlock(start, anchor, tuple(candidates)), records
 
@@ -494,7 +507,7 @@ class QwenAsyncGpuWindow:
             matched, len(old) - matched, output[-1], end, reason, tuple(segments))
 
     def recover(self, result, ahead, mode, loops, *, refill=True, candidate_cap=None, eos_ids=()):
-        if mode not in ("fixed_replay", "recheck") or loops < 1:
+        if mode not in ("fixed_replay", "recheck", "replay") or loops < 1:
             raise ValueError("recovery requires a supported mode and positive loops")
         if (self.canonical_length != result.checkpoint.length
                 or self.runner.frontier.target_valid_len != self.canonical_length
@@ -516,6 +529,10 @@ class QwenAsyncGpuWindow:
         if tail is not None and tail.candidates:
             if mode == "fixed_replay":
                 return tail, dict(reason="install_only", retained=True, matched=None, dropped=0)
+            if mode == "replay":
+                self.replay(tail, check_error=False)
+                return tail, dict(reason="replayed", retained=True, matched=None, dropped=0,
+                                  replayed_rows=len(tail.candidates))
             # Recheck can produce one more token than the retained candidates.
             checked = self.recheck(tail, cap, eos_ids=eos_ids)
             block = checked.block
@@ -534,11 +551,13 @@ class QwenAsyncGpuWindow:
             return block, trace
         if not refill:
             return None, dict(reason="discarded", retained=False, dropped=len(ahead.candidates))
-        block, inner = self.generate_block(result.tokens[-1], loops, candidate_cap=cap)
+        refill_loops = getattr(self.engine.config, "cpu_async_recovery_loops", None) or loops
+        block, inner = self.generate_block(result.tokens[-1], refill_loops, candidate_cap=cap)
         self._record_timing("replay_end")
-        return block, dict(reason="regenerated", retained=False, dropped=len(ahead.candidates), inner=inner)
+        return block, dict(reason="regenerated", retained=False, dropped=len(ahead.candidates),
+                           generation_loops=refill_loops, inner=inner)
 
-    def generate_ahead(self, submitted, loops, *, candidate_cap=None):
+    def generate_ahead(self, submitted, loops, *, candidate_cap=None, stop=None):
         start = self.runner.frontier.target_valid_len
         if start == submitted.start:
             anchor = submitted.anchor
@@ -546,9 +565,11 @@ class QwenAsyncGpuWindow:
             anchor = submitted.candidates[-1]
         else:
             raise ValueError("GPU frontier does not match the submitted candidate block")
+        if stop is not None:
+            return self.generate_block(anchor, loops, candidate_cap=candidate_cap, stop=stop)
         return self.generate_block(anchor, loops, candidate_cap=candidate_cap)
 
-    def replay(self, block):
+    def replay(self, block, *, check_error=True):
         r, e = self.runner, self.engine
         if block.start != r.frontier.target_valid_len or block.start != self.canonical_length:
             raise ValueError("fixed-token replay must start at the refreshed CPU frontier")
@@ -567,14 +588,18 @@ class QwenAsyncGpuWindow:
                 r._reserve(start + count)
                 ids = self.token_buffer[:count]
                 ids.copy_(torch.as_tensor(inputs[offset:offset + count], dtype=torch.int32))
-                _, hidden = self._lossy(ids, start, need_logits=False)
+                if check_error:
+                    _, hidden = self._lossy(ids, start, need_logits=False)
+                else:
+                    _, hidden = self._lossy(ids, start, need_logits=False, check_error=False)
                 self.count_buffer.fill_(count)
                 r._commit_state(self.states[count], self.count_buffer)
                 self._refresh("cpu_async_replay_mtp", block.candidates[offset:offset + count],
                               hidden, start, offset + count == len(inputs))
             end = block.start + len(inputs)
             r.frontier = SpeculativeFrontier(1, end, end, r._reserved_len)
-            self.experts.check_error()
+            if check_error:
+                self.experts.check_error()
             self._record_timing("replay_end")
 
     def close_request(self):
