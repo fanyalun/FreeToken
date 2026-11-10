@@ -171,7 +171,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 if isinstance(value, dict):
                     ws[name] = {layer: tensor[:bs] for layer, tensor in value.items()}
                 elif name == "gpu_workspace":
-                    gk = self.top_k if self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+                    gk = self.top_k
                     ws[name] = (value[0][:bs], value[1][:bs * gk], value[2][:bs])
                 else:
                     ws[name] = value[:bs]
@@ -180,7 +180,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         def empty(*shape, dtype=torch.float16):
             return torch.empty(shape, device=self.device, dtype=dtype)
         k, h = self.top_k, self.hidden
-        gk = self.top_k if self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+        gk = self.top_k
         inter = self.config.model_config.moe_intermediate_size
         ws = dict(
             slots=empty(bs, gk, dtype=torch.int32), full_slots=empty(bs, k, dtype=torch.int32),
@@ -300,6 +300,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         return self._run(layer_id, hidden_states, weights, ids, ws, False)
 
     def uses_modes_routing(self, prefill):
+        if not prefill and getattr(self.config, "moe_policy", "native") == "modes_prefill_tablemoe_decode":
+            return False
         return self.external_mask and not (prefill and self.prefill_uses_tablemoe)
 
     def lookup_enabled(self, prefill):
@@ -345,13 +347,13 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         bs, k = ids.shape
         cache = self.expert_cache
         online = self.fixed_online[layer]
-        gpu_k = k if prefill or self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+        gpu_k = k
         slots = ws["full_slots"]
         kernels._prepare_routes[(triton.cdiv(ids.numel(), 256),)](
             ids, slots, ws["keep"], ws["cpu_ids"], ws["cache_hit"],
             cache.slot_for_id if cache is not None else ids, ws["request_slots"],
             k, self.config.tablemoe_decode_keep_k, self.num_experts, layer, self.dummy_slot,
-            prefill, cache is not None, 256, ids.numel(), self.external_mask)
+            prefill, cache is not None, 256, ids.numel(), self.uses_modes_routing(prefill))
         if not prefill:
             ws["slots"].copy_(slots[:, :gpu_k])
             slots = ws["slots"]

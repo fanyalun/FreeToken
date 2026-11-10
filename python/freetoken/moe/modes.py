@@ -53,11 +53,13 @@ def modes_keep_mask(weights, modality, valid, importance, tau):
 
 def prepare_modes_config(config):
     policy = getattr(config, "moe_policy", "native")
-    if policy not in ("native", "modes", "modes_tablemoe"):
+    if policy not in ("native", "modes", "modes_tablemoe", "modes_prefill_tablemoe_decode"):
         raise ValueError("invalid --moe-policy")
     prefill_policy = getattr(config, "modes_prefill_policy", "modes")
     if prefill_policy not in ("modes", "tablemoe"):
         raise ValueError("invalid --modes-prefill-policy")
+    if policy == "modes_prefill_tablemoe_decode" and prefill_policy != "modes":
+        raise ValueError("modes_prefill_tablemoe_decode requires MoDES prefill")
     if policy == "native":
         if getattr(config, "modes_config", None):
             raise ValueError("--modes-config requires a MoDES policy")
@@ -80,7 +82,8 @@ def prepare_modes_config(config):
         object.__setattr__(config, "cuda_graph_max_bs", 0)
     object.__setattr__(mc, "norm_topk_prob", True)
     object.__setattr__(config, "tablemoe_expert_mode", config.moe_strategy)
-    object.__setattr__(config, "tablemoe_decode_keep_k", mc.num_experts_per_tok)
+    if policy != "modes_prefill_tablemoe_decode":
+        object.__setattr__(config, "tablemoe_decode_keep_k", mc.num_experts_per_tok)
     if policy == "modes":
         if prefill_policy == "modes":
             object.__setattr__(config, "tablemoe_skip_lookup", True)

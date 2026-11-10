@@ -11,6 +11,7 @@ import sys
 import warnings
 import types
 import logging
+import importlib.util
 
 
 def load_dataset(kit, name, dataset_only=False):
@@ -61,12 +62,33 @@ def kit_fingerprint(root):
     return dict(root=str(root), commit=commit, files=files, python=sys.executable)
 
 
-def prepare(dataset, output, media_path_remap=None):
+def load_prompt_model(kit, dataset, name):
+    if name != "qwen3_vl":
+        raise ValueError(f"unsupported prompt model: {name}")
+    module = sys.modules["vlmeval.dataset"]
+    if not hasattr(module, "DATASET_TYPE"):
+        module.DATASET_TYPE = lambda name, default=None: dataset.TYPE if name == dataset.dataset_name else default
+    path = Path(kit) / "vlmeval/vlm/qwen3_vl/prompt.py"
+    spec = importlib.util.spec_from_file_location("vlmeval_qwen3_vl_prompt", path)
+    prompt = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prompt)
+    model = prompt.Qwen3VLPromptMixin()
+    model.set_dump_image(dataset.dump_image)
+    return model
+
+
+def select_prompt(dataset, line, model=None):
+    if model is not None and model.use_custom_prompt(dataset.dataset_name):
+        return model.build_prompt(line, dataset=dataset.dataset_name), "model.build_prompt"
+    return dataset.build_prompt(line), "dataset.build_prompt"
+
+
+def prepare(dataset, output, media_path_remap=None, prompt_model=None):
     frame = dataset.data
     rows = []
     for i in range(len(frame)):
         line = frame.iloc[i]
-        message = dataset.build_prompt(line)
+        message, prompt_source = select_prompt(dataset, line, prompt_model)
         original_message = [dict(part) for part in message]
         for part in message:
             if part["type"] == "image" and not Path(part["value"]).exists():
@@ -81,7 +103,7 @@ def prepare(dataset, output, media_path_remap=None):
             idx = int(idx)
         rows.append(dict(id=f"{dataset.dataset_name}:{idx}", index=idx, dataset=dataset.dataset_name,
                          metadata=meta, vlmeval_message=message, messages=api_messages(message),
-                         native_vlmeval_message=original_message,
+                         native_vlmeval_message=original_message, prompt_source=prompt_source,
                          images=[image_identity(part["value"]) for part in message if part["type"] == "image"],
                          circular_group=int(idx) % 1000000 if dataset.dataset_name.startswith("MMBench") else None))
     write_rows(output, group_rows(rows))
@@ -167,6 +189,7 @@ def main():
     parser.add_argument("--judge", default="{}")
     parser.add_argument("--dataset-only-import", action="store_true")
     parser.add_argument("--media-path-remap", default="{}")
+    parser.add_argument("--prompt-model", choices=["qwen3_vl"])
     parser.add_argument("--expected-kit", type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -180,7 +203,8 @@ def main():
     if args.expected_kit and json.loads(args.expected_kit.read_text()) != fingerprint:
         raise ValueError("VLMEvalKit source/interpreter changed since prompt preparation")
     if args.stage == "prepare":
-        prepare(dataset, args.output, json.loads(args.media_path_remap))
+        model = load_prompt_model(args.kit, dataset, args.prompt_model) if args.prompt_model else None
+        prepare(dataset, args.output, json.loads(args.media_path_remap), model)
         write_json(args.output.with_suffix(".kit.json"), fingerprint)
     else:
         write_json(args.output / "kit.json", fingerprint)

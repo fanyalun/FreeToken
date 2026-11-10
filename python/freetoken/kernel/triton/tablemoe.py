@@ -58,12 +58,16 @@ def _prepare_routes(ids, slots, keep, cpu_ids, cache_hit, slot_for_id, request_s
     r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     eid = tl.load(ids + r, r < N, 0).to(tl.int32)
     req = tl.load(request_slots + r // TOP_K, r < N, DUMMY)
-    exact = (tl.load(keep + r, r < N, False) if PREFILL or EXTERNAL_MASK else r % TOP_K < KEEP_K) & (req != DUMMY)
-    tl.store(keep + r, exact, r < N)
+    valid = (r < N) & (req != DUMMY) & (eid >= 0)
     hit = tl.full((BLOCK,), False, tl.int1)
     if HAS_CACHE:
-        hit = exact & (tl.load(slot_for_id + LAYER * EXPERTS + eid, r < N, -1) >= 0)
-    tl.store(cache_hit + r, hit, r < N)
+        hit = tl.load(slot_for_id + LAYER * EXPERTS + eid, valid, -1) >= 0
+    if PREFILL or EXTERNAL_MASK:
+        exact = tl.load(keep + r, r < N, False) & valid
+    else:
+        exact = ((r % TOP_K < KEEP_K) | hit) & valid
+    tl.store(keep + r, exact, r < N)
+    tl.store(cache_hit + r, exact & hit, r < N)
     tl.store(slots + r, tl.where(exact, eid, -1), r < N)
     tl.store(cpu_ids + r, tl.where(exact, eid, -1), r < N)
 

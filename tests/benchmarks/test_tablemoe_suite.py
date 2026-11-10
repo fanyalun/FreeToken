@@ -11,6 +11,43 @@ from tablemoe_data import api_messages, fixed_rows, group_rows, split_rows, veri
 from bench_tablemoe_suite import distribution, effective_config, report
 
 
+@pytest.mark.parametrize("custom", [False, True])
+def test_prompt_dispatch_prioritizes_model_before_dataset(custom):
+    from types import SimpleNamespace
+    from tablemoe_vlmeval import select_prompt
+
+    calls = []
+    dataset = SimpleNamespace(dataset_name="RealWorldQA", build_prompt=lambda row: calls.append("dataset") or ["native"])
+    model = SimpleNamespace(use_custom_prompt=lambda name: custom,
+                            build_prompt=lambda row, dataset: calls.append("model") or ["custom"])
+    message, source = select_prompt(dataset, {"question": "q"}, model)
+    assert message == (["custom"] if custom else ["native"])
+    assert calls == (["model"] if custom else ["dataset"])
+    assert source == ("model.build_prompt" if custom else "dataset.build_prompt")
+
+
+def test_prefill_calibration_excludes_decode_from_mask_and_denominator():
+    from types import SimpleNamespace
+    import torch
+    from modes_calibration import calibration_mlp_forward
+
+    state = SimpleNamespace(modality=torch.tensor([1, 1]), route_rows=torch.tensor([True, False]),
+                            ablation=None, tau={"text": 2., "visual": 2.},
+                            importance={0: {"text": 1., "visual": 1.}}, total_routes=0, skipped_routes=0)
+    module = SimpleNamespace(_modes_calibration=state, _modes_layer=0,
+                             gate=lambda x: (None, torch.ones(len(x), 2).half() / 2,
+                                             torch.zeros(len(x), 2, dtype=torch.long)),
+                             experts=lambda x, ids, weights: x * weights.sum(-1, keepdim=True))
+    x = torch.ones(2, 3).half()
+    result = calibration_mlp_forward(module, x)
+    assert torch.equal(result, torch.tensor([[0., 0., 0.], [1., 1., 1.]]).half())
+    assert state.total_routes == state.skipped_routes == 2
+    state.ablation = (0, "text")
+    module.experts = lambda x, ids, weights: x * 3
+    result = calibration_mlp_forward(module, x)
+    assert torch.equal(result, torch.tensor([[1., 1., 1.], [3., 3., 3.]]).half())
+
+
 def test_decode_calibration_adds_only_missing_categories_and_preserves_rows():
     from bench_modes_decode_calibration import extend_samples
     from mmlongbench_write import CATEGORIES

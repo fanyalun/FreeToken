@@ -59,7 +59,7 @@ class ModesRuntime(TableMoeOptimizedRuntime):
             result.update(moe_policy=self.config.moe_policy,
                           modes_prefill_policy=getattr(self.config, "modes_prefill_policy", "modes"),
                           valid_routes=valid, table_recovered_routes=recovered)
-            if self.prefill_uses_tablemoe:
+            if self.prefill_uses_tablemoe or self.config.moe_policy == "modes_prefill_tablemoe_decode":
                 result.update(skipped_routes=skipped, skip_fraction=skipped / valid if valid else 0.)
             else:
                 result.update(modes_skipped_routes=skipped,
@@ -70,6 +70,8 @@ class ModesRuntime(TableMoeOptimizedRuntime):
     def forward(self, layer_id, hidden_states, weights, ids, batch):
         if batch.tablemoe_slots is None:
             self.prepare_batch(batch)
+        if not batch.is_prefill and self.config.moe_policy == "modes_prefill_tablemoe_decode":
+            return super().forward(layer_id, hidden_states, weights, ids, batch)
         if batch.is_prefill and self.prefill_uses_tablemoe:
             return super()._prefill(layer_id, hidden_states, weights, ids, batch)
         weights = weights.to(torch.float16)

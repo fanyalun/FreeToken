@@ -147,6 +147,8 @@ def kit_command(config, stage, dataset, output):
         command.append("--dataset-only-import")
     if stage == "prepare":
         command.extend(["--media-path-remap", json.dumps(config.get("media_path_remap", {}))])
+        if config.get("prompt_model"):
+            command.extend(["--prompt-model", config["prompt_model"]])
     return command
 
 

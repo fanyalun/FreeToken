@@ -42,6 +42,13 @@ offline assets are still required for TableMoE prefill.
 
 ## Import calibration
 
+`--moe-policy modes_prefill_tablemoe_decode` uses MoDES prefill thresholds and
+standalone TableMoE decode routing. Decode computes top-h plus GPU expert-cache
+hits, then queries online/offline tables for the remaining routes. This policy
+accepts `--tablemoe-decode-top-h`; it requires offline assets and preserves the
+configured online capacity. It is distinct from `modes_tablemoe`, whose decode
+continues to select routes with MoDES thresholds.
+
 Upstream MoDES provides calibration and tau-search scripts. The reference is
 `git@github.com:fanyalun/MoDES.git` at
 `933b3ccac3c23e01c763771f1a7d60c4e7ed13a4`, also available from

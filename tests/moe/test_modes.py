@@ -219,6 +219,69 @@ def _prepare_config(model, path, policy, prefill_policy):
         moe_cache_rate=None, moe_cache_auto=False, moe_cpu_layers=None)
 
 
+def test_mixed_prefill_preserves_decode_top_h_and_lookup(tmp_path):
+    model, importance, search = _assets(tmp_path)
+    path = _importer()(importance, search, model, tmp_path / "imported")
+    config = _prepare_config(model, path, "modes_prefill_tablemoe_decode", "modes")
+    pca, cache = tmp_path / "pca", tmp_path / "cache"
+    pca.mkdir()
+    cache.mkdir()
+    config.tablemoe_pca_dir, config.tablemoe_cache_dir = str(pca), str(cache)
+    prepare_modes_config(config)
+    assert config.tablemoe_decode_keep_k == 1
+    assert config.tablemoe_online_cache_size == 64
+    assert not config.tablemoe_skip_lookup
+    config.modes_prefill_policy = "tablemoe"
+    with pytest.raises(ValueError, match="requires MoDES prefill"):
+        prepare_modes_config(config)
+
+
+def test_mixed_decode_dispatches_to_tablemoe_without_threshold(monkeypatch):
+    from freetoken.moe.modes_runtime import ModesRuntime
+    from freetoken.moe.tablemoe_optimized import TableMoeOptimizedRuntime
+
+    runtime = object.__new__(ModesRuntime)
+    runtime.config = SimpleNamespace(moe_policy="modes_prefill_tablemoe_decode")
+    runtime.external_mask = True
+    runtime.prefill_uses_tablemoe = False
+    runtime.bypass_tables = False
+    assert runtime.uses_modes_routing(True)
+    assert not runtime.uses_modes_routing(False)
+    assert not runtime.lookup_enabled(True)
+    assert runtime.lookup_enabled(False)
+    expected = object()
+    monkeypatch.setattr(TableMoeOptimizedRuntime, "forward", lambda *args: expected)
+    batch = SimpleNamespace(tablemoe_slots=object(), is_prefill=False)
+    assert runtime.forward(0, None, None, None, batch) is expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mixed_decode_keeps_top_h_and_cache_hits_in_graph():
+    from freetoken.kernel.triton.tablemoe import _prepare_routes
+
+    ids = torch.tensor([[0, 1, 2, 3]], device="cuda", dtype=torch.int32)
+    slots = torch.empty_like(ids)
+    keep = torch.zeros_like(ids, dtype=torch.bool)
+    cpu_ids = torch.empty_like(ids)
+    hits = torch.empty_like(keep)
+    cache = torch.tensor([-1, -1, 0, -1], device="cuda", dtype=torch.int32)
+    requests = torch.tensor([0], device="cuda", dtype=torch.int32)
+
+    def run():
+        _prepare_routes[(1,)](ids, slots, keep, cpu_ids, hits, cache, requests,
+                              4, 1, 4, 0, 99, False, True, 256, 4, False)
+
+    run()
+    expected = torch.tensor([[True, False, True, False]], device="cuda")
+    assert torch.equal(keep, expected)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    cache.copy_(torch.tensor([-1, 0, -1, -1], device="cuda", dtype=torch.int32))
+    graph.replay()
+    assert torch.equal(keep, torch.tensor([[True, True, False, False]], device="cuda"))
+
+
 @pytest.mark.parametrize("policy", ["modes", "modes_tablemoe"])
 def test_tablemoe_prefill_requires_assets_even_with_pure_modes_decode(tmp_path, policy):
     model, importance, search = _assets(tmp_path)

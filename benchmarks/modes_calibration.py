@@ -105,8 +105,11 @@ def calibration_mlp_forward(module, hidden_states):
     if flat.shape[0] != modality.numel():
         raise ValueError("calibration modality map and MoE input differ")
     ablate = state.ablation
+    active = getattr(state, "route_rows", None)
+    if active is None:
+        active = torch.ones_like(modality, dtype=torch.bool)
     if ablate is not None and ablate[0] == module._modes_layer:
-        skip = modality == (1 if ablate[1] == "text" else 0)
+        skip = (modality == (1 if ablate[1] == "text" else 0)) & active
         kept = ~skip
         result = flat.clone()
         # The pinned upstream layer-importance ablation returns the input on skipped rows.
@@ -120,15 +123,24 @@ def calibration_mlp_forward(module, hidden_states):
         exact = torch.ones_like(weights, dtype=torch.bool)
         for name, mod in (("visual", 0), ("text", 1)):
             score = (weights * layer[name]).half()
-            exact &= ~((modality == mod)[:, None] & (score < state.tau[name]))
-        state.total_routes += weights.numel()
+            exact &= ~((modality == mod)[:, None] & active[:, None] & (score < state.tau[name]))
+        state.total_routes += int(active.sum()) * weights.shape[1]
         state.skipped_routes += int((~exact).sum())
+        if hasattr(state, "stage_routes"):
+            counts = state.stage_routes[state.stage]
+            counts["total"] += int(active.sum()) * weights.shape[1]
+            counts["skipped"] += int((~exact).sum())
         weights = weights.masked_fill(~exact, 0)
     return module.experts(flat, ids, weights).reshape(shape)
 
 
 class CalibrationModel:
-    def __init__(self, model, tokenizer, logits_chunk=128, sequence_chunk=1024):
+    def __init__(self, model, tokenizer, logits_chunk=128, sequence_chunk=1024, scope="prefill_decode"):
+        if scope not in ("prefill", "prefill_decode"):
+            raise ValueError("invalid MoDES calibration scope")
+        self.scope = scope
+        self.route_rows = None
+        self.stage_routes = {name: dict(total=0, skipped=0) for name in ("prefill", "decode")}
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.logits_chunk = logits_chunk
@@ -153,15 +165,19 @@ class CalibrationModel:
         if inputs["input_ids"].shape[0] != 1:
             raise ValueError("single-device calibration requires batch size one")
 
-        def forward(piece, **kwargs):
+        def forward(piece, *, is_decode=False, route_rows=None, **kwargs):
             ids = piece["input_ids"]
+            self.stage = "decode" if is_decode else "prefill"
             visual = (ids == self.model.config.image_token_id) | (ids == self.model.config.video_token_id)
             text = ~torch.isin(ids, torch.tensor(self.tokenizer.all_special_ids, device=ids.device))
             self.modality = torch.where(visual, 0, torch.where(text, 1, 2))
+            self.route_rows = (torch.full_like(ids, not is_decode or self.scope != "prefill", dtype=torch.bool)
+                               if route_rows is None else route_rows).reshape(-1)
             return self.model(**piece, return_dict=True, **kwargs)
 
         if self.sequence_chunk is None:
-            return forward(inputs, use_cache=False).logits[mask].contiguous()
+            rows = ~mask if self.scope == "prefill" else torch.ones_like(mask)
+            return forward(inputs, route_rows=rows, use_cache=False).logits[mask].contiguous()
         prefix = int(mask[0].nonzero()[0])
         length = inputs["input_ids"].shape[1]
         if "image_grid_thw" in inputs or "video_grid_thw" in inputs:
@@ -186,7 +202,7 @@ class CalibrationModel:
                 piece["attention_mask"] = inputs["attention_mask"][:, :end]
             if "mm_token_type_ids" in inputs:
                 piece["mm_token_type_ids"] = inputs["mm_token_type_ids"][:, start:end]
-            output = forward(piece, past_key_values=cache, use_cache=True)
+            output = forward(piece, is_decode=True, past_key_values=cache, use_cache=True)
             cache = output.past_key_values
             states.append(output.logits[mask[:, start:end]].cpu())
         return torch.cat(states).to(self.model.device)

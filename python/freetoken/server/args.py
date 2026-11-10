@@ -724,7 +724,7 @@ def parse_args(
         ),
     )
 
-    parser.add_argument("--moe-policy", choices=["native", "modes", "modes_tablemoe"],
+    parser.add_argument("--moe-policy", choices=["native", "modes", "modes_tablemoe", "modes_prefill_tablemoe_decode"],
                         default=ServerArgs.moe_policy)
     parser.add_argument("--modes-config", default=None)
     parser.add_argument("--modes-prefill-policy", choices=["modes", "tablemoe"],
@@ -755,7 +755,9 @@ def parse_args(
     parser.add_argument("--tablemoe-prefill-chunk-size", type=int,
                         default=ServerArgs.tablemoe_prefill_chunk_size,
                         help="Optimized TableMoE prefill subchunk size; 0 uses the scheduler chunk. CPU execution remains capacity limited.")
-    parser.add_argument("--tablemoe-decode-keep-k", type=int, default=ServerArgs.tablemoe_decode_keep_k)
+    parser.add_argument("--tablemoe-decode-top-h", "--tablemoe-decode-keep-k", dest="tablemoe_decode_keep_k",
+                        type=int, default=ServerArgs.tablemoe_decode_keep_k,
+                        help="Decode computes the leading h routes plus GPU expert-cache hits exactly; other routes use tables.")
     parser.add_argument("--tablemoe-online-cache-size", type=int, default=ServerArgs.tablemoe_online_cache_size)
     parser.add_argument("--tablemoe-offline-cosine-threshold-vision", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_vision)
     parser.add_argument("--tablemoe-offline-cosine-threshold-text", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_text)
@@ -828,7 +830,8 @@ def parse_args(
         import sys
 
         provided = sys.argv[1:] if args is None else args
-        conflicts = {"--tablemoe-decode-keep-k"}
+        conflicts = (set() if kwargs["moe_policy"] == "modes_prefill_tablemoe_decode"
+                     else {"--tablemoe-decode-top-h", "--tablemoe-decode-keep-k"})
         if kwargs["modes_prefill_policy"] == "modes":
             conflicts.add("--tablemoe-prefill-keep-rate")
         if any(flag.split("=", 1)[0] in conflicts for flag in provided):
