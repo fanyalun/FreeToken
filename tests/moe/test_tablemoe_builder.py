@@ -9,6 +9,31 @@ from freetoken.moe.tablemoe_builder import (
 )
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_offline_stages_check_paths_without_hashing_tensor_contents(tmp_path, monkeypatch, legacy):
+    from freetoken.moe import tablemoe_artifacts
+
+    path = tmp_path / "layer_0/L0_E0_text_cache.pt"
+    path.parent.mkdir()
+    path.write_bytes(b"old tensor")
+    if legacy:
+        finish_stage(tmp_path, {}, [path], pca_outputs={})
+    original_hash = tablemoe_artifacts.file_hash
+
+    def metadata_hash(value):
+        assert Path(value).suffix not in {".bin", ".phase", ".pt"}
+        return original_hash(value)
+
+    monkeypatch.setattr(tablemoe_artifacts, "file_hash", metadata_hash)
+    if not legacy:
+        finish_stage(tmp_path, {}, [path], hash_outputs=False, pca_outputs={})
+    path.write_bytes(b"updated tensor contents")
+    assert str(path.relative_to(tmp_path)) in verify_stage(tmp_path)["outputs"]
+    path.unlink()
+    with pytest.raises(ValueError, match="missing artifact"):
+        verify_stage(tmp_path)
+
+
 def test_disk_reservoir_resume_and_owned_snapshot(tmp_path):
     from types import SimpleNamespace
 
@@ -70,9 +95,19 @@ def test_cuda_centroids_repeat_at_reservoir_capacity():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_full_builder_sparse_assets_and_expert_values(tmp_path, device):
+def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
+    from freetoken.moe import tablemoe_artifacts, tablemoe_builder
+
+    original_hash = tablemoe_artifacts.file_hash
+
+    def metadata_hash(path):
+        assert Path(path).suffix not in {".bin", ".phase", ".pt"}, "offline tensors must not be hashed"
+        return original_hash(path)
+
+    monkeypatch.setattr(tablemoe_artifacts, "file_hash", metadata_hash)
+    monkeypatch.setattr(tablemoe_builder, "file_hash", metadata_hash)
     torch.manual_seed(42)
     collect = tmp_path / "collect"
     collector = InputCollector(collect, dict(reservoir_size=30), 4, 2)
@@ -110,7 +145,9 @@ def test_full_builder_sparse_assets_and_expert_values(tmp_path, device):
     with pytest.raises(ValueError, match="mismatch"):
         cluster(tmp_path, {**config, "clusters": 4})
     path.write_bytes(b"interrupted")
-    with pytest.raises(ValueError, match="changed artifact"):
+    assert verify_stage(tmp_path / "cache")["output_validation"] == "paths"
+    path.unlink()
+    with pytest.raises(ValueError, match="missing artifact"):
         verify_stage(tmp_path / "cache")
 
 
@@ -222,16 +259,16 @@ def test_incomplete_modality_population_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize("capacity", [4, 30000])
-def test_incremental_checksums_match_files_for_append_and_reservoir_replacement(tmp_path, capacity):
-    from freetoken.moe.tablemoe_artifacts import file_hash
+def test_collection_checkpoints_record_only_reservoir_metadata(tmp_path, capacity):
     collector = InputCollector(tmp_path, dict(reservoir_size=capacity), 4, 1)
     for start in range(0, 32, 4):
         x = torch.arange(start * 4, (start + 4) * 4).reshape(4, 4).half()
         collector.add(0, x, torch.zeros(4, 1, dtype=torch.long), torch.ones(4, dtype=torch.int8), "decode")
         collector.flush(start)
         state = read_json(tmp_path / "progress.json")["buckets"]["L0_E0_text"]
-        for suffix in ("bin", "phase"):
-            assert state[suffix + "_sha256"] == file_hash(tmp_path / f"layer_0/L0_E0_text.{suffix}")
+        assert "bin_sha256" not in state and "phase_sha256" not in state
+        assert (tmp_path / "layer_0/L0_E0_text.bin").stat().st_size == state["kept"] * 4 * 2
+        assert (tmp_path / "layer_0/L0_E0_text.phase").stat().st_size == state["kept"]
     collector.close()
 
 

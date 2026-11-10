@@ -160,7 +160,7 @@ def build(config, manifest):
         timings["stages"]["finalize_and_verify_collection_s"] = time.perf_counter() - before
         write_json(root / "build_time.json", timings)
     else:
-        verify_stage(collect, inputs)
+        verify_stage(collect, inputs, hash_outputs=False)
     for name, function in (("pca_and_cluster", cluster), ("materialize", materialize)):
         timings.update(active_stage=name, active_stage_started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         write_json(root / "build_time.json", timings)
@@ -175,9 +175,10 @@ def build(config, manifest):
     timings.setdefault("attempts", []).append(dict(begin_utc=begin_utc, elapsed_s=time.perf_counter() - started))
     timings.update(complete=True, total_stage_wall_s=sum(timings["stages"].values()),
                    active_stage=None,
-                   collection_tokens=verify_stage(collect)["tokens"], algorithm=algorithm,
-                   calibration_samples=len(calibration), includes_startup_collection_writes_hash_checks=True)
-    collection = verify_stage(collect)
+                   collection_tokens=verify_stage(collect, hash_outputs=False)["tokens"], algorithm=algorithm,
+                   calibration_samples=len(calibration), includes_startup_collection_writes_metadata_checks=True,
+                   artifact_validation="paths")
+    collection = verify_stage(collect, hash_outputs=False)
     if collection.get("sampling"):
         sampling = collection["sampling"]["0"]
         if any(layer != sampling for layer in collection["sampling"].values()):
@@ -198,7 +199,7 @@ def predict(config, manifest, modes):
     warmup = read_rows(root / "prepare/calibration.jsonl")[:1]
     for mode in modes:
         folder = root / "predictions" / mode
-        asset = verify_stage(root / "assets/cache") if mode == "tablemoe" else None
+        asset = verify_stage(root / "assets/cache", hash_outputs=False) if mode == "tablemoe" else None
         inputs = dict(mode=mode, evaluation=digest(evaluation), config=manifest["config_sha256"],
                       source=digest(manifest["source"]), assets=digest(asset))
         if (folder / "complete.json").exists() and read_json(folder / "complete.json").get("complete"):
@@ -295,7 +296,7 @@ def report(config):
     built = read_json(root / "build_time.json") if (root / "build_time.json").exists() else dict(complete=False)
     try:
         verify_stage(root / "prepare")
-        verify_stage(root / "assets/cache")
+        verify_stage(root / "assets/cache", hash_outputs=False)
     except (OSError, ValueError) as exc:
         errors.append(str(exc))
     complete = not errors and built["complete"] and len(rows) == 21

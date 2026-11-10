@@ -16,6 +16,43 @@ from freetoken.moe.tablemoe import (
 )
 
 
+def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monkeypatch):
+    from freetoken.moe import tablemoe_artifacts
+
+    pca, cache, model = (tmp_path / name for name in ("pca", "cache", "model"))
+    for folder in (pca / "layer_0", cache / "layer_0", model):
+        folder.mkdir(parents=True)
+    pca_files = []
+    for mod in ("vision", "text"):
+        path = pca / "layer_0" / f"L0_{mod}_pca.pt"
+        torch.save(dict(mean=torch.zeros(4), proj=torch.eye(4, 2)), path)
+        pca_files.append(str(path.relative_to(pca)))
+    tensor = cache / "layer_0/L0_E0_text_cache.pt"
+    torch.save(dict(key=torch.zeros(1, 2).half(), value=torch.ones(1, 4).half()), tensor)
+    tablemoe_artifacts.finish_stage(cache, {}, [tensor],
+        provenance=dict(checkpoint=dict(path=str(model)), convert_bf16=True, processor={}),
+        pca_outputs={name: "legacy checksum" for name in pca_files})
+    original_hash = tablemoe_artifacts.file_hash
+
+    def metadata_hash(path):
+        assert Path(path).suffix != ".pt", "asset loading must not hash tensors"
+        return original_hash(path)
+
+    monkeypatch.setattr(tablemoe_artifacts, "file_hash", metadata_hash)
+    runtime = TableMoeRuntime.__new__(TableMoeRuntime)
+    runtime.config = SimpleNamespace(tablemoe_pca_dir=str(pca), tablemoe_cache_dir=str(cache),
+                                    model_path=str(model), tablemoe_convert_bf16_weights=True,
+                                    mm=SimpleNamespace(processor_kwargs={}))
+    runtime.num_layers, runtime.num_experts, runtime.hidden = 1, 1, 4
+    runtime.pca, runtime.offline_paths = {}, {}
+    runtime._load_assets()
+    assert runtime.asset_provenance == "paths_checked"
+    assert runtime.offline_paths[0, 0, "text"] == tensor
+    tensor.unlink()
+    with pytest.raises(ValueError, match="missing artifact"):
+        runtime._load_assets()
+
+
 def test_prefill_selection_uses_last_token_attention_and_router_weights():
     ids = torch.tensor([[0, 1], [0, 2], [2, 1]])
     weights = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3]])

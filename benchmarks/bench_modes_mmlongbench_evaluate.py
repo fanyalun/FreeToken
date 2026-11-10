@@ -121,15 +121,15 @@ def verify_calibration_runtime(config, experiment):
 def table_assets(config, checkpoint):
     if evaluation_method(config) == "modes" and config.get("modes_prefill_policy", "modes") == "modes":
         return None
-    cache = verify_stage(config["cache_dir"])
+    cache = verify_stage(config["cache_dir"], hash_outputs=False)
     provenance = cache["provenance"]
     if (provenance["checkpoint"] != checkpoint or provenance["processor"] != config["processor"]
             or provenance["convert_bf16"] != config["convert_bf16"]):
         raise ValueError("TableMoE assets differ from the calibrated checkpoint/processor/precision")
     pca_root = Path(config["pca_dir"])
-    for name, checksum in cache["pca_outputs"].items():
-        if file_hash(pca_root / name) != checksum:
-            raise ValueError(f"TableMoE PCA/cache binding differs: {name}")
+    for name in cache["pca_outputs"]:
+        if not (pca_root / name).is_file():
+            raise ValueError(f"missing TableMoE PCA file: {name}")
     return dict(cache_manifest_sha256=digest(cache), pca_outputs=cache["pca_outputs"],
                 decode_online_cosine_threshold=.7, decode_offline_cosine_threshold=.7)
 

@@ -166,11 +166,13 @@ sample counts (circular groups or native POPE category expansion). A configured
 `judge` object creates a separate score directory and report table. Unavailable
 judges and warnings about native exact-matching fallback fail that stage.
 
-Stage markers bind effective inputs/configuration and output SHA256 values.
+Offline-table stage records bind effective inputs/configuration and output paths.
+Collection, PCA/cluster and cache tensor files are not hashed or scanned for integrity.
+Existing offline-table manifests also use path checks, even when they contain historical hashes.
 Checkpoint identities include full SHA256 plus inode/size/ctime/mtime; unchanged
 file stamps allow subsequent startup validation to reuse the verified hash.
-Asset loading verifies conversion policy, processor settings, cache hashes and
-matching PCA hashes. Assets without manifests are explicitly legacy unverified;
+Asset loading checks conversion policy, processor settings, model/table paths and
+the dimensions/dtypes needed to use the tensors. Assets without manifests use legacy path checks;
 new incomplete assets cannot load. Kit commit and current Python source hashes
 include its dirty worktree. FreeToken source hashes include Python and native code.
 The runtime manifest also records interpreter/package versions, GPU UUIDs,
@@ -178,7 +180,7 @@ driver version, native extension hashes and relevant noncredential environment
 settings. Judge credentials must come from environment variables.
 
 Completed stages resume only after verification. Collection can resume at a fully
-exported request boundary when reservoir hashes, configuration and prediction
+exported request boundary when reservoir file lengths, configuration and prediction
 coverage agree. A mid-request interruption fails validation and remains diagnostic.
 Cluster/materialize rebuild their own incomplete files deterministically. Failed
 timing cells retain logs/partial requests and require a fresh suite destination.

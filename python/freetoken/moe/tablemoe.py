@@ -196,30 +196,29 @@ class TableMoeRuntime:
             if marker.exists() and not json.loads(marker.read_text()).get("complete"):
                 raise ValueError(f"incomplete TableMoE assets: {root}")
         if (Path(cfg.tablemoe_cache_dir) / "manifest.json").exists():
-            from freetoken.moe.tablemoe_artifacts import checkpoint_identity, file_hash, verify_stage
+            from freetoken.moe.tablemoe_artifacts import verify_stage
 
-            manifest = verify_stage(cfg.tablemoe_cache_dir)
+            manifest = verify_stage(cfg.tablemoe_cache_dir, hash_outputs=False)
             actual = {str(p.relative_to(cfg.tablemoe_cache_dir)) for p in Path(cfg.tablemoe_cache_dir).glob("layer_*/*_cache.pt")}
             declared = {p for p in manifest["outputs"] if p.endswith("_cache.pt")}
             if actual != declared:
                 raise ValueError("TableMoE cache contains undeclared or missing asset files")
             expected = manifest["provenance"]["checkpoint"]
-            if (expected != checkpoint_identity(cfg.model_path, expected=expected) or
+            if (Path(expected["path"]).resolve() != Path(cfg.model_path).resolve() or
                     manifest["provenance"]["convert_bf16"] != cfg.tablemoe_convert_bf16_weights):
                 raise ValueError("TableMoE asset checkpoint/conversion mismatch")
             if manifest["provenance"]["processor"] != cfg.mm.processor_kwargs:
                 raise ValueError("TableMoE asset processor configuration mismatch")
-            for name, expected in manifest["pca_outputs"].items():
-                if file_hash(Path(cfg.tablemoe_pca_dir) / name) != expected:
-                    raise ValueError(f"TableMoE PCA/cache mismatch: {name}")
-            self.asset_provenance = "verified"
+            for name in manifest["pca_outputs"]:
+                if not (Path(cfg.tablemoe_pca_dir) / name).is_file():
+                    raise ValueError(f"missing TableMoE PCA file: {name}")
+            self.asset_provenance = "paths_checked"
         else:
-            self.asset_provenance = "legacy_unverified"
-            logger.warning("TableMoE legacy assets: provenance is not fully verified")
+            self.asset_provenance = "legacy_paths_checked"
             if getattr(cfg, "moe_policy", "native") != "native":
-                from freetoken.moe.tablemoe_artifacts import file_hash
+                from freetoken.moe.tablemoe_artifacts import digest, file_metadata
 
-                self.asset_fingerprints = {str(path.resolve()): file_hash(path)
+                self.asset_fingerprints = {str(path.resolve()): digest(file_metadata(path))
                                            for root in (cfg.tablemoe_pca_dir, cfg.tablemoe_cache_dir)
                                            for path in sorted(Path(root).glob("layer_*/*.pt"))}
         pca_root = Path(cfg.tablemoe_pca_dir)

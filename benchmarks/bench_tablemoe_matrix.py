@@ -208,7 +208,9 @@ def main():
                     prepared_samples_sha256=sha(args.output / "prepared_samples.json"),
                     benchmark_sha256=sha(Path(__file__)), audit_sha256=sha(REPO / "benchmarks/tablemoe_audit/sitecustomize.py"),
                     model_header_hashes={p.name: sha(p) for p in model_root.glob("*.json")},
-                    asset_hashes={str(p): sha(p) for root in (args.pca, args.cache) for p in Path(root).rglob("*.pt")},
+                    asset_validation="paths",
+                    asset_files={str(p): dict(bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns)
+                                 for root in (args.pca, args.cache) for p in Path(root).rglob("*.pt")},
                     compiled_cpu_moe_sha256=sha(next((REPO / "python/freetoken/kernel").glob("_cpu_moe*.so"))))
     for row in rows:
         for msg in row["messages"]:

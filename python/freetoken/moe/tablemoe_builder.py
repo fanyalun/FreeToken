@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import queue
@@ -70,12 +69,9 @@ def _draw(seed, count):
     return (z ^ (z >> 31)) % count
 
 
-def _file_hasher(path):
-    result = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for block in iter(lambda: handle.read(8 << 20), b""):
-            result.update(block)
-    return result
+def _collection_file(path, size):
+    if not path.is_file() or path.stat().st_size != size:
+        raise ValueError(f"missing or truncated collection file: {path}")
 
 
 class InputCollector:
@@ -93,7 +89,6 @@ class InputCollector:
         self.active_samples = {}
         self.sample_batch = None
         self.sample_batch_key = None
-        self.hashers = {}
         self.identity = identity
         if (self.root / "progress.json").exists():
             saved = read_json(self.root / "progress.json")
@@ -101,20 +96,15 @@ class InputCollector:
                 raise ValueError("collection resume configuration mismatch")
             for key, state in saved["buckets"].items():
                 folder = self.root / f"layer_{state['layer']}"
-                hashes = []
                 for suffix in ("bin", "phase"):
-                    h = _file_hasher(folder / f"{key}.{suffix}")
-                    if h.hexdigest() != state[f"{suffix}_sha256"]:
-                        raise ValueError("interrupted or changed collection reservoir")
-                    hashes.append(h)
-                self.hashers[key] = hashes
+                    size = state["kept"] * (hidden * 2 if suffix == "bin" else 1)
+                    _collection_file(folder / f"{key}.{suffix}", size)
             self.buckets, self.tokens, self.requests = saved["buckets"], saved["tokens"], saved["requests"]
             self.sampling = saved.get("sampling", {})
             self.sample_state = saved.get("sample_state", self.sample_state)
             if "rng_state" in self.sample_state:
                 self.sample_rng.bit_generator.state = self.sample_state["rng_state"]
         self.error = None
-        self.dirty = set()
         self.handles = {}
         self.pending = queue.Queue(maxsize=4)
         self.worker = threading.Thread(target=self._worker, daemon=True)
@@ -306,8 +296,6 @@ class InputCollector:
             key = f"L{layer}_E{expert}_{name}"
             state = self.buckets.setdefault(key, dict(layer=layer, expert=expert, modality=name,
                                                       seen=0, prefill=0, decode=0, kept=0))
-            if key not in self.hashers:
-                self.hashers[key] = [hashlib.sha256(), hashlib.sha256()]
             folder = self.root / f"layer_{layer}"
             folder.mkdir(exist_ok=True)
             data = folder / f"{key}.bin"
@@ -320,14 +308,10 @@ class InputCollector:
             raw = memoryview(rows).cast("B")
             initial = min(len(rows), max(0, self.config["reservoir_size"] - state["seen"]))
             if initial:
-                self.dirty.add(key)
                 vectors.seek(state["seen"] * self.hidden * 2)
                 vectors.write(raw[:initial * self.hidden * 2])
                 phases.seek(state["seen"])
                 phases.write(bytes([phase == "decode"]) * initial)
-                if self.hashers[key] is not None:
-                    self.hashers[key][0].update(raw[:initial * self.hidden * 2])
-                    self.hashers[key][1].update(bytes([phase == "decode"]) * initial)
                 state["seen"] += initial
                 state[phase] += initial
             for index in range(initial, len(rows)):
@@ -336,8 +320,6 @@ class InputCollector:
                 count, capacity = state["seen"], self.config["reservoir_size"]
                 slot = count - 1 if count <= capacity else _draw(seed, count)
                 if slot < capacity:
-                    self.dirty.add(key)
-                    self.hashers[key] = None
                     vectors.seek(slot * self.hidden * 2)
                     vectors.write(raw[index * self.hidden * 2:(index + 1) * self.hidden * 2])
                     phases.seek(slot)
@@ -350,15 +332,9 @@ class InputCollector:
         if uid is not None:
             self.requests.append(uid)
             self.active_samples.pop(uid, None)
-        for key, state in self.buckets.items():
-            if key not in self.dirty and "bin_sha256" in state:
-                continue
-            folder = self.root / f"layer_{state['layer']}"
-            for index, suffix in enumerate(("bin", "phase")):
-                hashes = self.hashers.get(key)
-                state[f"{suffix}_sha256"] = (hashes[index].hexdigest() if hashes is not None else
-                                              file_hash(folder / f"{key}.{suffix}"))
-        self.dirty.clear()
+        for state in self.buckets.values():
+            state.pop("bin_sha256", None)
+            state.pop("phase_sha256", None)
         write_json(self.root / "progress.json", dict(buckets=self.buckets, tokens=self.tokens,
                                                       requests=self.requests, hidden=self.hidden,
                                                       identity=self.identity, config=self.config, sampling=self.sampling,
@@ -403,8 +379,8 @@ def finalize_collection(root, inputs, num_layers, num_experts):
     for key, state in progress["buckets"].items():
         folder = root / f"layer_{state['layer']}"
         for suffix in ("bin", "phase"):
-            if file_hash(folder / f"{key}.{suffix}") != state[f"{suffix}_sha256"]:
-                raise ValueError("interrupted collection reservoir hash mismatch")
+            size = state["kept"] * (progress["hidden"] * 2 if suffix == "bin" else 1)
+            _collection_file(folder / f"{key}.{suffix}", size)
         if not progress["config"].get("export_inputs", True):
             outputs.extend(folder / f"{key}.{suffix}" for suffix in ("bin", "phase"))
             continue
@@ -416,7 +392,7 @@ def finalize_collection(root, inputs, num_layers, num_experts):
         torch.save(dict(inputs=x, phase=phases), temp)
         temp.replace(path)
         outputs.append(path)
-    return finish_stage(root, inputs, outputs, buckets=progress["buckets"], tokens=progress["tokens"],
+    return finish_stage(root, inputs, outputs, hash_outputs=False, buckets=progress["buckets"], tokens=progress["tokens"],
                         hidden=progress["hidden"], num_layers=num_layers, num_experts=num_experts,
                         sampling=progress.get("sampling", {}))
 
@@ -546,7 +522,7 @@ def batched_kmeans(samples, config):
 
 def cluster(root, config):
     root, config = Path(root), algorithm_config(config)
-    source = verify_stage(root / "collect")
+    source = verify_stage(root / "collect", hash_outputs=False)
     target = root / "cluster"
     inputs = dict(collect=source["input_sha256"], collect_outputs=source["outputs"], algorithm=config,
                   builder_sha256=file_hash(__file__), torch_version=torch.__version__, cuda_version=torch.version.cuda)
@@ -602,7 +578,7 @@ def cluster(root, config):
                     path = folder / f"{name}_clusters.pt"
                     torch.save(data, path)
                     outputs.append(path)
-    return finish_stage(target, inputs, outputs, missing_tables=missing, source_inputs=source["inputs"],
+    return finish_stage(target, inputs, outputs, hash_outputs=False, missing_tables=missing, source_inputs=source["inputs"],
                         num_layers=source["num_layers"], num_experts=source["num_experts"])
 
 
@@ -616,15 +592,14 @@ def expert_values(x, gate_up, down, chunk=64):
 
 def materialize(root, config, pieces=None, model_config=None):
     root, config = Path(root), algorithm_config(config)
-    source = verify_stage(root / "cluster")
+    source = verify_stage(root / "cluster", hash_outputs=False)
     provenance = source["source_inputs"]
-    from freetoken.moe.tablemoe_artifacts import checkpoint_identity
-
     if pieces is None:
-        identity = checkpoint_identity(provenance["checkpoint"]["path"], expected=provenance["checkpoint"])
-        if identity != provenance["checkpoint"]:
-            raise ValueError("checkpoint changed since collection")
-        pieces = iter_checkpoint_experts(identity["path"])
+        model = Path(provenance["checkpoint"]["path"])
+        if not model.is_dir() or any(not (model / name).is_file()
+                                    for name in provenance["checkpoint"].get("files", {})):
+            raise ValueError("missing checkpoint files for table construction")
+        pieces = iter_checkpoint_experts(model)
     target = root / "cache"
     inputs = dict(cluster=source["input_sha256"], cluster_outputs=source["outputs"],
                   checkpoint=provenance["checkpoint"], convert_bf16=provenance["convert_bf16"],
@@ -664,7 +639,7 @@ def materialize(root, config, pieces=None, model_config=None):
                 outputs.append(out)
     if len(visited) != source["num_layers"] * source["num_experts"]:
         raise ValueError("checkpoint expert coverage gap")
-    return finish_stage(target, inputs, outputs, pca_root=str((root / "cluster").resolve()),
+    return finish_stage(target, inputs, outputs, hash_outputs=False, pca_root=str((root / "cluster").resolve()),
                         missing_tables=source["missing_tables"], provenance=provenance,
                         pca_outputs={name: h for name, h in source["outputs"].items() if name.endswith("_pca.pt")})
 

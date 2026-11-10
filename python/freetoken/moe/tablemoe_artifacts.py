@@ -1,4 +1,4 @@
-"""Content-addressed stage markers shared by the builder and benchmark suite."""
+"""Stage records shared by the builder and benchmark suite."""
 
 from __future__ import annotations
 
@@ -55,16 +55,31 @@ def checkpoint_identity(model, expected=None):
     return {"path": str(root), "files": identities}
 
 
-def finish_stage(root, inputs, outputs, **details):
+def file_metadata(path):
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError(f"missing artifact: {path}")
+    stat = path.stat()
+    return dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+
+
+def finish_stage(root, inputs, outputs, *, hash_outputs=True, **details):
     root = Path(root)
+    paths = {}
+    for value in outputs:
+        path = Path(value)
+        file_metadata(path)
+        paths[str(path.relative_to(root))] = file_hash(path) if hash_outputs else None
     manifest = dict(inputs=inputs, input_sha256=digest(inputs),
-                    outputs={str(Path(p).relative_to(root)): file_hash(p) for p in outputs}, **details)
+                    outputs=paths, **details)
+    if not hash_outputs:
+        manifest["output_validation"] = "paths"
     write_json(root / "manifest.json", manifest)
     write_json(root / "complete.json", dict(complete=True, manifest_sha256=file_hash(root / "manifest.json")))
     return manifest
 
 
-def verify_stage(root, inputs=None):
+def verify_stage(root, inputs=None, *, hash_outputs=None):
     root = Path(root)
     marker = read_json(root / "complete.json")
     if not marker.get("complete") or marker.get("manifest_sha256") != file_hash(root / "manifest.json"):
@@ -74,8 +89,13 @@ def verify_stage(root, inputs=None):
         raise ValueError(f"changed stage inputs: {root}")
     if inputs is not None and digest(inputs) != manifest["input_sha256"]:
         raise ValueError(f"resume input mismatch: {root}")
+    if hash_outputs is None:
+        # Legacy offline-table records also use path checks, without rescanning their tensors.
+        table = "buckets" in manifest or "pca_outputs" in manifest or "source_inputs" in manifest
+        hash_outputs = manifest.get("output_validation") != "paths" and not table
     for name, expected in manifest["outputs"].items():
-        if file_hash(root / name) != expected:
+        file_metadata(root / name)
+        if hash_outputs and file_hash(root / name) != expected:
             raise ValueError(f"changed artifact: {root / name}")
     for dependency, expected in manifest.get("dependencies", {}).items():
         if file_hash(Path(dependency) / "manifest.json") != expected:

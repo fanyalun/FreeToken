@@ -195,7 +195,7 @@ def test_modes_mmlongbench_combination_requires_matching_table_assets(tmp_path, 
     elif change == "precision":
         config["convert_bf16"] = False
     elif change == "pca":
-        key.write_bytes(b"different")
+        key.unlink()
     if change:
         with pytest.raises(ValueError, match="TableMoE"):
             table_assets(config, checkpoint)

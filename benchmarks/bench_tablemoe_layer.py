@@ -81,7 +81,8 @@ def main():
             tensor = source.get_tensor(key).transpose(-1, -2).contiguous()
             banks[role] = alloc_pinned_tensor(*tensor.shape, dtype=torch.float16)
             banks[role].copy_(tensor)
-    manifest = dict(inputs={str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in traces[:4]},
+    manifest = dict(inputs={str(p): dict(bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns) for p in traces[:4]},
+                    input_validation="paths",
                     model=str(args.model), layer=0, gpu=args.gpu, model_dtype="BF16 -> FP16",
                     device=torch.cuda.get_device_name(args.gpu), expert_slots=3072,
                     measurement="complete MoE layer; state/cache restore outside measurement; CUDA events plus synchronized wall time")

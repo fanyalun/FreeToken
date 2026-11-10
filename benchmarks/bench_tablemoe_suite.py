@@ -256,7 +256,7 @@ def build(config, manifest, smoke=False, collect_only=False):
             calibration = calibration[:config["smoke_calibration_limit"]]
         algorithm = algorithm_config({**config["builder"], **(config.get("smoke_builder", {}) if smoke else {})})
         if dataset in config.get("smoke_asset_roots" if smoke else "asset_roots", {}):
-            existing = verify_stage(asset_root / "cache")
+            existing = verify_stage(asset_root / "cache", hash_outputs=False)
             provenance = existing["provenance"]
             if (existing["inputs"]["algorithm"] != algorithm or provenance["checkpoint"] != manifest["checkpoint"] or
                     provenance["processor"] != config["processor"] or provenance["convert_bf16"] != config["convert_bf16"] or
@@ -270,7 +270,7 @@ def build(config, manifest, smoke=False, collect_only=False):
                       source_sha256=digest(manifest["source"]))
         collect = asset_root / "collect"
         if (collect / "complete.json").exists() and read_json(collect / "complete.json").get("complete"):
-            verify_stage(collect, inputs)
+            verify_stage(collect, inputs, hash_outputs=False)
         else:
             predictions = read_rows(collect / "requests.jsonl") if (collect / "requests.jsonl").exists() else []
             if (collect / "progress.json").exists():
@@ -381,7 +381,7 @@ def run_cell(config, manifest, spec, kind, round_id, smoke=False):
     if len(warmup_rows) != config["warmup_samples"]:
         raise ValueError("insufficient calibration samples for the configured warmup")
     assets = asset_root_for(config, dataset, smoke)
-    asset_manifest = verify_stage(assets / "cache") if group.startswith("table_") else None
+    asset_manifest = verify_stage(assets / "cache", hash_outputs=False) if group.startswith("table_") else None
     inputs = dict(spec=spec, rows=digest(rows), warmup=digest(warmup_rows), config=manifest["config_sha256"],
                   source=digest(manifest["source"]), asset=digest(asset_manifest), kind=kind, round=round_id)
     if (root / "complete.json").exists() and read_json(root / "complete.json").get("complete"):

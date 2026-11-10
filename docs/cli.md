@@ -108,6 +108,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tablemoe-decode-offline-cosine-threshold` | unset | Optional minimum decode PCA cosine similarity for offline reuse; unset preserves the positive-dot rule |
 | `--tablemoe-decode-online-cosine-threshold` | unset | Optional minimum decode hidden-state cosine similarity for online reuse; normalizes queries and cached keys; unset preserves the positive-dot rule |
 
+Offline TableMoE construction, reuse and loading check artifact paths, completion records and required metadata. Raw reservoirs, exported input tensors, PCA, clusters and cache tensors are not scanned for content checksums. Historical hashes in offline-table manifests are not compared. Loading still checks tensor dimensions and dtypes required for computation.
+
 ### API behaviour
 
 | Flag | Default | Meaning |

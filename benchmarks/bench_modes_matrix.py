@@ -78,12 +78,14 @@ def initialize(config):
     if any(control["layers"][i]["importance"] != layer["importance"] for i, layer in calibration["layers"].items()):
         raise ValueError("control and MoDES importance differ")
     data = verify_stage(config["prepared_root"])
-    table = verify_stage(config["cache_dir"])
+    table = verify_stage(config["cache_dir"], hash_outputs=False)
     if data["inputs"]["checkpoint"] != calibration["checkpoint"]:
         raise ValueError("prepared prompts and MoDES checkpoint differ")
     if data["inputs"]["config"]["processor"] != config["processor"]:
         raise ValueError("prepared prompt processor settings differ")
-    pca = {str(path.resolve()): file_hash(path) for path in sorted(Path(config["pca_dir"]).glob("layer_*/*.pt"))}
+    from freetoken.moe.tablemoe_artifacts import file_metadata
+
+    pca = {str(path.resolve()): file_metadata(path) for path in sorted(Path(config["pca_dir"]).glob("layer_*/*.pt"))}
     inputs = dict(config=config, source=source, runtime=runtime,
                   checkpoint=calibration["checkpoint"], data=digest(data), table=digest(table), pca=pca,
                   modes=file_hash(config["modes_config"]), control=file_hash(config["control_config"]))

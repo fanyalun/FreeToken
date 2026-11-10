@@ -615,7 +615,7 @@ def predict(config):
             continue
         asset = None
         if method == "modes_tablemoe" or (method != "full_fp16" and config.get("modes_prefill_policy") == "tablemoe"):
-            asset = verify_stage(config["cache_dir"])
+            asset = verify_stage(config["cache_dir"], hash_outputs=False)
         settings = {**suite.DEFAULTS, **config, "gpu": 0,
                     "modes_config": str(root / "modes_config/modes_config.json"),
                     "control_config": str(root / "control_config/modes_config.json")}

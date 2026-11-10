@@ -6,13 +6,23 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) first. It is binding for humans and agen
 
 AI-assisted code is welcome. Submitting code the contributor does not understand is not. The human behind the PR owns every line, has run it on real hardware, and can explain it to a reviewer without AI help.
 
+Agents may commit and push changes when the user explicitly requests or authorizes them. Authorization already given in the session remains valid within that scope; do not ask for the same permission again.
+
 Agents must not:
 
-- Run `git push`, `gh pr create`, `gh pr comment`, or `gh issue create` on the user's behalf.
+- Run `gh pr create`, `gh pr comment`, or `gh issue create` without explicit user instructions.
 - Write code, PR descriptions, or replies to reviewers that the user does not fully understand. The user must be able to explain and defend every line without AI help.
 - Report tests or benchmarks as run when they were not.
 
 If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
+
+## Offline table checks
+
+- These rules apply to collection, construction, resuming, loading, reuse, benchmarks, evaluations, and all future tests that use offline tables.
+- Do not compute or compare full-file content checksums for raw collected inputs, exported tensors, PCA, clusters, or offline cache tables. This includes SHA-256 and other content hashes for `.bin`, `.phase`, `.pt`, and equivalent large artifact files.
+- Check paths, file existence, completion records, required configuration metadata, file lengths, and tensor shapes/dtypes needed for computation. Do not add a separate full-content validation pass before or after a benchmark or test.
+- Historical manifests may retain checksums; those fields must not trigger content scans or comparisons when reusing or testing tables.
+- Read tensor contents when the algorithm or requested test needs them, without an additional integrity scan. Hashing source code and small configuration/record files remains allowed.
 
 ## Repository layout
 
@@ -68,4 +78,4 @@ Comments explain a non-obvious "why", never restate the code. Write the code fir
 fix(kvcache): size the SWA radix pool for chunked prefill
 ```
 
-PRs are squash-merged, so the PR title follows the same format. The subject line is usually enough; add a body only when the change needs a why that the diff does not show, and keep it to a few lines. Only commit when the user asks. If the user wants attribution, use `Assisted-by: <agent name>`, not `Co-authored-by`.
+PRs are squash-merged, so the PR title follows the same format. The subject line is usually enough; add a body only when the change needs a why that the diff does not show, and keep it to a few lines. Only commit or push when the user requests or authorizes it. Stage only the requested changes and preserve unrelated worktree changes. If the user wants attribution, use `Assisted-by: <agent name>`, not `Co-authored-by`.
