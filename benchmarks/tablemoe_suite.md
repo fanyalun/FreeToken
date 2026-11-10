@@ -6,6 +6,12 @@ VLMEvalKit runs in a separately configured Python process. It supplies the nativ
 The [official development interface](https://github.com/open-compass/VLMEvalKit/blob/main/docs/en/Development.md)
 defines these two responsibilities.
 
+New runs preserve original router weights for exact routes and table hits in both
+prefill and decode; misses contribute zero. The resolved configuration records
+`tablemoe_renormalize_weights: false`. Set it to `true` to opt into survivor-weight
+renormalization. Historical results retain their frozen source and configuration;
+use those records when reproducing runs made before this default changed.
+
 ## Run stages
 
 Copy `benchmarks/tablemoe_suite_example.json` to a task-specific configuration and

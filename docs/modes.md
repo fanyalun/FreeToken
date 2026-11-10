@@ -30,8 +30,9 @@ long prompts split across scheduler chunks select a fresh set for each chunk.
 This option does not select a single expert set for the entire prompt.
 
 Prefill then computes retained routes, queries the vision/text offline tables for
-other routes, and renormalizes the weights of surviving routes, matching existing
-TableMoE. Defaults are keep rate 0.6, vision cosine threshold 0.6 and text cosine
+other routes, and preserves their original router weights by default. Use
+`--tablemoe-renormalize-weights` to renormalize TableMoE prefill survivors.
+Defaults are keep rate 0.6, vision cosine threshold 0.6 and text cosine
 threshold 0.7. It does not query the online table during prefill. With
 `--moe-policy modes_tablemoe`, real and offline-hit outputs populate the online
 table as unweighted values; decode applies MoDES filtering, online/offline lookup
@@ -118,7 +119,8 @@ in both phases.
 
 Both decode cosine thresholds default to 0.7 for the combined policy, and each
 can be overridden separately. Existing standalone `--moe-strategy tablemoe`
-keeps its defaults, fixed keep rules and surviving-weight renormalization.
+uses its own keep rules and preserves original surviving-route weights by default;
+`--tablemoe-renormalize-weights` opts into renormalization.
 Passing standalone TableMoE together with a MoDES policy fails. Explicit CLI
 `--tablemoe-prefill-keep-rate` fails with the default MoDES prefill policy;
 `--tablemoe-decode-keep-k` fails with every MoDES policy.

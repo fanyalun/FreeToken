@@ -437,7 +437,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             ws["result"], self._route_counts, k, gpu_k, self.hidden,
             0 if self.bypass_tables else self.capacity, self.dummy_slot, cache is not None,
             pending is not None, self.stats_enabled, 256, triton.next_power_of_2(k),
-            getattr(self.config, "tablemoe_renormalize_weights", True) and not self.uses_modes_routing(prefill))
+            getattr(self.config, "tablemoe_renormalize_weights", False) and not self.uses_modes_routing(prefill))
         if self.capacity and not self.bypass_tables:
             kernels._advance_online[(bs,)](online["size"], online["pointer"], ws["request_slots"],
                                            ws["update_counts"], self.capacity, self.dummy_slot)

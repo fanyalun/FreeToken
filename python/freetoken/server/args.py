@@ -734,9 +734,13 @@ def parse_args(
     parser.add_argument("--tablemoe-implementation", choices=["reference", "optimized"],
                         default=ServerArgs.tablemoe_implementation)
     parser.add_argument("--tablemoe-stats", action="store_true", default=ServerArgs.tablemoe_stats)
-    parser.add_argument("--tablemoe-no-renormalize-weights", action="store_false",
-                        dest="tablemoe_renormalize_weights", default=ServerArgs.tablemoe_renormalize_weights,
-                        help="Preserve original router weights for surviving TableMoE routes in both phases.")
+    tablemoe_weights = parser.add_mutually_exclusive_group()
+    tablemoe_weights.add_argument("--tablemoe-renormalize-weights", action="store_true",
+                                 default=ServerArgs.tablemoe_renormalize_weights,
+                                 help="Renormalize surviving TableMoE route weights in both phases.")
+    tablemoe_weights.add_argument("--tablemoe-no-renormalize-weights", action="store_false",
+                                 dest="tablemoe_renormalize_weights", default=ServerArgs.tablemoe_renormalize_weights,
+                                 help="Preserve original TableMoE router weights in both phases (default).")
     parser.add_argument("--tablemoe-report-path", default=None)
     parser.add_argument("--tablemoe-collect-config", default=None)
     parser.add_argument("--tablemoe-skip-lookup", action="store_true", default=ServerArgs.tablemoe_skip_lookup,

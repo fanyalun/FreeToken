@@ -520,7 +520,7 @@ class TableMoeRuntime:
         for uid, lo, hi in spans:
             self._update_online(uid, layer_id, hidden_states[lo:hi], ids[lo:hi], outputs[lo:hi], survived[lo:hi])
         merged_weights = (renormalize_weights(weights, survived)
-                          if getattr(self.config, "tablemoe_renormalize_weights", True)
+                          if getattr(self.config, "tablemoe_renormalize_weights", False)
                           else weights.float() * survived)
         result = (outputs.float() * merged_weights[:, :, None]).sum(1)
         self._stats_event.record()

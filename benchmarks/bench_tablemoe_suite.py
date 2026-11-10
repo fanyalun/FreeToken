@@ -33,6 +33,7 @@ DEFAULTS = dict(model="/data/fanya/models/Qwen3-VL-30B-A3B-Instruct", python=str
                 fetch_cap=0, num_pages=65536, page_size=1, graph_max_bs=4, cpu_threads=16,
                 convert_bf16=True, online_capacity=64, prefill_keep_rate=.6, decode_keep_k=4,
                 decode_offline_cosine_threshold=None, decode_online_cosine_threshold=None,
+                tablemoe_renormalize_weights=False,
                 processor={"size": {"shortest_edge": 602112, "longest_edge": 4014080}},
                 judge=None, builder={}, server_env={}, vlmeval_env={}, startup_timeout=900,
                 dataset_only_import=False, smoke_samples=1, smoke_calibration_limit=5)
@@ -228,8 +229,8 @@ def server_command(config, group, asset_root, audit_path=None, collect_path=None
                 command.extend([f"--tablemoe-decode-{kind}-cosine-threshold", str(threshold)])
     if config["convert_bf16"]:
         command.append("--tablemoe-convert-bf16-weights")
-    if not config.get("tablemoe_renormalize_weights", True):
-        command.append("--tablemoe-no-renormalize-weights")
+    command.append("--tablemoe-renormalize-weights" if config.get("tablemoe_renormalize_weights", False)
+                   else "--tablemoe-no-renormalize-weights")
     if audit_path is not None:
         command.extend(["--tablemoe-report-path", str(audit_path)])
     if collect_path is not None:

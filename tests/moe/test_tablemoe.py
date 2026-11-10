@@ -72,6 +72,40 @@ def test_survivor_renormalization_and_empty_row():
     assert torch.equal(result[1], torch.zeros(3))
 
 
+def test_tablemoe_config_defaults_preserve_original_weights():
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.server.args import ServerArgs
+
+    config = EngineConfig(model_path="/models/unused", tp_info=DistributedInfo(0, 1), dtype=torch.float16)
+    assert config.tablemoe_renormalize_weights is False
+    assert ServerArgs.tablemoe_renormalize_weights is False
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ([], False), (["--tablemoe-no-renormalize-weights"], False),
+    (["--tablemoe-renormalize-weights"], True),
+])
+def test_tablemoe_cli_weight_mode(flags, expected):
+    from freetoken.server.args import parse_args
+
+    args, _ = parse_args(["--model", "/models/unused", "--dtype", "float16",
+                          "--tool-call-parser", "llama3", "--reasoning-parser", "off", *flags])
+    assert args.tablemoe_renormalize_weights is expected
+
+
+@pytest.mark.parametrize("flags", [
+    ["--tablemoe-renormalize-weights", "--tablemoe-no-renormalize-weights"],
+    ["--tablemoe-no-renormalize-weights", "--tablemoe-renormalize-weights"],
+])
+def test_tablemoe_cli_weight_modes_are_mutually_exclusive(flags):
+    from freetoken.server.args import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "/models/unused", "--dtype", "float16",
+                    "--tool-call-parser", "llama3", "--reasoning-parser", "off", *flags])
+
+
 def _executor(g, d, top_k):
     banks = SimpleNamespace(num_layers=1, num_experts=g.shape[0],
                             bank_sources={"gate_up": [g], "down": [d]})
@@ -125,7 +159,7 @@ def runtime(tmp_path):
         tablemoe_offline_cosine_threshold_text=0.7,
         tablemoe_offline_cosine_threshold_vision=0.6,
         tablemoe_prefill_keep_rate=0.5, tablemoe_decode_keep_k=1,
-        tablemoe_online_cache_size=2,
+        tablemoe_online_cache_size=2, tablemoe_renormalize_weights=True,
     )
     rt.hidden, rt.num_layers, rt.num_experts = 4, 1, 2
     rt.expert_mode, rt.expert_cache = "cpu", None
@@ -501,10 +535,13 @@ def _optimized_batch(uid=100, slot=0, n=1, prefill=False):
 
 @pytest.mark.parametrize("implementation", ["reference", "optimized"])
 @pytest.mark.parametrize("prefill", [False, True])
-@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("renormalize", [None, False, True])
 def test_tablemoe_survivor_weight_mode(runtime, monkeypatch, implementation, prefill, renormalize):
     rt = _optimized(runtime) if implementation == "optimized" else runtime
-    rt.config.tablemoe_renormalize_weights = renormalize
+    if renormalize is None:
+        del rt.config.tablemoe_renormalize_weights
+    else:
+        rt.config.tablemoe_renormalize_weights = renormalize
     rt.config.tablemoe_decode_keep_k = 0
     module = "freetoken.moe.tablemoe_optimized" if implementation == "optimized" else "freetoken.moe.tablemoe"
     monkeypatch.setattr(module + ".prefill_keep_mask", lambda ids, *args: torch.zeros_like(ids, dtype=torch.bool))

@@ -75,8 +75,11 @@ if os.environ.get("TABLEMOE_AUDIT_DIR"):
                 computed = self.fixed_online[layer]["values"][slot, (int(saved["pointer"]) % self.capacity)]
                 reference_values = torch.where(keep[:, :, None], computed[None], reference_values)
                 surviving_weights = weights.masked_fill(~routes, 0)
-                normalized = surviving_weights / surviving_weights.sum(-1, keepdim=True).clamp_min(1e-30)
-                reference_output = (reference_values.float() * normalized[:, :, None]).sum(1).half()
+                renormalize = (getattr(self.config, "tablemoe_renormalize_weights", False)
+                               and not self.uses_modes_routing(prefill))
+                if renormalize:
+                    surviving_weights = surviving_weights / surviving_weights.sum(-1, keepdim=True).clamp_min(1e-30)
+                reference_output = (reference_values.float() * surviving_weights[:, :, None]).sum(1).half()
                 selected = hit | (packed >= 0)
                 torch.testing.assert_close(ws["values"][selected], reference_values[selected], atol=2e-2, rtol=2e-2)
                 torch.testing.assert_close(result, reference_output, atol=2e-2, rtol=2e-2)

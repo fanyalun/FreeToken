@@ -1052,6 +1052,22 @@ def test_modes_matrix_smoke_gate_requires_timing_audit_identity(tmp_path, monkey
         assert len(result["dependencies"]) == 12
 
 
+@pytest.mark.parametrize("renormalize", [None, False, True])
+def test_server_command_preserves_default_and_explicit_weight_modes(tmp_path, renormalize):
+    from bench_tablemoe_suite import server_command
+
+    overrides = {} if renormalize is None else dict(tablemoe_renormalize_weights=renormalize)
+    config = effective_config(dict(output=str(tmp_path), vlmeval_python=sys.executable, **overrides))
+    expected = renormalize is True
+    assert config["tablemoe_renormalize_weights"] is expected
+    selected = "--tablemoe-renormalize-weights" if expected else "--tablemoe-no-renormalize-weights"
+    opposite = "--tablemoe-no-renormalize-weights" if expected else "--tablemoe-renormalize-weights"
+    for group in ("table_offload_graph", "full_offload_graph"):
+        command = server_command(config, group, tmp_path)
+        assert selected in command
+        assert opposite not in command
+
+
 @pytest.mark.parametrize("threshold", [None, 0.0, 0.7])
 def test_server_command_decode_cosine_thresholds(tmp_path, threshold):
     from bench_tablemoe_suite import server_command

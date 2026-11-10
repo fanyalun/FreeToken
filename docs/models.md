@@ -51,8 +51,10 @@ These families accept image input by default; pass `--text-model-only` to skip t
   require explicit `--moe-cache-size`, for example 3072, and load only important
   experts into that cache. Hybrid decode honors `--moe-hybrid-max-fetch` (automatic
   FP16 selection currently falls back to 1). Remaining routes reuse online or
-  offline `.pt` values. Missing routes are dropped and surviving weights are
-  renormalized. Requires `--tablemoe-pca-dir` and `--tablemoe-cache-dir`.
+  offline `.pt` values. Missing routes are dropped; exact routes and table hits
+  retain their original router weights by default. Use
+  `--tablemoe-renormalize-weights` to opt into survivor-weight renormalization.
+  Requires `--tablemoe-pca-dir` and `--tablemoe-cache-dir`.
   Prefill importance uses the current chunk's last-token attention only. Decode
   uses the `optimized` implementation by default. It enables fixed request-slot GPU
   online storage and decode CUDA Graphs for offload/hybrid;

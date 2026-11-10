@@ -82,7 +82,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--moe-strategy` | auto | `fused`/`offload`/`cpu`/`hybrid`/`tablemoe`; auto → offload, or hybrid with a `ft bench bw` profile. `--moe-backend` is the deprecated old spelling |
 | `--moe-policy` | native | `native`, `modes`, or `modes_tablemoe`; MoDES policies require FP16 Qwen3-VL-MoE, TP=1 and an explicit offload/hybrid/cpu backend. See [MoDES](modes.md) |
 | `--modes-config` | required for MoDES | Imported calibration JSON with checkpoint binding, layer importance and modality tau; validated together with its manifest |
-| `--modes-prefill-policy` | modes | `modes` uses MoDES in prefill; `tablemoe` uses TableMoE attention-ranked experts, offline lookup and survivor renormalization. Decode follows `--moe-policy` |
+| `--modes-prefill-policy` | modes | `modes` uses MoDES in prefill; `tablemoe` uses TableMoE attention-ranked experts, offline lookup and the TableMoE weight setting. Decode follows `--moe-policy` |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
@@ -96,7 +96,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tablemoe-expert-mode` | offload | Important routes: `cpu`, `offload`, or `hybrid`. Offload/hybrid require explicit `--moe-cache-size`; hybrid uses GPU prefill and capped fetch plus CPU overflow on decode |
 | `--tablemoe-implementation` | optimized | `reference` uses eager host-addressed value fetch; `optimized` uses mapped CPU values, fixed GPU request state, fused merge/update, and decode CUDA Graphs for offload/hybrid |
 | `--tablemoe-stats` | off | Collect route and transfer counters on GPU; read at request release. Use only for independent audit, disable for timing |
-| `--tablemoe-no-renormalize-weights` | off | Preserve original top-k router weights for exact routes and table hits in prefill and decode; misses contribute zero. By default TableMoE renormalizes surviving weights; MoDES phases always preserve weights |
+| `--tablemoe-renormalize-weights` | off | Opt into survivor-weight renormalization in TableMoE prefill and decode. By default exact routes and table hits retain original top-k router weights; misses contribute zero. MoDES phases always preserve weights |
+| `--tablemoe-no-renormalize-weights` | default behavior | Explicitly preserve original TableMoE router weights in both phases; retained for compatibility. Mutually exclusive with `--tablemoe-renormalize-weights` |
 | `--tablemoe-report-path` | off | Optimized implementation only: write request/layer/phase/modality counters, startup IO, shared expert fetch/padding IO and shutdown reconciliation to a fresh JSONL path; implies statistics |
 | `--tablemoe-collect-config` | off | Full-expert eager calibration only: collect original routed inputs using a builder JSON with `output`, `builder`, and `input_sha256`; performance runs omit this flag |
 | `--tablemoe-convert-bf16-weights` | off | Explicitly allow a BF16 source checkpoint and convert its CPU expert banks to FP16 |

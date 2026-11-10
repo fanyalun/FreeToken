@@ -183,7 +183,7 @@ def _merge_update(x, ids, weights, keep, cpu_ids, gpu_slots, gpu_values, cpu_add
                    H: tl.constexpr, CAP: tl.constexpr, DUMMY: tl.constexpr,
                    HAS_GPU: tl.constexpr, HAS_CPU: tl.constexpr, STATS: tl.constexpr,
                    BLOCK_H: tl.constexpr, BLOCK_K: tl.constexpr,
-                   RENORMALIZE: tl.constexpr = True):
+                   RENORMALIZE: tl.constexpr = False):
     row, block = tl.program_id(0), tl.program_id(1)
     req = tl.load(request_slots + row)
     hs = block * BLOCK_H + tl.arange(0, BLOCK_H)
