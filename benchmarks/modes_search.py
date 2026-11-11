@@ -119,6 +119,7 @@ def validate_full_target(anchor, maximum, evaluate, target, *, max_evaluations=4
             break
     if not feasible:
         raise ValueError("full validation did not find a feasible threshold within the budget")
-    best = min(feasible, key=lambda result: result["loss"])
+    within_tolerance = [result for result in feasible if result["skip_proportion"] <= target + tolerance]
+    best = min(within_tolerance or feasible, key=lambda result: result["loss"])
     return dict(tau=best["tau"], best_val=best["loss"], skip_proportion=best["skip_proportion"],
                 full_validation=measured, target_tolerance_met=best["skip_proportion"] <= target + tolerance)
