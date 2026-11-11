@@ -32,6 +32,12 @@ class ReportTests(unittest.TestCase):
             save(bounded + 'score.json', {'known_count': 419, 'unknown': 1, 'pending': 0,
                                          'full_denominator_accuracy_lower_pct': 40.0,
                                          'full_denominator_accuracy_upper_pct': 40.24})
+            doc_bounded = 'cells/MMLongBench_DOC/tablemoe/score_local_fused_native_bounded_512/'
+            save(doc_bounded + 'traversal_complete.json', {'complete': True, 'traversal_complete': True,
+                                                          'strict_primary_complete': False})
+            save(doc_bounded + 'score.json', {'known_count': 435, 'unknown': 1, 'pending': 0,
+                                             'full_denominator_accuracy_lower_pct': 12.0,
+                                             'full_denominator_accuracy_upper_pct': 12.23})
             previous = report.ROOT
             try:
                 report.ROOT = root
@@ -52,7 +58,12 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(mm['accuracy_lower_pct'], 40.0)
             self.assertEqual(mm['accuracy_upper_pct'], 40.24)
             self.assertEqual(summary['completed_scored_cells'], 2)
-            self.assertEqual(summary['completed_bounded_judging_cells'], 1)
+            doc = rows['MMLongBench_DOC', 'tablemoe']
+            self.assertFalse(doc['scoring_complete'])
+            self.assertIsNone(doc['accuracy_pct'])
+            self.assertEqual(doc['accuracy_lower_pct'], 12.0)
+            self.assertEqual(doc['accuracy_upper_pct'], 12.23)
+            self.assertEqual(summary['completed_bounded_judging_cells'], 2)
             self.assertFalse(summary['complete'])
 
 

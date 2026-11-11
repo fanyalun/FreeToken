@@ -22,7 +22,8 @@ def main():
             score_path=Path(complete.get('score_file',folder/'score_local_fused_native/score.json'))
             score=read(score_path)
             progress=read(folder/'progress.json')
-            bounded_folder=folder/'score_local_fused_native_bounded_2048'
+            bounded_budget=512 if dataset=='MMLongBench_DOC' else 2048
+            bounded_folder=folder/f'score_local_fused_native_bounded_{bounded_budget}'
             bounded_marker=read(bounded_folder/'traversal_complete.json')
             bounded=read(bounded_folder/'score.json') or read(bounded_folder/'progress.json')
             row=dict(dataset=dataset,method=method,batch_size=1,seed=42,

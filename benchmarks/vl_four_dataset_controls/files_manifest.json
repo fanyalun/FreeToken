@@ -58,7 +58,7 @@
     {
       "source": "report_results.py",
       "destination": "report_results.py",
-      "sha256": "9c94cd87109bd9dc18a8f9f7de384986a6d1240e3b4bfb53d00bbffe10bd5e79"
+      "sha256": "d97671c9bb10dcb63ad8a70c9779724964ad71cfbe0a04d1177affae9a211364"
     },
     {
       "source": "pause_collection.py",
@@ -94,6 +94,16 @@
       "source": "score_mmmu_bounded_with_server.py",
       "destination": "score_mmmu_bounded_with_server.py",
       "sha256": "aa1437eaf291074c057e9ce264d3924f077269787dfbe7573ff07cc0f2bde30a"
+    },
+    {
+      "source": "score_doc_bounded.py",
+      "destination": "score_doc_bounded.py",
+      "sha256": "79c47eb8feae4442b986b42d3b7a45d330086b875b51ffdeb23da23493e5d50f"
+    },
+    {
+      "source": "score_doc_bounded_with_server.py",
+      "destination": "score_doc_bounded_with_server.py",
+      "sha256": "660b5adebccf2e1560d05a71aef36640dff9221981fa5776b885a6179b231664"
     }
   ],
   "supporting_sources": [
@@ -227,12 +237,17 @@
     {
       "source": "validation/test_report_results_v2.py",
       "destination": "validation/test_report_results_v2.py",
-      "sha256": "c6746c0623d3730133d4bc23157524b53f7326c0a2ebc8cb8cf0d9e54496593c"
+      "sha256": "c2ff5917e9cdb5ad28c1da853f50f42ec4d93d3c70367b441162e68978e47c4a"
     },
     {
       "source": "validation/test_vision_formal_progress.py",
       "destination": "validation/test_vision_formal_progress.py",
       "sha256": "f465a41f4eeb4be90a8af2533fc9e35dfe6ffd95f600ed7589fc7b751bd610dc"
+    },
+    {
+      "source": "validation/doc_bounded_continuation/test_doc_bounded.py",
+      "destination": "validation/doc_bounded_continuation/test_doc_bounded.py",
+      "sha256": "8127900625905ac50670613c2d5b01d7453d09bd225563b1edd373e9a9ef8cef"
     }
   ],
   "package_metadata": [
@@ -255,7 +270,8 @@
     "prepared native Vision2Web runtime plus CPU browser/image fixtures and successful GPU component admission receipts",
     "For Doc repair, prepare validation/visual_coverage_candidate/tablemoe_builder.py from the exact frozen runtime_snapshot_visual_coverage builder; the full experimental candidate is intentionally not published.",
     "Bounded MMMU CPU replay requires the preserved original 298 native records, judge requests, full 420 predictions and frozen native scorer sources; these result records are not published.",
-    "Vision progress CPU replay requires the preserved official runtime, heldout membership and failed aihw smoke record; these dependencies are not published."
+    "Vision progress CPU replay requires the preserved official runtime, heldout membership and failed aihw smoke record; these dependencies are not published.",
+    "Doc bounded512 CPU replay requires preserved tablemoe339 and fused436 judge records, requests, predictions, native scorer sources and original absolute score_output_path bindings; no result data is published."
   ],
   "excluded": [
     "runtime_snapshot/**",

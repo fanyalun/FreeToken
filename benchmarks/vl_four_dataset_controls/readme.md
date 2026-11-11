@@ -91,6 +91,8 @@ it is not evaluated as a single HTML completion.
 | `score_exact_matching.py` | Produce a separate deterministic MMMU exact-matching auxiliary score |
 | `score_mmmu_bounded.py` | Continue native MMMU extraction while retaining exhausted matches as UNKNOWN and reporting bounds |
 | `score_mmmu_bounded_with_server.py` | Own the fused server for the separate bounded MMMU traversal |
+| `score_doc_bounded.py` | Continue Doc extraction at the frozen 512-token budget and retain proven format failures as UNKNOWN |
+| `score_doc_bounded_with_server.py` | Own the fused server for the separate bounded Doc traversal |
 | `report_results.py` | Follow each cell's selected native score file and keep auxiliary bounds separate from primary completion |
 | `vision_pipeline.py` | Own official Vision2Web generation, independent fused visual judging and report stages |
 | `vision_formal_adapter.py` | Preserve the official 40-project / 120-viewport denominator, including proven terminal no-start model failures as zero |
@@ -301,6 +303,28 @@ matches, so appending a final choice cannot remove the existing labels or
 shorten that prefix. The 8192 option remains available as an explicit control;
 it is not a completed or validated remedy for that failure.
 
+Doc bounded continuation also keeps the 512-token budget. The completed fused
+512-token primary score remains intact. The TableMoE primary scorer stopped
+after 339 records when sample 877 produced three nonempty 512-token responses
+without the native answer markers. The bounded control validates and imports
+that exact prefix, then processes the remaining samples in the separate
+`score_local_fused_native_bounded_512` directory. Only three ordered, nonempty
+HTTP responses with proven native format errors from the current invocation
+can become `UNKNOWN`. Empty responses, API/transport errors, mixed failure
+types, changed prompts or budgets remain fatal. The control does not extend
+the output budget or invent an extracted answer.
+
+Doc's native `eval_score` is continuous in [0, 1]. Bounded ACC uses the sum of
+known native scores over all 436 samples; unknown and pending items contribute
+only to the upper bound. The known-subset ACC is separately labeled. Exact
+overall F1 is not reported for this continuation. Its traversal marker retains
+`strict_primary_complete=false` and never creates a primary cell completion.
+The report reads Doc's 512-token and MMMU's 2048-token auxiliary directories
+separately. CPU tests replayed all 339 original TableMoE records and all 436
+completed fused records, including reproduction of fused native ACC, and
+checked the failure boundaries with mocks. Those checks do not establish that
+the queued real GPU bounded continuation has completed.
+
 MMMU bounded continuation keeps the original 2048-token budget and native
 three-attempt matcher. It imports the 298 prior successful records only after
 checking the original protocol, native parser replay and matching judge request
@@ -326,6 +350,14 @@ The bounded and Vision checks need this task's preserved input records and
 official runtime; they are not standalone fixtures shipped with the package.
 Their CPU success does not establish completion of the ongoing GPU scoring or
 formal Vision2Web runs.
+
+`validation/doc_bounded_continuation/test_doc_bounded.py` adds 24 CPU checks for
+Doc512. It requires the preserved 339-record and 436-record inputs plus the
+original absolute `score_output_path` bindings. When testing copied control
+sources in another directory, bind the imported `score_doc_bounded.ROOT` to the
+original experiment before replaying the untouched records; the test then uses
+its own persistent fixture root for mocked continuation. This path binding
+does not change the frozen sources or copied primary records.
 
 Vision2Web infrastructure readiness uses component checks and does not require
 the model to successfully generate a website. Before the manager's GPU probe,
