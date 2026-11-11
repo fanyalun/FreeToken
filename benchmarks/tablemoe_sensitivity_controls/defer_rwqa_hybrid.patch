@@ -1,0 +1,104 @@
+--- a/run_experiment.py
++++ b/run_experiment.py
+@@ -323,7 +323,40 @@
+     STATE['jobs'][job['parent']]['state'] = 'complete'
+ 
+ 
++def job_deferral(identifier, parent=None):
++    path = ROOT / 'job_policy.json'
++    policy = read(path) if path.exists() else {}
++    candidates = (identifier, parent or identifier.removeprefix('score_'))
++    for candidate in candidates:
++        record = policy.get('deferred_jobs', {}).get(candidate)
++        if record is not None:
++            return record
++    if any(candidate in policy.get('resumed_jobs', []) for candidate in candidates):
++        return None
++    for candidate in candidates:
++        record = STATE.get('disabled_jobs', {}).get(candidate, {})
++        if record.get('state') == 'deferred' and record.get('explicit_resume_required'):
++            return record
++    return None
++
++
++def apply_job_policy(include_running=False):
++    for identifier, job in list(STATE['jobs'].items()):
++        policy = job_deferral(identifier, job.get('parent'))
++        score_running = STATE['jobs'].get('score_' + identifier, {}).get('state') == 'running'
++        if (policy is None or job['state'] == 'complete' or
++                ((job['state'] == 'running' or score_running) and not include_running)):
++            continue
++        STATE.setdefault('disabled_jobs', {})[identifier] = dict(
++            job, previous_state=job['state'], state='deferred',
++            reason=policy.get('reason', 'user_requested_defer'),
++            explicit_resume_required=True, retain_existing_artifacts=True, deferred_utc=now())
++        del STATE['jobs'][identifier]
++
++
+ def add_job(identifier, dataset, kind='generate', **kwargs):
++    if job_deferral(identifier, kwargs.get('parent')) is not None:
++        return
+     STATE['jobs'].setdefault(identifier, dict(id=identifier, dataset=dataset, kind=kind,
+                                              state='pending', **kwargs))
+ 
+@@ -425,6 +458,7 @@
+ 
+ 
+ def reconcile_artifacts():
++    apply_job_policy()
+     for job in list(STATE['jobs'].values()):
+         if job['dataset'] not in ALIASES or job['state'] in ('complete', 'running'):
+             continue
+@@ -655,6 +689,8 @@
+     observation = resource(gpu) if gpu is not None else None
+     for job in STATE['jobs'].values():
+         if job['state'] != 'pending' or job['dataset'] not in ALIASES:
++            continue
++        if job_deferral(job['id'], job.get('parent')) is not None:
+             continue
+         if job.get('auto_retry_disabled'):
+             continue
+@@ -797,7 +833,8 @@
+                 STATE['workers'][str(gpu)].update(state='job_failed', error=repr(error))
+                 persist()
+             print(traceback.format_exc(), flush=True)
+-            if job['kind'] == 'score' and not job.get('auto_retry_disabled'):
++            if (job['kind'] == 'score' and not job.get('auto_retry_disabled') and
++                    job_deferral(job['id'], job.get('parent')) is None):
+                 failures = ROOT / 'cells' / job['parent'] / 'score/judge_parse_failures.jsonl'
+                 deterministic = False
+                 if failures.exists():
+@@ -816,8 +853,10 @@
+ 
+ 
+ def completion_summary():
++    apply_job_policy()
+     required = [f'{name}_evaluate_{scope}' for name in ALIASES
+-                for scope in ('prefill', 'prefill_decode')]
++                for scope in ('prefill', 'prefill_decode')
++                if job_deferral(f'{name}_evaluate_{scope}') is None]
+     reports = all((ROOT / name).exists() and read(ROOT / name).get('complete') for name in
+                   ('prefill_comparison.json', 'prefill_schedule_ablation.json'))
+     primary = (len(STATE['selections']) == 2 and reports and all(
+@@ -828,9 +867,12 @@
+     exempt = set(missing_alpha) | {'score_' + identifier for identifier in missing_alpha}
+     remaining = [identifier for identifier, job in STATE['jobs'].items()
+                  if job['state'] != 'complete' and identifier not in exempt]
++    deferred = sorted(identifier for identifier, job in STATE.get('disabled_jobs', {}).items()
++                      if job.get('state') == 'deferred' and job_deferral(identifier, job.get('parent')) is not None)
+     return dict(primary_workflow_complete=primary and not remaining,
+                 all_alpha_scores_complete=not missing_alpha, missing_alpha_scores=missing_alpha,
+-                required_jobs_incomplete=remaining, complete=primary and not remaining and not missing_alpha)
++                deferred_jobs=deferred, required_jobs_incomplete=remaining,
++                complete=primary and not remaining and not missing_alpha)
+ 
+ 
+ def main(resume=False):
+@@ -845,6 +887,7 @@
+         STATE.clear()
+         STATE.update(previous)
+         STATE['workers'] = {}
++        apply_job_policy(include_running=True)
+         reconcile_artifacts()
+         for job in STATE['jobs'].values():
+             if job['state'] in ('running', 'failed', 'interrupted') and not job.get('auto_retry_disabled'):

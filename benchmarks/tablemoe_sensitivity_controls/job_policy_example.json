@@ -1,0 +1,17 @@
+{
+  "schema": "tablemoe_job_policy_v1",
+  "deferred_jobs": {
+    "rwqa_evaluate_prefill": {
+      "reason": "user_requested_defer",
+      "requested_utc": "2026-11-11T08:32:44.402298+00:00",
+      "explicit_resume_required": true,
+      "retain_existing_artifacts": true
+    },
+    "score_rwqa_evaluate_prefill": {
+      "reason": "user_requested_defer",
+      "requested_utc": "2026-11-11T08:32:44.402298+00:00",
+      "explicit_resume_required": true,
+      "retain_existing_artifacts": true
+    }
+  }
+}
