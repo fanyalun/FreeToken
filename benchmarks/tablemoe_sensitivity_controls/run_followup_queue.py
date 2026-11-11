@@ -56,9 +56,30 @@ def report(root, protocol):
         path = Path(path)
         if path.exists() and read(path).get('complete'):
             results[name] = read(path)['quality_metric']
+    baseline = read(protocol['baseline_record'])['quality_metric'] if protocol.get('baseline_record') else None
+    rows = []
+    for definition in protocol.get('comparison_rows', []):
+        path = Path(definition['record'])
+        record = read(path) if path.exists() else {}
+        score = record.get('quality_metric') if record.get('complete') else None
+        rows.append(dict(definition, score=score, complete=score is not None,
+                         difference_from_baseline=score - baseline if score is not None and baseline is not None else None))
     save(root / 'comparison.json', dict(complete=len(results) == len(protocol['comparison_records']),
-         scores=results, alpha=.7, decode_top_h=4, expert_slots=3072,
+         scores=results, alpha=protocol.get('alpha', .7), decode_top_h=protocol.get('decode_top_h', 4),
+         expert_slots=protocol.get('expert_slots', 3072), baseline_score=baseline, comparison_rows=rows,
          quality_only=True, formal_performance_eligible=False, updated_utc=now()))
+    if rows:
+        lines = ['| alpha | method | overall score | vs lossless baseline |',
+                 '|---|---|---:|---:|']
+        for row in rows:
+            score = f"{row['score']:.4f}" if row['score'] is not None else 'pending'
+            delta = row['difference_from_baseline']
+            difference = f'{delta:+.4f}' if delta is not None else '-'
+            alpha = row['alpha'] if row['alpha'] is not None else '-'
+            lines.append(f"| {alpha} | {row['label']} | {score} | {difference} |")
+        temporary = root / 'comparison.md.partial'
+        temporary.write_text('\n'.join(lines) + '\n')
+        temporary.replace(root / 'comparison.md')
 
 
 def main(root):
