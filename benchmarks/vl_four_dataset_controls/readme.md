@@ -147,8 +147,9 @@ those records with its actual owned jobs or remove that adoption path. Never
 adopt unrelated PIDs.
 
 `scheduling_policy.json` may override job priorities and command arrays. This
-task prioritizes the three offline builds, then complete BabyVision comparisons
-and MMMU before the remaining evaluation work. The policy does not change frozen
+task prioritizes the three offline builds and complete BabyVision comparisons,
+with an early Doc fused run to measure output cost. Remaining Doc comparisons
+precede optional MMMU additions. The policy does not change frozen
 sample membership or generation limits. Repeated manager attempts use separate
 control logs. A manager restart adopts its live owned workers.
 
