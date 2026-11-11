@@ -1,0 +1,145 @@
+{
+  "schema": "vl_four_dataset_controls_publication_v1",
+  "freeze_status": "frozen",
+  "source_root": "artifacts/vl_four_dataset_bs1_20261111",
+  "destination_root": "benchmarks/vl_four_dataset_controls",
+  "execution_layout": "copy controls into experiment root; ROOT remains Path(__file__).resolve().parent",
+  "control_files": [
+    {
+      "source": "prepare_data.py",
+      "destination": "prepare_data.py",
+      "sha256": "607e9e559e88e303200ce7876b031488e093b983ecf3612cfbd68ba3bf6323e5"
+    },
+    {
+      "source": "prepare_vision2web.py",
+      "destination": "prepare_vision2web.py",
+      "sha256": "31edf8c2b6cc4088a4c834b61592338a384decab200b1fdcf6b4a89c50e93c9c"
+    },
+    {
+      "source": "run_cell.py",
+      "destination": "run_cell.py",
+      "sha256": "312133c8fb093c4b15191f10022ad2d0d77ecf42bc2534bf07309b81e2d55b94"
+    },
+    {
+      "source": "build_table.py",
+      "destination": "build_table.py",
+      "sha256": "4729b36e79392d1c1256d8981df24d2878d138289a7e25e48c235d38f47d40c9"
+    },
+    {
+      "source": "calibrate_modes.py",
+      "destination": "calibrate_modes.py",
+      "sha256": "76f88c73bbb6934674d6e8cb6dcacde13c34696c7dfc158ce826977340e7ed8f"
+    },
+    {
+      "source": "manager.py",
+      "destination": "manager.py",
+      "sha256": "d8378ef154e3d59f69492b6e51218b358a16b7e5aff6c10f6f53eb993bde6d57"
+    },
+    {
+      "source": "score_native.py",
+      "destination": "score_native.py",
+      "sha256": "1e9ba67cc9124f4b081934118aaa927334e0894f7d63337cb5e8ce55a79264f9"
+    },
+    {
+      "source": "score_with_server.py",
+      "destination": "score_with_server.py",
+      "sha256": "b72d125c0b9bb37694391cd32432497ae26ca302bf9c9500de98d1d74af457b5"
+    },
+    {
+      "source": "vision_pipeline.py",
+      "destination": "vision_pipeline.py",
+      "sha256": "9c3d9e719cf1c542916b08d6fa9090128390d74b61b9f6505f7c9af793b1109e"
+    },
+    {
+      "source": "vision_validate.py",
+      "destination": "vision_validate.py",
+      "sha256": "16c7313f7d66d213e43cdd68cdbf458b5d9af0f9835b3483892ae1ee986ca6c5"
+    },
+    {
+      "source": "report_results.py",
+      "destination": "report_results.py",
+      "sha256": "3d12a7c2a1a71ea226b0b41db3941ccdb23ae6904619e36c1a3d1cc9507ff89b"
+    }
+  ],
+  "supporting_sources": [
+    {
+      "source": "sources/calibrate_source.py",
+      "destination": "sources/calibrate_source.py",
+      "sha256": "3100443840ad1614502ff3949c4625412b0b4953bef817b354c37a0f6f7d1df3"
+    },
+    {
+      "source": "calibration_support/modes_search.py",
+      "destination": "calibration_support/modes_search.py",
+      "sha256": "66abf0a61726697a8a13617a748dd68c98ab145fca792d2a5f3c897836ac6b78"
+    }
+  ],
+  "optional_validation_sources": [
+    {
+      "source": "validate_modes_cpu.py",
+      "destination": "validate_modes_cpu.py",
+      "sha256": "1ec375538726c2cc7015ffb7c120f33f1c7239a775b3e447d08fa25d76805cb5"
+    },
+    {
+      "source": "score_selftest.py",
+      "destination": "score_selftest.py",
+      "sha256": "bc92298cd7bcc754542d7106ef8ef7106f9b5f5761ca4eda1b348687dff67b04"
+    },
+    {
+      "source": "score_transport_selftest.py",
+      "destination": "score_transport_selftest.py",
+      "sha256": "ad70c2159ad072d2f02327a2420a22bd2169a00277b72664e8a3d3435cecc576"
+    },
+    {
+      "source": "vision_mock_probe.py",
+      "destination": "vision_mock_probe.py",
+      "sha256": "f9e91b74a14668fe2e34b55927b2aac1a340e2f7b1769cc8f0ac8b667382e5b3"
+    }
+  ],
+  "package_metadata": [
+    "readme.md",
+    "files_manifest.json"
+  ],
+  "external_runtime_requirements": [
+    "runtime_snapshot/python",
+    "runtime_snapshot/benchmarks",
+    "prepared dataset manifests and frozen split provenance",
+    "existing MMMU offline table and original frozen split",
+    "checkpoint_binding.json and its task-specific provenance directory",
+    "execution_policy.json with the absolute authorized deadline",
+    "additional_jobs.json for native scoring and Vision2Web smoke/evaluation",
+    "owned-job adoption records or a fresh-run manager without adoption",
+    "required CPU/GPU validation completion markers"
+  ],
+  "excluded": [
+    "runtime_snapshot/**",
+    "prepare/**",
+    "cells/**",
+    "build/**",
+    "calibration/**",
+    "judges/**",
+    "vision/**",
+    "logs/**",
+    "validation/**",
+    "tmp/**",
+    "pycache/**",
+    "triton_cache/**",
+    "cuda_cache/**",
+    "torch_extensions/**",
+    "*.pt",
+    "*.bin",
+    "*.phase",
+    "*.jsonl"
+  ],
+  "finalization": [
+    "Finish implementation and preserve the measured experiment sources.",
+    "Copy only explicitly allowlisted source files after they stop changing.",
+    "Fill source SHA-256 fields and verify each copied file equals its frozen source.",
+    "Run syntax and applicable CPU validations on the copied controls.",
+    "Set freeze_status to frozen and record source revision and validation receipts.",
+    "Stage only this package and other root-approved task changes; preserve unrelated dirty files."
+  ],
+  "copied_source_files": true,
+  "result_data_included": false,
+  "offline_tensor_content_scans": false,
+  "source_revision": "705b74bfa98bfa1c675d83565cb30651759703d1"
+}
