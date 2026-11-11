@@ -386,6 +386,12 @@ def parse_args(
         help="Print one decode scheduler status line every N decode forwards.",
     )
 
+    parser.add_argument(
+        "--profile-io", nargs="?", const="auto", default=ServerArgs.profile_io, metavar="JSON_PATH",
+        help="Profile MoE logical transfer bytes: prefill total and mean per decode batch step. "
+             "Synchronizes each forward. Without a path, writes a fresh JSON under artifacts/profile_io/.",
+    )
+
     kv_capacity_group = parser.add_mutually_exclusive_group()
     kv_capacity_group.add_argument(
         "--num-pages",

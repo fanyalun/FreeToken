@@ -661,3 +661,59 @@ def test_cpu_moe_executor_is_collectable():
     if watchdog is not None:
         watchdog.join(timeout=5.0)  # exits on the first tick after the weakref dies
         assert not watchdog.is_alive(), "watchdog thread must exit after executor GC"
+
+
+@pytest.mark.parametrize("fmt", ["fp16_routes", "bf16"])
+@pytest.mark.parametrize("mapped_output", [False, True])
+@pytest.mark.parametrize("flag_sync", [False, True])
+def test_cpu_io_profile_counts_staged_payload_and_explicit_outputs(monkeypatch, fmt, mapped_output, flag_sync):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    bs, hidden, top_k = 3, 5, 2
+    dtype = torch.float16 if fmt == "fp16_routes" else torch.bfloat16
+    x = torch.arange(bs * hidden, dtype=dtype).reshape(bs, hidden)
+    ids = torch.tensor([[0, -1], [-1, -1], [2, 1]], dtype=torch.int64)
+    weights = torch.full((bs, top_k), .5, dtype=torch.float64)
+    io = dict(x=torch.empty_like(x), ids=torch.empty(bs, top_k, dtype=torch.int32),
+              w=torch.empty(bs, top_k, dtype=torch.float32),
+              y=torch.full((bs, top_k, hidden) if fmt == "fp16_routes" else (bs, hidden),
+                           7., dtype=dtype))
+    calls, counts = [], {}
+
+    def add(component, size):
+        counts[component] = counts.get(component, 0) + int(size)
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.quant_format, executor._gpu_prequant = fmt, False
+    executor.top_k, executor.H = top_k, hidden
+    executor._io = {bs: io}
+    executor._io_for = lambda size: io
+    executor._task_for = lambda layer, size: "task"
+    executor._flag_sync, executor._flag_slots = flag_sync, {(0, bs): 0}
+    executor._ready = torch.zeros(1, dtype=torch.int64)
+    executor._done = torch.zeros_like(executor._ready)
+    executor._cpu_moe = SimpleNamespace(
+        memop_submit=lambda *args: calls.append("flag_submit"),
+        memop_sync=lambda *args: calls.append("flag_sync"))
+    executor._ext = SimpleNamespace(
+        submit_with_cuda_stream=lambda *args: calls.append("host_submit"),
+        sync_with_cuda_stream=lambda *args: calls.append("host_sync"))
+    executor.io_profiler = SimpleNamespace(add=add)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=123))
+
+    for _ in range(2):
+        pending = executor.decode_submit(0, x, weights, ids, mapped_output=mapped_output)
+        result = executor.decode_sync(pending)
+        assert torch.equal(result, io["y"])
+        assert (result is io["y"]) == mapped_output
+    assert torch.equal(io["x"], x) and torch.equal(io["ids"], ids.int())
+    if fmt != "fp16_routes":
+        assert torch.equal(io["w"], weights.float())
+    expected = dict(activation_d2h_bytes=60,
+                    routing_metadata_d2h_bytes=48 if fmt == "fp16_routes" else 96)
+    if not mapped_output:
+        expected["cpu_output_h2d_bytes"] = 120 if fmt == "fp16_routes" else 60
+    if flag_sync:
+        expected.update(cpu_flag_mapped_write_d2h_bytes=16, cpu_flag_mapped_read_h2d_bytes=8)
+    assert counts == expected
+    assert calls == (["flag_submit", "flag_sync"] if flag_sync else ["host_submit", "host_sync"]) * 2

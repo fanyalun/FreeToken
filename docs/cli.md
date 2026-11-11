@@ -134,6 +134,40 @@ query it, and exact prefill results seed it for decode. A zero online cache size
 its updates and queries. Request audits record the effective lookup mode and the enabled
 online/offline sources for each phase.
 
+### MoE I/O profiling
+
+Add `--profile-io artifacts/profile_io/offload.json` to an inference command to record
+MoE transfer payloads. The same option works with native offload, CPU/hybrid,
+`--moe-policy modes`, and TableMoE (including its lookup ablations). Without a path,
+`--profile-io` creates a fresh timestamped JSON under `artifacts/profile_io/`.
+Explicit output paths must be fresh and outside `/tmp`. TP runs write one file per rank.
+
+The JSON is updated after each completed forward and finalized at graceful shutdown:
+
+| Field | Meaning |
+|---|---|
+| `prefill.total_bytes` | Cumulative H2D + D2H payload across all actual prefill forwards |
+| `prefill.steps` | Number of actual prefill batch forwards, including prompt chunks |
+| `decode.total_bytes` | Cumulative H2D + D2H payload across all actual decode forwards |
+| `decode.steps` | Number of decode batch forwards across all MoE layers; each batch counts once |
+| `decode.mean_bytes_per_step` | `decode.total_bytes / decode.steps`; `null` if no decode step ran |
+| `component_bytes` | Expert weights, activations, routing metadata, CPU outputs, offline values, request slots and CPU handshake flags |
+| `d2d_bytes` | GPU expert-cache copies, reported separately from the host/GPU I/O total |
+
+`total_mib` and `mean_mib_per_step` provide binary MiB equivalents. Batch padding is
+included when it causes a transfer; `real_rows` and `padded_rows` record the executed
+batch sizes. Table values and CPU outputs read from mapped host memory are separate
+components from explicit copies. Online tables live on GPU and add no host/GPU payload.
+Native prefill counts actual whole-layer or hit/miss-split copies, including small
+banks copied in full even when large weight banks hit the GPU cache.
+
+This mode reports **MoE logical transfer bytes**. Startup loading, Graph capture,
+internal warmup, encoder/attention/KV, sampling, general control transfers, and profiler
+telemetry are excluded. It does not measure physical PCIe transactions or protocol
+overhead. Each forward synchronizes to read the counters, so collect I/O separately
+from latency/throughput timings. Compare methods using the same model, precision,
+prompts, batch size and cache budget, with a separate output file for each method.
+
 ### API behaviour
 
 | Flag | Default | Meaning |

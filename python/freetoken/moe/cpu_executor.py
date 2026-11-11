@@ -581,6 +581,13 @@ class CpuMoeExecutor:
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         if self.quant_format != "fp16_routes":
             io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
+        profiler = getattr(self, "io_profiler", None)
+        if profiler is not None:
+            profiler.add("activation_d2h_bytes", hidden_states.numel() * hidden_states.element_size())
+            routing_bytes = topk_ids.numel() * 4
+            if self.quant_format != "fp16_routes":
+                routing_bytes += topk_weights.numel() * 4
+            profiler.add("routing_metadata_d2h_bytes", routing_bytes)
 
         task = self._task_for(layer_id, bs)
         out = (io["y"] if mapped_output else
@@ -594,6 +601,8 @@ class CpuMoeExecutor:
                 torch.cuda.current_stream().cuda_stream,
                 self._done.data_ptr(), self._ready.data_ptr(), slot,
             )
+            if profiler is not None:
+                profiler.add("cpu_flag_mapped_write_d2h_bytes", 8)
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
@@ -610,12 +619,16 @@ class CpuMoeExecutor:
             self._cpu_moe.memop_sync(
                 torch.cuda.current_stream().cuda_stream, self._done.data_ptr(), slot,
             )
+            if (profiler := getattr(self, "io_profiler", None)) is not None:
+                profiler.add("cpu_flag_mapped_read_h2d_bytes", 4)
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
         io = self._io[bs]
         if out is not io["y"]:
             out.copy_(io["y"], non_blocking=True)
+            if (profiler := getattr(self, "io_profiler", None)) is not None:
+                profiler.add("cpu_output_h2d_bytes", out.numel() * out.element_size())
         return out
 
     def _watchdog_tick(self, suspects: dict) -> None:

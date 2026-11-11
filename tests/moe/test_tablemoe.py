@@ -1549,3 +1549,141 @@ def test_audit_concurrent_completion_abort_and_online_capacity(runtime, tmp_path
     assert not records[-1]["unreleased_response_ids"]
     assert records[-1]["total_io_bytes"] == sum(r["total_io_bytes"] for r in records
                                                if r["type"] in ("request", "batch_shared"))
+
+
+class _IoProfileProbe:
+    components = ("activation_d2h_bytes", "routing_metadata_d2h_bytes", "cpu_output_h2d_bytes",
+                  "cpu_flag_mapped_write_d2h_bytes", "cpu_flag_mapped_read_h2d_bytes",
+                  "lookup_metadata_d2h_bytes", "offline_table_value_h2d_bytes",
+                  "routing_metadata_h2d_bytes", "request_slot_h2d_bytes",
+                  "offline_table_value_mapped_read_bytes", "cpu_output_mapped_read_bytes",
+                  "expert_weight_mapped_read_bytes", "expert_weight_h2d_bytes")
+
+    def __init__(self):
+        self.counts = torch.zeros(len(self.components), device="cuda", dtype=torch.int64)
+
+    def add(self, component, amount):
+        self.counts[self.components.index(component)].add_(amount)
+
+    def totals(self):
+        torch.cuda.synchronize()
+        return dict(zip(self.components, self.counts.cpu().tolist()))
+
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized"])
+def test_io_profile_distinguishes_explicit_and_mapped_table_values(runtime, implementation):
+    runtime.config.tablemoe_lookup_mode = "offline"
+    rt = _optimized(runtime) if implementation == "optimized" else runtime
+    profiler = _IoProfileProbe()
+    rt.io_profiler = rt.executor.io_profiler = profiler
+    make_batch = _optimized_batch if implementation == "optimized" else _batch
+    x = torch.tensor([[1., 0., 0., 0.]], device="cuda").half()
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.75, .25]], device="cuda")
+    for prefill in (True, False):
+        actual = rt.forward(0, x, weights, ids, make_batch(prefill=prefill))
+        torch.testing.assert_close(actual, x * .5)
+    counts = profiler.totals()
+    assert counts["activation_d2h_bytes"] == 16
+    assert counts["routing_metadata_d2h_bytes"] == 16
+    if implementation == "reference":
+        assert counts["lookup_metadata_d2h_bytes"] == 32
+        assert counts["offline_table_value_h2d_bytes"] == 16
+        assert counts["routing_metadata_h2d_bytes"] == 16
+        assert counts["cpu_output_h2d_bytes"] == 32
+        assert counts["offline_table_value_mapped_read_bytes"] == 0
+        assert counts["cpu_output_mapped_read_bytes"] == 0
+    else:
+        assert counts["lookup_metadata_d2h_bytes"] == 0
+        assert counts["offline_table_value_h2d_bytes"] == 0
+        assert counts["cpu_output_h2d_bytes"] == 0
+        assert counts["offline_table_value_mapped_read_bytes"] == 16
+        assert counts["cpu_output_mapped_read_bytes"] == 16
+        assert counts["request_slot_h2d_bytes"] == 8
+        rt.close()
+
+
+
+def test_io_profile_graph_counts_actual_offline_hits_on_each_replay(runtime):
+    runtime.config.tablemoe_lookup_mode = "offline"
+    runtime.config.tablemoe_renormalize_weights = False
+    rt = _optimized(runtime, "offload")
+    rt.config.tablemoe_decode_keep_k = 0
+    profiler = rt.io_profiler = _IoProfileProbe()
+    x = torch.zeros(1, rt.hidden, device="cuda", dtype=torch.float16)
+    x[:, 0] = 1
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.25, .75]], device="cuda")
+    batch = _optimized_batch()
+    rt.prepare_batch(batch)
+    rt.forward(0, x, weights, ids, batch)
+    captured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(captured):
+        out = rt.forward(0, x, weights, ids, batch)
+    profiler.counts.zero_()
+    for scale in (1., -1., 1.):
+        x[:, 0] = scale
+        captured.replay()
+        expected = torch.zeros_like(out)
+        expected[:, 0] = 1.5 if scale > 0 else 0.
+        torch.testing.assert_close(out, expected)
+    counts = profiler.totals()
+    assert counts["offline_table_value_mapped_read_bytes"] == 2 * rt.hidden * 2
+    assert counts["cpu_output_mapped_read_bytes"] == counts["cpu_output_h2d_bytes"] == 0
+    assert counts["request_slot_h2d_bytes"] == 0
+    rt.close()
+
+
+
+def test_io_profile_modes_counts_prefill_and_decode_with_skipped_routes(runtime, tmp_path):
+    from freetoken.moe.io_profile import MoeIoProfiler
+
+    dtype = torch.float16
+    rt = _modes_runtime(runtime, "cpu", combined=False)
+    gate = torch.stack((torch.full((4, 4), .1), torch.full((4, 4), .2))).to(dtype)
+    down = torch.stack((torch.full((4, 2), .3), torch.full((4, 2), .4))).to(dtype)
+    rt.executor = _executor(gate, down, 2)
+    rt.config.profile_io = str(tmp_path / "modes_profile.json")
+    rt.config.model_path = "/models/unused"
+    rt.config.moe_strategy = "cpu"
+    rt.config.tp_info = SimpleNamespace(rank=0, size=1)
+    rt.config.dtype = torch.float16
+    profiler = rt.io_profiler = rt.executor.io_profiler = MoeIoProfiler(rt.config, "cuda")
+    x = torch.tensor([[1., 0., 0., 0.]] * 3, device="cuda").to(dtype)
+    ids = torch.tensor([[0, 1]] * 3, device="cuda")
+    weights = torch.tensor([[.25, .75], [.25, .25], [.75, .25]], device="cuda")
+    routes = []
+    for expert in (0, 1):
+        g, u = F.linear(x.cpu(), gate[expert]).chunk(2, -1)
+        routes.append(F.linear(F.silu(g) * u, down[expert]).cuda())
+    expected = torch.zeros_like(x)
+    expected[0] = routes[1][0] * .75
+    expected[2] = routes[0][2] * .75
+    batch = _modes_batch(n=3, prefill=True)
+    batch.reqs = batch.padded_reqs
+    with profiler.batch(batch):
+        actual = rt.forward(0, x, weights, ids, batch).clone()
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=.02)
+    for row in (0, 1):
+        batch = _modes_batch()
+        batch.reqs = batch.padded_reqs
+        with profiler.batch(batch):
+            actual = rt.forward(0, x[row:row + 1], weights[row:row + 1], ids[row:row + 1], batch).clone()
+        torch.testing.assert_close(actual, expected[row:row + 1], atol=1e-4, rtol=.02)
+    report = profiler.report()
+    prefill, decode = report["prefill"], report["decode"]
+    assert prefill["steps"] == 1 and decode["steps"] == 2
+    for phase, rows, exact_routes in ((prefill, 3, 2), (decode, 2, 1)):
+        counts = phase["component_bytes"]
+        assert counts["activation_d2h_bytes"] == rows * 4 * 2
+        assert counts["routing_metadata_d2h_bytes"] == rows * 2 * 4
+        assert counts["request_slot_h2d_bytes"] == rows * 4
+        assert counts["cpu_output_mapped_read_bytes"] == exact_routes * 4 * 2
+        assert counts["cpu_output_h2d_bytes"] == 0
+        assert counts["offline_table_value_mapped_read_bytes"] == 0
+        assert counts["offline_table_value_h2d_bytes"] == counts["lookup_metadata_d2h_bytes"] == 0
+    assert not rt.lookup_enabled(True) and not rt.lookup_enabled(False)
+    assert decode["mean_bytes_per_step"] == decode["total_bytes"] / 2
+    profiler.close()
+    rt.close()

@@ -665,6 +665,8 @@ class OffloadMoeCache:
             # classification is pure host math.
             with torch.cuda.stream(self.prefill_copy_stream):
                 self._prefill_slot_snapshot.copy_(self.slot_for_id, non_blocking=True)
+                if profiler := getattr(self, "io_profiler", None):
+                    profiler.add("routing_metadata_d2h_bytes", self.slot_for_id.numel() * self.slot_for_id.element_size())
             self.prefill_copy_stream.synchronize()
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
@@ -687,6 +689,10 @@ class OffloadMoeCache:
             self._invalidate_prefill_buffer(buffer_id)
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+            if profiler := getattr(self, "io_profiler", None):
+                profiler.add("expert_weight_h2d_bytes", sum(
+                    per_layer[layer_id].numel() * per_layer[layer_id].element_size()
+                    for per_layer, _ in self.banks))
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -786,6 +792,9 @@ class OffloadMoeCache:
                 self._prefill_hit_num,
                 blocks_per_bank=64,
             )
+            if profiler := getattr(self, "io_profiler", None):
+                profiler.add("expert_weight_d2d_bytes", self._prefill_hit_num[0] * sum(
+                    self._copy_feat_bytes_host[b] for b in self._gather_bank_ids))
         miss = np.nonzero(~hit_mask)[0]
         with torch.cuda.stream(self.prefill_copy_stream):
             if self._prefill_buffer_has_release_event[buffer_id]:
@@ -815,6 +824,8 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
+                if profiler := getattr(self, "io_profiler", None):
+                    profiler.add("expert_weight_h2d_bytes", int(sum(nbytes)))
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:
@@ -1025,7 +1036,15 @@ class OffloadMoeCache:
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
+            if profiler := getattr(self, "io_profiler", None):
+                profiler.add("expert_weight_h2d_bytes", sum(
+                    per_layer[layer_id].numel() * per_layer[layer_id].element_size()
+                    for per_layer, _ in self.banks))
             return
+        if profiler := getattr(self, "io_profiler", None):
+            row_bytes = sum(per_layer[layer_id][0].numel() * per_layer[layer_id].element_size()
+                            for per_layer, _ in self.banks)
+            profiler.add("expert_weight_mapped_read_bytes", self.num_indices[0] * row_bytes)
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 

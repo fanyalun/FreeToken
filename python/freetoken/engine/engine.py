@@ -406,6 +406,16 @@ class Engine:
                 layer.tablemoe_runtime = self.tablemoe_runtime
         elif is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+        self.io_profiler = None
+        if getattr(config, "profile_io", None):
+            from freetoken.moe.io_profile import MoeIoProfiler
+
+            if self.moe_offload_cache is None and self.cpu_moe_executor is None:
+                raise ValueError("profile-io requires an offload, CPU, hybrid, MoDES or TableMoE runtime")
+            self.io_profiler = MoeIoProfiler(config, self.device)
+            for source in (self.moe_offload_cache, self.cpu_moe_executor, self.tablemoe_runtime):
+                if source is not None:
+                    source.io_profiler = self.io_profiler
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -1042,11 +1052,13 @@ class Engine:
         assert torch.cuda.current_stream() == self.stream
         if batch.mm_gather_plan:
             self._run_mm_encoder(batch)
-        if self.tablemoe_runtime is not None and hasattr(self.tablemoe_runtime, "prepare_batch"):
-            self.tablemoe_runtime.prepare_batch(batch)
-        use_graph = self.graph_runner.can_use_cuda_graph(batch)
-        with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
-            logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
+        profiler = getattr(self, "io_profiler", None)
+        with profiler.batch(batch) if profiler is not None else contextlib.nullcontext():
+            if self.tablemoe_runtime is not None and hasattr(self.tablemoe_runtime, "prepare_batch"):
+                self.tablemoe_runtime.prepare_batch(batch)
+            use_graph = self.graph_runner.can_use_cuda_graph(batch)
+            with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
+                logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
@@ -1127,6 +1139,8 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         if self.tablemoe_runtime is not None and hasattr(self.tablemoe_runtime, "close"):
             self.tablemoe_runtime.close()
+        if profiler := getattr(self, "io_profiler", None):
+            profiler.close()
         torch.distributed.destroy_process_group()
         destroy_distributed()
 

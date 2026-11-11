@@ -415,6 +415,8 @@ class TableMoeRuntime:
             )
             self._fetch_buffers[slots] = io
         io["metadata"].copy_(descriptor.reshape(-1), non_blocking=True)
+        if (profiler := getattr(self, "io_profiler", None)) is not None:
+            profiler.add("lookup_metadata_d2h_bytes", descriptor.numel() * descriptor.element_size())
         io["event"].record()
         # Only host table-value addressing needs a host wait; native experts are already running.
         io["event"].synchronize()
@@ -426,6 +428,9 @@ class TableMoeRuntime:
             io["slots"][:count].copy_(hit_slots)
             io["gpu_values"][:count].copy_(io["values"][:count], non_blocking=True)
             slots_gpu = io["slots"][:count].to(device=self.device, non_blocking=True)
+            if profiler is not None:
+                profiler.add("offline_table_value_h2d_bytes", count * self.hidden * 2)
+                profiler.add("routing_metadata_h2d_bytes", count * io["slots"].element_size())
             outputs.view(-1, self.hidden).index_copy_(0, slots_gpu, io["gpu_values"][:count])
         self.counters["table_value_h2d_bytes"] += count * self.hidden * 2
         self.counters["lookup_metadata_d2h_bytes"] += descriptor.numel() * descriptor.element_size()

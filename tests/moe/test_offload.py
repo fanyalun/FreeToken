@@ -800,6 +800,133 @@ def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
         cache.copy_missing()
 
 
+class _IoCounter:
+    def __init__(self, device="cpu"):
+        self.counts = {name: torch.zeros((), dtype=torch.int64, device=device) for name in (
+            "expert_weight_h2d_bytes", "expert_weight_mapped_read_bytes",
+            "expert_weight_d2d_bytes", "routing_metadata_d2h_bytes")}
+
+    def add(self, component, amount):
+        self.counts[component].add_(amount)
+
+
+def test_profile_io_counts_pageable_whole_layer_copies():
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,))
+    cache.io_profiler = counter = _IoCounter()
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
+    cache.copy_missing()
+    assert counter.counts["expert_weight_h2d_bytes"] == 6144
+    assert counter.counts["expert_weight_mapped_read_bytes"] == 0
+    assert torch.equal(cache.bank_caches["gate_up"][:4], sources["gate_up"][1])
+
+
+def test_profile_io_counts_each_prefill_layer_copy_once():
+    cache, sources = _make_split_cache(num_layers=2, locked=(), prefill_overlap=True)
+    cache.io_profiler = counter = _IoCounter()
+    cache.begin_prefill()
+    cache.prefetch_prefill_layer(0)
+    cache.prefetch_prefill_layer(0)
+    assert counter.counts["expert_weight_h2d_bytes"] == 6144
+    assert torch.equal(cache.prefill_bank_buffers[0][0], sources["gate_up"][0])
+    cache.prefetch_prefill_layer(1)
+    assert counter.counts["expert_weight_h2d_bytes"] == 12288
+
+
+def test_profile_io_counts_prefill_cache_snapshot_bytes(monkeypatch):
+    from types import SimpleNamespace
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.device, cache.prefill_overlap, cache.prefill_hit_d2d = torch.device("cpu"), True, True
+    cache.prefill_copy_stream = SimpleNamespace(wait_event=lambda event: None, synchronize=lambda: None)
+    cache.prefill_begin_event = SimpleNamespace(record=lambda stream: None)
+    cache._hit_d2d_usable = lambda: True
+    cache.slot_for_id = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+    cache._prefill_slot_snapshot = torch.empty_like(cache.slot_for_id)
+    cache.io_profiler = counter = _IoCounter()
+
+    @contextmanager
+    def stream(_):
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
+    cache.begin_prefill()
+    assert counter.counts["routing_metadata_d2h_bytes"] == 48
+    assert torch.equal(cache._prefill_slot_snapshot, cache.slot_for_id)
+
+
+@pytest.mark.parametrize("hits", [0, 2, 4])
+def test_profile_io_split_prefill_counts_full_small_banks_with_cache_hits(monkeypatch, hits):
+    import numpy as np
+    from types import SimpleNamespace
+    from freetoken.moe.offload_cache import OffloadMoeCache, _SMALL_BANK_FEAT_BYTES
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.num_experts, cache.device = 4, torch.device("cpu")
+    cache._prefill_snapshot_np = np.array([[8] * hits + [-1] * (4 - hits)], dtype=np.int32)
+    cache.prefill_hit_rows = cache.prefill_total_rows = 0
+    cache._gather_dst_ptrs = torch.tensor([1024], dtype=torch.int64)
+    cache._gather_feat_bytes = torch.tensor([_SMALL_BANK_FEAT_BYTES], dtype=torch.int64)
+    cache._gather_bank_ids = [1]
+    cache._copy_feat_bytes_host = [32, _SMALL_BANK_FEAT_BYTES]
+    cache._copy_dst_ptrs_host = [1024, 2048]
+    cache._copy_src_ptrs_host = [[4096, 8192]]
+    cache._prefill_hit_dst = cache._prefill_hit_src = torch.empty(4, dtype=torch.int32)
+    cache._prefill_hit_num = torch.tensor([hits], dtype=torch.int64)
+    cache.prefill_copy_stream = object()
+    cache._prefill_buffer_has_release_event = [False, False]
+    cache.prefill_ready_events = [SimpleNamespace(record=lambda stream: None)]
+    cache._invalidate_prefill_buffer = lambda buffer_id: None
+    copied = []
+    cache._batch_memcpy = lambda dst, src, nbytes, stream: copied.extend(nbytes.tolist())
+    cache.io_profiler = counter = _IoCounter()
+
+    @contextmanager
+    def stream(_):
+        yield
+
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=17))
+    monkeypatch.setattr("freetoken.moe.offload_kernels.prefill_hit_compact", lambda *args: None)
+    monkeypatch.setattr("freetoken.kernel.fast_index_copy.fast_index_copy_multi_jit", lambda *args, **kwargs: None)
+    cache._prefetch_split(0, 0)
+    assert copied[0] == 128
+    assert sum(copied) == 128 + (4 - hits) * _SMALL_BANK_FEAT_BYTES
+    assert counter.counts["expert_weight_h2d_bytes"] == sum(copied)
+    assert counter.counts["expert_weight_d2d_bytes"] == hits * _SMALL_BANK_FEAT_BYTES
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fused", [True, False])
+def test_profile_io_mapped_copies_follow_live_graph_row_counts(fused):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6,
+                            device=torch.device("cuda"), quant_format="fp16")
+    gate = torch.arange(4 * 16 * 16, dtype=torch.float16).reshape(4, 16, 16).pin_memory()
+    down = torch.arange(4 * 16 * 8, dtype=torch.float16).reshape(4, 16, 8).pin_memory()
+    cache.set_bank_sources({"gate_up": [gate], "down": [down]})
+    cache._copy_fused_ok = cache._copy_fused_ok and fused
+    cache.io_profiler = counter = _IoCounter("cuda")
+    cache._pending_src_layer, cache._pending_whole_layer = 0, False
+    cache.evict_slots[:4].copy_(torch.arange(4, device="cuda", dtype=torch.int32))
+    cache.src_indices[:4].copy_(torch.arange(4, device="cuda", dtype=torch.int32))
+    cache.num_indices.fill_(1)
+    cache.copy_missing()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cache.copy_missing()
+    counter.counts["expert_weight_mapped_read_bytes"].zero_()
+    for count in (0, 1, 3):
+        cache.num_indices.fill_(count)
+        graph.replay()
+    assert counter.counts["expert_weight_mapped_read_bytes"].item() == 3072
+    torch.testing.assert_close(cache.bank_caches["gate_up"][:3], gate[:3].cuda())
+    torch.testing.assert_close(cache.bank_caches["down"][:3], down[:3].cuda())
+
+
 def test_requested_residency_routes_layer_settles(monkeypatch):
     # the ambient plan installed by load_expert_banks must route each layer's banks by label at both slow-path settle points (PinPipeline layer sink, list-valued pin_banks) and record that it was consulted
     # without a plan everything pins

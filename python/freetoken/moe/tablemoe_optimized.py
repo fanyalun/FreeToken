@@ -232,6 +232,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             raise ValueError("TableMoE batch exceeds the prepared request-slot capacity")
         batch.tablemoe_slots = self.batch_slots[:len(slots)]
         batch.tablemoe_slots.copy_(torch.tensor(slots, device="cpu", dtype=torch.int32), non_blocking=True)
+        if (profiler := getattr(self, "io_profiler", None)) is not None:
+            profiler.add("request_slot_h2d_bytes", batch.tablemoe_slots.numel() * batch.tablemoe_slots.element_size())
         if self.audit is not None:
             self.audit.slots_io(slots, batch.is_prefill)
 
@@ -445,6 +447,10 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             0 if self.bypass_tables else self.capacity, self.dummy_slot, cache is not None,
             pending is not None, self.stats_enabled, 256, triton.next_power_of_2(k),
             getattr(self.config, "tablemoe_renormalize_weights", False) and not self.uses_modes_routing(prefill))
+        if (profiler := getattr(self, "io_profiler", None)) is not None:
+            profiler.add("offline_table_value_mapped_read_bytes", ws["off"].sum() * self.hidden * 2)
+            if pending is not None:
+                profiler.add("cpu_output_mapped_read_bytes", (ws["cpu_ids"] >= 0).sum() * self.hidden * 2)
         if self.capacity and not self.bypass_tables:
             kernels._advance_online[(bs,)](online["size"], online["pointer"], ws["request_slots"],
                                            ws["update_counts"], self.capacity, self.dummy_slot)

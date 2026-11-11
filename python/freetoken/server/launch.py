@@ -123,7 +123,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 raise KeyboardInterrupt
 
         try:
-            if args.tablemoe_report_path or args.tablemoe_collect_config:
+            if args.tablemoe_report_path or args.tablemoe_collect_config or args.profile_io:
                 # The frontend's SIGTERM must not interrupt an in-progress audit export.
                 for signum in (signal.SIGINT, signal.SIGTERM):
                     previous_handlers[signum] = signal.signal(signum, stop_with_moe_export)
