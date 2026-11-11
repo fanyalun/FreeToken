@@ -87,6 +87,10 @@ def test_persistent_mounts_keep_upstream_copy_source_separate(config, official_s
         return 0, "container-id", ""
 
     monkeypatch.setattr(SandboxManager, "_exec_docker_command", capture)
+    monkeypatch.setenv("NO_PROXY", "upper.example")
+    monkeypatch.setenv("no_proxy", "lower.example")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9876")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
     config["sandbox_image"] = "test-image"
     workspace = Path(config["output"]) / "result"
     workspace.mkdir()
@@ -99,6 +103,12 @@ def test_persistent_mounts_keep_upstream_copy_source_separate(config, official_s
     assert all(f"src={workspace}," not in mount for mount in mounts)
     assert "TMPDIR=/v2w_runtime/tmp" in command
     assert "host.docker.internal:host-gateway" in command
+    assert "host.docker.internal" in sandbox.proxy_env["NO_PROXY"]
+    assert "localhost" in sandbox.proxy_env["no_proxy"]
+    assert "upper.example" in sandbox.proxy_env["no_proxy"]
+    assert "lower.example" in sandbox.proxy_env["NO_PROXY"]
+    assert "HTTP_PROXY" not in sandbox.proxy_env
+    assert sandbox.proxy_env["HTTPS_PROXY"] == "http://proxy.example:8080"
 
 
 def test_official_analyzer_scores_survive_but_incomplete_run_stays_incomplete(config, official_source):

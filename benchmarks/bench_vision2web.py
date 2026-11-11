@@ -108,6 +108,9 @@ def prepare(config):
         os.environ[variable] = str(target)
     tempfile.tempdir = str(root / "work")
     sys.pycache_prefix = str(root / "pycache")
+    for variable in ("NO_PROXY", "no_proxy"):
+        os.environ[variable] = ",".join(filter(None, [os.environ.get(variable),
+            "localhost", "127.0.0.1", "host.docker.internal"]))
     runtime = root / "official_runtime"
     files = subprocess.check_output(["git", "-C", str(source), "ls-files"], text=True).splitlines()
     files = [name for name in files if name.startswith(("vision2web/", "docker/")) or name == "README.md"]
@@ -250,7 +253,16 @@ def persistent_sandbox(config, stage, logger):
                     "-e", "TEMP=/v2w_runtime/tmp"] + cmd[2:]
             return await super()._exec_docker_command(cmd, error_msg, timeout)
 
-    return PersistentSandbox(image_name=config["sandbox_image"], logger=logger)
+    sandbox = PersistentSandbox(image_name=config["sandbox_image"], logger=logger)
+    for variable in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        proxy = sandbox.proxy_env.get(variable)
+        if proxy and urlsplit(proxy).hostname in ("localhost", "127.0.0.1", "::1"):
+            del sandbox.proxy_env[variable]
+            logger.warning("Ignoring host loopback %s inside Docker; external downloads use direct access", variable)
+    bypass = ",".join(filter(None, [sandbox.proxy_env.get("NO_PROXY"),
+        sandbox.proxy_env.get("no_proxy"), "localhost", "127.0.0.1", "host.docker.internal"]))
+    sandbox.proxy_env.update(NO_PROXY=bypass, no_proxy=bypass)
+    return sandbox
 
 
 def workspaces(config):

@@ -61,6 +61,10 @@ the Chrome package download out of `/tmp`.
 `http://host.docker.internal:23840`, without `/v1`. Task containers receive the
 Docker host-gateway mapping. Bind the FreeToken generation server to `0.0.0.0` so
 the container can reach it. Keep the normal model tool-call parser enabled.
+Local model addresses bypass inherited HTTP proxies. Task containers ignore host
+loopback proxy addresses and use direct access instead: `127.0.0.1` refers to a
+different network namespace there. If external downloads require a proxy, set a
+proxy address reachable from the containers before launching the runner.
 
 `evaluation.base_url` is a host-side OpenAI API root, for example
 `http://127.0.0.1:23880/v1`. The visual judge can be a separate lossless FreeToken
@@ -92,6 +96,12 @@ and task result under `results/webpage/claude_code/MODEL/PROJECT/`. The root
 the selected workflows and asset paths/sizes. `judge_records/` retains the actual
 image-bearing judge messages and the response returned after the official retry
 loop. `official_analysis.json` comes from the official analyzer.
+
+For Level 1, read `L1: Static Webpage / Avg` in the official printed table. Its
+`Overall` column averages Levels 1, 2 and 3, including zeros for absent levels;
+it is not the Level 1 score. In `official_analysis.json`, the corresponding
+`statistics["webpage:claude_code:MODEL"].prototype_scores` values are on a 0-1
+scale; the printed Level 1 average is their mean multiplied by 100.
 
 `complete.json` requires every selected task to have successful generation and
 evaluation records, a deployment script, all three screenshots and valid nonempty
