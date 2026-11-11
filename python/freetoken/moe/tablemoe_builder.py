@@ -38,6 +38,8 @@ def algorithm_config(config):
         raise ValueError("vision sampling budget exceeds its verified population")
     if result["sampling_policy"] not in ("all_tokens", "tablemoe_default"):
         raise ValueError("unknown collection sampling policy")
+    if result.get("raw_storage", "dense") not in ("dense", "indexed"):
+        raise ValueError("unknown raw collection storage")
     if type(result["sample_decode_tokens"]) is not int or result["sample_decode_tokens"] < 0:
         raise ValueError("sample_decode_tokens must be a nonnegative integer")
     if result["sampling_policy"] == "tablemoe_default":
@@ -48,6 +50,12 @@ def algorithm_config(config):
                 raise ValueError("invalid per-sample sampling bounds")
             if result[f"max_{mod}_tokens"] < 0:
                 raise ValueError("negative collection budget")
+    if "collection_image_ids" in result:
+        if result["sampling_policy"] != "tablemoe_default" or len(result["collection_image_ids"]) != result["sample_count"]:
+            raise ValueError("image deduplication requires one identity list per calibration sample")
+        if any(not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys)
+               for keys in result["collection_image_ids"]):
+            raise ValueError("collection image identities must be nonempty strings")
     return result
 
 
@@ -83,6 +91,7 @@ class InputCollector:
         self.config = algorithm_config(config)
         self.hidden, self.num_experts = hidden, num_experts
         self.buckets, self.tokens, self.requests = {}, {"prefill": 0, "decode": 0}, []
+        self.token_banks = {}
         self.sampling = {}
         self.sample_state = dict(records=[], counts=dict(vision=0, text=0), history=dict(vision=[], text=[]))
         self.sample_rng = np.random.default_rng(self.config["seed"])
@@ -96,16 +105,23 @@ class InputCollector:
                 raise ValueError("collection resume configuration mismatch")
             for key, state in saved["buckets"].items():
                 folder = self.root / f"layer_{state['layer']}"
-                for suffix in ("bin", "phase"):
-                    size = state["kept"] * (hidden * 2 if suffix == "bin" else 1)
+                suffix, width = ("index", 8) if state.get("raw_storage") == "indexed" else ("bin", hidden * 2)
+                for suffix, width in ((suffix, width), ("phase", 1)):
+                    size = state["kept"] * width
                     _collection_file(folder / f"{key}.{suffix}", size)
+            self.token_banks = saved.get("token_banks", {})
+            for bank, state in self.token_banks.items():
+                _collection_file(self.root / f"layer_{state['layer']}" / f"{bank}.bin", state["rows"] * hidden * 2)
             self.buckets, self.tokens, self.requests = saved["buckets"], saved["tokens"], saved["requests"]
             self.sampling = saved.get("sampling", {})
             self.sample_state = saved.get("sample_state", self.sample_state)
             if "rng_state" in self.sample_state:
                 self.sample_rng.bit_generator.state = self.sample_state["rng_state"]
+        self.collected_image_ids = {key for record in self.sample_state["records"]
+                                    for key in record.get("image_ids", [])}
         self.error = None
         self.handles = {}
+        self.bank_handles = {}
         self.pending = queue.Queue(maxsize=4)
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
@@ -116,7 +132,10 @@ class InputCollector:
         if (self.config["sampling_policy"] == "tablemoe_default" and not batch.is_prefill
                 and not self.config["sample_decode_tokens"]):
             return
-        n = sum(r.extend_len if batch.is_prefill else 1 for r in batch.padded_reqs if r.uid != -1)
+        requests = [r for r in batch.padded_reqs if r.uid != -1]
+        if "collection_image_ids" in self.config and len(requests) > 1:
+            raise ValueError("ordered image identities require serial bs1 collection")
+        n = sum(r.extend_len if batch.is_prefill else 1 for r in requests)
         if self.config["sampling_policy"] == "tablemoe_default":
             key = (batch.is_prefill, tuple((r.uid, r.cached_len) for r in batch.padded_reqs if r.uid != -1))
             if self.sample_batch is not batch or self.sample_batch_key != key:
@@ -158,6 +177,8 @@ class InputCollector:
             if req.uid == -1:
                 continue
             if req.uid not in self.active_samples:
+                if "collection_image_ids" in self.config and self.active_samples:
+                    raise ValueError("ordered image identities require one active calibration request")
                 ordinal = len(self.sample_state["records"])
                 if ordinal >= self.config["sample_count"] or req.cached_len:
                     raise ValueError("per-sample collection requires an uncached first prompt chunk")
@@ -166,9 +187,25 @@ class InputCollector:
                 for item in getattr(req, "mm_items", None) or []:
                     for lo, hi in item.offsets:
                         vision[lo:hi] = True
+                collect_vision = vision.copy()
+                image_ids, new_image_ids = [], []
+                if "collection_image_ids" in self.config:
+                    image_ids = self.config["collection_image_ids"][ordinal]
+                    items = getattr(req, "mm_items", None) or []
+                    if len(items) != len(image_ids):
+                        raise ValueError("collection image identities differ from model image inputs")
+                    for key, item in zip(image_ids, items):
+                        if key in self.collected_image_ids:
+                            for lo, hi in item.offsets:
+                                collect_vision[lo:hi] = False
+                        else:
+                            self.collected_image_ids.add(key)
+                            new_image_ids.append(key)
                 record = dict(uid=req.uid, ordinal=ordinal, prompt_tokens=length,
-                              candidates={}, selected={}, positions={}, decode_seen=0)
-                for mod, mask in (("vision", vision), ("text", ~vision)):
+                              candidates={}, selected={}, positions={}, decode_seen=0,
+                              image_ids=image_ids, new_image_ids=new_image_ids,
+                              duplicate_visual_tokens=int((vision & ~collect_vision).sum()))
+                for mod, mask in (("vision", collect_vision), ("text", ~vision)):
                     positions = np.flatnonzero(mask)
                     if mod == "text" and self.config["sample_decode_tokens"]:
                         # Fixed-length generation makes the future decode-input positions known.
@@ -182,6 +219,12 @@ class InputCollector:
                     record["candidates"][mod], record["selected"][mod] = len(positions), count
                     self.sample_state["counts"][mod] += count
                     self.sample_state["history"][mod].append(len(positions))
+                if "collection_image_ids" in self.config:
+                    record["image_offsets"] = [[list(span) for span in item.offsets] for item in items]
+                    record["selected_visual_tokens_per_image"] = [
+                        sum(any(lo <= position < hi for lo, hi in spans)
+                            for position in record["positions"]["vision"])
+                        for spans in record["image_offsets"]]
                 self.sample_state["records"].append(record)
                 self.active_samples[req.uid] = record
             record = self.active_samples[req.uid]
@@ -280,6 +323,25 @@ class InputCollector:
         unique = np.unique(routes.reshape(-1) * len(inputs) + row_indices)
         if not len(inputs):
             return
+        indexed = self.config.get("raw_storage") == "indexed"
+        bank_indices = np.full(len(inputs), -1, dtype=np.int64)
+        if indexed:
+            folder = self.root / f"layer_{layer}"
+            folder.mkdir(exist_ok=True)
+            for mod, name in enumerate(("vision", "text")):
+                positions = np.flatnonzero(selected.numpy() & (modality.numpy() == mod))
+                if not len(positions):
+                    continue
+                bank = f"L{layer}_{name}_tokens"
+                state = self.token_banks.setdefault(bank, dict(layer=layer, modality=name, rows=0))
+                if bank not in self.bank_handles:
+                    path = folder / f"{bank}.bin"
+                    self.bank_handles[bank] = path.open("r+b" if path.exists() else "w+b", buffering=0)
+                handle = self.bank_handles[bank]
+                handle.seek(state["rows"] * self.hidden * 2)
+                handle.write(memoryview(np.ascontiguousarray(inputs[positions])).cast("B"))
+                bank_indices[positions] = np.arange(state["rows"], state["rows"] + len(positions))
+                state["rows"] += len(positions)
         experts, row_indices = unique // len(inputs), unique % len(inputs)
         valid = selected.numpy()[row_indices]
         experts, row_indices = experts[valid], row_indices[valid]
@@ -292,13 +354,17 @@ class InputCollector:
                 continue
             group = int(groups[begin])
             expert, name = group // 2, ("vision", "text")[group % 2]
-            rows = np.ascontiguousarray(inputs[row_indices[begin:end]])
+            positions = row_indices[begin:end]
+            rows = np.ascontiguousarray(bank_indices[positions] if indexed else inputs[positions])
+            row_bytes = 8 if indexed else self.hidden * 2
             key = f"L{layer}_E{expert}_{name}"
             state = self.buckets.setdefault(key, dict(layer=layer, expert=expert, modality=name,
                                                       seen=0, prefill=0, decode=0, kept=0))
+            if indexed:
+                state.update(raw_storage="indexed", bank=f"L{layer}_{name}_tokens")
             folder = self.root / f"layer_{layer}"
             folder.mkdir(exist_ok=True)
-            data = folder / f"{key}.bin"
+            data = folder / f"{key}.{'index' if indexed else 'bin'}"
             labels = folder / f"{key}.phase"
             seed = self.config["seed"] ^ int(digest(key)[:16], 16)
             if key not in self.handles:
@@ -308,8 +374,8 @@ class InputCollector:
             raw = memoryview(rows).cast("B")
             initial = min(len(rows), max(0, self.config["reservoir_size"] - state["seen"]))
             if initial:
-                vectors.seek(state["seen"] * self.hidden * 2)
-                vectors.write(raw[:initial * self.hidden * 2])
+                vectors.seek(state["seen"] * row_bytes)
+                vectors.write(raw[:initial * row_bytes])
                 phases.seek(state["seen"])
                 phases.write(bytes([phase == "decode"]) * initial)
                 state["seen"] += initial
@@ -320,8 +386,8 @@ class InputCollector:
                 count, capacity = state["seen"], self.config["reservoir_size"]
                 slot = count - 1 if count <= capacity else _draw(seed, count)
                 if slot < capacity:
-                    vectors.seek(slot * self.hidden * 2)
-                    vectors.write(raw[index * self.hidden * 2:(index + 1) * self.hidden * 2])
+                    vectors.seek(slot * row_bytes)
+                    vectors.write(raw[index * row_bytes:(index + 1) * row_bytes])
                     phases.seek(slot)
                     phases.write(bytes([phase == "decode"]))
             state["kept"] = min(state["seen"], self.config["reservoir_size"])
@@ -338,7 +404,7 @@ class InputCollector:
         write_json(self.root / "progress.json", dict(buckets=self.buckets, tokens=self.tokens,
                                                       requests=self.requests, hidden=self.hidden,
                                                       identity=self.identity, config=self.config, sampling=self.sampling,
-                                                      sample_state=self.sample_state))
+                                                      sample_state=self.sample_state, token_banks=self.token_banks))
 
     def close(self):
         self.flush()
@@ -348,6 +414,9 @@ class InputCollector:
             for handle in handles:
                 handle.close()
         self.handles.clear()
+        for handle in self.bank_handles.values():
+            handle.close()
+        self.bank_handles.clear()
 
 
 def finalize_collection(root, inputs, num_layers, num_experts):
@@ -376,16 +445,20 @@ def finalize_collection(root, inputs, num_layers, num_experts):
     outputs = [root / "progress.json"]
     if (root / "requests.jsonl").exists():
         outputs.append(root / "requests.jsonl")
+    for bank, state in progress.get("token_banks", {}).items():
+        path = root / f"layer_{state['layer']}" / f"{bank}.bin"
+        _collection_file(path, state["rows"] * progress["hidden"] * 2)
+        outputs.append(path)
     for key, state in progress["buckets"].items():
         folder = root / f"layer_{state['layer']}"
-        for suffix in ("bin", "phase"):
-            size = state["kept"] * (progress["hidden"] * 2 if suffix == "bin" else 1)
-            _collection_file(folder / f"{key}.{suffix}", size)
+        suffix, width = ("index", 8) if state.get("raw_storage") == "indexed" else ("bin", progress["hidden"] * 2)
+        for part, width in ((suffix, width), ("phase", 1)):
+            size = state["kept"] * width
+            _collection_file(folder / f"{key}.{part}", size)
         if not progress["config"].get("export_inputs", True):
-            outputs.extend(folder / f"{key}.{suffix}" for suffix in ("bin", "phase"))
+            outputs.extend(folder / f"{key}.{part}" for part in (suffix, "phase"))
             continue
-        x = torch.from_file(str(folder / f"{key}.bin"), size=state["kept"] * progress["hidden"],
-                            dtype=torch.float16).reshape(-1, progress["hidden"]).clone()
+        x = load_inputs(root, key, state, progress["hidden"], prefer_exported=False).clone()
         phases = torch.from_file(str(folder / f"{key}.phase"), size=state["kept"], dtype=torch.uint8).clone()
         path = folder / f"{key}_inputs.pt"
         temp = path.with_suffix(".partial")
@@ -394,14 +467,27 @@ def finalize_collection(root, inputs, num_layers, num_experts):
         outputs.append(path)
     return finish_stage(root, inputs, outputs, hash_outputs=False, buckets=progress["buckets"], tokens=progress["tokens"],
                         hidden=progress["hidden"], num_layers=num_layers, num_experts=num_experts,
-                        sampling=progress.get("sampling", {}))
+                        sampling=progress.get("sampling", {}), raw_storage=progress["config"].get("raw_storage", "dense"),
+                        token_banks=progress.get("token_banks", {}))
 
 
-def load_inputs(root, key, state, hidden):
+def load_inputs(root, key, state, hidden, *, prefer_exported=True):
     path = Path(root) / f"layer_{state['layer']}"
     exported = path / f"{key}_inputs.pt"
-    if exported.exists():
+    if prefer_exported and exported.exists():
         return torch.load(exported, weights_only=True)["inputs"]
+    if state.get("raw_storage") == "indexed":
+        bank = path / f"{state['bank']}.bin"
+        size = bank.stat().st_size
+        if size % (hidden * 2):
+            raise ValueError(f"truncated token bank: {bank}")
+        index_path = path / f"{key}.index"
+        _collection_file(index_path, state["kept"] * 8)
+        indices = torch.from_file(str(index_path), size=state["kept"], dtype=torch.int64)
+        if len(indices) and (int(indices.min()) < 0 or int(indices.max()) >= size // (hidden * 2)):
+            raise ValueError(f"token bank index outside row range: {index_path}")
+        values = torch.from_file(str(bank), size=size // 2, dtype=torch.float16).reshape(-1, hidden)
+        return values.index_select(0, indices)
     return torch.from_file(str(path / f"{key}.bin"), size=state["kept"] * hidden,
                            dtype=torch.float16).reshape(-1, hidden)
 

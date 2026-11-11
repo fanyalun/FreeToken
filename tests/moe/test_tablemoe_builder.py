@@ -411,3 +411,121 @@ def test_fixed_decode_sampling_rejects_incomplete_generation(tmp_path):
     collector.close()
     with pytest.raises(ValueError, match='fixed-length collection coverage'):
         finalize_collection(tmp_path, dict(sample_count=1), 1, 1)
+
+
+from freetoken.moe.tablemoe_builder import load_inputs
+
+
+def _indexed_test_collect(root, storage, dtype, export, resume, reservoir=17):
+    config = dict(raw_storage=storage, dtype=str(dtype).removeprefix('torch.'), export_inputs=export, seed=42, reservoir_size=reservoir)
+    collector = InputCollector(root / 'collect', config, 8, 4)
+    generator = torch.Generator().manual_seed(918)
+    for request in range(3):
+        for phase, count in [('prefill', 29), ('decode', 5)]:
+            modality = torch.arange(count) % 2
+            if phase == 'decode':
+                modality[:] = 1
+            for layer in range(2):
+                x = torch.randn(count, 8, generator=generator).to(dtype)
+                ids = torch.stack([torch.arange(count) % 3, (torch.arange(count) + 1) % 3, torch.arange(count) % 3], dim=1)
+                collector.add(layer, x, ids, modality, phase)
+        collector.flush(request)
+        if resume and request == 1:
+            collector.close()
+            collector = InputCollector(root / 'collect', config, 8, 4)
+    collector.close()
+    inputs = dict(sample_count=3, checkpoint={'path': 'fixture'}, convert_bf16=dtype == torch.float16, processor={})
+    manifest = finalize_collection(root / 'collect', inputs, 2, 4)
+    progress = read_json(root / 'collect/progress.json')
+    values = {key: load_inputs(root / 'collect', key, state, 8).clone() for key, state in progress['buckets'].items()}
+    phases = {key: torch.from_file(str(root / 'collect' / f"layer_{state['layer']}" / f'{key}.phase'), size=state['kept'], dtype=torch.uint8).clone() for key, state in progress['buckets'].items()}
+    return (progress, values, phases, manifest)
+
+@pytest.mark.parametrize('dtype', [torch.float16])
+@pytest.mark.parametrize('export', [False, True])
+@pytest.mark.parametrize('resume', [False, True])
+def test_indexed_reservoir_is_bit_identical_to_dense(tmp_path, dtype, export, resume):
+    dense = _indexed_test_collect(tmp_path / 'dense', 'dense', dtype, export, resume)
+    indexed = _indexed_test_collect(tmp_path / 'indexed', 'indexed', dtype, export, resume)
+    assert dense[0]['tokens'] == indexed[0]['tokens']
+    assert dense[0]['sampling'] == indexed[0]['sampling']
+    assert dense[0]['requests'] == indexed[0]['requests']
+    assert set(dense[0]['buckets']) == set(indexed[0]['buckets'])
+    assert all(('_E3_' not in key for key in indexed[0]['buckets']))
+    for key, state in dense[0]['buckets'].items():
+        other = {k: v for k, v in indexed[0]['buckets'][key].items() if k not in ('raw_storage', 'bank')}
+        assert state == other
+        assert torch.equal(dense[1][key].view(torch.uint16), indexed[1][key].view(torch.uint16))
+        assert torch.equal(dense[2][key], indexed[2][key])
+    assert not list((tmp_path / 'indexed/collect').glob('layer_*/*_E*.bin'))
+    assert len(indexed[0]['token_banks']) == 4
+
+def test_indexed_inputs_keep_pca_clusters_and_materialized_values_exact(tmp_path):
+    for name in ('dense', 'indexed'):
+        _indexed_test_collect(tmp_path / name, name, torch.float16, False, True, reservoir=100)
+        cluster(tmp_path / name, dict(device='cpu', pca_dim=2, clusters=4, iterations=5))
+        generator = torch.Generator().manual_seed(183)
+        pieces = [(layer, 0, 4, dict(gate_up=torch.randn(4, 12, 8, generator=generator).half(), down=torch.randn(4, 8, 6, generator=generator).half())) for layer in range(2)]
+        materialize(tmp_path / name, dict(device='cpu', pca_dim=2, clusters=4, iterations=5), pieces=pieces)
+    for stage in ('cluster', 'cache'):
+        left = tmp_path / 'dense' / stage
+        right = tmp_path / 'indexed' / stage
+        paths = sorted(left.glob('layer_*/*.pt'))
+        assert paths
+        for path in paths:
+            a = torch.load(path, weights_only=True)
+            b = torch.load(right / path.relative_to(left), weights_only=True)
+            assert a.keys() == b.keys()
+            assert all((torch.equal(a[key], b[key]) for key in a))
+
+def test_indexed_resume_rejects_truncated_bank_and_index(tmp_path):
+    config = dict(raw_storage='indexed', export_inputs=False)
+    root = tmp_path / 'collect'
+    collector = InputCollector(root, config, 8, 2)
+    collector.add(0, torch.ones(5, 8).half(), torch.zeros(5, 1, dtype=torch.long), torch.ones(5, dtype=torch.int8), 'prefill')
+    collector.flush(0)
+    collector.close()
+    bank = root / 'layer_0/L0_text_tokens.bin'
+    original = bank.read_bytes()
+    bank.write_bytes(original[:-2])
+    with pytest.raises(ValueError, match='truncated'):
+        InputCollector(root, config, 8, 2)
+    bank.write_bytes(original)
+    index = root / 'layer_0/L0_E0_text.index'
+    original = index.read_bytes()
+    index.write_bytes(original[:-1])
+    with pytest.raises(ValueError, match='truncated'):
+        InputCollector(root, config, 8, 2)
+
+def test_image_identity_collection_rejects_concurrent_requests(tmp_path):
+    from types import SimpleNamespace
+    collector = InputCollector(tmp_path, dict(sampling_policy='tablemoe_default', sample_count=2, collection_image_ids=[[], []]), 8, 1)
+    requests = [SimpleNamespace(uid=uid, cached_len=0, extend_len=2, input_ids=torch.arange(2), mm_items=[]) for uid in range(2)]
+    batch = SimpleNamespace(is_prefill=True, padded_reqs=requests)
+    try:
+        with pytest.raises(ValueError, match='serial bs1'):
+            collector.snapshot(0, torch.ones(4, 8).half(), torch.zeros(4, 1, dtype=torch.long), batch)
+        one = SimpleNamespace(is_prefill=True, padded_reqs=requests[:1], prompt_admissions=[(0, 2, 0)])
+        collector.snapshot(0, torch.ones(2, 8).half(), torch.zeros(2, 1, dtype=torch.long), one)
+        second = SimpleNamespace(is_prefill=True, padded_reqs=requests[1:], prompt_admissions=[(1, 2, 0)])
+        with pytest.raises(ValueError, match='one active'):
+            collector.snapshot(0, torch.ones(2, 8).half(), torch.zeros(2, 1, dtype=torch.long), second)
+    finally:
+        collector.close()
+
+def test_per_image_selected_tokens_exclude_shared_images(tmp_path):
+    from types import SimpleNamespace
+    config = dict(raw_storage='indexed', sampling_policy='tablemoe_default', sample_count=2, collection_image_ids=[['a'], ['a', 'b']], min_vision_per_sample=10, max_vision_per_sample=10)
+    collector = InputCollector(tmp_path, config, 8, 1)
+    try:
+        for uid, spans in [(0, [(1, 3)]), (1, [(1, 3), (4, 6)])]:
+            req = SimpleNamespace(uid=uid, input_ids=torch.arange(8), cached_len=0, extend_len=8, mm_items=[SimpleNamespace(offsets=[span]) for span in spans])
+            batch = SimpleNamespace(is_prefill=True, padded_reqs=[req], prompt_admissions=[(uid, 8, 0)])
+            collector.snapshot(0, torch.ones(8, 8).half(), torch.zeros(8, 1, dtype=torch.long), batch)
+            collector.flush(uid)
+    finally:
+        collector.close()
+    a, b = collector.sample_state['records']
+    assert a['image_offsets'] == [[[1, 3]]] and b['image_offsets'] == [[[1, 3]], [[4, 6]]]
+    assert a['selected_visual_tokens_per_image'] == [2]
+    assert b['selected_visual_tokens_per_image'] == [0, 2]
