@@ -79,7 +79,7 @@ def finish_stage(root, inputs, outputs, *, hash_outputs=True, **details):
     return manifest
 
 
-def verify_stage(root, inputs=None, *, hash_outputs=None):
+def verify_stage(root, inputs=None, *, hash_outputs=None, output_filter=None):
     root = Path(root)
     marker = read_json(root / "complete.json")
     if not marker.get("complete") or marker.get("manifest_sha256") != file_hash(root / "manifest.json"):
@@ -94,11 +94,13 @@ def verify_stage(root, inputs=None, *, hash_outputs=None):
         table = "buckets" in manifest or "pca_outputs" in manifest or "source_inputs" in manifest
         hash_outputs = manifest.get("output_validation") != "paths" and not table
     for name, expected in manifest["outputs"].items():
+        if output_filter is not None and not output_filter(name):
+            continue
         file_metadata(root / name)
         if hash_outputs and file_hash(root / name) != expected:
             raise ValueError(f"changed artifact: {root / name}")
     for dependency, expected in manifest.get("dependencies", {}).items():
         if file_hash(Path(dependency) / "manifest.json") != expected:
             raise ValueError(f"changed dependency: {dependency}")
-        verify_stage(dependency)
+        verify_stage(dependency, output_filter=output_filter)
     return manifest

@@ -27,7 +27,7 @@ def reconcile(c, lookup_enabled=True, offline_enabled=None):
     exact = c["cpu_exact_routes"] + c["gpu_exact_routes"]
     checks = [c["routes"] == exact + c["online_hits"] + c["offline_hits"] + c["dropped_routes"],
               c["offline_queries"] == (c.get("lookup_eligible_routes", c["routes"] - exact)
-                                       - c["online_hits"] if offline_enabled else 0),
+                                       - c.get("offline_eligible_online_hits", c["online_hits"]) if offline_enabled else 0),
               c["offline_queries"] == c["offline_hits"] + c["offline_misses"],
               c["online_queries"] == c["online_hits"] + c["online_misses"],
               c["gpu_cache_queries"] == c["gpu_cache_hit_routes"] + c["gpu_cache_miss_routes"],
@@ -126,7 +126,7 @@ class RequestAudit:
             ws["request_slots"], ws["modality"], rt.gpu_counts.get(layer, ids),
             self.counts, shared, rt.top_k, rt.hidden, layer, rt.num_layers, phase, rt.dummy_slot,
             rt.expert_cache is not None, has_cpu, not prefill and rt.online_enabled() and not bypass,
-            bypass, triton.next_power_of_2(rt.top_k), offline)
+            bypass, triton.next_power_of_2(rt.top_k), offline, len(rt.offline_modalities()))
         flag = has_cpu and rt.executor._flag_sync and (layer, len(ids)) in rt.executor._flag_slots
         _audit_shared[(1,)](shared, rt.expert_cache.num_indices if rt.expert_cache is not None else ids,
                             rt.expert_bytes, rt.expert_cache is not None, flag)
@@ -162,7 +162,8 @@ class RequestAudit:
                     for name, value in c.items():
                         total[name] += value
                     lookup = rt.lookup_enabled(phase == 0)
-                    offline = rt.offline_enabled(phase == 0)
+                    offline = rt.offline_enabled(phase == 0) and mod < len(rt.offline_modalities())
+                    lookup = offline or (phase == 1 and rt.online_enabled() and lookup)
                     rows.append(dict(layer=layer, phase=("prefill", "decode")[phase], modality=("vision", "text")[mod],
                                      routing_policy="modes" if rt.uses_modes_routing(phase == 0) else "tablemoe",
                                      counters=c, lookup_enabled=lookup,
@@ -176,6 +177,8 @@ class RequestAudit:
         total["lookup_eligible_routes"] = sum(
             row["counters"]["routes"] - row["counters"]["cpu_exact_routes"] - row["counters"]["gpu_exact_routes"]
             for row in rows if row["offline_enabled"])
+        total["offline_eligible_online_hits"] = sum(
+            row["counters"]["online_hits"] for row in rows if row["offline_enabled"])
         if getattr(rt, "external_mask", False):
             total["modes_skipped_routes"] = sum(
                 row["counters"]["routes"] - row["counters"]["cpu_exact_routes"] - row["counters"]["gpu_exact_routes"]

@@ -53,6 +53,49 @@ def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monke
         runtime._load_assets()
 
 
+def test_modality_split_loads_only_vision_assets_from_mixed_manifest(tmp_path, monkeypatch):
+    from freetoken.moe import tablemoe_artifacts
+
+    pca, cache, model = (tmp_path / name for name in ("pca", "cache", "model"))
+    for folder in (pca / "layer_0", cache / "layer_0", model):
+        folder.mkdir(parents=True)
+    vision_pca = pca / "layer_0/L0_vision_pca.pt"
+    vision_cache = cache / "layer_0/L0_E0_vision_cache.pt"
+    torch.save(dict(mean=torch.zeros(4), proj=torch.eye(4, 2)), vision_pca)
+    torch.save(dict(key=torch.ones(1, 2).half(), value=torch.ones(1, 4).half()), vision_cache)
+    manifest = dict(inputs={}, input_sha256=tablemoe_artifacts.digest({}),
+                    outputs={"layer_0/L0_E0_vision_cache.pt": None, "layer_0/L0_E0_text_cache.pt": None},
+                    pca_outputs={"layer_0/L0_vision_pca.pt": None, "layer_0/L0_text_pca.pt": None},
+                    provenance=dict(checkpoint=dict(path=str(model)), convert_bf16=False, processor={}))
+    tablemoe_artifacts.write_json(cache / "manifest.json", manifest)
+    tablemoe_artifacts.write_json(cache / "complete.json", dict(
+        complete=True, manifest_sha256=tablemoe_artifacts.file_hash(cache / "manifest.json")))
+    original_load, original_hash = torch.load, tablemoe_artifacts.file_hash
+    loaded = []
+
+    def load(path, **kwargs):
+        assert "_text_" not in str(path)
+        loaded.append(Path(path))
+        return original_load(path, **kwargs)
+
+    def metadata_hash(path):
+        assert Path(path).suffix != ".pt"
+        return original_hash(path)
+
+    monkeypatch.setattr(torch, "load", load)
+    monkeypatch.setattr(tablemoe_artifacts, "file_hash", metadata_hash)
+    rt = TableMoeRuntime.__new__(TableMoeRuntime)
+    rt.config = SimpleNamespace(tablemoe_lookup_mode="modality_split", tablemoe_pca_dir=str(pca),
+        tablemoe_cache_dir=str(cache), model_path=str(model), tablemoe_convert_bf16_weights=False,
+        mm=SimpleNamespace(processor_kwargs={}))
+    rt.hidden, rt.num_experts, rt.num_layers = 4, 1, 1
+    rt.pca, rt.offline_paths = {}, {}
+    rt._load_assets()
+    assert loaded == [vision_pca, vision_cache]
+    assert set(rt.pca) == {(0, "vision")}
+    assert set(rt.offline_paths) == {(0, 0, "vision")}
+
+
 def test_prefill_selection_uses_last_token_attention_and_router_weights():
     ids = torch.tensor([[0, 1], [0, 2], [2, 1]])
     weights = torch.tensor([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3]])
@@ -404,7 +447,7 @@ def test_bf16_source_requires_explicit_conversion_flag(tmp_path):
 
 
 @pytest.mark.parametrize("lookup_mode,needs_assets", [("all", True), ("offline", True),
-                                                       ("online", False), ("none", False)])
+                                                       ("online", False), ("none", False), ("modality_split", True)])
 def test_lookup_mode_requires_only_its_offline_assets(tmp_path, lookup_mode, needs_assets):
     save_file({"model.layers.0.experts.down_proj": torch.ones(2, 2, dtype=torch.float16)},
               tmp_path / "model.safetensors")
@@ -1061,6 +1104,118 @@ def test_lookup_mode_graph_replays_without_cross_table_fallback(runtime, tmp_pat
     else:
         assert counters["online_queries"] == 6 and counters["online_hits"] == 3
         assert counters["offline_queries"] == 0
+
+
+def _modality_split_assets(runtime):
+    runtime.config.tablemoe_lookup_mode = "modality_split"
+    runtime.config.tablemoe_renormalize_weights = False
+    root = Path(runtime.config.tablemoe_cache_dir) / "layer_0"
+    torch.save(dict(key=torch.tensor([[1., 0.]]).half(),
+                    value=torch.tensor([[2., 0., 0., 0.]]).half()), root / "L0_E1_vision_cache.pt")
+    runtime.pca.clear()
+    runtime.offline_paths.clear()
+    runtime._load_assets()
+    runtime._prepare_gpu_assets()
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized"])
+def test_modality_split_prefill_seed_decode_threshold_and_isolation(runtime, tmp_path, implementation):
+    from freetoken.moe.tablemoe_stats import reconcile
+
+    _modality_split_assets(runtime)
+    runtime.config.tablemoe_report_path = str(tmp_path / "split_audit.jsonl")
+    rt = _optimized(runtime) if implementation == "optimized" else runtime
+    assert set(rt.pca) == {(0, "vision")}
+    assert rt.gpu_keys[0].shape[1] == rt.gpu_counts[0].shape[1] == 1
+    assert rt.host_values[0].numel() == (4 if implementation == "optimized" else 8)
+    gate = torch.full((2, 4, 4), .2, dtype=torch.float16)
+    down = torch.full((2, 4, 2), .4, dtype=torch.float16)
+    rt.executor = _executor(gate, down, 2)
+    make_batch = _optimized_batch if implementation == "optimized" else _batch
+    x = torch.tensor([[1., 0., 0., 0.], [.65, .76, 0., 0.], [2., 0., 0., 0.],
+                      [.5, .866, 0., 0.], [1., 0., 0., 0.]], device="cuda").half()
+    ids = torch.tensor([[0, 1]] * 5, device="cuda")
+    weights = torch.tensor([[.75, .25]] * 5, device="cuda")
+    batch = make_batch(n=5, prefill=True)
+    batch.mm_rows = torch.tensor([1, 3, 4], device="cuda")
+    batch.tablemoe_attn_scores = {0: torch.ones(5, device="cuda")}
+    actual = rt.forward(0, x, weights, ids, batch).clone()
+    g, u = F.linear(x.cpu(), gate[0]).chunk(2, -1)
+    expected = (F.linear(F.silu(g) * u, down[0]).cuda().float() * .75).half()
+    expected[[1, 4], 0] += .5
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=.02)
+    online = rt.fixed_online[0] if implementation == "optimized" else rt.online[100][0]
+    keys = online["keys"][0] if implementation == "optimized" else online["keys"]
+    torch.testing.assert_close(keys, x[[0, 2]])
+    rt.config.tablemoe_decode_keep_k = 0
+    for query, hit in ((x[:1] * 3, True), (x[1:2], False)):
+        result = rt.forward(0, query, weights[:1], ids[:1], make_batch()).clone()
+        torch.testing.assert_close(result, expected[:1] if hit else torch.zeros_like(result), atol=1e-3, rtol=.02)
+    fresh = make_batch(uid=101, **({"slot": 1} if implementation == "optimized" else {}))
+    assert not rt.forward(0, x[:1], weights[:1], ids[:1], fresh).any()
+    if implementation == "optimized":
+        rt.release_request(100)
+        audit = rt.audit.last_request
+        assert reconcile(audit["counters"], offline_enabled=True)
+        assert audit["counters"]["offline_queries"] == 3
+        for row in audit["rows"]:
+            assert row["reconciled"]
+            if row["modality"] == "text":
+                assert row["counters"]["offline_queries"] == 0
+        assert int(rt.fixed_online[0]["size"][0]) == 0
+        rt.close()
+
+
+@pytest.mark.parametrize("capacity", [0, 2])
+def test_modality_split_visual_prefill_does_not_seed_online(runtime, capacity):
+    _modality_split_assets(runtime)
+    runtime.config.tablemoe_online_cache_size = capacity
+    rt = _optimized(runtime)
+    x = torch.tensor([[1., 0., 0., 0.]], device="cuda").half()
+    batch = _optimized_batch(prefill=True)
+    batch.mm_rows = torch.tensor([0], device="cuda")
+    rt.forward(0, x, torch.tensor([[.75, .25]], device="cuda"), torch.tensor([[0, 1]], device="cuda"), batch)
+    assert not rt.fixed_online[0]["size"].any()
+    rt.close()
+
+
+def test_modality_split_decode_graph_has_no_offline_fallback(runtime):
+    _modality_split_assets(runtime)
+    rt = _optimized(runtime, "offload")
+    rt.config.tablemoe_decode_keep_k = 0
+    x = torch.zeros(1, rt.hidden, device="cuda", dtype=torch.float16)
+    x[:, 0] = 1
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.25, .75]], device="cuda")
+    batch = _optimized_batch()
+    rt.prepare_batch(batch)
+    batch.tablemoe_slots.fill_(rt.dummy_slot)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rt.forward(0, x, weights, ids, batch)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = rt.forward(0, x, weights, ids, batch)
+    batch.tablemoe_slots.zero_()
+    for similarity, expected in ((1., 2.25), (.65, 0.), (.8, 2.25)):
+        rt.reset_capture_state()
+        online = rt.fixed_online[0]
+        online["keys"][0, 0].zero_()
+        online["keys"][0, 0, 0] = similarity * 3
+        online["keys"][0, 0, 1] = (1 - similarity**2)**.5 * 3
+        online["ids"][0, 0].copy_(ids[0])
+        online["ids"][0, 0, 0] = -1
+        online["values"][0, 0].zero_()
+        online["values"][0, 0, 1, 0] = 3
+        online["size"][0:1].fill_(1)
+        graph.replay()
+        reference = torch.zeros_like(x)
+        reference[:, 0] = expected
+        torch.testing.assert_close(result, reference)
+        assert rt.stats()["offline_hits"] == 0
+    rt.close()
 
 
 def test_optimized_mapped_sparse_values_and_online_reuse(runtime):

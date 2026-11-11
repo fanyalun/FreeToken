@@ -121,6 +121,7 @@ weight setting and prefill scheduling identical, and change only the lookup mode
 | `+schedule` | `--tablemoe-lookup-mode none` | Skip | Skip | Off |
 | `+table` | `--tablemoe-lookup-mode offline` | Offline table with modality thresholds | Offline table | Off |
 | Online only | `--tablemoe-lookup-mode online` | Skip | Online table; skip misses | On |
+| Modality split | `--tablemoe-lookup-mode modality_split` | Vision: offline; text: skip | Text: online only; skip misses | Text tokens only |
 | Full TableMoE | `--tablemoe-lookup-mode all` | Offline table with modality thresholds | Online, then offline on misses | On |
 
 Exact selection remains attention-ranked active experts in prefill, and Top-h plus routed
@@ -133,6 +134,25 @@ Online-only lookup uses the same request-local table as the full mode: prefill d
 query it, and exact prefill results seed it for decode. A zero online cache size disables
 its updates and queries. Request audits record the effective lookup mode and the enabled
 online/offline sources for each phase.
+
+`modality_split` loads only vision PCA and vision offline keys/values, with a single
+modality dimension in GPU tables. Text offline files are neither required nor loaded,
+including when reusing a manifest that also lists text assets. Vision prefill lookups
+use `--tablemoe-offline-cosine-threshold-vision` (default 0.6). Text prefill does not
+query either table; its exact expert outputs seed the request-local online table.
+Only text rows consume online capacity, including in mixed and chunked prefill batches.
+Vision rows never seed the online table. Decode queries and updates only the online
+table, without PCA projection or offline fallback. Its cosine threshold defaults to
+`--tablemoe-offline-cosine-threshold-text` (0.7); an explicit
+`--tablemoe-decode-online-cosine-threshold` overrides that value.
+
+To enable the split variant on an existing TableMoE command, add:
+
+```bash
+--tablemoe-lookup-mode modality_split \
+--tablemoe-offline-cosine-threshold-vision 0.6 \
+--tablemoe-decode-online-cosine-threshold 0.7
+```
 
 ### MoE I/O profiling
 

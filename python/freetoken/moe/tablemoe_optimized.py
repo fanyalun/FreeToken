@@ -49,10 +49,11 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             data = [(key, torch.load(path, map_location="cpu", weights_only=True, mmap=True))
                     for key, path in self.offline_paths.items() if key[0] == layer]
             clusters = max([1] + [d["key"].shape[0] for _, d in data])
-            width = self.pca[layer, "text"][0].shape[1]
-            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=torch.float16)
-            counts = torch.zeros(self.num_experts, 2, dtype=torch.int32)
-            offsets = torch.full((self.num_experts, 2), -1, dtype=torch.int64)
+            modalities = self.offline_modalities()
+            width = self.pca[layer, modalities[0]][0].shape[1]
+            keys = torch.zeros(self.num_experts, len(modalities), clusters, width, dtype=torch.float16)
+            counts = torch.zeros(self.num_experts, len(modalities), dtype=torch.int32)
+            offsets = torch.full((self.num_experts, len(modalities)), -1, dtype=torch.int64)
             total = sum(d["value"].shape[0] for _, d in data)
             try:
                 values = alloc_pinned_tensor(max(1, total), self.hidden, dtype=torch.float16)
@@ -70,7 +71,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             self.gpu_keys[layer], self.gpu_counts[layer] = keys.to(self.device), counts.to(self.device)
             self.value_offsets[layer] = offsets.to(self.device)
             self.host_values[layer], self.value_addresses[layer] = values, address
-            for mod in ("vision", "text"):
+            for mod in modalities:
                 path = Path(self.config.tablemoe_pca_dir) / f"layer_{layer}" / f"L{layer}_{mod}_pca.pt"
                 d = torch.load(path, map_location="cpu", weights_only=True)
                 proj = d["proj"].to(device=self.device, dtype=torch.float16)
@@ -192,10 +193,10 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             request_slots=empty(bs, dtype=torch.int32), update_rows=empty(bs, dtype=torch.int32),
             update_counts=empty(bs, dtype=torch.int32), modality=torch.ones(bs, device=self.device, dtype=torch.int32),
             gathered=empty(bs, max(1, self.capacity), h), scores=empty(bs, 1, max(1, self.capacity)),
-            query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
+            query={layer: empty(bs, self.pca[layer, self.offline_modalities()[0]][0].shape[1]) for layer in range(self.num_layers)
                    if self.offline_enabled()},
-            vision_query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
-                          if self.offline_enabled()},
+            vision_query={layer: empty(bs, self.pca[layer, "vision"][0].shape[1]) for layer in range(self.num_layers)
+                          if self.offline_enabled() and len(self.offline_modalities()) == 2},
             gpu_weights=torch.ones(bs, gk, device=self.device, dtype=torch.float32),
             gpu_workspace=(empty(bs, gk, 2 * inter), empty(bs * gk, inter), empty(bs, gk, h)),
         )
@@ -316,6 +317,10 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         exact = torch.empty_like(ids, dtype=torch.bool)
         update = torch.full((x.shape[0],), -1, device=self.device, dtype=torch.int32)
         advance = torch.zeros_like(update)
+        text_rows = None
+        if len(self.offline_modalities()) == 1 and batch.mm_rows is not None:
+            text_rows = torch.ones(x.shape[0], device=self.device, dtype=torch.bool)
+            text_rows[batch.mm_rows.long()] = False
         offset = 0
         for req in batch.padded_reqs:
             n = req.extend_len
@@ -324,8 +329,13 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 batch.tablemoe_attn_scores[layer][offset:offset + n],
                 self.num_experts, self.config.tablemoe_prefill_keep_rate)
             count = min(n, self.capacity)
+            candidates = None
+            if count and text_rows is not None:
+                candidates = torch.arange(offset, offset + n, device=self.device)[text_rows[offset:offset + n]]
+                count = min(candidates.numel(), self.capacity)
             if count and req.uid != -1:
-                update[offset + n - count:offset + n] = torch.arange(count, device=self.device)
+                rows = candidates[-count:] if candidates is not None else slice(offset + n - count, offset + n)
+                update[rows] = torch.arange(count, device=self.device, dtype=update.dtype)
                 advance[offset + n - 1] = count
             offset += n
         output = torch.empty_like(x)
@@ -383,7 +393,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 kernels._gather_online_keys[(bs, self.capacity, triton.cdiv(self.hidden, 256))](
                     online["keys"], ws["gathered"], ws["request_slots"], online["size"],
                     self.hidden, self.capacity, self.dummy_slot, 256)
-                threshold = getattr(self.config, "tablemoe_decode_online_cosine_threshold", None)
+                threshold = self.online_threshold()
                 online_query = x
                 if threshold is not None:
                     online_query = F.normalize(x.float(), dim=-1, eps=1e-6).to(x.dtype)
@@ -395,14 +405,16 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                     self.dummy_slot, triton.next_power_of_2(self.capacity),
                     triton.next_power_of_2(self.hidden), triton.next_power_of_2(k), threshold)
             if self.offline_enabled(prefill):
-                proj, bias = self.pca[layer, "text"]
+                split = len(self.offline_modalities()) == 1
+                proj, bias = self.pca[layer, "vision" if split else "text"]
                 query = ws["query"][layer]
                 torch.addmm(bias, x, proj, out=query)
-                if prefill:
+                if prefill and not split:
                     proj, bias = self.pca[layer, "vision"]
                     vq = ws["vision_query"][layer]
                     torch.addmm(bias, x, proj, out=vq)
                     torch.where((ws["modality"] == 0)[:, None], vq, query, out=query)
+                if prefill:
                     F.normalize(query, dim=-1, eps=1e-6, out=query)
             self.lookup_ready.record()
             self.lookup_stream.wait_event(self.lookup_ready)
@@ -417,7 +429,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                         triton.next_power_of_2(self.hidden), prefill,
                         self.config.tablemoe_offline_cosine_threshold_vision,
                         self.config.tablemoe_offline_cosine_threshold_text,
-                        getattr(self.config, "tablemoe_decode_offline_cosine_threshold", None))
+                        getattr(self.config, "tablemoe_decode_offline_cosine_threshold", None), keys.shape[1])
                 else:
                     ws["off"].zero_()
                 self.lookup_done.record()

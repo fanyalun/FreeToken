@@ -19,8 +19,8 @@ _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
 
 def tablemoe_lookup_mode(config) -> str:
     mode = getattr(config, "tablemoe_lookup_mode", "all")
-    if mode not in ("all", "offline", "online", "none"):
-        raise ValueError("tablemoe lookup mode must be all, offline, online, or none")
+    if mode not in ("all", "offline", "online", "none", "modality_split"):
+        raise ValueError("tablemoe lookup mode must be all, offline, online, none, or modality_split")
     return "none" if getattr(config, "tablemoe_skip_lookup", False) else mode
 
 
@@ -194,17 +194,27 @@ class TableMoeRuntime:
         if config.tablemoe_convert_bf16_weights:
             logger.info("TableMoE converted BF16 source experts into FP16 CPU banks")
 
+    def offline_modalities(self):
+        return ("vision",) if tablemoe_lookup_mode(self.config) == "modality_split" else ("vision", "text")
+
+    def online_threshold(self):
+        threshold = getattr(self.config, "tablemoe_decode_online_cosine_threshold", None)
+        if threshold is None and tablemoe_lookup_mode(self.config) == "modality_split":
+            threshold = self.config.tablemoe_offline_cosine_threshold_text
+        return threshold
+
     def offline_enabled(self, prefill=None):
         policy = getattr(self.config, "moe_policy", "native")
         phase_enabled = (prefill is None or policy == "native" or
                          (getattr(self.config, "modes_prefill_policy", "modes") == "tablemoe"
                           if prefill else policy != "modes"))
+        mode = tablemoe_lookup_mode(self.config)
         return (not getattr(self, "bypass_tables", False) and phase_enabled and
-                tablemoe_lookup_mode(self.config) in ("all", "offline"))
+                (mode in ("all", "offline") or (mode == "modality_split" and prefill is not False)))
 
     def online_enabled(self):
         return (not getattr(self, "bypass_tables", False) and
-                tablemoe_lookup_mode(self.config) in ("all", "online") and
+                tablemoe_lookup_mode(self.config) in ("all", "online", "modality_split") and
                 self.config.tablemoe_online_cache_size > 0)
 
     def lookup_enabled(self, prefill):
@@ -212,6 +222,11 @@ class TableMoeRuntime:
 
     def _load_assets(self) -> None:
         cfg = self.config
+        modalities = self.offline_modalities()
+
+        def selected(path):
+            return len(modalities) == 2 or not str(path).endswith(("_text_cache.pt", "_text_pca.pt"))
+
         if getattr(self, "bypass_tables", False):
             self.asset_provenance = "skip_lookup" if tablemoe_lookup_mode(cfg) == "none" else "full_expert_bypass"
             return
@@ -225,9 +240,9 @@ class TableMoeRuntime:
         if (Path(cfg.tablemoe_cache_dir) / "manifest.json").exists():
             from freetoken.moe.tablemoe_artifacts import verify_stage
 
-            manifest = verify_stage(cfg.tablemoe_cache_dir, hash_outputs=False)
-            actual = {str(p.relative_to(cfg.tablemoe_cache_dir)) for p in Path(cfg.tablemoe_cache_dir).glob("layer_*/*_cache.pt")}
-            declared = {p for p in manifest["outputs"] if p.endswith("_cache.pt")}
+            manifest = verify_stage(cfg.tablemoe_cache_dir, hash_outputs=False, output_filter=selected)
+            actual = {str(p.relative_to(cfg.tablemoe_cache_dir)) for p in Path(cfg.tablemoe_cache_dir).glob("layer_*/*_cache.pt") if selected(p)}
+            declared = {p for p in manifest["outputs"] if p.endswith("_cache.pt") and selected(p)}
             if actual != declared:
                 raise ValueError("TableMoE cache contains undeclared or missing asset files")
             expected = manifest["provenance"]["checkpoint"]
@@ -237,6 +252,8 @@ class TableMoeRuntime:
             if manifest["provenance"]["processor"] != cfg.mm.processor_kwargs:
                 raise ValueError("TableMoE asset processor configuration mismatch")
             for name in manifest["pca_outputs"]:
+                if not selected(name):
+                    continue
                 if not (Path(cfg.tablemoe_pca_dir) / name).is_file():
                     raise ValueError(f"missing TableMoE PCA file: {name}")
             self.asset_provenance = "paths_checked"
@@ -247,11 +264,11 @@ class TableMoeRuntime:
 
                 self.asset_fingerprints = {str(path.resolve()): digest(file_metadata(path))
                                            for root in (cfg.tablemoe_pca_dir, cfg.tablemoe_cache_dir)
-                                           for path in sorted(Path(root).glob("layer_*/*.pt"))}
+                                           for path in sorted(Path(root).glob("layer_*/*.pt")) if selected(path)}
         pca_root = Path(cfg.tablemoe_pca_dir)
         cache_root = Path(cfg.tablemoe_cache_dir)
         for layer in range(self.num_layers):
-            for modality in ("vision", "text"):
+            for modality in modalities:
                 path = pca_root / f"layer_{layer}" / f"L{layer}_{modality}_pca.pt"
                 if not path.is_file():
                     raise ValueError(f"missing TableMoE PCA file: {path}")
@@ -261,13 +278,15 @@ class TableMoeRuntime:
                     raise ValueError(f"incompatible TableMoE PCA dimensions: {path}")
                 self.pca[layer, modality] = (proj.float().contiguous(),
                                              -mean.float() @ proj.float())
-            width = self.pca[layer, "text"][0].shape[1]
-            if self.pca[layer, "vision"][0].shape[1] != width:
+            width = self.pca[layer, modalities[0]][0].shape[1]
+            if any(self.pca[layer, mod][0].shape[1] != width for mod in modalities):
                 raise ValueError(f"TableMoE PCA modalities disagree at layer {layer}")
             for path in (cache_root / f"layer_{layer}").glob("*_cache.pt"):
                 match = _CACHE_NAME.fullmatch(path.name)
                 if match is None or int(match[1]) != layer or int(match[2]) >= self.num_experts:
                     raise ValueError(f"invalid TableMoE cache filename: {path}")
+                if match[3] not in modalities:
+                    continue
                 data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
                 key, value = data["key"], data["value"]
                 if (key.ndim != 2 or key.shape[1] != width or value.shape != (key.shape[0], self.hidden)
@@ -284,10 +303,11 @@ class TableMoeRuntime:
             data = [(key, torch.load(path, map_location="cpu", weights_only=True, mmap=True))
                     for key, path in files]
             clusters = max([1] + [d["key"].shape[0] for _, d in data])
-            width = self.pca[layer, "text"][0].shape[1]
-            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=torch.float16)
-            counts = torch.zeros(self.num_experts, 2, dtype=torch.int32)
-            values = torch.empty(self.num_experts, 2, clusters, self.hidden, dtype=torch.float16)
+            modalities = self.offline_modalities()
+            width = self.pca[layer, modalities[0]][0].shape[1]
+            keys = torch.zeros(self.num_experts, len(modalities), clusters, width, dtype=torch.float16)
+            counts = torch.zeros(self.num_experts, len(modalities), dtype=torch.int32)
+            values = torch.empty(self.num_experts, len(modalities), clusters, self.hidden, dtype=torch.float16)
             for (_, expert, modality), d in data:
                 mod = 0 if modality == "vision" else 1
                 n = d["key"].shape[0]
@@ -297,7 +317,7 @@ class TableMoeRuntime:
             self.gpu_keys[layer] = keys.to(self.device)
             self.gpu_counts[layer] = counts.to(self.device)
             self.host_values[layer] = values.reshape(-1, self.hidden)
-            for modality in ("vision", "text"):
+            for modality in modalities:
                 # Match the reference's FP16 mean/projection and FP16 bias rounding.
                 path = Path(self.config.tablemoe_pca_dir) / f"layer_{layer}" / f"L{layer}_{modality}_pca.pt"
                 d = torch.load(path, map_location="cpu", weights_only=True)
@@ -343,7 +363,7 @@ class TableMoeRuntime:
         if cache is None or cache["size"] == 0:
             return torch.zeros(shape, dtype=x.dtype, device=x.device), torch.zeros_like(ids, dtype=torch.bool)
         size = cache["size"]
-        threshold = getattr(self.config, "tablemoe_decode_online_cosine_threshold", None)
+        threshold = self.online_threshold()
         keys = cache["keys"][:size]
         if threshold is not None:
             x = F.normalize(x.float(), dim=-1, eps=1e-6).to(x.dtype)
@@ -357,7 +377,7 @@ class TableMoeRuntime:
         return values.masked_fill(~hit[:, :, None], 0), hit
 
     def _update_online(self, uid, layer, x, ids, outputs, survived):
-        if not self.online_enabled():
+        if not self.online_enabled() or x.shape[0] == 0:
             return
         capacity = self.config.tablemoe_online_cache_size
         if capacity == 0:
@@ -382,14 +402,18 @@ class TableMoeRuntime:
     def _search(self, layer, x, ids, modality, reuse, prefill):
         from freetoken.kernel.triton.tablemoe import offline_search
 
-        text_proj, text_bias = self.pca[layer, "text"]
+        split = len(self.offline_modalities()) == 1
+        has_modality = modality is not None
+        if modality is None:
+            modality = torch.ones(x.shape[0], dtype=torch.int32, device=x.device)
+        if split:
+            reuse = reuse & (modality == 0)[:, None]
+        text_proj, text_bias = self.pca[layer, "vision" if split else "text"]
         query = torch.addmm(text_bias, x, text_proj)
-        if modality is not None:
+        if not split and has_modality:
             vision_proj, vision_bias = self.pca[layer, "vision"]
             vision_query = torch.addmm(vision_bias, x, vision_proj)
             query = torch.where((modality == 0)[:, None], vision_query, query)
-        else:
-            modality = torch.ones(x.shape[0], dtype=torch.int32, device=x.device)
         if prefill:
             query = F.normalize(query, dim=-1, eps=1e-6)
         return offline_search(
@@ -553,7 +577,10 @@ class TableMoeRuntime:
                     (~survived[start:end]).sum(), (~survived[start:end].any(-1)).sum(),
                 ))
         for uid, lo, hi in spans:
-            self._update_online(uid, layer_id, hidden_states[lo:hi], ids[lo:hi], outputs[lo:hi], survived[lo:hi])
+            rows = slice(lo, hi)
+            if batch.is_prefill and modality is not None and len(self.offline_modalities()) == 1:
+                rows = torch.arange(lo, hi, device=ids.device)[modality[lo:hi] == 1]
+            self._update_online(uid, layer_id, hidden_states[rows], ids[rows], outputs[rows], survived[rows])
         merged_weights = (renormalize_weights(weights, survived)
                           if getattr(self.config, "tablemoe_renormalize_weights", False)
                           else weights.float() * survived)

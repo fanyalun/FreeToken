@@ -8,7 +8,8 @@ def _offline_search(query, keys, counts, ids, modality, reuse, result,
                     TOP_K: tl.constexpr, DIM: tl.constexpr, CLUSTERS: tl.constexpr,
                     BLOCK_D: tl.constexpr, BLOCK_K: tl.constexpr,
                     PREFILL: tl.constexpr, VISION_THRESHOLD: tl.constexpr,
-                    TEXT_THRESHOLD: tl.constexpr, DECODE_THRESHOLD: tl.constexpr = None):
+                    TEXT_THRESHOLD: tl.constexpr, DECODE_THRESHOLD: tl.constexpr = None,
+                    MODALITIES: tl.constexpr = 2):
     slot = tl.program_id(0)
     if not tl.load(reuse + slot):
         tl.store(result + slot, -1)
@@ -16,13 +17,16 @@ def _offline_search(query, keys, counts, ids, modality, reuse, result,
     row = slot // TOP_K
     expert = tl.load(ids + slot)
     mod = tl.load(modality + row)
-    count = tl.load(counts + expert * 2 + mod)
+    if mod >= MODALITIES:
+        tl.store(result + slot, -1)
+        return
+    count = tl.load(counts + expert * MODALITIES + mod)
     ds = tl.arange(0, BLOCK_D)
     ks = tl.arange(0, BLOCK_K)
     q = tl.load(query + row * DIM + ds, ds < DIM, 0).to(tl.float32)
     if not PREFILL and DECODE_THRESHOLD is not None:
         q = q / tl.maximum(tl.sqrt(tl.sum(q * q, 0)), 1e-6)
-    key = tl.load(keys + ((expert * 2 + mod) * CLUSTERS + ks[:, None]) * DIM + ds[None, :],
+    key = tl.load(keys + ((expert * MODALITIES + mod) * CLUSTERS + ks[:, None]) * DIM + ds[None, :],
                   (ks[:, None] < count) & (ds[None, :] < DIM), 0).to(tl.float32)
     scores = tl.sum(key * q[None, :], 1)
     scores = tl.where(ks < count, scores, -float("inf"))
@@ -34,7 +38,7 @@ def _offline_search(query, keys, counts, ids, modality, reuse, result,
     else:
         hit = best > 0.0
     tl.store(result + slot, tl.where(hit & (count > 0),
-                                    (expert * 2 + mod) * CLUSTERS + index, -1))
+                                    (expert * MODALITIES + mod) * CLUSTERS + index, -1))
 
 
 def offline_search(query, keys, counts, ids, modality, reuse, *, prefill,
@@ -44,7 +48,7 @@ def offline_search(query, keys, counts, ids, modality, reuse, *, prefill,
         query, keys, counts, ids, modality, reuse, result,
         ids.shape[1], query.shape[1], keys.shape[2],
         triton.next_power_of_2(query.shape[1]), triton.next_power_of_2(keys.shape[2]),
-        prefill, vision_threshold, text_threshold, decode_threshold,
+        prefill, vision_threshold, text_threshold, decode_threshold, keys.shape[1],
     )
     return result
 
@@ -142,21 +146,21 @@ def _mapped_offline(query, keys, counts, offsets, host_addr, ids, modality, keep
                     CLUSTERS: tl.constexpr, DUMMY: tl.constexpr,
                     BLOCK_D: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_H: tl.constexpr,
                     PREFILL: tl.constexpr, VISION: tl.constexpr, TEXT: tl.constexpr,
-                    DECODE_THRESHOLD: tl.constexpr = None):
+                    DECODE_THRESHOLD: tl.constexpr = None, MODALITIES: tl.constexpr = 2):
     route = tl.program_id(0)
     row = route // TOP_K
     hit = tl.full((), False, tl.int1)
     index = tl.full((), -1, tl.int64)
     req = tl.load(request_slots + row)
-    if (req != DUMMY) & ~tl.load(keep + route) & ~tl.load(online_hits + route):
+    mod = tl.load(modality + row) if PREFILL else 1
+    if (req != DUMMY) & (mod < MODALITIES) & ~tl.load(keep + route) & ~tl.load(online_hits + route):
         eid = tl.load(ids + route).to(tl.int32)
-        mod = tl.load(modality + row) if PREFILL else 1
-        count = tl.load(counts + eid * 2 + mod)
+        count = tl.load(counts + eid * MODALITIES + mod)
         ds, cs = tl.arange(0, BLOCK_D), tl.arange(0, BLOCK_C)
         q = tl.load(query + row * DIM + ds, ds < DIM, 0).to(tl.float32)
         if not PREFILL and DECODE_THRESHOLD is not None:
             q = q / tl.maximum(tl.sqrt(tl.sum(q * q, 0)), 1e-6)
-        key = tl.load(keys + ((eid * 2 + mod) * CLUSTERS + cs[:, None]) * DIM + ds[None, :],
+        key = tl.load(keys + ((eid * MODALITIES + mod) * CLUSTERS + cs[:, None]) * DIM + ds[None, :],
                       (cs[:, None] < count) & (ds[None, :] < DIM), 0).to(tl.float32)
         # Match the reference offline kernel's FP32 reduction and lowest-index tie.
         score = tl.sum(key * q[None, :], 1)
@@ -169,7 +173,7 @@ def _mapped_offline(query, keys, counts, offsets, host_addr, ids, modality, keep
         else:
             accepted = best > 0
         hit = (count > 0) & accepted
-        offset = tl.load(offsets + eid * 2 + mod).to(tl.int64)
+        offset = tl.load(offsets + eid * MODALITIES + mod).to(tl.int64)
         index = tl.where(hit, offset + cluster.to(tl.int64), -1)
         hs = tl.arange(0, BLOCK_H)
         ptr = host_addr.to(tl.uint64).to(tl.pointer_type(tl.float16))
@@ -260,7 +264,7 @@ def _audit_routes(ids, keep, cpu_ids, cache_hit, online, offline, request_slots,
                   LAYER: tl.constexpr, LAYERS: tl.constexpr, PHASE: tl.constexpr,
                   DUMMY: tl.constexpr, HAS_CACHE: tl.constexpr, HAS_CPU: tl.constexpr,
                   ONLINE_ENABLED: tl.constexpr, BYPASS: tl.constexpr, BLOCK_K: tl.constexpr,
-                  OFFLINE_ENABLED: tl.constexpr = True):
+                  OFFLINE_ENABLED: tl.constexpr = True, MODALITIES: tl.constexpr = 2):
     row = tl.program_id(0)
     req = tl.load(request_slots + row)
     if req == DUMMY:
@@ -281,9 +285,10 @@ def _audit_routes(ids, keep, cpu_ids, cache_hit, online, offline, request_slots,
     fq = mask & ~exact & ~on & (not BYPASS) & OFFLINE_ENABLED
     missing = tl.full((BLOCK_K,), False, tl.int1)
     mod = tl.load(modality + row) if PHASE == 0 else 1
+    fq = fq & (mod < MODALITIES)
     if not BYPASS and OFFLINE_ENABLED:
         eid = tl.load(ids + r, mask, 0).to(tl.int32)
-        missing = fq & (tl.load(table_counts + eid * 2 + mod, mask, 0) == 0)
+        missing = fq & (tl.load(table_counts + eid * MODALITIES + mod, mask & (mod < MODALITIES), 0) == 0)
     nc = tl.sum(cpu.to(tl.int64), 0)
     ne = tl.sum(exact.to(tl.int64), 0)
     non = tl.sum(on.to(tl.int64), 0)
