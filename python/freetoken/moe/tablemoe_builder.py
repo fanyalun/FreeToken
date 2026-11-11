@@ -82,6 +82,29 @@ def _collection_file(path, size):
         raise ValueError(f"missing or truncated collection file: {path}")
 
 
+class _CollectionWriter:
+    def __init__(self, path):
+        self.handle = path.open("r+b" if path.exists() else "w+b", buffering=65536)
+        self.position = 0
+        self.dirty = False
+
+    def write_at(self, position, value):
+        # Seeking a buffered file flushes it even when the next write is contiguous.
+        if position != self.position:
+            self.handle.seek(position)
+        self.handle.write(value)
+        self.position = position + len(value)
+        self.dirty = True
+
+    def flush(self):
+        if self.dirty:
+            self.handle.flush()
+            self.dirty = False
+
+    def close(self):
+        self.handle.close()
+
+
 class InputCollector:
     """Bounded writer queue with disk reservoirs; never retains mutable engine views."""
 
@@ -336,10 +359,10 @@ class InputCollector:
                 state = self.token_banks.setdefault(bank, dict(layer=layer, modality=name, rows=0))
                 if bank not in self.bank_handles:
                     path = folder / f"{bank}.bin"
-                    self.bank_handles[bank] = path.open("r+b" if path.exists() else "w+b", buffering=0)
+                    self.bank_handles[bank] = _CollectionWriter(path)
                 handle = self.bank_handles[bank]
-                handle.seek(state["rows"] * self.hidden * 2)
-                handle.write(memoryview(np.ascontiguousarray(inputs[positions])).cast("B"))
+                handle.write_at(state["rows"] * self.hidden * 2,
+                                memoryview(np.ascontiguousarray(inputs[positions])).cast("B"))
                 bank_indices[positions] = np.arange(state["rows"], state["rows"] + len(positions))
                 state["rows"] += len(positions)
         experts, row_indices = unique // len(inputs), unique % len(inputs)
@@ -368,16 +391,13 @@ class InputCollector:
             labels = folder / f"{key}.phase"
             seed = self.config["seed"] ^ int(digest(key)[:16], 16)
             if key not in self.handles:
-                self.handles[key] = (data.open("r+b" if data.exists() else "w+b", buffering=0),
-                                     labels.open("r+b" if labels.exists() else "w+b", buffering=0))
+                self.handles[key] = (_CollectionWriter(data), _CollectionWriter(labels))
             vectors, phases = self.handles[key]
             raw = memoryview(rows).cast("B")
             initial = min(len(rows), max(0, self.config["reservoir_size"] - state["seen"]))
             if initial:
-                vectors.seek(state["seen"] * row_bytes)
-                vectors.write(raw[:initial * row_bytes])
-                phases.seek(state["seen"])
-                phases.write(bytes([phase == "decode"]) * initial)
+                vectors.write_at(state["seen"] * row_bytes, raw[:initial * row_bytes])
+                phases.write_at(state["seen"], bytes([phase == "decode"]) * initial)
                 state["seen"] += initial
                 state[phase] += initial
             for index in range(initial, len(rows)):
@@ -386,15 +406,19 @@ class InputCollector:
                 count, capacity = state["seen"], self.config["reservoir_size"]
                 slot = count - 1 if count <= capacity else _draw(seed, count)
                 if slot < capacity:
-                    vectors.seek(slot * row_bytes)
-                    vectors.write(raw[index * row_bytes:(index + 1) * row_bytes])
-                    phases.seek(slot)
-                    phases.write(bytes([phase == "decode"]))
+                    vectors.write_at(slot * row_bytes, raw[index * row_bytes:(index + 1) * row_bytes])
+                    phases.write_at(slot, bytes([phase == "decode"]))
             state["kept"] = min(state["seen"], self.config["reservoir_size"])
 
     def flush(self, uid=None):
         self.pending.join()
         self._raise()
+        # Publish progress only after every layer's buffered records reach the file.
+        for handles in self.handles.values():
+            for handle in handles:
+                handle.flush()
+        for handle in self.bank_handles.values():
+            handle.flush()
         if uid is not None:
             self.requests.append(uid)
             self.active_samples.pop(uid, None)

@@ -529,3 +529,95 @@ def test_per_image_selected_tokens_exclude_shared_images(tmp_path):
     assert a['image_offsets'] == [[[1, 3]]] and b['image_offsets'] == [[[1, 3]], [[4, 6]]]
     assert a['selected_visual_tokens_per_image'] == [2]
     assert b['selected_visual_tokens_per_image'] == [0, 2]
+
+
+def test_collection_writer_combines_contiguous_writes_and_preserves_overwrites():
+    import io
+    from types import SimpleNamespace
+    from freetoken.moe.tablemoe_builder import _CollectionWriter
+
+    class CountedRaw(io.BytesIO):
+        writes = 0
+        seeks = 0
+
+        def write(self, value):
+            self.writes += 1
+            return super().write(value)
+
+        def seek(self, position, whence=0):
+            self.seeks += 1
+            return super().seek(position, whence)
+
+    raw = CountedRaw()
+    path = SimpleNamespace(exists=lambda: False,
+                           open=lambda mode, buffering: io.BufferedRandom(raw, buffer_size=buffering))
+    writer = _CollectionWriter(path)
+    for position in range(1000):
+        writer.write_at(position, b'x')
+    assert raw.writes == raw.seeks == 0
+    writer.flush()
+    assert raw.writes == 1
+    after_flush = raw.writes, raw.seeks
+    writer.flush()
+    assert (raw.writes, raw.seeks) == after_flush
+    writer.write_at(4, b'ab')
+    writer.flush()
+    assert raw.getvalue() == b'xxxxab' + b'x' * 994
+    writer.close()
+
+
+@pytest.mark.parametrize('storage', ['dense', 'indexed'])
+def test_collection_flushes_raw_files_before_publishing_progress(tmp_path, monkeypatch, storage):
+    from freetoken.moe import tablemoe_builder
+
+    original = tablemoe_builder.write_json
+    publications = []
+
+    def checked_progress(path, value):
+        if Path(path).name == 'progress.json':
+            for key, state in value['buckets'].items():
+                suffix, width = ('index', 8) if storage == 'indexed' else ('bin', 8)
+                folder = tmp_path / f'layer_{state["layer"]}'
+                assert (folder / f'{key}.{suffix}').stat().st_size == state['kept'] * width
+                assert (folder / f'{key}.phase').read_bytes() == b'\0' * state['kept']
+            for bank, state in value['token_banks'].items():
+                bank_path = tmp_path / f'layer_{state["layer"]}' / f'{bank}.bin'
+                assert bank_path.stat().st_size == state['rows'] * 8
+            publications.append(list(value['requests']))
+        original(path, value)
+
+    monkeypatch.setattr(tablemoe_builder, 'write_json', checked_progress)
+    collector = InputCollector(tmp_path, dict(raw_storage=storage, export_inputs=False), 4, 1)
+    try:
+        for layer in range(2):
+            collector.add(layer, torch.ones(2, 4).half(), torch.zeros(2, 1, dtype=torch.long),
+                          torch.ones(2, dtype=torch.int8), 'prefill')
+        collector.flush(0)
+        assert publications == [[0]]
+    finally:
+        collector.close()
+
+
+def test_collection_flush_error_does_not_publish_new_request(tmp_path, monkeypatch):
+    collector = InputCollector(tmp_path, dict(export_inputs=False), 4, 1)
+    x = torch.ones(2, 4).half()
+    ids = torch.zeros(2, 1, dtype=torch.long)
+    modality = torch.ones(2, dtype=torch.int8)
+    collector.add(0, x, ids, modality, 'prefill')
+    collector.flush(0)
+    previous = read_json(tmp_path / 'progress.json')
+    collector.add(0, x, ids, modality, 'decode')
+    writer = next(iter(collector.handles.values()))[0]
+
+    def fail_flush():
+        raise OSError('flush failed')
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(writer, 'flush', fail_flush)
+            with pytest.raises(OSError, match='flush failed'):
+                collector.flush(1)
+            assert read_json(tmp_path / 'progress.json') == previous
+            assert collector.requests == [0]
+    finally:
+        collector.close()
