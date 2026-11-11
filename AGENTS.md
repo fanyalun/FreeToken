@@ -19,6 +19,7 @@ If you are a fully autonomous agent with no human in the loop, do not contribute
 ## Calibration splits and shared images
 
 - These rules apply to all future calibration, offline-table collection, and calibration/test splits. Fix and record the random seed before sampling; use seed 42 unless the user or benchmark protocol specifies another seed. Reuse frozen split records when resuming an existing experiment.
+- Default to a 6:4 split: 60% calibration and 40% test, unless the user explicitly specifies another ratio. Reuse existing frozen splits.
 - If the benchmark has categories, split calibration and test samples separately within each category using the fixed seed and the requested ratio or quota. Do not substitute a single unstratified split of the entire benchmark.
 - Group samples sharing a document or any input image before splitting, including transitive overlaps, and keep each group entirely in one partition. Preserve this isolation when groups span categories; record any category-quota deviation required to keep shared images out of both partitions.
 - Deduplicate visual calibration collection at the image level while retaining every selected sample's text. Within the same calibration run and image-preprocessing configuration, collect each shared image's visual-token records once; later samples collect their own text-token records and any previously unseen images.
