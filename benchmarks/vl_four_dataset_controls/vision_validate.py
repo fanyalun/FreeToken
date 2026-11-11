@@ -26,7 +26,8 @@ def main():
                 strategy = cmd[cmd.index('--moe-strategy') + 1]
                 expected = 'fused' if stage == 'evaluate' or method == 'fused' else 'offload' if method == 'modes' else 'tablemoe'
                 assert strategy == expected
-                assert args.reasoning_parser == ('qwen3' if stage == 'inference' else None)
+                assert args.reasoning_parser is None
+                assert args.tool_call_parser == 'qwen25'
                 if stage == 'inference' and method in ('tablemoe', 'schedule', 'table'):
                     assert args.tablemoe_prefill_keep_rate == .6
                     assert args.tablemoe_decode_keep_k == 4 and args.moe_cache_size == 3072

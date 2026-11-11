@@ -48,12 +48,12 @@
     {
       "source": "vision_pipeline.py",
       "destination": "vision_pipeline.py",
-      "sha256": "4650ea4789ac25399390659c1bffe8734eb616949a7e97e00afd0ed8f602c10a"
+      "sha256": "cf8980bb0c7905ae6861138e324769410cb62336528e4b8d27eff9e3e6aa446c"
     },
     {
       "source": "vision_validate.py",
       "destination": "vision_validate.py",
-      "sha256": "16c7313f7d66d213e43cdd68cdbf458b5d9af0f9835b3483892ae1ee986ca6c5"
+      "sha256": "63340eeba2f623d39caea63675d934b69e6df39bd0c82b470d707e72507a7e12"
     },
     {
       "source": "report_results.py",
@@ -118,6 +118,11 @@
       "source": "validation/io_buffer_candidate/test_buffered_collection.py",
       "destination": "validation/io_buffer_candidate/test_buffered_collection.py",
       "sha256": "f004479c1651b7f18f5fc5522609a79dc1831b8f55fda1b887bda1d6e9912e3d"
+    },
+    {
+      "source": "validation/vision_tool_replay_selftest.py",
+      "destination": "validation/vision_tool_replay_selftest.py",
+      "sha256": "db63712abb76fdef578852dce2e893525e8b3505a8b2a26478b25dd6727d47d1"
     }
   ],
   "package_metadata": [

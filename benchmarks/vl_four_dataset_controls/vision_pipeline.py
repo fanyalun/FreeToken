@@ -22,7 +22,8 @@ from freetoken.moe.tablemoe_artifacts import write_json
 DATASET = 'Vision2Web_Level1'
 METHODS = ('fused', 'tablemoe', 'modes', 'schedule', 'table')
 KIT_PYTHON = '/home/fanya/miniforge/envs/tablemoe/bin/python'
-RUNS = Path('/data/fanya/tablemoe/vl_four_dataset_bs1_20261111/vision2web_runs')
+RUNS = Path(os.environ.get('VISION2WEB_RUNS_ROOT',
+    '/data/fanya/tablemoe/vl_four_dataset_bs1_20261111/vision2web_runs'))
 OFFICIAL = Path('/home/fanya/vision2web')
 ADAPTER = SNAPSHOT / 'benchmarks/bench_vision2web.py'
 
@@ -76,8 +77,8 @@ def stage_command(method, gpu, stage, config):
     set_argument(args, '--max-output-tokens', 64000)
     set_argument(args, '--max-running-requests', 1)
     set_argument(args, '--tool-call-parser', 'auto')
-    # Instruct answers must remain visible to the official content-only visual scorer.
-    set_argument(args, '--reasoning-parser', 'off' if judge else 'auto')
+    # The Instruct template does not open thinking; qwen3 would hide its tool calls.
+    set_argument(args, '--reasoning-parser', 'off')
     return args, port
 
 

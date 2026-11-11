@@ -207,7 +207,13 @@ not a completed benchmark.
 Vision2Web `smoke` uses one calibration task and must complete official inference,
 independent fused judging and the report before writing
 `validation/vision_pipeline_ready.json`. A passing CPU command check never
-creates that marker. The optional `vision_mock_probe.py` runs the same official
+creates that marker. Qwen3-VL Instruct generation and judging both use
+`--reasoning-parser off`; the Qwen tool parser remains enabled. The Instruct
+template does not open a thinking block, so forcing the Qwen3 thinking parser
+would hide its tool calls from the official CLI. Set `VISION2WEB_RUNS_ROOT` to a
+new persistent directory for a failed smoke retry, and enqueue a unique retry
+job ID. Preserve the failed directory and its original protocol unchanged.
+The optional `vision_mock_probe.py` runs the same official
 Claude Code adapter against a local mock Anthropic endpoint in a fresh sandbox.
 It checks the model identifier, tool round trip, container-to-host networking
 and persistent `TMPDIR`, then removes its own container. It calls no real model,
