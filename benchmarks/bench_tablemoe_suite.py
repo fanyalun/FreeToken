@@ -31,7 +31,7 @@ DEFAULTS = dict(model="/data/fanya/models/Qwen3-VL-30B-A3B-Instruct", python=str
                 natural_max_tokens=128, fixed_tokens=[32, 128, 256], fixed_sample_limit=100,
                 warmup_samples=5, warmup_tokens=10, gpu=0, port=19760, gpu_expert_slots=3072,
                 fetch_cap=0, num_pages=65536, page_size=1, graph_max_bs=4, cpu_threads=16,
-                convert_bf16=True, online_capacity=64, prefill_keep_rate=.6, decode_keep_k=4,
+                dtype="float16", convert_bf16=True, online_capacity=64, prefill_keep_rate=.6, decode_keep_k=4,
                 decode_offline_cosine_threshold=None, decode_online_cosine_threshold=None,
                 tablemoe_renormalize_weights=False,
                 processor={"size": {"shortest_edge": 602112, "longest_edge": 4014080}},
@@ -49,7 +49,18 @@ def asset_root_for(config, dataset, smoke=False):
 
 
 def effective_config(config):
-    config = {**DEFAULTS, **config}
+    defaults = dict(DEFAULTS)
+    model_config = Path(config.get("model", defaults["model"])) / "config.json"
+    if model_config.is_file() and "Gemma4ForConditionalGeneration" in read_json(model_config).get("architectures", []):
+        defaults.update(dtype="bfloat16", convert_bf16=False, processor={})
+    config = {**defaults, **config}
+    if config["dtype"] not in ("float16", "bfloat16"):
+        raise ValueError("TableMoE suite dtype must be float16 or bfloat16")
+    if config["dtype"] == "bfloat16" and config["convert_bf16"]:
+        raise ValueError("BF16 TableMoE does not use convert_bf16")
+    if config["builder"].get("dtype", config["dtype"]) != config["dtype"]:
+        raise ValueError("builder and inference dtype must match")
+    config["builder"] = {**config["builder"], "dtype": config["dtype"]}
     if "output" not in config or "vlmeval_python" not in config:
         raise ValueError("output and vlmeval_python must be explicit")
     config["output"] = str(Path(config["output"]).resolve())
@@ -211,7 +222,7 @@ def prepare(config, manifest):
 def server_command(config, group, asset_root, audit_path=None, collect_path=None):
     method, mode, execution = group.split("_")
     command = [config["python"], "-m", "freetoken.cli", "serve", "--model", config["model"], "--gpu", str(config["gpu"]),
-               "--dtype", "float16", "--moe-strategy", "tablemoe", "--moe-cache-size",
+               "--dtype", config["dtype"], "--moe-strategy", "tablemoe", "--moe-cache-size",
                str(0 if mode == "cpu" else config["gpu_expert_slots"]), "--moe-hybrid-max-fetch", str(config["fetch_cap"]),
                "--moe-cpu-threads", str(config["cpu_threads"]), "--cuda-graph-max-bs",
                str(0 if execution == "eager" else config["graph_max_bs"]),
@@ -261,13 +272,14 @@ def build(config, manifest, smoke=False, collect_only=False):
         if dataset in config.get("smoke_asset_roots" if smoke else "asset_roots", {}):
             existing = verify_stage(asset_root / "cache", hash_outputs=False)
             provenance = existing["provenance"]
-            if (existing["inputs"]["algorithm"] != algorithm or provenance["checkpoint"] != manifest["checkpoint"] or
+            if (existing.get("dtype", "float16") != config["dtype"] or
+                    existing["inputs"]["algorithm"] != algorithm or provenance["checkpoint"] != manifest["checkpoint"] or
                     provenance["processor"] != config["processor"] or provenance["convert_bf16"] != config["convert_bf16"] or
                     provenance["calibration_sha256"] != digest(calibration)):
                 raise ValueError("external TableMoE asset configuration/calibration mismatch")
             print("VERIFIED EXTERNAL ASSETS", dataset, str(asset_root), flush=True)
             continue
-        inputs = dict(checkpoint=manifest["checkpoint"], convert_bf16=config["convert_bf16"],
+        inputs = dict(checkpoint=manifest["checkpoint"], convert_bf16=config["convert_bf16"], dtype=config["dtype"],
                       processor=config["processor"], calibration_sha256=digest(calibration),
                       calibration_ids=[r["id"] for r in calibration], sample_count=len(calibration), algorithm=algorithm,
                       source_sha256=digest(manifest["source"]))

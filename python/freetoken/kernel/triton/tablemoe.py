@@ -116,7 +116,7 @@ def _online_select(scores, online_ids, online_values, sizes, request_slots, ids,
     req = tl.load(request_slots + row)
     ds = tl.arange(0, BLOCK_H)
     hit = tl.full((), False, tl.int1)
-    value = tl.full((BLOCK_H,), 0, tl.float16)
+    value = tl.full((BLOCK_H,), 0, outputs.dtype.element_ty)
     if (req != DUMMY) & ~tl.load(keep + route):
         size = tl.load(sizes + req)
         cs = tl.arange(0, BLOCK_C)
@@ -172,7 +172,7 @@ def _mapped_offline(query, keys, counts, offsets, host_addr, ids, modality, keep
         offset = tl.load(offsets + eid * 2 + mod).to(tl.int64)
         index = tl.where(hit, offset + cluster.to(tl.int64), -1)
         hs = tl.arange(0, BLOCK_H)
-        ptr = host_addr.to(tl.uint64).to(tl.pointer_type(tl.float16))
+        ptr = host_addr.to(tl.uint64).to(tl.pointer_type(outputs.dtype.element_ty))
         value = tl.load(ptr + index * H + hs.to(tl.int64), hit & (hs < H), 0)
         tl.store(outputs + route * H + hs, value, hs < H)
     tl.store(hits + route, hit)
@@ -210,7 +210,7 @@ def _merge_update(x, ids, weights, keep, cpu_ids, gpu_slots, gpu_values, cpu_add
                      mask & (ks[:, None] < GPU_K) & (slot[:, None] >= 0), 0)
         val = tl.where(exact[:, None] & ~cpu[:, None], gv, val)
     if HAS_CPU:
-        ptr = cpu_addr.to(tl.uint64).to(tl.pointer_type(tl.float16))
+        ptr = cpu_addr.to(tl.uint64).to(tl.pointer_type(result.dtype.element_ty))
         cv = tl.load(ptr + route[:, None].to(tl.int64) * H + hs[None, :], mask & cpu[:, None], 0)
         val = tl.where(cpu[:, None], cv, val)
     val = tl.where(survivor[:, None], val, 0)

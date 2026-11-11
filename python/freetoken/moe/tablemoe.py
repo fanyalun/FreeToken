@@ -1,4 +1,4 @@
-"""FP16 CPU experts and request-local TableMoE lookup for Qwen3-VL-MoE."""
+"""FP16/BF16 experts and request-local TableMoE lookup for Qwen3-VL-MoE and Gemma 4."""
 
 from __future__ import annotations
 
@@ -17,7 +17,15 @@ logger = init_logger(__name__)
 _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
 
 
-def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False) -> None:
+def tablemoe_activation(architectures) -> str:
+    if "Gemma4ForConditionalGeneration" in architectures:
+        return "gelu_tanh"
+    if "Qwen3VLMoeForConditionalGeneration" in architectures:
+        return "silu"
+    raise ValueError("tablemoe requires Qwen3VLMoeForConditionalGeneration or Gemma4ForConditionalGeneration")
+
+
+def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False, dtype=torch.float16) -> None:
     root = Path(model_path)
     if not root.is_dir():
         return
@@ -25,27 +33,35 @@ def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False) -> No
     files = (sorted({root / name for name in json.loads(index.read_text())["weight_map"].values()})
              if index.is_file() else sorted(root.glob("*.safetensors")))
     if not files:
-        raise ValueError("tablemoe requires raw FP16 safetensors checkpoint files")
+        raise ValueError("tablemoe requires raw FP16/BF16 safetensors checkpoint files")
     from safetensors import safe_open
 
+    expected = "BF16" if dtype == torch.bfloat16 else "F16"
     for path in files:
         with safe_open(path, framework="pt", device="cpu") as source:
             for key in source.keys():
-                dtype = source.get_slice(key).get_dtype()
-                if dtype in ("F32", "F64") or (dtype == "BF16" and not allow_bf16):
-                    raise ValueError(f"tablemoe requires FP16 checkpoint weights; {key} is {dtype}")
+                actual = source.get_slice(key).get_dtype()
+                allowed = {expected, "BF16"} if allow_bf16 and expected == "F16" else {expected}
+                if actual in ("F16", "BF16", "F32", "F64") and actual not in allowed:
+                    label = "BF16" if expected == "BF16" else "FP16"
+                    raise ValueError(f"tablemoe requires {label} checkpoint weights; {key} is {actual}")
 
 
 def validate_tablemoe_config(config) -> None:
     mc = config.model_config
-    if "Qwen3VLMoeForConditionalGeneration" not in mc.architectures:
-        raise ValueError("--moe-strategy tablemoe requires Qwen3VLMoeForConditionalGeneration")
-    if config.dtype != torch.float16 or config.tp_info.size != 1:
-        raise ValueError("tablemoe requires FP16 and TP=1")
+    activation = tablemoe_activation(mc.architectures)
+    if config.dtype not in (torch.float16, torch.bfloat16) or config.tp_info.size != 1:
+        raise ValueError("tablemoe requires FP16 or BF16 and TP=1")
+    if mc.num_experts <= 0 or mc.num_experts_per_tok <= 0:
+        raise ValueError("tablemoe requires a routed MoE checkpoint")
+    if activation == "gelu_tanh" and getattr(config, "tablemoe_renormalize_weights", False):
+        raise ValueError("Gemma4 TableMoE must preserve router per-expert scales; disable weight renormalization")
     if mc.expert_quant != "none":
-        raise ValueError("tablemoe requires unquantized FP16 experts")
+        raise ValueError("tablemoe requires unquantized FP16/BF16 experts")
     if config.use_dummy_weight:
-        raise ValueError("tablemoe requires real FP16 checkpoint experts")
+        raise ValueError("tablemoe requires real FP16/BF16 checkpoint experts")
+    if config.dtype == torch.bfloat16 and config.tablemoe_convert_bf16_weights:
+        raise ValueError("BF16 TableMoE does not use --tablemoe-convert-bf16-weights")
     mode = getattr(config, "tablemoe_expert_mode", "cpu")
     if mode not in ("cpu", "offload", "hybrid"):
         raise ValueError("invalid TableMoE expert mode")
@@ -57,7 +73,7 @@ def validate_tablemoe_config(config) -> None:
         raise ValueError("TableMoE offload/hybrid requires --moe-cache-size >= num_experts")
     if config.moe_cpu_layers:
         raise ValueError("tablemoe uses --tablemoe-expert-mode; --moe-cpu-layers is unsupported")
-    validate_fp16_checkpoint(config.model_path, allow_bf16=config.tablemoe_convert_bf16_weights)
+    validate_fp16_checkpoint(config.model_path, allow_bf16=config.tablemoe_convert_bf16_weights, dtype=config.dtype)
     full = (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
             config.tablemoe_decode_keep_k == mc.num_experts_per_tok and
             getattr(config, "tablemoe_implementation", "optimized") == "optimized")
@@ -131,9 +147,13 @@ def renormalize_weights(weights: torch.Tensor, survived: torch.Tensor) -> torch.
 
 
 class TableMoeRuntime:
+    dtype = torch.float16
+    activation = "silu"
+
     def __init__(self, config):
         validate_tablemoe_config(config)
         self.config = config
+        self.dtype = config.dtype
         self.expert_mode = getattr(config, "tablemoe_expert_mode", "cpu")
         self.stats_enabled = getattr(config, "tablemoe_stats", False)
         mc = config.model_config
@@ -150,7 +170,7 @@ class TableMoeRuntime:
         self.counters = defaultdict(int)
         self._load_assets()
         self._prepare_gpu_assets()
-        gate_up, down = self._load_fp16_banks(config)
+        gate_up, down = self._load_expert_banks(config)
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
         banks = SimpleNamespace(num_layers=self.num_layers, num_experts=self.num_experts,
@@ -160,7 +180,7 @@ class TableMoeRuntime:
             self.executor = CpuMoeExecutor(
                 banks, top_k=mc.num_experts_per_tok, activation="silu",
                 apply_router_weight_on_input=False, num_threads=config.moe_cpu_threads,
-                max_tokens=max(128, config.max_running_req), device=self.device, fmt="fp16_routes",
+                max_tokens=max(128, config.max_running_req), device=self.device, fmt="bf16_routes" if self.dtype == torch.bfloat16 else "fp16_routes",
             )
         self.expert_cache = None
         self.hybrid_max_fetch = max(0, config.moe_hybrid_max_fetch)
@@ -169,20 +189,20 @@ class TableMoeRuntime:
 
             self.expert_cache = OffloadMoeCache(
                 self.num_layers, self.num_experts, config.moe_cache_size, self.device,
-                cache_policy=config.moe_cache_policy, quant_format="fp16",
+                cache_policy=config.moe_cache_policy, quant_format="bf16" if self.dtype == torch.bfloat16 else "fp16",
                 prefill_overlap=False,
             )
             self.expert_cache.set_bank_sources(banks.bank_sources)
             if self.expert_mode == "hybrid" and config.moe_hybrid_max_fetch < 0:
                 self.hybrid_max_fetch = 1
-                logger.info("TableMoE hybrid FP16: automatic fetch cap falls back to 1; override --moe-hybrid-max-fetch")
+                logger.info("TableMoE hybrid: automatic fetch cap falls back to 1; override --moe-hybrid-max-fetch")
         self.expert_bytes = 3 * mc.moe_intermediate_size * self.hidden * 2
         self._fetch_buffers = {}
         self._route_counts = torch.zeros(5, dtype=torch.int64, device=self.device)
         self._gpu_counts = torch.zeros(3, dtype=torch.int64, device=self.device)
         self._stats_event = torch.cuda.Event()
-        logger.info("TableMoE ready: expert_mode=%s FP16 GPU expert slots=%d, %d offline files",
-                    self.expert_mode, config.moe_cache_size, len(self.offline_paths))
+        logger.info("TableMoE ready: expert_mode=%s %s GPU expert slots=%d, %d offline files",
+                    self.expert_mode, self.dtype, config.moe_cache_size, len(self.offline_paths))
         if config.tablemoe_convert_bf16_weights:
             logger.info("TableMoE converted BF16 source experts into FP16 CPU banks")
 
@@ -203,6 +223,8 @@ class TableMoeRuntime:
             declared = {p for p in manifest["outputs"] if p.endswith("_cache.pt")}
             if actual != declared:
                 raise ValueError("TableMoE cache contains undeclared or missing asset files")
+            if manifest.get("dtype", "float16") != str(self.dtype).removeprefix("torch."):
+                raise ValueError("TableMoE asset dtype mismatch; rebuild tables in the runtime dtype")
             expected = manifest["provenance"]["checkpoint"]
             if (Path(expected["path"]).resolve() != Path(cfg.model_path).resolve() or
                     manifest["provenance"]["convert_bf16"] != cfg.tablemoe_convert_bf16_weights):
@@ -232,6 +254,8 @@ class TableMoeRuntime:
                 mean, proj = data["mean"], data["proj"]
                 if mean.shape != (self.hidden,) or proj.ndim != 2 or proj.shape[0] != self.hidden:
                     raise ValueError(f"incompatible TableMoE PCA dimensions: {path}")
+                if self.dtype == torch.bfloat16 and (mean.dtype != self.dtype or proj.dtype != self.dtype):
+                    raise ValueError(f"incompatible BF16 TableMoE PCA dtype: {path}")
                 self.pca[layer, modality] = (proj.float().contiguous(),
                                              -mean.float() @ proj.float())
             width = self.pca[layer, "text"][0].shape[1]
@@ -244,7 +268,7 @@ class TableMoeRuntime:
                 data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
                 key, value = data["key"], data["value"]
                 if (key.ndim != 2 or key.shape[1] != width or value.shape != (key.shape[0], self.hidden)
-                        or key.dtype != torch.float16 or value.dtype != torch.float16):
+                        or key.dtype != self.dtype or value.dtype != self.dtype):
                     raise ValueError(f"incompatible TableMoE cache dimensions or dtype: {path}")
                 self.offline_paths[layer, int(match[2]), match[3]] = path
 
@@ -258,9 +282,9 @@ class TableMoeRuntime:
                     for key, path in files]
             clusters = max([1] + [d["key"].shape[0] for _, d in data])
             width = self.pca[layer, "text"][0].shape[1]
-            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=torch.float16)
+            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=self.dtype)
             counts = torch.zeros(self.num_experts, 2, dtype=torch.int32)
-            values = torch.empty(self.num_experts, 2, clusters, self.hidden, dtype=torch.float16)
+            values = torch.empty(self.num_experts, 2, clusters, self.hidden, dtype=self.dtype)
             for (_, expert, modality), d in data:
                 mod = 0 if modality == "vision" else 1
                 n = d["key"].shape[0]
@@ -271,14 +295,14 @@ class TableMoeRuntime:
             self.gpu_counts[layer] = counts.to(self.device)
             self.host_values[layer] = values.reshape(-1, self.hidden)
             for modality in ("vision", "text"):
-                # Match the reference's FP16 mean/projection and FP16 bias rounding.
+                # Match the reference's mean/projection and bias rounding in the runtime dtype.
                 path = Path(self.config.tablemoe_pca_dir) / f"layer_{layer}" / f"L{layer}_{modality}_pca.pt"
                 d = torch.load(path, map_location="cpu", weights_only=True)
-                proj = d["proj"].to(device=self.device, dtype=torch.float16)
-                mean = d["mean"].to(device=self.device, dtype=torch.float16)
+                proj = d["proj"].to(device=self.device, dtype=self.dtype)
+                mean = d["mean"].to(device=self.device, dtype=self.dtype)
                 self.pca[layer, modality] = (proj, -mean @ proj)
 
-    def _load_fp16_banks(self, config):
+    def _load_expert_banks(self, config):
         from freetoken.layers.quantization import QuantKind
         from freetoken.moe.expert_pieces import iter_expert_pieces
 
@@ -286,8 +310,8 @@ class TableMoeRuntime:
         from freetoken.kernel.pinned import alloc_pinned_tensor
 
         def allocate(*shape):
-            return (torch.empty(shape, dtype=torch.float16) if self.expert_mode == "cpu"
-                    else alloc_pinned_tensor(*shape, dtype=torch.float16))
+            return (torch.empty(shape, dtype=self.dtype) if self.expert_mode == "cpu"
+                    else alloc_pinned_tensor(*shape, dtype=self.dtype))
 
         gate_up = [allocate(mc.num_experts, 2 * mc.moe_intermediate_size, self.hidden)
                    for _ in range(self.num_layers)]
@@ -297,17 +321,17 @@ class TableMoeRuntime:
         for layer, e0, e1, piece in iter_expert_pieces(config.model_path, mc, QuantKind.NONE,
                                                        parallel=False, workers=1, chunk=8 << 20):
             if written[layer, e0:e1].any():
-                raise ValueError(f"duplicate FP16 expert rows at layer {layer}, experts {e0}:{e1}")
+                raise ValueError(f"duplicate expert rows at layer {layer}, experts {e0}:{e1}")
             source_dtypes = {piece["gate_up"].dtype, piece["down"].dtype}
             allowed = ({torch.float16, torch.bfloat16} if config.tablemoe_convert_bf16_weights
-                       else {torch.float16})
+                       else {self.dtype})
             if not source_dtypes <= allowed:
-                raise ValueError(f"tablemoe requires FP16 checkpoint experts at layer {layer}; got {source_dtypes}")
+                raise ValueError(f"tablemoe requires matching checkpoint expert dtype at layer {layer}; got {source_dtypes}")
             gate_up[layer][e0:e1].copy_(piece["gate_up"])
             down[layer][e0:e1].copy_(piece["down"])
             written[layer, e0:e1] = True
         if not written.all():
-            raise ValueError("FP16 expert checkpoint is missing rows")
+            raise ValueError("expert checkpoint is missing rows")
         return gate_up, down
 
     def _online_search(self, uid, layer, x, ids):
@@ -379,9 +403,9 @@ class TableMoeRuntime:
         if io is None:
             io = dict(
                 metadata=alloc_pinned_tensor(slots, dtype=torch.int64),
-                values=alloc_pinned_tensor(slots, self.hidden, dtype=torch.float16),
+                values=alloc_pinned_tensor(slots, self.hidden, dtype=self.dtype),
                 slots=alloc_pinned_tensor(slots, dtype=torch.int64),
-                gpu_values=torch.empty(slots, self.hidden, dtype=torch.float16, device=self.device),
+                gpu_values=torch.empty(slots, self.hidden, dtype=self.dtype, device=self.device),
                 event=torch.cuda.Event(),
             )
             self._fetch_buffers[slots] = io

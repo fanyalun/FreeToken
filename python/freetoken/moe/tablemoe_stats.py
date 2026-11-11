@@ -83,7 +83,8 @@ class RequestAudit:
                         moe_policy=getattr(runtime.config, "moe_policy", "native"),
                         modes_prefill_policy=getattr(runtime.config, "modes_prefill_policy", "modes"),
                         modes_calibration=getattr(runtime, "calibration", None),
-                        physical_pcie_bytes=None, coverage="FP16 optimized MoE logical transfers; excludes attention/encoder/KV and allocator setup"))
+                        dtype=str(runtime.dtype).removeprefix("torch."),
+                        physical_pcie_bytes=None, coverage="FP16/BF16 optimized MoE logical transfers; excludes attention/encoder/KV and allocator setup"))
 
     def write(self, record):
         if self.path is None:

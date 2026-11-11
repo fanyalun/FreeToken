@@ -411,3 +411,79 @@ def test_fixed_decode_sampling_rejects_incomplete_generation(tmp_path):
     collector.close()
     with pytest.raises(ValueError, match='fixed-length collection coverage'):
         finalize_collection(tmp_path, dict(sample_count=1), 1, 1)
+
+
+def test_gemma_checkpoint_expert_layout_is_not_transposed(tmp_path):
+    from safetensors.torch import save_file
+    from freetoken.moe.tablemoe_builder import iter_checkpoint_experts
+
+    write_json(tmp_path / "config.json", dict(architectures=["Gemma4ForConditionalGeneration"],
+               text_config=dict(num_hidden_layers=1, num_experts=2)))
+    gate = torch.arange(2 * 6 * 4).reshape(2, 6, 4).bfloat16()
+    down = torch.arange(2 * 4 * 3).reshape(2, 4, 3).bfloat16()
+    save_file({"model.language_model.layers.0.experts.gate_up_proj": gate},
+              tmp_path / "model-00001-of-00002.safetensors")
+    save_file({"model.language_model.layers.0.experts.down_proj": down},
+              tmp_path / "model-00002-of-00002.safetensors")
+    pieces = list(iter_checkpoint_experts(tmp_path))
+    assert len(pieces) == 2
+    for expert, (layer, lo, hi, data) in enumerate(pieces):
+        assert (layer, lo, hi) == (0, expert, expert + 1)
+        torch.testing.assert_close(data["gate_up"], gate[expert:expert + 1], atol=0, rtol=0)
+        torch.testing.assert_close(data["down"], down[expert:expert + 1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("export", [False, True])
+def test_bf16_collection_roundtrip_resume_and_dtype_guard(tmp_path, export):
+    from freetoken.moe.tablemoe_builder import load_inputs
+
+    config = dict(export_inputs=export, reservoir_size=32, dtype="bfloat16")
+    x = (torch.arange(32).reshape(8, 4) * 100000.).bfloat16()
+    for start in (0, 4):
+        collector = InputCollector(tmp_path, config, 4, 1, identity="bf16")
+        collector.add(0, x[start:start + 4], torch.zeros(4, 1, dtype=torch.long), torch.ones(4), "prefill")
+        collector.flush(start)
+        collector.close()
+    with pytest.raises(ValueError, match="resume configuration mismatch"):
+        InputCollector(tmp_path, {**config, "dtype": "float16"}, 4, 1, identity="bf16")
+    manifest = finalize_collection(tmp_path, dict(sample_count=2), 1, 1)
+    assert manifest["dtype"] == "bfloat16"
+    actual = load_inputs(tmp_path, "L0_E0_text", manifest["buckets"]["L0_E0_text"], 4, dtype=torch.bfloat16)
+    torch.testing.assert_close(actual, x, atol=0, rtol=0)
+    assert torch.isfinite(actual).all() and actual.max() > 65504
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_gemma_bf16_offline_build_end_to_end(tmp_path, batch_size):
+    from types import SimpleNamespace
+
+    torch.manual_seed(53)
+    config = dict(dtype="bfloat16", pca_dim=2, clusters=3, iterations=3,
+                  pca_per_expert=32, device="cpu", cluster_batch_size=batch_size)
+    collector = InputCollector(tmp_path / "collect", config, 4, 2)
+    x = torch.randn(40, 4).bfloat16()
+    collector.add(0, x, torch.tensor([[0, 1]] * 40), torch.tensor([0] * 20 + [1] * 20), "prefill")
+    collector.flush(0)
+    collector.close()
+    provenance = dict(sample_count=1, checkpoint={}, convert_bf16=False, processor={})
+    finalize_collection(tmp_path / "collect", provenance, 1, 2)
+    with pytest.raises(ValueError, match="stage dtype mismatch"):
+        cluster(tmp_path, {**config, "dtype": "float16"})
+    clustered = cluster(tmp_path, config)
+    assert clustered["dtype"] == "bfloat16"
+    gate, down = torch.randn(2, 6, 4).bfloat16(), torch.randn(2, 4, 3).bfloat16()
+    cached = materialize(tmp_path, config, [(0, 0, 2, dict(gate_up=gate, down=down))],
+                         SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"]))
+    assert cached["dtype"] == "bfloat16" and cached["activation"] == "gelu_tanh"
+    assert not cached["missing_tables"]
+    for mod in ("vision", "text"):
+        pca = torch.load(tmp_path / "cluster/layer_0" / f"L0_{mod}_pca.pt", weights_only=True)
+        assert pca["mean"].dtype == pca["proj"].dtype == torch.bfloat16
+        for expert in range(2):
+            name = f"L0_E{expert}_{mod}"
+            data = torch.load(tmp_path / "cluster/layer_0" / f"{name}_clusters.pt", weights_only=True)
+            cache = torch.load(tmp_path / "cache/layer_0" / f"{name}_cache.pt", weights_only=True)
+            assert data["key"].dtype == data["centroid"].dtype == cache["value"].dtype == torch.bfloat16
+            g, u = torch.nn.functional.linear(data["centroid"], gate[expert]).chunk(2, -1)
+            expected = torch.nn.functional.linear(torch.nn.functional.gelu(g, approximate="tanh") * u, down[expert])
+            torch.testing.assert_close(cache["value"], expected, atol=0, rtol=0)

@@ -50,12 +50,12 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                     for key, path in self.offline_paths.items() if key[0] == layer]
             clusters = max([1] + [d["key"].shape[0] for _, d in data])
             width = self.pca[layer, "text"][0].shape[1]
-            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=torch.float16)
+            keys = torch.zeros(self.num_experts, 2, clusters, width, dtype=self.dtype)
             counts = torch.zeros(self.num_experts, 2, dtype=torch.int32)
             offsets = torch.full((self.num_experts, 2), -1, dtype=torch.int64)
             total = sum(d["value"].shape[0] for _, d in data)
             try:
-                values = alloc_pinned_tensor(max(1, total), self.hidden, dtype=torch.float16)
+                values = alloc_pinned_tensor(max(1, total), self.hidden, dtype=self.dtype)
                 address = device_ptr(values)
             except RuntimeError as exc:
                 raise RuntimeError("optimized TableMoE requires device-mapped pinned CPU memory") from exc
@@ -73,8 +73,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             for mod in ("vision", "text"):
                 path = Path(self.config.tablemoe_pca_dir) / f"layer_{layer}" / f"L{layer}_{mod}_pca.pt"
                 d = torch.load(path, map_location="cpu", weights_only=True)
-                proj = d["proj"].to(device=self.device, dtype=torch.float16)
-                mean = d["mean"].to(device=self.device, dtype=torch.float16)
+                proj = d["proj"].to(device=self.device, dtype=self.dtype)
+                mean = d["mean"].to(device=self.device, dtype=self.dtype)
                 self.pca[layer, mod] = (proj, -mean @ proj)
 
     def _init_optimized_state(self):
@@ -97,9 +97,9 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         slots = self.dummy_slot + 1
         for layer in range(self.num_layers):
             self.fixed_online[layer] = dict(
-                keys=torch.empty(slots, cap, self.hidden, device=self.device, dtype=torch.float16),
+                keys=torch.empty(slots, cap, self.hidden, device=self.device, dtype=self.dtype),
                 ids=torch.empty(slots, cap, self.top_k, device=self.device, dtype=torch.int64),
-                values=torch.empty(slots, cap, self.top_k, self.hidden, device=self.device, dtype=torch.float16),
+                values=torch.empty(slots, cap, self.top_k, self.hidden, device=self.device, dtype=self.dtype),
                 size=torch.zeros(slots, device=self.device, dtype=torch.int32),
                 pointer=torch.zeros(slots, device=self.device, dtype=torch.int32),
             )
@@ -116,7 +116,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
 
             collection = read_json(path)
             self.collector = InputCollector(collection["output"], collection["builder"], self.hidden, self.num_experts,
-                                            identity=collection["input_sha256"])
+                                            identity=collection["input_sha256"], dtype=self.dtype)
         self.lookup_stream = torch.cuda.Stream(device=self.device)
         self.lookup_ready, self.lookup_done = torch.cuda.Event(), torch.cuda.Event()
         prefill_size = 128
@@ -177,7 +177,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                     ws[name] = value[:bs]
             self.workspaces[bs] = ws
             return ws
-        def empty(*shape, dtype=torch.float16):
+        def empty(*shape, dtype=self.dtype):
             return torch.empty(shape, device=self.device, dtype=dtype)
         k, h = self.top_k, self.hidden
         gk = self.top_k
