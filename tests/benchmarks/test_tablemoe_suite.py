@@ -1349,3 +1349,20 @@ def test_integrity_declared_images_must_match_prompt_media(tmp_path):
                   vlmeval_message=message, messages=api_messages(message))
     with pytest.raises(ValueError, match="image.*prompt"):
         validate_manifest([record])
+
+
+def test_gemma_suite_defaults_to_native_bf16_for_inference_and_building(tmp_path):
+    from bench_tablemoe_suite import server_command
+
+    (tmp_path / "config.json").write_text(json.dumps(dict(architectures=["Gemma4ForConditionalGeneration"])))
+    base = dict(model=str(tmp_path), output=str(tmp_path / "run"), vlmeval_python="python")
+    config = effective_config(base)
+    assert config["dtype"] == config["builder"]["dtype"] == "bfloat16"
+    assert config["convert_bf16"] is False and config["processor"] == {}
+    command = server_command(config, "table_hybrid_graph", tmp_path / "assets")
+    assert command[command.index("--dtype") + 1] == "bfloat16"
+    assert "--tablemoe-convert-bf16-weights" not in command
+    with pytest.raises(ValueError, match="must match"):
+        effective_config({**base, "builder": {"dtype": "float16"}})
+    with pytest.raises(ValueError, match="does not use"):
+        effective_config({**base, "convert_bf16": True})

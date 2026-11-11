@@ -70,7 +70,7 @@ _ACT_IDS = {
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4,
-             "fp16_routes": 5}
+             "fp16_routes": 5, "bf16_routes": 6}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -164,11 +164,11 @@ class CpuMoeExecutor:
         from freetoken.moe.legacy_format import canonical_role
 
         fmt = fmt or cache.quant_format
-        if fmt == "fp16_routes":
-            if not getattr(_cpu_moe, "supports_fp16_routes", lambda: False)():
-                raise RuntimeError("rebuild _cpu_moe with `python setup.py build_ext --inplace` for FP16 routes")
+        if fmt in ("fp16_routes", "bf16_routes"):
+            if not getattr(_cpu_moe, f"supports_{fmt}", lambda: False)():
+                raise RuntimeError(f"rebuild _cpu_moe with `python setup.py build_ext --inplace` for {fmt}")
             if activation not in ("silu", "gelu_tanh") or apply_router_weight_on_input:
-                raise ValueError("FP16 routes require unweighted SiLU or GELU-tanh experts")
+                raise ValueError("TableMoE routes require unweighted SiLU or GELU-tanh experts")
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "
@@ -352,7 +352,7 @@ class CpuMoeExecutor:
         is actually a per-layer table's address (see ``_make_table``), not a single
         bank's -- the C++ ctor resolves ``tbl[layer_id]`` per task.
         """
-        if fmt in ("bf16", "fp16_routes"):
+        if fmt in ("bf16", "fp16_routes", "bf16_routes"):
             gate_up = banks["gate_up"]
             down = banks["down"]
             dtype = torch.float16 if fmt == "fp16_routes" else torch.bfloat16
@@ -500,8 +500,8 @@ class CpuMoeExecutor:
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
         io = self._io.get(bs)
         if io is None:
-            routes = self.quant_format == "fp16_routes"
-            dtype = torch.float16 if routes else torch.bfloat16
+            routes = self.quant_format in ("fp16_routes", "bf16_routes")
+            dtype = torch.float16 if self.quant_format == "fp16_routes" else torch.bfloat16
             io = {
                 "x": alloc_pinned_tensor(bs, self.H, dtype=dtype),
                 "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
@@ -579,13 +579,13 @@ class CpuMoeExecutor:
         # D2H: ship this step's activations + routing to pinned host memory.
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
-        if self.quant_format != "fp16_routes":
+        if self.quant_format not in ("fp16_routes", "bf16_routes"):
             io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)
 
         task = self._task_for(layer_id, bs)
         out = (io["y"] if mapped_output else
                torch.empty((bs, self.top_k, self.H), device=hidden_states.device, dtype=hidden_states.dtype)
-               if self.quant_format == "fp16_routes" else torch.empty_like(hidden_states))
+               if self.quant_format in ("fp16_routes", "bf16_routes") else torch.empty_like(hidden_states))
         slot = self._flag_slots.get((layer_id, bs)) if self._flag_sync else None
         if slot is not None:
             # Front-end memops: done[slot]=0 then ready[slot]=1 (the coordinator's

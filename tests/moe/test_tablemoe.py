@@ -117,23 +117,24 @@ def _executor(g, d, top_k, activation="silu"):
                             bank_sources={"gate_up": [g], "down": [d]})
     return CpuMoeExecutor(
         banks, top_k=top_k, activation=activation, apply_router_weight_on_input=False,
-        num_threads=2, max_tokens=128, device=torch.device("cuda"), fmt="fp16_routes",
+        num_threads=2, max_tokens=128, device=torch.device("cuda"), fmt="bf16_routes" if g.dtype == torch.bfloat16 else "fp16_routes",
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("hidden,inter", [(6, 4), (128, 96)])
 @pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
-def test_fp16_native_routes_mask_and_repeated_async_buffers(hidden, inter, activation):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_native_routes_mask_and_repeated_async_buffers(hidden, inter, activation, dtype):
     torch.manual_seed(3)
-    g = torch.randn(3, 2 * inter, hidden).half() / 5
-    d = torch.randn(3, hidden, inter).half() / 5
+    g = torch.randn(3, 2 * inter, hidden).to(dtype) / 5
+    d = torch.randn(3, hidden, inter).to(dtype) / 5
     executor = _executor(g, d, 2, activation=activation)
     ids = torch.tensor([[0, -1], [-1, 2], [0, 1], [-1, -1], [1, 0]], device="cuda", dtype=torch.int32)
     outputs, expected = [], []
     for _ in range(4):
-        x = torch.randn(5, hidden).half()
-        reference = torch.zeros(5, 2, hidden).half()
+        x = torch.randn(5, hidden).to(dtype)
+        reference = torch.zeros(5, 2, hidden).to(dtype)
         for row, slot in torch.nonzero(ids.cpu() >= 0).tolist():
             expert = ids[row, slot].item()
             gate, up = F.linear(x[row], g[expert]).chunk(2)
@@ -369,11 +370,11 @@ def test_bad_pca_dimensions_fail_startup(runtime):
 def test_tablemoe_rejects_wrong_model_dtype_and_tp(tmp_path):
     mc = SimpleNamespace(architectures=["Qwen3VLMoeForConditionalGeneration"],
                          expert_quant="none", num_experts_per_tok=8)
-    cfg = SimpleNamespace(model_config=mc, dtype=torch.bfloat16,
+    cfg = SimpleNamespace(model_config=mc, dtype=torch.float32,
                           tp_info=SimpleNamespace(size=1), use_dummy_weight=False,
                           moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False,
                           moe_cpu_layers=None)
-    with pytest.raises(ValueError, match="FP16 and TP=1"):
+    with pytest.raises(ValueError, match="FP16 or BF16 and TP=1"):
         validate_tablemoe_config(cfg)
 
 
@@ -458,10 +459,10 @@ def _with_gpu_cache(runtime, mode, fetch=1):
         proj, bias = runtime.pca[0, mod]
         runtime.pca[0, mod] = (F.pad(proj, (0, 0, 0, hidden - 4)), bias)
     runtime.host_values[0] = F.pad(runtime.host_values[0], (0, hidden - 4))
-    gate = copy_to_pinned_tensor(torch.randn(2, 2 * inter, hidden).half() / 5)
-    down = copy_to_pinned_tensor(torch.randn(2, hidden, inter).half() / 5)
+    gate = copy_to_pinned_tensor(torch.randn(2, 2 * inter, hidden).to(runtime.dtype) / 5)
+    down = copy_to_pinned_tensor(torch.randn(2, hidden, inter).to(runtime.dtype) / 5)
     runtime.executor = _executor(gate, down, 2, activation=runtime.activation) if mode == 'hybrid' else None
-    runtime.expert_cache = OffloadMoeCache(1, 2, 2, torch.device('cuda'), quant_format='fp16')
+    runtime.expert_cache = OffloadMoeCache(1, 2, 2, torch.device('cuda'), quant_format='bf16' if runtime.dtype == torch.bfloat16 else 'fp16')
     runtime.expert_cache.set_bank_sources({'gate_up': [gate], 'down': [down]})
     runtime.expert_bytes = 3 * hidden * inter * 2
     runtime.hybrid_max_fetch = fetch
@@ -1400,14 +1401,16 @@ def test_gemma_attention_scores_respect_scale_window_and_request_boundaries():
 
 @pytest.mark.parametrize("mode", ["offload", "hybrid"])
 @pytest.mark.parametrize("graph", [False, True])
-def test_gemma_exact_decode_preserves_scaled_router_weights(runtime, mode, graph):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gemma_exact_decode_preserves_scaled_router_weights(runtime, mode, graph, dtype):
+    runtime.dtype = dtype
     runtime.activation = "gelu_tanh"
     rt = _optimized(runtime, mode)
     rt.bypass_tables = True
     rt.config.tablemoe_decode_keep_k = 2
     rt.config.tablemoe_renormalize_weights = False
     rt.hybrid_max_fetch = 0
-    x = torch.randn(1, rt.hidden, device="cuda", dtype=torch.float16) / 3
+    x = torch.randn(1, rt.hidden, device="cuda", dtype=dtype) / 3
     ids = torch.tensor([[0, 1]], device="cuda")
     weights = torch.tensor([[1.25, .4]], device="cuda")
     cache = rt.expert_cache
@@ -1416,7 +1419,7 @@ def test_gemma_exact_decode_preserves_scaled_router_weights(runtime, mode, graph
     for expert in range(2):
         g, u = F.linear(x, gate[expert]).chunk(2, -1)
         values.append(F.linear(F.gelu(g, approximate="tanh") * u, down[expert]))
-    expected = (values[0].float() * 1.25 + values[1].float() * .4).half()
+    expected = (values[0].float() * 1.25 + values[1].float() * .4).to(dtype)
     batch = _optimized_batch()
     rt.prepare_batch(batch)
     out = rt.forward(0, x, weights, ids, batch)
@@ -1427,3 +1430,55 @@ def test_gemma_exact_decode_preserves_scaled_router_weights(runtime, mode, graph
         captured.replay()
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
     assert torch.isfinite(out).all()
+
+
+def test_native_bf16_checkpoint_header_and_conversion_guard(tmp_path):
+    save_file({"model.layers.0.experts.down_proj": torch.ones(2, 2).bfloat16()}, tmp_path / "model.safetensors")
+    validate_fp16_checkpoint(str(tmp_path), dtype=torch.bfloat16)
+    cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"],
+                          num_experts=128, num_experts_per_tok=8, expert_quant="none"), dtype=torch.bfloat16,
+                          tp_info=SimpleNamespace(size=1), use_dummy_weight=False,
+                          tablemoe_convert_bf16_weights=True)
+    with pytest.raises(ValueError, match="does not use"):
+        validate_tablemoe_config(cfg)
+    save_file({"model.layers.0.experts.down_proj": torch.ones(2, 2).half()}, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="requires BF16"):
+        validate_fp16_checkpoint(str(tmp_path), dtype=torch.bfloat16)
+
+
+def test_bf16_mapped_offline_values_and_online_cache_graph(runtime):
+    runtime.dtype = torch.bfloat16
+    runtime.executor = _executor(torch.zeros(2, 4, 4).bfloat16(), torch.zeros(2, 4, 2).bfloat16(), 2)
+    rt = _optimized(runtime)
+    rt.host_values[0].mul_(100000)
+    rt.config.tablemoe_renormalize_weights = False
+    x = torch.tensor([[1., 0., 0., 0.]], device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.75, .25]], device="cuda")
+    batch = _optimized_batch()
+    rt.prepare_batch(batch)
+    out = rt.forward(0, x, weights, ids, batch)
+    expected = torch.tensor([[49920., 0., 0., 0.]], device="cuda", dtype=torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    captured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(captured):
+        out = rt.forward(0, x, weights, ids, batch)
+    captured.replay()
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    rt.fixed_online[0]["values"].fill_(400000)
+    captured.replay()
+    assert torch.isfinite(out).all() and out.max() > 65504
+
+
+@pytest.mark.parametrize("stored", [None, "float16", "bfloat16"])
+def test_asset_manifest_rejects_runtime_dtype_mismatch(tmp_path, stored):
+    from freetoken.moe.tablemoe_artifacts import finish_stage
+
+    runtime = TableMoeRuntime.__new__(TableMoeRuntime)
+    runtime.dtype = torch.float16 if stored == "bfloat16" else torch.bfloat16
+    runtime.activation = "gelu_tanh"
+    runtime.config = SimpleNamespace(tablemoe_cache_dir=str(tmp_path), tablemoe_pca_dir=str(tmp_path))
+    finish_stage(tmp_path, {}, [], hash_outputs=False, activation="gelu_tanh",
+                 **({"dtype": stored} if stored else {}))
+    with pytest.raises(ValueError, match="asset dtype mismatch"):
+        runtime._load_assets()
