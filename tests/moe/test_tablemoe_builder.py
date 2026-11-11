@@ -17,7 +17,12 @@ def test_offline_stages_check_paths_without_hashing_tensor_contents(tmp_path, mo
     path.parent.mkdir()
     path.write_bytes(b"old tensor")
     if legacy:
-        finish_stage(tmp_path, {}, [path], pca_outputs={})
+        manifest = finish_stage(tmp_path, {}, [path], hash_outputs=False, pca_outputs={})
+        manifest.pop("output_validation")
+        manifest["outputs"][str(path.relative_to(tmp_path))] = "historical checksum"
+        write_json(tmp_path / "manifest.json", manifest)
+        write_json(tmp_path / "complete.json", dict(complete=True,
+                   manifest_sha256=tablemoe_artifacts.file_hash(tmp_path / "manifest.json")))
     original_hash = tablemoe_artifacts.file_hash
 
     def metadata_hash(value):
@@ -95,7 +100,8 @@ def test_cuda_centroids_repeat_at_reservoir_capacity():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypatch):
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypatch, activation):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from freetoken.moe import tablemoe_artifacts, tablemoe_builder
@@ -123,25 +129,32 @@ def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypa
     gate = torch.randn(2, 6, 4).bfloat16()
     down = torch.randn(2, 4, 3).bfloat16()
     pieces = [(0, 0, 2, dict(gate_up=gate, down=down))]
-    materialize(tmp_path, config, pieces=pieces)
+    from types import SimpleNamespace
+
+    mc = SimpleNamespace(architectures=["Gemma4ForConditionalGeneration" if activation == "gelu_tanh"
+                                        else "Qwen3VLMoeForConditionalGeneration"])
+    materialize(tmp_path, config, pieces=pieces, model_config=mc)
     manifest = verify_stage(tmp_path / "cache")
     assert manifest["missing_tables"] == ["L0_E1_vision", "L0_E1_text"]
     path = tmp_path / "cache/layer_0/L0_E0_text_cache.pt"
     data = torch.load(path, weights_only=True)
     centroids = torch.load(tmp_path / "cluster/layer_0/L0_E0_text_clusters.pt", weights_only=True)["centroid"]
-    expected = expert_values(centroids.to(device), gate[0].to(device).half(), down[0].to(device).half())
+    g, u = torch.nn.functional.linear(centroids.to(device), gate[0].to(device).half()).chunk(2, -1)
+    act = torch.nn.functional.gelu(g, approximate="tanh") if activation == "gelu_tanh" else torch.nn.functional.silu(g)
+    expected = torch.nn.functional.linear(act * u, down[0].to(device).half()).cpu()
     torch.testing.assert_close(data["value"], expected, atol=0, rtol=0)
     assert data["key"].dtype == data["value"].dtype == torch.float16
     assert data["id"].tolist() == list(range(len(data["key"])))
-    assert materialize(tmp_path, config, pieces=pieces)["input_sha256"] == manifest["input_sha256"]
+    assert manifest["activation"] == activation
+    assert materialize(tmp_path, config, pieces=pieces, model_config=mc)["input_sha256"] == manifest["input_sha256"]
     write_json(tmp_path / "cluster/complete.json", dict(complete=False))
     cluster(tmp_path, config)
     write_json(tmp_path / "cache/complete.json", dict(complete=False))
-    materialize(tmp_path, config, pieces=pieces)
+    materialize(tmp_path, config, pieces=pieces, model_config=mc)
     write_json(tmp_path / "cache/complete.json", dict(complete=False))
     with pytest.raises(ValueError, match="input mismatch"):
-        materialize(tmp_path, {**config, "value_chunk": 32}, pieces=pieces)
-    materialize(tmp_path, config, pieces=pieces)
+        materialize(tmp_path, {**config, "value_chunk": 32}, pieces=pieces, model_config=mc)
+    materialize(tmp_path, config, pieces=pieces, model_config=mc)
     with pytest.raises(ValueError, match="mismatch"):
         cluster(tmp_path, {**config, "clusters": 4})
     path.write_bytes(b"interrupted")
@@ -181,7 +194,8 @@ def test_conversion_mismatch_is_not_a_complete_asset(tmp_path):
     path = root / "layer_0/L0_E0_text_clusters.pt"
     path.parent.mkdir(parents=True)
     torch.save(dict(key=torch.zeros(1, 2).half(), centroid=torch.ones(1, 4).half()), path)
-    finish_stage(root, {}, [path], source_inputs=dict(checkpoint={}, convert_bf16=False, processor={}),
+    finish_stage(root, {}, [path], hash_outputs=False,
+                 source_inputs=dict(checkpoint={}, convert_bf16=False, processor={}),
                  num_layers=1, num_experts=1, missing_tables=["L0_E0_vision"])
     with pytest.raises(ValueError, match="conversion policy"):
         materialize(tmp_path, dict(device="cpu"), pieces=[(0, 0, 1, dict(gate_up=torch.ones(1, 6, 4).bfloat16(),
@@ -411,3 +425,23 @@ def test_fixed_decode_sampling_rejects_incomplete_generation(tmp_path):
     collector.close()
     with pytest.raises(ValueError, match='fixed-length collection coverage'):
         finalize_collection(tmp_path, dict(sample_count=1), 1, 1)
+
+
+def test_gemma_checkpoint_expert_layout_is_not_transposed(tmp_path):
+    from safetensors.torch import save_file
+    from freetoken.moe.tablemoe_builder import iter_checkpoint_experts
+
+    write_json(tmp_path / "config.json", dict(architectures=["Gemma4ForConditionalGeneration"],
+               text_config=dict(num_hidden_layers=1, num_experts=2)))
+    gate = torch.arange(2 * 6 * 4).reshape(2, 6, 4).bfloat16()
+    down = torch.arange(2 * 4 * 3).reshape(2, 4, 3).bfloat16()
+    save_file({"model.language_model.layers.0.experts.gate_up_proj": gate},
+              tmp_path / "model-00001-of-00002.safetensors")
+    save_file({"model.language_model.layers.0.experts.down_proj": down},
+              tmp_path / "model-00002-of-00002.safetensors")
+    pieces = list(iter_checkpoint_experts(tmp_path))
+    assert len(pieces) == 2
+    for expert, (layer, lo, hi, data) in enumerate(pieces):
+        assert (layer, lo, hi) == (0, expert, expert + 1)
+        torch.testing.assert_close(data["gate_up"], gate[expert:expert + 1], atol=0, rtol=0)
+        torch.testing.assert_close(data["down"], down[expert:expert + 1], atol=0, rtol=0)

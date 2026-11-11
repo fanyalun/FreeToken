@@ -167,8 +167,8 @@ class CpuMoeExecutor:
         if fmt == "fp16_routes":
             if not getattr(_cpu_moe, "supports_fp16_routes", lambda: False)():
                 raise RuntimeError("rebuild _cpu_moe with `python setup.py build_ext --inplace` for FP16 routes")
-            if activation != "silu" or apply_router_weight_on_input:
-                raise ValueError("FP16 routes require unweighted SiLU experts")
+            if activation not in ("silu", "gelu_tanh") or apply_router_weight_on_input:
+                raise ValueError("FP16 routes require unweighted SiLU or GELU-tanh experts")
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
                 f"--moe-strategy cpu/hybrid computes experts on the CPU and supports "

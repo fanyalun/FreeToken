@@ -16,7 +16,8 @@ from freetoken.moe.tablemoe import (
 )
 
 
-def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monkeypatch):
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monkeypatch, activation):
     from freetoken.moe import tablemoe_artifacts
 
     pca, cache, model = (tmp_path / name for name in ("pca", "cache", "model"))
@@ -29,9 +30,9 @@ def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monke
         pca_files.append(str(path.relative_to(pca)))
     tensor = cache / "layer_0/L0_E0_text_cache.pt"
     torch.save(dict(key=torch.zeros(1, 2).half(), value=torch.ones(1, 4).half()), tensor)
-    tablemoe_artifacts.finish_stage(cache, {}, [tensor],
+    tablemoe_artifacts.finish_stage(cache, {}, [tensor], hash_outputs=False,
         provenance=dict(checkpoint=dict(path=str(model)), convert_bf16=True, processor={}),
-        pca_outputs={name: "legacy checksum" for name in pca_files})
+        pca_outputs={name: "legacy checksum" for name in pca_files}, activation=activation)
     original_hash = tablemoe_artifacts.file_hash
 
     def metadata_hash(path):
@@ -40,6 +41,7 @@ def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monke
 
     monkeypatch.setattr(tablemoe_artifacts, "file_hash", metadata_hash)
     runtime = TableMoeRuntime.__new__(TableMoeRuntime)
+    runtime.activation = activation
     runtime.config = SimpleNamespace(tablemoe_pca_dir=str(pca), tablemoe_cache_dir=str(cache),
                                     model_path=str(model), tablemoe_convert_bf16_weights=True,
                                     mm=SimpleNamespace(processor_kwargs={}))
@@ -48,6 +50,10 @@ def test_asset_loading_checks_paths_without_hashing_tensor_files(tmp_path, monke
     runtime._load_assets()
     assert runtime.asset_provenance == "paths_checked"
     assert runtime.offline_paths[0, 0, "text"] == tensor
+    runtime.activation = "silu" if activation == "gelu_tanh" else "gelu_tanh"
+    with pytest.raises(ValueError, match="activation mismatch"):
+        runtime._load_assets()
+    runtime.activation = activation
     tensor.unlink()
     with pytest.raises(ValueError, match="missing artifact"):
         runtime._load_assets()
@@ -106,22 +112,23 @@ def test_tablemoe_cli_weight_modes_are_mutually_exclusive(flags):
                     "--tool-call-parser", "llama3", "--reasoning-parser", "off", *flags])
 
 
-def _executor(g, d, top_k):
+def _executor(g, d, top_k, activation="silu"):
     banks = SimpleNamespace(num_layers=1, num_experts=g.shape[0],
                             bank_sources={"gate_up": [g], "down": [d]})
     return CpuMoeExecutor(
-        banks, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
+        banks, top_k=top_k, activation=activation, apply_router_weight_on_input=False,
         num_threads=2, max_tokens=128, device=torch.device("cuda"), fmt="fp16_routes",
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("hidden,inter", [(6, 4), (128, 96)])
-def test_fp16_native_routes_mask_and_repeated_async_buffers(hidden, inter):
+@pytest.mark.parametrize("activation", ["silu", "gelu_tanh"])
+def test_fp16_native_routes_mask_and_repeated_async_buffers(hidden, inter, activation):
     torch.manual_seed(3)
     g = torch.randn(3, 2 * inter, hidden).half() / 5
     d = torch.randn(3, hidden, inter).half() / 5
-    executor = _executor(g, d, 2)
+    executor = _executor(g, d, 2, activation=activation)
     ids = torch.tensor([[0, -1], [-1, 2], [0, 1], [-1, -1], [1, 0]], device="cuda", dtype=torch.int32)
     outputs, expected = [], []
     for _ in range(4):
@@ -130,7 +137,8 @@ def test_fp16_native_routes_mask_and_repeated_async_buffers(hidden, inter):
         for row, slot in torch.nonzero(ids.cpu() >= 0).tolist():
             expert = ids[row, slot].item()
             gate, up = F.linear(x[row], g[expert]).chunk(2)
-            reference[row, slot] = F.linear(F.silu(gate) * up, d[expert])
+            act = F.gelu(gate, approximate="tanh") if activation == "gelu_tanh" else F.silu(gate)
+            reference[row, slot] = F.linear(act * up, d[expert])
         pending = executor.decode_submit(0, x.cuda(), torch.ones_like(ids).float(), ids)
         # Enqueue independent GPU work between submit and sync.
         torch.mm(torch.ones(32, 32, device="cuda"), torch.ones(32, 32, device="cuda"))
@@ -369,6 +377,16 @@ def test_tablemoe_rejects_wrong_model_dtype_and_tp(tmp_path):
         validate_tablemoe_config(cfg)
 
 
+@pytest.mark.parametrize("dense", [False, True])
+def test_gemma_rejects_dense_models_and_scale_renormalization(dense):
+    cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"],
+                          num_experts=0 if dense else 128, num_experts_per_tok=8),
+                          dtype=torch.float16, tp_info=SimpleNamespace(size=1),
+                          tablemoe_renormalize_weights=not dense)
+    with pytest.raises(ValueError, match="routed MoE" if dense else "per-expert scales"):
+        validate_tablemoe_config(cfg)
+
+
 def test_checkpoint_dtype_is_checked_from_safetensors_header(tmp_path):
     path = tmp_path / "model.safetensors"
     save_file({"model.layers.0.experts.down_proj": torch.zeros(2, 2, dtype=torch.bfloat16)}, path)
@@ -379,15 +397,16 @@ def test_checkpoint_dtype_is_checked_from_safetensors_header(tmp_path):
     validate_fp16_checkpoint(str(tmp_path))
 
 
-def test_bf16_source_requires_explicit_conversion_flag(tmp_path):
+@pytest.mark.parametrize("architecture", ["Qwen3VLMoeForConditionalGeneration", "Gemma4ForConditionalGeneration"])
+def test_bf16_source_requires_explicit_conversion_flag(tmp_path, architecture):
     save_file({"model.layers.0.experts.down_proj": torch.ones(2, 2, dtype=torch.bfloat16)},
               tmp_path / "model.safetensors")
     (tmp_path / "pca").mkdir()
     (tmp_path / "cache").mkdir()
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
-            architectures=["Qwen3VLMoeForConditionalGeneration"], expert_quant="none",
-            num_experts_per_tok=8,
+            architectures=[architecture], expert_quant="none",
+            num_experts_per_tok=8, num_experts=128,
         ),
         dtype=torch.float16, tp_info=SimpleNamespace(size=1), use_dummy_weight=False,
         moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False, moe_cpu_layers=None,
@@ -441,7 +460,7 @@ def _with_gpu_cache(runtime, mode, fetch=1):
     runtime.host_values[0] = F.pad(runtime.host_values[0], (0, hidden - 4))
     gate = copy_to_pinned_tensor(torch.randn(2, 2 * inter, hidden).half() / 5)
     down = copy_to_pinned_tensor(torch.randn(2, hidden, inter).half() / 5)
-    runtime.executor = _executor(gate, down, 2) if mode == 'hybrid' else None
+    runtime.executor = _executor(gate, down, 2, activation=runtime.activation) if mode == 'hybrid' else None
     runtime.expert_cache = OffloadMoeCache(1, 2, 2, torch.device('cuda'), quant_format='fp16')
     runtime.expert_cache.set_bank_sources({'gate_up': [gate], 'down': [down]})
     runtime.expert_bytes = 3 * hidden * inter * 2
@@ -1364,3 +1383,47 @@ def test_audit_concurrent_completion_abort_and_online_capacity(runtime, tmp_path
     assert not records[-1]["unreleased_response_ids"]
     assert records[-1]["total_io_bytes"] == sum(r["total_io_bytes"] for r in records
                                                if r["type"] in ("request", "batch_shared"))
+
+
+def test_gemma_attention_scores_respect_scale_window_and_request_boundaries():
+    torch.manual_seed(2)
+    q = torch.randn(7, 4, 8)
+    k = torch.randn(7, 2, 8)
+    reqs = [SimpleNamespace(extend_len=n) for n in (4, 0, 3)]
+    actual = last_token_attention_scores(q, k, reqs, sm_scale=1.0, sliding_window=2)
+    expected = torch.zeros(7)
+    for lo, hi in ((0, 4), (4, 7)):
+        logits = torch.einsum("hd,thd->ht", q[hi - 1], k[hi - 2:hi].repeat_interleave(2, dim=1))
+        expected[hi - 2:hi] = logits.softmax(-1).mean(0)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+@pytest.mark.parametrize("graph", [False, True])
+def test_gemma_exact_decode_preserves_scaled_router_weights(runtime, mode, graph):
+    runtime.activation = "gelu_tanh"
+    rt = _optimized(runtime, mode)
+    rt.bypass_tables = True
+    rt.config.tablemoe_decode_keep_k = 2
+    rt.config.tablemoe_renormalize_weights = False
+    rt.hybrid_max_fetch = 0
+    x = torch.randn(1, rt.hidden, device="cuda", dtype=torch.float16) / 3
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[1.25, .4]], device="cuda")
+    cache = rt.expert_cache
+    gate, down = (cache.bank_sources[name][0].cuda() for name in ("gate_up", "down"))
+    values = []
+    for expert in range(2):
+        g, u = F.linear(x, gate[expert]).chunk(2, -1)
+        values.append(F.linear(F.gelu(g, approximate="tanh") * u, down[expert]))
+    expected = (values[0].float() * 1.25 + values[1].float() * .4).half()
+    batch = _optimized_batch()
+    rt.prepare_batch(batch)
+    out = rt.forward(0, x, weights, ids, batch)
+    if graph:
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            out = rt.forward(0, x, weights, ids, batch)
+        captured.replay()
+    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+    assert torch.isfinite(out).all()

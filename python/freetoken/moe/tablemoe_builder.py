@@ -582,11 +582,14 @@ def cluster(root, config):
                         num_layers=source["num_layers"], num_experts=source["num_experts"])
 
 
-def expert_values(x, gate_up, down, chunk=64):
+def expert_values(x, gate_up, down, chunk=64, *, activation="silu"):
+    if activation not in ("silu", "gelu_tanh"):
+        raise ValueError(f"unsupported TableMoE expert activation: {activation}")
     result = []
     for part in x.split(chunk):
         gate, up = F.linear(part, gate_up).chunk(2, -1)
-        result.append(F.linear(F.silu(gate) * up, down).cpu())
+        activated = F.gelu(gate, approximate="tanh") if activation == "gelu_tanh" else F.silu(gate)
+        result.append(F.linear(activated * up, down).cpu())
     return torch.cat(result).half()
 
 
@@ -594,16 +597,28 @@ def materialize(root, config, pieces=None, model_config=None):
     root, config = Path(root), algorithm_config(config)
     source = verify_stage(root / "cluster", hash_outputs=False)
     provenance = source["source_inputs"]
+    from freetoken.moe.tablemoe import tablemoe_activation
+
+    model_path = provenance["checkpoint"].get("path")
+    model = Path(model_path) if model_path else None
+    if model_config is not None:
+        activation = tablemoe_activation(model_config.architectures)
+    elif model is not None and (model / "config.json").is_file():
+        activation = tablemoe_activation(read_json(model / "config.json")["architectures"])
+    elif pieces is not None:
+        activation = "silu"
+    else:
+        raise ValueError("missing checkpoint config for table construction")
     if pieces is None:
-        model = Path(provenance["checkpoint"]["path"])
-        if not model.is_dir() or any(not (model / name).is_file()
+        if model is None or not model.is_dir() or any(not (model / name).is_file()
                                     for name in provenance["checkpoint"].get("files", {})):
             raise ValueError("missing checkpoint files for table construction")
         pieces = iter_checkpoint_experts(model)
     target = root / "cache"
     inputs = dict(cluster=source["input_sha256"], cluster_outputs=source["outputs"],
                   checkpoint=provenance["checkpoint"], convert_bf16=provenance["convert_bf16"],
-                  processor=provenance["processor"], algorithm=config, builder_sha256=file_hash(__file__),
+                  processor=provenance["processor"], activation=activation,
+                  algorithm=config, builder_sha256=file_hash(__file__),
                   torch_version=torch.__version__, cuda_version=torch.version.cuda)
     if (target / "complete.json").exists() and read_json(target / "complete.json").get("complete"):
         return verify_stage(target, inputs)
@@ -633,48 +648,60 @@ def materialize(root, config, pieces=None, model_config=None):
                 if str(path.relative_to(root / "cluster")) not in source["outputs"]:
                     continue
                 data = torch.load(path, weights_only=True)
-                value = expert_values(data["centroid"].to(config["device"]), gate, down, config["value_chunk"])
+                value = expert_values(data["centroid"].to(config["device"]), gate, down,
+                                      config["value_chunk"], activation=activation)
                 out = folder / f"{key}_cache.pt"
                 torch.save(dict(id=torch.arange(len(value)), key=data["key"], value=value), out)
                 outputs.append(out)
     if len(visited) != source["num_layers"] * source["num_experts"]:
         raise ValueError("checkpoint expert coverage gap")
     return finish_stage(target, inputs, outputs, hash_outputs=False, pca_root=str((root / "cluster").resolve()),
-                        missing_tables=source["missing_tables"], provenance=provenance,
+                        missing_tables=source["missing_tables"], provenance=provenance, activation=activation,
                         pca_outputs={name: h for name, h in source["outputs"].items() if name.endswith("_pca.pt")})
 
 
 def iter_checkpoint_experts(model):
     from safetensors import safe_open
     from freetoken.models.qwen3_vl.weight import _linear_layout, rename_vl_prefix
+    from freetoken.models.gemma4.weight import _rename_language_key
     from freetoken.moe.expert_pieces import packed_expert_source_info
+    from freetoken.moe.tablemoe import tablemoe_activation
 
     geometry = read_json(Path(model) / "config.json")
-    if geometry["architectures"] != ["Qwen3VLMoeForConditionalGeneration"]:
-        raise ValueError("builder requires Qwen3-VL-MoE")
+    activation = tablemoe_activation(geometry["architectures"])
+    gemma = activation == "gelu_tanh"
+    rename = _rename_language_key if gemma else rename_vl_prefix
+    text = geometry["text_config"]
+    if not text.get("num_experts", 0):
+        raise ValueError("builder requires a routed MoE checkpoint")
     sources = {}
     for path in sorted(Path(model).glob("*.safetensors")):
         with safe_open(path, framework="pt", device="cpu") as handle:
             for key in handle.keys():
-                info = packed_expert_source_info(rename_vl_prefix(key))
+                info = packed_expert_source_info(rename(key))
                 if info is not None:
                     if info in sources:
                         raise ValueError("duplicate checkpoint expert tensor")
                     sources[info] = (path, key)
     from contextlib import ExitStack
-    text = geometry["text_config"]
     for layer in range(text["num_hidden_layers"]):
         with ExitStack() as stack:
             handles = {}
             tensors = {}
             for leaf, role in (("gate_up_proj", "gate_up"), ("down_proj", "down")):
+                if (layer, leaf) not in sources:
+                    raise ValueError(f"missing checkpoint expert tensor: layer {layer} {leaf}")
                 path, key = sources[layer, leaf]
                 if path not in handles:
                     handles[path] = stack.enter_context(safe_open(path, framework="pt", device="cpu"))
                 tensors[role] = handles[path].get_slice(key)
+                if tensors[role].get_shape()[0] != text["num_experts"]:
+                    raise ValueError(f"checkpoint expert count mismatch: layer {layer} {leaf}")
             for expert in range(text["num_experts"]):
+                piece = {role: view[expert:expert + 1] for role, view in tensors.items()}
                 yield layer, expert, expert + 1, {
-                    role: _linear_layout(view[expert:expert + 1]).contiguous() for role, view in tensors.items()}
+                    role: (value if gemma else _linear_layout(value)).contiguous()
+                    for role, value in piece.items()}
 
 
 def main():

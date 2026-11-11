@@ -420,12 +420,12 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             if prefill:
                 from freetoken.moe.fused import fused_experts_impl
                 gpu_values = fused_experts_impl(x.contiguous(), cache.bank_caches["gate_up"], cache.bank_caches["down"],
-                                               torch.ones_like(slots, dtype=torch.float32), slots, return_routes=True)
+                                               torch.ones_like(slots, dtype=torch.float32), slots, activation=self.activation, return_routes=True)
             else:
                 from freetoken.moe.fused import fused_experts_decode_impl
                 gpu_values = fused_experts_decode_impl(
                     x, cache.bank_caches["gate_up"], cache.bank_caches["down"], ws["gpu_weights"], slots,
-                    return_routes=True, workspace=ws["gpu_workspace"])
+                    activation=self.activation, return_routes=True, workspace=ws["gpu_workspace"])
         cpu_addr = 0
         if pending is not None:
             cpu_values = self.executor.decode_sync(pending)

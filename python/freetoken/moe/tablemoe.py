@@ -1,8 +1,7 @@
-"""FP16 CPU experts and request-local TableMoE lookup for Qwen3-VL-MoE."""
+"""FP16 experts and request-local TableMoE lookup for Qwen3-VL-MoE and Gemma 4."""
 
 from __future__ import annotations
 
-import math
 import json
 import re
 from collections import defaultdict
@@ -15,6 +14,14 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
+
+
+def tablemoe_activation(architectures) -> str:
+    if "Gemma4ForConditionalGeneration" in architectures:
+        return "gelu_tanh"
+    if "Qwen3VLMoeForConditionalGeneration" in architectures:
+        return "silu"
+    raise ValueError("tablemoe requires Qwen3VLMoeForConditionalGeneration or Gemma4ForConditionalGeneration")
 
 
 def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False) -> None:
@@ -38,10 +45,13 @@ def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False) -> No
 
 def validate_tablemoe_config(config) -> None:
     mc = config.model_config
-    if "Qwen3VLMoeForConditionalGeneration" not in mc.architectures:
-        raise ValueError("--moe-strategy tablemoe requires Qwen3VLMoeForConditionalGeneration")
+    activation = tablemoe_activation(mc.architectures)
     if config.dtype != torch.float16 or config.tp_info.size != 1:
         raise ValueError("tablemoe requires FP16 and TP=1")
+    if mc.num_experts <= 0 or mc.num_experts_per_tok <= 0:
+        raise ValueError("tablemoe requires a routed MoE checkpoint")
+    if activation == "gelu_tanh" and getattr(config, "tablemoe_renormalize_weights", False):
+        raise ValueError("Gemma4 TableMoE must preserve router per-expert scales; disable weight renormalization")
     if mc.expert_quant != "none":
         raise ValueError("tablemoe requires unquantized FP16 experts")
     if config.use_dummy_weight:
@@ -92,7 +102,9 @@ def validate_tablemoe_config(config) -> None:
             raise ValueError("tablemoe cosine thresholds must be in [-1, 1]")
 
 
-def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list) -> torch.Tensor:
+def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list, *,
+                                sm_scale: float | None = None,
+                                sliding_window: int | None = None) -> torch.Tensor:
     """Average head attention from each current chunk's last token to that chunk."""
     scores = torch.empty(q.shape[0], dtype=torch.float32, device=q.device)
     offset = 0
@@ -104,7 +116,10 @@ def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list) ->
         if q.shape[1] != k.shape[1]:
             keys = keys.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
         logits = torch.einsum("hd,thd->ht", q[offset + n - 1].float(), keys.float())
-        scores[offset:offset + n] = (logits / math.sqrt(q.shape[-1])).softmax(-1).mean(0)
+        logits *= q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
+        if sliding_window is not None:
+            logits[:, :max(0, n - sliding_window)] = -float("inf")
+        scores[offset:offset + n] = logits.softmax(-1).mean(0)
         offset += n
     if offset != q.shape[0]:
         raise ValueError("TableMoE attention rows do not match current request chunks")
@@ -131,12 +146,15 @@ def renormalize_weights(weights: torch.Tensor, survived: torch.Tensor) -> torch.
 
 
 class TableMoeRuntime:
+    activation = "silu"
+
     def __init__(self, config):
         validate_tablemoe_config(config)
         self.config = config
         self.expert_mode = getattr(config, "tablemoe_expert_mode", "cpu")
         self.stats_enabled = getattr(config, "tablemoe_stats", False)
         mc = config.model_config
+        self.activation = tablemoe_activation(mc.architectures)
         self.hidden = mc.hidden_size
         self.num_experts = mc.num_experts
         self.num_layers = mc.num_moe_layers
@@ -158,7 +176,7 @@ class TableMoeRuntime:
         self.executor = None
         if self.expert_mode != "offload":
             self.executor = CpuMoeExecutor(
-                banks, top_k=mc.num_experts_per_tok, activation="silu",
+                banks, top_k=mc.num_experts_per_tok, activation=self.activation,
                 apply_router_weight_on_input=False, num_threads=config.moe_cpu_threads,
                 max_tokens=max(128, config.max_running_req), device=self.device, fmt="fp16_routes",
             )
@@ -199,6 +217,8 @@ class TableMoeRuntime:
             from freetoken.moe.tablemoe_artifacts import verify_stage
 
             manifest = verify_stage(cfg.tablemoe_cache_dir, hash_outputs=False)
+            if manifest.get("activation", "silu") != self.activation:
+                raise ValueError("TableMoE asset expert activation mismatch; rebuild tables for this model")
             actual = {str(p.relative_to(cfg.tablemoe_cache_dir)) for p in Path(cfg.tablemoe_cache_dir).glob("layer_*/*_cache.pt")}
             declared = {p for p in manifest["outputs"] if p.endswith("_cache.pt")}
             if actual != declared:
@@ -214,6 +234,8 @@ class TableMoeRuntime:
                     raise ValueError(f"missing TableMoE PCA file: {name}")
             self.asset_provenance = "paths_checked"
         else:
+            if self.activation == "gelu_tanh":
+                raise ValueError("Gemma4 TableMoE requires a cache manifest with GELU-tanh activation metadata")
             self.asset_provenance = "legacy_paths_checked"
             if getattr(cfg, "moe_policy", "native") != "native":
                 from freetoken.moe.tablemoe_artifacts import digest, file_metadata
@@ -448,7 +470,7 @@ class TableMoeRuntime:
         return function(
             x.contiguous(), cache.bank_caches["gate_up"], cache.bank_caches["down"],
             torch.ones_like(slots, dtype=torch.float32), slots,
-            return_routes=True,
+            activation=self.activation, return_routes=True,
         )
 
     def forward(self, layer_id: int, hidden_states: torch.Tensor, weights: torch.Tensor,

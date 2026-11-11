@@ -100,6 +100,14 @@ class Gemma4Attention(BaseOP):
 
         q, k = self._apply_rope(positions, q, k)
 
+        if (getattr(ctx, "tablemoe_runtime", None) is not None and ctx.batch.is_prefill
+                and getattr(ctx.tablemoe_runtime, "prefill_uses_tablemoe", True)):
+            from freetoken.moe.tablemoe import last_token_attention_scores
+
+            ctx.batch.tablemoe_attn_scores[self.layer_id] = last_token_attention_scores(
+                q, k, ctx.batch.padded_reqs, sm_scale=self.attn_spec.sm_scale,
+                sliding_window=self.attn_spec.sliding_window)
+
         k = k.reshape(T, self.num_kv_heads * self.head_dim)
         v = v.reshape(T, self.num_kv_heads * self.head_dim)
         o = ctx.attn_backend.forward(
