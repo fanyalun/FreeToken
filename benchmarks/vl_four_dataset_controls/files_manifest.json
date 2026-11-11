@@ -23,7 +23,7 @@
     {
       "source": "build_table.py",
       "destination": "build_table.py",
-      "sha256": "4729b36e79392d1c1256d8981df24d2878d138289a7e25e48c235d38f47d40c9"
+      "sha256": "41c0c98dec5b3f75c627f92d0981ab2c4c5416311145dbb0b3c9e8c8d319db06"
     },
     {
       "source": "calibrate_modes.py",
@@ -33,7 +33,7 @@
     {
       "source": "manager.py",
       "destination": "manager.py",
-      "sha256": "d8378ef154e3d59f69492b6e51218b358a16b7e5aff6c10f6f53eb993bde6d57"
+      "sha256": "5cb48d3356dd8f7cf8fe07cf3dd58f1d972f27b338f2b34364c926ccd4d398fd"
     },
     {
       "source": "score_native.py",
@@ -48,7 +48,7 @@
     {
       "source": "vision_pipeline.py",
       "destination": "vision_pipeline.py",
-      "sha256": "9c3d9e719cf1c542916b08d6fa9090128390d74b61b9f6505f7c9af793b1109e"
+      "sha256": "4650ea4789ac25399390659c1bffe8734eb616949a7e97e00afd0ed8f602c10a"
     },
     {
       "source": "vision_validate.py",
@@ -59,6 +59,16 @@
       "source": "report_results.py",
       "destination": "report_results.py",
       "sha256": "3d12a7c2a1a71ea226b0b41db3941ccdb23ae6904619e36c1a3d1cc9507ff89b"
+    },
+    {
+      "source": "pause_collection.py",
+      "destination": "pause_collection.py",
+      "sha256": "016a9656a26f1e2c50cdb26b58db72825dcb2c9d10bcf4afc80244487810dfc4"
+    },
+    {
+      "source": "resume_build_table.py",
+      "destination": "resume_build_table.py",
+      "sha256": "88c6a639ebcc13beff94cb9ff9e6520b9eb16a1c07bd974f00da3d5cac72a07c"
     }
   ],
   "supporting_sources": [
@@ -93,6 +103,21 @@
       "source": "vision_mock_probe.py",
       "destination": "vision_mock_probe.py",
       "sha256": "f9e91b74a14668fe2e34b55927b2aac1a340e2f7b1769cc8f0ac8b667382e5b3"
+    },
+    {
+      "source": "validation/vision_deadline_selftest.py",
+      "destination": "validation/vision_deadline_selftest.py",
+      "sha256": "872fe43bbb94afd782a3541167747f1aa23dd506e89098d3a79e1c407901db48"
+    },
+    {
+      "source": "validation/io_buffer_candidate/test_resume_driver.py",
+      "destination": "validation/io_buffer_candidate/test_resume_driver.py",
+      "sha256": "fd91fa4309f27d7bb498e58a4e8b492d1669cfe24866bd2d7c87eea34c0af540"
+    },
+    {
+      "source": "validation/io_buffer_candidate/test_buffered_collection.py",
+      "destination": "validation/io_buffer_candidate/test_buffered_collection.py",
+      "sha256": "f004479c1651b7f18f5fc5522609a79dc1831b8f55fda1b887bda1d6e9912e3d"
     }
   ],
   "package_metadata": [
@@ -108,7 +133,10 @@
     "execution_policy.json with the absolute authorized deadline",
     "additional_jobs.json for native scoring and Vision2Web smoke/evaluation",
     "owned-job adoption records or a fresh-run manager without adoption",
-    "required CPU/GPU validation completion markers"
+    "required CPU/GPU validation completion markers",
+    "scheduling_policy.json for task priorities and verified resume commands",
+    "runtime_snapshot_compact and runtime_snapshot_buffered for indexed/resumed collection",
+    "buffered writer and resume CPU validation receipts for the exact source hashes"
   ],
   "excluded": [
     "runtime_snapshot/**",

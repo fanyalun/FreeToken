@@ -6,7 +6,8 @@ import sys
 import time
 
 if __name__=='__main__' and sys.argv[1] in ('MMLongBench_DOC','Vision2Web_Level1'):
-    os.environ['FREETOKEN_EXPERIMENT_SNAPSHOT']=str(Path(__file__).resolve().parent/'runtime_snapshot_compact')
+    os.environ.setdefault('FREETOKEN_EXPERIMENT_SNAPSHOT',
+                          str(Path(__file__).resolve().parent/'runtime_snapshot_compact'))
 
 from run_cell import ROOT,SNAPSHOT,MODEL,asset_root,command,environment,processor
 from tablemoe_common import running_server,stream_request

@@ -35,6 +35,15 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
+def deadline_timeout(deadline, limit):
+    if deadline is None:
+        return limit
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError('the authorized experiment deadline has been reached')
+    return min(limit, remaining)
+
+
 def port_pair():
     while True:
         with socket.socket() as api, socket.socket() as backend:
@@ -126,18 +135,20 @@ def cleanup_own_containers(config, stage):
 
 
 def adapter_call(stage, path, folder, gpu, deadline=None):
+    deadline_timeout(deadline, 1)
     cmd = [KIT_PYTHON, '-B', str(ADAPTER), stage, '--config', str(path)]
     log = folder / f'pipeline_{stage}.log'
     mode = 'a' if log.exists() else 'w'
+    env = kit_environment(gpu)
+    deadline_timeout(deadline, 1)
     with log.open(mode) as handle:
-        proc = subprocess.Popen(cmd, env=kit_environment(gpu), cwd=SNAPSHOT,
+        proc = subprocess.Popen(cmd, env=env, cwd=SNAPSHOT,
                                 stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
         write_json(folder / f'pipeline_{stage}_job.json', dict(pid=proc.pid, command=cmd, started_utc=now()))
         try:
             while proc.poll() is None:
-                if deadline is not None and time.time() >= deadline:
-                    raise TimeoutError('the authorized experiment deadline has been reached')
-                time.sleep(1)
+                time.sleep(deadline_timeout(deadline, 1))
+            deadline_timeout(deadline, 1)
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGINT)
@@ -153,10 +164,12 @@ def adapter_call(stage, path, folder, gpu, deadline=None):
             raise RuntimeError(f'official {stage} failed with exit {proc.returncode}: {log}')
 
 
-def prepare(method, gpu, smoke=False):
+def prepare(method, gpu, smoke=False, deadline=None):
+    deadline_timeout(deadline, 1)
     folder, path, config = config_for(method, smoke)
-    adapter_call('prepare', path, folder, gpu)
-    adapter_call('doctor', path, folder, gpu)
+    adapter_call('prepare', path, folder, gpu, deadline)
+    adapter_call('doctor', path, folder, gpu, deadline)
+    deadline_timeout(deadline, 1)
     commands = {stage: stage_command(method, gpu, stage, config)[0] for stage in ('inference', 'evaluate')}
     write_json(folder / 'pipeline_protocol.json', dict(dataset=DATASET, method=method, smoke=smoke,
         batch_size=1, max_running_requests=1, generation_max_workers=1, evaluation_max_workers=1,
@@ -174,10 +187,11 @@ def prepare(method, gpu, smoke=False):
     return folder, path, config
 
 
-def endpoint_probe(port, config, stage, folder):
+def endpoint_probe(port, config, stage, folder, deadline=None):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(f'http://127.0.0.1:{port}/v1/models', timeout=30) as response:
+    with opener.open(f'http://127.0.0.1:{port}/v1/models', timeout=deadline_timeout(deadline, 30)) as response:
         models = json.load(response)
+    deadline_timeout(deadline, 1)
     expected = config['evaluation' if stage == 'evaluate' else 'generation']['model']
     if expected not in [model['id'] for model in models.get('data', [])]:
         raise ValueError('served model identity differs from the frozen official endpoint')
@@ -188,10 +202,11 @@ def endpoint_probe(port, config, stage, folder):
                                 input_schema=dict(type='object', properties=dict(path=dict(type='string')), required=['path']))])
         request = urllib.request.Request(f'http://127.0.0.1:{port}/v1/messages/count_tokens',
             data=json.dumps(body).encode(), headers={'Content-Type': 'application/json', 'anthropic-version': '2023-06-01'})
-        with opener.open(request, timeout=30) as response:
+        with opener.open(request, timeout=deadline_timeout(deadline, 30)) as response:
             record['anthropic_count_tokens'] = json.load(response)
         if record['anthropic_count_tokens'].get('input_tokens', 0) < 1:
             raise ValueError('Anthropic tool-aware token counting returned no input tokens')
+    deadline_timeout(deadline, 1)
     write_json(folder / f'endpoint_probe_{stage}.json', record)
 
 
@@ -240,46 +255,50 @@ def publish_completion(method, stage, config, folder, smoke):
 def main(dataset, method, gpu, stage, smoke=False, deadline=None):
     if dataset != DATASET:
         raise ValueError('this pipeline only runs Vision2Web Level 1')
-    folder, path, config = prepare(method, gpu, smoke)
-    if stage == 'prepare':
-        return
-    if stage == 'report':
-        adapter_call('report', path, folder, gpu, deadline)
-        publish_completion(method, 'evaluate', config, folder, smoke)
-        return
-    marker = folder / f'{stage}_complete.json'
-    if marker.is_file() and read(marker).get('complete'):
-        if stage == 'evaluate':
-            adapter_call('report', path, folder, gpu, deadline)
-        publish_completion(method, stage, config, folder, smoke)
-        return
-    if deadline is not None and time.time() >= deadline:
-        raise TimeoutError('the authorized experiment deadline has been reached')
-    if stage == 'evaluate' and not read(folder / 'inference_complete.json').get('complete'):
-        raise ValueError('official inference coverage must complete before visual scoring')
-    args, port = stage_command(method, gpu, stage, config)
-    server_dir = folder / f'{stage}_server'
-    attempt = 1
-    while server_dir.exists():
-        attempt += 1
-        server_dir = folder / f'{stage}_server_attempt_{attempt:03d}'
-    write_json(folder / f'{stage}_command.json', dict(command=args, gpu=gpu, server_log=str(server_dir / 'server.log')))
+    folder = RUNS / ('smoke' if smoke else 'heldout') / method
     started = time.time()
     try:
-        with running_server(args, server_dir, SNAPSHOT, environment(gpu), 1800) as server:
+        folder, path, config = prepare(method, gpu, smoke, deadline)
+        deadline_timeout(deadline, 1)
+        if stage == 'prepare':
+            return
+        if stage == 'report':
+            adapter_call('report', path, folder, gpu, deadline)
+            publish_completion(method, 'evaluate', config, folder, smoke)
+            return
+        marker = folder / f'{stage}_complete.json'
+        if marker.is_file() and read(marker).get('complete'):
+            if stage == 'evaluate':
+                adapter_call('report', path, folder, gpu, deadline)
+            publish_completion(method, stage, config, folder, smoke)
+            return
+        if stage == 'evaluate' and not read(folder / 'inference_complete.json').get('complete'):
+            raise ValueError('official inference coverage must complete before visual scoring')
+        args, port = stage_command(method, gpu, stage, config)
+        server_dir = folder / f'{stage}_server'
+        attempt = 1
+        while server_dir.exists():
+            attempt += 1
+            server_dir = folder / f'{stage}_server_attempt_{attempt:03d}'
+        env = environment(gpu)
+        startup_timeout = deadline_timeout(deadline, 1800)
+        write_json(folder / f'{stage}_command.json', dict(command=args, gpu=gpu,
+            server_log=str(server_dir / 'server.log'), startup_timeout_s=startup_timeout, deadline_unix=deadline))
+        with running_server(args, server_dir, SNAPSHOT, env, deadline_timeout(deadline, startup_timeout)) as server:
             write_json(folder / f'{stage}_server_process.json', dict(pid=server.pid,
                 physical_gpu=gpu, started_utc=now(), owned_by_this_pipeline=True))
-            endpoint_probe(port, config, stage, folder)
+            endpoint_probe(port, config, stage, folder, deadline)
             adapter_call(stage, path, folder, gpu, deadline)
         if stage == 'evaluate':
             adapter_call('report', path, folder, gpu, deadline)
+        deadline_timeout(deadline, 1)
+        write_json(folder / f'pipeline_{stage}_complete.json', dict(complete=True, elapsed_s=time.time()-started,
+            finished_utc=now(), official_marker=str(marker), batch_size=1))
+        publish_completion(method, stage, config, folder, smoke)
     except BaseException as error:
         write_json(folder / f'pipeline_{stage}_failure.json', dict(error=repr(error), failed_utc=now(),
-            elapsed_s=time.time()-started, complete=False))
+            elapsed_s=time.time()-started, deadline_unix=deadline, complete=False))
         raise
-    write_json(folder / f'pipeline_{stage}_complete.json', dict(complete=True, elapsed_s=time.time()-started,
-        finished_utc=now(), official_marker=str(marker), batch_size=1))
-    publish_completion(method, stage, config, folder, smoke)
 
 
 def interrupted(signum, frame):

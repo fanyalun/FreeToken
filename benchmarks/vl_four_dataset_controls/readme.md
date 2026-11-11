@@ -50,7 +50,7 @@ The task's prepared membership is:
 
 | Dataset | Calibration samples | Test samples | Split provenance |
 | --- | ---: | ---: | --- |
-| MMLongBench-Doc | 665 | 426 | Category quotas with document groups; actual 60.95% calibration |
+| MMLongBench-Doc | 655 | 436 | Exact rounded category quotas with document groups |
 | BabyVision | 234 | 154 | Four category quotas |
 | Vision2Web Level 1 | 60 | 40 | Task groups; user-authorized unstratified exception because per-task category labels are unavailable |
 | MMMU | 630 | 420 | Existing offline table and original frozen split |
@@ -77,7 +77,9 @@ it is not evaluated as a single HTML completion.
 | `calibrate_modes.py` | Select calibration-only references and calibrate the prefill/decode MoDES thresholds |
 | `run_cell.py` | Run one ordinary generation cell and save per-request timing/output records |
 | `manager.py` | Dispatch ready jobs on two GPUs, honor dependencies and the absolute deadline |
-| `score_native.py` | Apply dataset scoring with preserved predictions and a local lossless judge |
+| `pause_collection.py` | Drain one admitted request and close admission before stopping a collection driver |
+| `resume_build_table.py` | Verify the complete collection prefix and append the remaining frozen samples |
+| `score_native.py` | Apply dataset scoring with preserved predictions and a local full-route fused judge |
 | `score_with_server.py` | Own a fused judge server for one or more completed cells |
 | `vision_pipeline.py` | Own official Vision2Web generation, independent fused visual judging and report stages |
 | `vision_validate.py` | Validate commands, project isolation and visual-score denominators on CPU |
@@ -144,6 +146,29 @@ already-running MMMU fused and BabyVision build jobs; a new run must replace
 those records with its actual owned jobs or remove that adoption path. Never
 adopt unrelated PIDs.
 
+`scheduling_policy.json` may override job priorities and command arrays. This
+task prioritizes the three offline builds, then complete BabyVision comparisons
+and MMMU before the remaining evaluation work. The policy does not change frozen
+sample membership or generation limits. Repeated manager attempts use separate
+control logs. A manager restart adopts its live owned workers.
+
+Collection can use a separately frozen `runtime_snapshot_buffered` by setting
+`FREETOKEN_EXPERIMENT_SNAPSHOT` before `build_table.py`. Its collector coalesces
+small writes and flushes every dirty file before publishing each checkpoint;
+sampling, reservoir order, output bytes and checkpoint frequency are unchanged.
+The original dense and indexed collection snapshots remain recorded separately.
+
+The task migrated Doc after 77 complete requests using the frontend admission
+barrier. `pause_collection.py` stops only the synchronous client, observes one
+admitted request finish, closes admission, then lets the client persist that
+response and exit on the next HTTP 503. `resume_build_table.py` requires the stop
+receipt, stopped process identities, the exact request prefix, all-layer counts,
+sampling/RNG replay, file lengths, and matching CPU validation receipts. It never
+truncates a partial JSONL or rolls back reservoir writes. Run it without
+`--execute` to inspect the prefix first. New server logs and progress are under
+`build/DATASET/resume_runs/ATTEMPT/`; original collection records remain in place.
+The buffered writer's synthetic CPU validation does not establish GPU speedup.
+
 The task-specific wrappers retain references to the original MMMU assets and the
 historical checkpoint binding directory. Do not change those references while
 resuming this task. Rebinding them for another experiment requires a new frozen
@@ -196,6 +221,14 @@ The absolute authorized window for this task is **2026-11-11 18:23:09 UTC throug
 and the Vision2Web job arguments must agree. Resume does not start a new eight-hour
 window. A new experiment requires a newly authorized deadline and new policy;
 do not reuse an expired timestamp.
+
+Vision2Web checks that same deadline before preparation, doctor checks and each
+stage. Server startup is limited to the smaller of 1800 seconds and the remaining
+authorized time; API probe timeouts are similarly capped at 30 seconds. Expired
+work writes `pipeline_STAGE_failure.json`, and the server context stops its own
+process group even when startup never reaches readiness. Process cleanup can
+take its bounded shutdown grace after the deadline. These deadline controls
+leave the Vision2Web prefill chunk at 4096 and retain the official token budgets.
 
 At the deadline, stop only the experiment's owned processes and containers,
 flush completed requests and retain partial/failure records. A failed job must

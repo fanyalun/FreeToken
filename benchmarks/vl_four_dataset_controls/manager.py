@@ -68,6 +68,14 @@ def jobs():
             add('generate_'+dataset+'_'+method,cmd,marker,deps,dict(fused=5,tablemoe=6,modes=5,schedule=8,table=9)[method])
     if (ROOT/'additional_jobs.json').exists():
         result.extend(read_json(ROOT/'additional_jobs.json'))
+    policy=ROOT/'scheduling_policy.json'
+    if policy.exists():
+        values=read_json(policy)
+        priorities=values.get('priorities',{})
+        commands=values.get('commands',{})
+        for job in result:
+            job['priority']=priorities.get(job['id'],job['priority'])
+            job['command']=commands.get(job['id'],job['command'])
     return sorted(result,key=lambda j:j['priority'])
 
 
@@ -150,9 +158,14 @@ def main():
             job=ready[0]
             cmd=[p.replace('{gpu}',str(gpu)).replace('{smoke_deadline}',str(min(deadline,time.time()+1800))) for p in job['command']]
             env=environment(gpu)
-            with (ROOT/'logs'/(job['id']+'.log')).open('w') as output:
+            log=ROOT/'logs'/(job['id']+'.log')
+            attempt=1
+            while log.exists():
+                log=ROOT/'logs'/(job['id']+f'_attempt_{attempt:03d}.log')
+                attempt+=1
+            with log.open('x') as output:
                 proc=subprocess.Popen(cmd,env=env,cwd=ROOT,stdout=output,stderr=subprocess.STDOUT,start_new_session=True)
-            active[gpu]=dict(id=job['id'],pid=proc.pid,started_unix=time.time(),command=cmd)
+            active[gpu]=dict(id=job['id'],pid=proc.pid,started_unix=time.time(),command=cmd,log=str(log))
             processes[job['id']]=proc
         state.update(workers={str(k):v for k,v in active.items()},resources=resource,updated_unix=time.time(),
             jobs_complete=[j['id'] for j in queue if complete(j['marker'])],
