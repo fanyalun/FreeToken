@@ -44,9 +44,14 @@ if os.environ.get("TABLEMOE_AUDIT_DIR"):
 
         def run(self, layer, x, weights, ids, ws, prefill):
             global decode_calls
+            retrieval_enabled = self.offline_enabled(False) and self.online_enabled() and self.capacity > 0
             if layer == 0 and not prefill and not torch.cuda.is_current_stream_capturing():
                 decode_calls += 1
-            check = (not prefill and 45 < decode_calls <= 53
+                if decode_calls == 1 and not retrieval_enabled:
+                    (root / "retrieval_check_summary.json").write_text(json.dumps(dict(
+                        lookup_mode=self.lookup_mode, checked_routes=0,
+                        retrieval_check_skipped_reason="requires_all_lookup_and_online_state"), indent=2))
+            check = (retrieval_enabled and not prefill and 45 < decode_calls <= 53
                      and not self.bypass_tables and not torch.cuda.is_current_stream_capturing())
             if check:
                 slot = int(ws["request_slots"][0].item())

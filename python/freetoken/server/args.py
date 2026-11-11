@@ -745,6 +745,10 @@ def parse_args(
     parser.add_argument("--tablemoe-collect-config", default=None)
     parser.add_argument("--tablemoe-skip-lookup", action="store_true", default=ServerArgs.tablemoe_skip_lookup,
                         help="Execute important routes and drop other routes without online/offline lookup.")
+    parser.add_argument("--tablemoe-lookup-mode", choices=["all", "offline", "online", "none"],
+                        default=ServerArgs.tablemoe_lookup_mode,
+                        help="Table sources: all (default), offline only, decode online only, or none (skip). "
+                             "Offline/none disable online updates; --tablemoe-skip-lookup overrides this option.")
     parser.add_argument("--tablemoe-expert-mode", choices=["cpu", "offload", "hybrid"],
                         default=ServerArgs.tablemoe_expert_mode,
                         help="Execution of important TableMoE routes; hybrid uses GPU prefill and CPU overflow on decode.")

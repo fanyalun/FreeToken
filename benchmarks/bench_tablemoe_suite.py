@@ -362,7 +362,8 @@ def validate_audit(root, warmup, measured):
         record = indexed[prediction["response_id"]]
         if record.get("aborted"):
             raise ValueError("audit contains an aborted request")
-        if not record["reconciled"] or not reconcile(record["counters"], record.get("lookup_enabled", True)):
+        if not record["reconciled"] or not reconcile(record["counters"], record.get("lookup_enabled", True),
+                                                   record.get("offline_enabled")):
             raise ValueError("route counters do not reconcile")
         if record["prompt_vision_tokens"] + record["prompt_nonvision_tokens"] != prediction["usage"]["prompt_tokens"]:
             raise ValueError("audit expanded prompt coverage mismatch")

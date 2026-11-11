@@ -403,6 +403,32 @@ def test_bf16_source_requires_explicit_conversion_flag(tmp_path):
     validate_tablemoe_config(cfg)
 
 
+@pytest.mark.parametrize("lookup_mode,needs_assets", [("all", True), ("offline", True),
+                                                       ("online", False), ("none", False)])
+def test_lookup_mode_requires_only_its_offline_assets(tmp_path, lookup_mode, needs_assets):
+    save_file({"model.layers.0.experts.down_proj": torch.ones(2, 2, dtype=torch.float16)},
+              tmp_path / "model.safetensors")
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["Qwen3VLMoeForConditionalGeneration"],
+                                     expert_quant="none", num_experts_per_tok=2, num_experts=2),
+        dtype=torch.float16, tp_info=SimpleNamespace(size=1), use_dummy_weight=False,
+        moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False, moe_cpu_layers=None,
+        model_path=str(tmp_path), tablemoe_pca_dir=None, tablemoe_cache_dir=None,
+        tablemoe_convert_bf16_weights=False, tablemoe_implementation="optimized",
+        tablemoe_lookup_mode=lookup_mode, tablemoe_prefill_keep_rate=.5,
+        tablemoe_decode_keep_k=1, tablemoe_online_cache_size=2,
+        tablemoe_offline_cosine_threshold_vision=.6, tablemoe_offline_cosine_threshold_text=.7,
+    )
+    if needs_assets:
+        with pytest.raises(ValueError, match="tablemoe-pca-dir"):
+            validate_tablemoe_config(cfg)
+        for name in ("pca", "cache"):
+            (tmp_path / name).mkdir()
+        cfg.tablemoe_pca_dir = str(tmp_path / "pca")
+        cfg.tablemoe_cache_dir = str(tmp_path / "cache")
+    validate_tablemoe_config(cfg)
+
+
 @pytest.mark.parametrize('prefill', [False, True])
 @pytest.mark.parametrize('num_experts', [3, 3072])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -436,9 +462,11 @@ def _with_gpu_cache(runtime, mode, fetch=1):
     runtime.expert_mode = mode
     runtime.hidden = hidden
     for mod in ('text', 'vision'):
-        proj, bias = runtime.pca[0, mod]
-        runtime.pca[0, mod] = (F.pad(proj, (0, 0, 0, hidden - 4)), bias)
-    runtime.host_values[0] = F.pad(runtime.host_values[0], (0, hidden - 4))
+        if (0, mod) in runtime.pca:
+            proj, bias = runtime.pca[0, mod]
+            runtime.pca[0, mod] = (F.pad(proj, (0, 0, 0, hidden - 4)), bias)
+    if 0 in runtime.host_values:
+        runtime.host_values[0] = F.pad(runtime.host_values[0], (0, hidden - 4))
     gate = copy_to_pinned_tensor(torch.randn(2, 2 * inter, hidden).half() / 5)
     down = copy_to_pinned_tensor(torch.randn(2, hidden, inter).half() / 5)
     runtime.executor = _executor(gate, down, 2) if mode == 'hybrid' else None
@@ -520,8 +548,9 @@ def _optimized(runtime, mode="cpu", stats=True, max_extend_tokens=128):
         # _with_gpu_cache widens the fixture's CPU values, so restore mapped storage.
         from freetoken.kernel.pinned import copy_to_pinned_tensor, device_ptr
 
-        runtime.host_values[0] = copy_to_pinned_tensor(runtime.host_values[0])
-        runtime.value_addresses[0] = device_ptr(runtime.host_values[0])
+        if 0 in runtime.host_values:
+            runtime.host_values[0] = copy_to_pinned_tensor(runtime.host_values[0])
+            runtime.value_addresses[0] = device_ptr(runtime.host_values[0])
     runtime._init_optimized_state()
     return runtime
 
@@ -876,6 +905,162 @@ def test_skip_lookup_uses_important_routes_without_tables_or_online_updates(runt
         assert counters["online_queries"] == counters["offline_queries"] == 0
         assert reconcile(counters, lookup_enabled=False)
     rt.close()
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized"])
+def test_offline_lookup_ignores_online_state_and_keeps_both_phase_thresholds(runtime, implementation, monkeypatch):
+    runtime.config.tablemoe_lookup_mode = "offline"
+    runtime.config.tablemoe_renormalize_weights = False
+    rt = _optimized(runtime) if implementation == "optimized" else runtime
+
+    def reject_online(*args):
+        pytest.fail("offline mode must not query or update the online table")
+
+    monkeypatch.setattr(rt, "_online_search", reject_online)
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.75, .25]], device="cuda")
+    vectors = torch.tensor([[.8, .6, 0., 0.], [.6, .8, 0., 0.]], device="cuda").half()
+    make_batch = _optimized_batch if implementation == "optimized" else _batch
+    for vector, expected in zip(vectors, (.5, 0.)):
+        actual = rt.forward(0, vector[None], weights, ids, make_batch(prefill=True))
+        torch.testing.assert_close(actual[:, 0], torch.tensor([expected], device="cuda").half())
+    rt.config.tablemoe_decode_keep_k = 0
+    rt.config.tablemoe_decode_offline_cosine_threshold = .7
+    for _ in range(2):
+        actual = rt.forward(0, vectors[:1], weights, ids, make_batch())
+        torch.testing.assert_close(actual[:, 0], torch.tensor([.5], device="cuda").half())
+    assert rt.stats()["offline_hits"] == 3
+    assert rt.stats()["online_hits"] == 0
+    assert not rt.online
+    if implementation == "optimized":
+        assert rt.capacity == 0 and int(rt.fixed_online[0]["size"].sum()) == 0
+        rt.close()
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized"])
+def test_online_lookup_uses_prefill_exact_values_without_offline_assets(runtime, implementation, monkeypatch):
+    runtime.config.tablemoe_lookup_mode = "online"
+    runtime.config.tablemoe_renormalize_weights = False
+    runtime.config.tablemoe_pca_dir = runtime.config.tablemoe_cache_dir = None
+    runtime.pca.clear()
+    runtime.offline_paths.clear()
+    runtime._load_assets()
+    if implementation == "optimized":
+        rt = _optimized(runtime)
+    else:
+        runtime._prepare_gpu_assets()
+        rt = runtime
+    assert not rt.pca and not rt.gpu_keys and not rt.offline_paths
+    gate = torch.full((2, 4, 4), .2, dtype=torch.float16)
+    down = torch.full((2, 4, 2), .4, dtype=torch.float16)
+    rt.executor = _executor(gate, down, 2)
+
+    def reject_offline(*args):
+        pytest.fail("online mode must not query offline tables")
+
+    monkeypatch.setattr(rt, "_search", reject_offline)
+    x = torch.tensor([[1., 0., 0., 0.]], device="cuda").half()
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.25, .75]], device="cuda")
+    make_batch = _optimized_batch if implementation == "optimized" else _batch
+    g, u = F.linear(x.cpu(), gate[1]).chunk(2, -1)
+    expected = (F.linear(F.silu(g) * u, down[1]).cuda().float() * .75).half()
+    prefill = rt.forward(0, x, weights, ids, make_batch(prefill=True)).clone()
+    torch.testing.assert_close(prefill, expected, atol=1e-4, rtol=.02)
+    rt.config.tablemoe_decode_keep_k = 0
+    hit = rt.forward(0, x, weights, ids, make_batch()).clone()
+    torch.testing.assert_close(hit, expected, atol=1e-4, rtol=.02)
+    miss = rt.forward(0, x, weights, ids, make_batch(uid=101, **({"slot": 1} if implementation == "optimized" else {})))
+    assert not miss.any()
+    stats = rt.stats()
+    assert stats["online_hits"] == 1 and stats["offline_hits"] == 0
+    if implementation == "optimized":
+        rt.close()
+
+
+@pytest.mark.parametrize("legacy_skip", [False, True])
+def test_none_lookup_preserves_schedule_and_disables_online_updates(runtime, legacy_skip):
+    runtime.config.tablemoe_lookup_mode = "all" if legacy_skip else "none"
+    runtime.config.tablemoe_skip_lookup = legacy_skip
+    runtime.config.tablemoe_pca_dir = runtime.config.tablemoe_cache_dir = None
+    runtime.pca.clear()
+    runtime.offline_paths.clear()
+    runtime._load_assets()
+    rt = _optimized(runtime, "offload")
+    x = torch.randn(1, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.75, .25]], device="cuda")
+    gate, down = (bank[0][0].cuda() for bank in
+                  (rt.expert_cache.bank_sources["gate_up"], rt.expert_cache.bank_sources["down"]))
+    g, u = F.linear(x, gate).chunk(2, -1)
+    expected = F.linear(F.silu(g) * u, down)
+    for prefill in (True, False):
+        actual = rt.forward(0, x, weights, ids, _optimized_batch(prefill=prefill))
+        torch.testing.assert_close(actual, expected, atol=.02, rtol=.02)
+    stats = rt.stats()
+    assert stats["gpu_exact_routes"] == 2 and stats["dropped_routes"] == 2
+    assert stats["online_hits"] == stats["offline_hits"] == 0
+    assert int(rt.fixed_online[0]["size"].sum()) == 0
+    assert not rt.pca and rt.capacity == 0
+    rt.close()
+
+
+@pytest.mark.parametrize("lookup_mode", ["offline", "online"])
+def test_lookup_mode_graph_replays_without_cross_table_fallback(runtime, tmp_path, lookup_mode):
+    import json
+
+    runtime.config.tablemoe_lookup_mode = lookup_mode
+    runtime.config.tablemoe_renormalize_weights = False
+    runtime.config.tablemoe_report_path = str(tmp_path / "lookup_audit.jsonl")
+    if lookup_mode == "online":
+        runtime.config.tablemoe_pca_dir = runtime.config.tablemoe_cache_dir = None
+        runtime.pca.clear()
+        runtime.offline_paths.clear()
+        runtime._load_assets()
+    rt = _optimized(runtime, "offload")
+    rt.config.tablemoe_decode_keep_k = 0
+    x = torch.zeros(1, rt.hidden, device="cuda", dtype=torch.float16)
+    x[:, 0] = 1
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.25, .75]], device="cuda")
+    batch = _optimized_batch()
+    rt.prepare_batch(batch)
+    batch.tablemoe_slots.fill_(rt.dummy_slot)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rt.forward(0, x, weights, ids, batch)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = rt.forward(0, x, weights, ids, batch)
+    rt.reset_capture_state()
+    batch.tablemoe_slots.zero_()
+    if lookup_mode == "online":
+        online = rt.fixed_online[0]
+        online["keys"][0, 0].copy_(x[0])
+        online["ids"][0, 0].copy_(ids[0])
+        online["ids"][0, 0, 0] = -1
+        online["values"][0, 0].zero_()
+        online["values"][0, 0, 1, 0] = 3
+        online["size"][0:1].fill_(1)
+    for _ in range(3):
+        graph.replay()
+        expected = torch.zeros_like(x)
+        expected[:, 0] = 2.25 if lookup_mode == "online" else 1.5
+        torch.testing.assert_close(out, expected)
+    rt.release_request(100)
+    rt.close()
+    records = [json.loads(line) for line in (tmp_path / "lookup_audit.jsonl").read_text().splitlines()]
+    request = next(record for record in records if record["type"] == "request")
+    assert request["reconciled"]
+    counters = request["counters"]
+    if lookup_mode == "offline":
+        assert counters["offline_queries"] == 6 and counters["offline_hits"] == 3
+        assert counters["online_queries"] == 0
+    else:
+        assert counters["online_queries"] == 6 and counters["online_hits"] == 3
+        assert counters["offline_queries"] == 0
 
 
 def test_optimized_mapped_sparse_values_and_online_reuse(runtime):

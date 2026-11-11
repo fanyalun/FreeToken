@@ -259,7 +259,8 @@ def _audit_routes(ids, keep, cpu_ids, cache_hit, online, offline, request_slots,
                   table_counts, counts, shared, TOP_K: tl.constexpr, H: tl.constexpr,
                   LAYER: tl.constexpr, LAYERS: tl.constexpr, PHASE: tl.constexpr,
                   DUMMY: tl.constexpr, HAS_CACHE: tl.constexpr, HAS_CPU: tl.constexpr,
-                  ONLINE_ENABLED: tl.constexpr, BYPASS: tl.constexpr, BLOCK_K: tl.constexpr):
+                  ONLINE_ENABLED: tl.constexpr, BYPASS: tl.constexpr, BLOCK_K: tl.constexpr,
+                  OFFLINE_ENABLED: tl.constexpr = True):
     row = tl.program_id(0)
     req = tl.load(request_slots + row)
     if req == DUMMY:
@@ -277,10 +278,10 @@ def _audit_routes(ids, keep, cpu_ids, cache_hit, online, offline, request_slots,
     hit = tl.load(cache_hit + r, mask, False)
     eq = exact & HAS_CACHE
     oq = mask & ~exact & ONLINE_ENABLED
-    fq = mask & ~exact & ~on & (not BYPASS)
+    fq = mask & ~exact & ~on & (not BYPASS) & OFFLINE_ENABLED
     missing = tl.full((BLOCK_K,), False, tl.int1)
     mod = tl.load(modality + row) if PHASE == 0 else 1
-    if not BYPASS:
+    if not BYPASS and OFFLINE_ENABLED:
         eid = tl.load(ids + r, mask, 0).to(tl.int32)
         missing = fq & (tl.load(table_counts + eid * 2 + mod, mask, 0) == 0)
     nc = tl.sum(cpu.to(tl.int64), 0)

@@ -11,6 +11,38 @@ from tablemoe_data import api_messages, fixed_rows, group_rows, split_rows, veri
 from bench_tablemoe_suite import distribution, effective_config, report
 
 
+@pytest.mark.parametrize("mode,legacy", [("all", False), ("offline", False), ("online", False),
+                                        ("none", False), ("all", True), ("none", True)])
+def test_validate_audit_reconciles_enabled_table_sources(tmp_path, mode, legacy):
+    from bench_tablemoe_suite import validate_audit
+    from freetoken.moe.tablemoe_stats import COUNTERS
+
+    counters = dict.fromkeys(COUNTERS, 0)
+    counters.update(tokens=2, routes=4, cpu_exact_routes=2)
+    if mode in ("all", "online"):
+        counters.update(online_queries=2, online_hits=1, online_misses=1)
+    if mode in ("all", "offline"):
+        queries = 1 if mode == "all" else 2
+        counters.update(offline_queries=queries, offline_hits=1, offline_misses=queries - 1,
+                        threshold_rejections=queries - 1)
+    counters["dropped_routes"] = 2 - counters["online_hits"] - counters["offline_hits"]
+    counters["lookup_eligible_routes"] = 2 if mode in ("all", "offline") else 0
+    request = dict(type="request", response_id="chatcmpl-test", reconciled=True, counters=counters,
+                   lookup_enabled=mode != "none", prompt_vision_tokens=1, prompt_nonvision_tokens=1,
+                   total_io_bytes=0)
+    if not legacy:
+        request.update(lookup_mode=mode, offline_enabled=mode in ("all", "offline"))
+    summary = dict(type="run_summary", unreleased_response_ids=[], total_io_bytes=0)
+    prediction = dict(response_id="chatcmpl-test", usage=dict(prompt_tokens=2))
+    path = tmp_path / "audit.jsonl"
+    path.write_text("\n".join(json.dumps(record) for record in (request, summary)) + "\n")
+    assert validate_audit(tmp_path, [], [prediction]) == [request, summary]
+    counters["dropped_routes"] += 1
+    path.write_text("\n".join(json.dumps(record) for record in (request, summary)) + "\n")
+    with pytest.raises(ValueError, match="route counters"):
+        validate_audit(tmp_path, [], [prediction])
+
+
 @pytest.mark.parametrize("custom", [False, True])
 def test_prompt_dispatch_prioritizes_model_before_dataset(custom):
     from types import SimpleNamespace

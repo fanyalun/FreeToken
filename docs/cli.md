@@ -95,6 +95,8 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tablemoe-pca-dir`, `--tablemoe-cache-dir` | required for approximate tablemoe | Existing PCA and offline table `.pt` asset roots, each containing `layer_N` directories. Optimized full-expert control (`keep-rate=1`, `keep-k=top-k`) needs neither asset |
 | `--tablemoe-expert-mode` | offload | Important routes: `cpu`, `offload`, or `hybrid`. Offload/hybrid require explicit `--moe-cache-size`; hybrid uses GPU prefill and capped fetch plus CPU overflow on decode |
 | `--tablemoe-implementation` | optimized | `reference` uses eager host-addressed value fetch; `optimized` uses mapped CPU values, fixed GPU request state, fused merge/update, and decode CUDA Graphs for offload/hybrid |
+| `--tablemoe-lookup-mode` | all | `all`: prefill offline, decode online then offline. `offline`: offline lookup in both phases, no online queries or updates. `online`: decode online only, no offline/PCA assets; prefill exact outputs seed the online table. `none`: skip non-exact routes with no lookup or online updates. All modes preserve expert selection and scheduling |
+| `--tablemoe-skip-lookup` | off | Optimized compatibility flag for `--tablemoe-lookup-mode none`; overrides the lookup mode |
 | `--tablemoe-stats` | off | Collect route and transfer counters on GPU; read at request release. Use only for independent audit, disable for timing |
 | `--tablemoe-renormalize-weights` | off | Opt into survivor-weight renormalization in TableMoE prefill and decode. By default exact routes and table hits retain original top-k router weights; misses contribute zero. MoDES phases always preserve weights |
 | `--tablemoe-no-renormalize-weights` | default behavior | Explicitly preserve original TableMoE router weights in both phases; retained for compatibility. Mutually exclusive with `--tablemoe-renormalize-weights` |
@@ -110,6 +112,27 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tablemoe-decode-online-cosine-threshold` | unset | Optional minimum decode hidden-state cosine similarity for online reuse; normalizes queries and cached keys; unset preserves the positive-dot rule |
 
 Offline TableMoE construction, reuse and loading check artifact paths, completion records and required metadata. Raw reservoirs, exported input tensors, PCA, clusters and cache tensors are not scanned for content checksums. Historical hashes in offline-table manifests are not compared. Loading still checks tensor dimensions and dtypes required for computation.
+
+For ablations, keep the checkpoint, precision, cache slots, prefill keep rate, decode top-h,
+weight setting and prefill scheduling identical, and change only the lookup mode:
+
+| Variant | Extra flags | Prefill non-exact routes | Decode non-exact routes | Online updates |
+|---|---|---|---|---|
+| `+schedule` | `--tablemoe-lookup-mode none` | Skip | Skip | Off |
+| `+table` | `--tablemoe-lookup-mode offline` | Offline table with modality thresholds | Offline table | Off |
+| Online only | `--tablemoe-lookup-mode online` | Skip | Online table; skip misses | On |
+| Full TableMoE | `--tablemoe-lookup-mode all` | Offline table with modality thresholds | Online, then offline on misses | On |
+
+Exact selection remains attention-ranked active experts in prefill, and Top-h plus routed
+GPU expert-weight-cache hits in decode. `+table` uses the configured vision/text prefill
+cosine thresholds (defaults 0.6/0.7). Decode retains the positive-dot rule unless
+`--tablemoe-decode-offline-cosine-threshold` is set. For example, add
+`--tablemoe-decode-offline-cosine-threshold 0.7` to require decode cosine similarity >= 0.7.
+Table misses contribute zero; original router weights remain the default.
+Online-only lookup uses the same request-local table as the full mode: prefill does not
+query it, and exact prefill results seed it for decode. A zero online cache size disables
+its updates and queries. Request audits record the effective lookup mode and the enabled
+online/offline sources for each phase.
 
 ### API behaviour
 

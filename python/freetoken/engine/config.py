@@ -72,6 +72,7 @@ class EngineConfig:
     tablemoe_expert_mode: str = "offload"
     tablemoe_implementation: str = "optimized"
     tablemoe_skip_lookup: bool = False
+    tablemoe_lookup_mode: str = "all"
     tablemoe_renormalize_weights: bool = False
     tablemoe_stats: bool = False
     tablemoe_report_path: str | None = None

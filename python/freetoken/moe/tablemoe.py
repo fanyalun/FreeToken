@@ -17,6 +17,13 @@ logger = init_logger(__name__)
 _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
 
 
+def tablemoe_lookup_mode(config) -> str:
+    mode = getattr(config, "tablemoe_lookup_mode", "all")
+    if mode not in ("all", "offline", "online", "none"):
+        raise ValueError("tablemoe lookup mode must be all, offline, online, or none")
+    return "none" if getattr(config, "tablemoe_skip_lookup", False) else mode
+
+
 def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False) -> None:
     root = Path(model_path)
     if not root.is_dir():
@@ -61,6 +68,7 @@ def validate_tablemoe_config(config) -> None:
     full = (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
             config.tablemoe_decode_keep_k == mc.num_experts_per_tok and
             getattr(config, "tablemoe_implementation", "optimized") == "optimized")
+    lookup_mode = tablemoe_lookup_mode(config)
     skip = getattr(config, "tablemoe_skip_lookup", False)
     if skip and config.tablemoe_implementation != "optimized":
         raise ValueError("skip lookup requires optimized implementation")
@@ -69,7 +77,7 @@ def validate_tablemoe_config(config) -> None:
     if getattr(config, "tablemoe_collect_config", None):
         if not full or config.cuda_graph_max_bs or config.cuda_graph_bs:
             raise ValueError("collection requires full-expert eager execution")
-    for name in (() if full or skip else ("tablemoe_pca_dir", "tablemoe_cache_dir")):
+    for name in (() if full or lookup_mode in ("online", "none") else ("tablemoe_pca_dir", "tablemoe_cache_dir")):
         path = getattr(config, name)
         if not path or not Path(path).is_dir():
             raise ValueError(f"--{name.replace('_', '-')} must name an existing directory")
@@ -140,7 +148,7 @@ class TableMoeRuntime:
         self.hidden = mc.hidden_size
         self.num_experts = mc.num_experts
         self.num_layers = mc.num_moe_layers
-        self.bypass_tables = getattr(config, "tablemoe_skip_lookup", False) or (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
+        self.bypass_tables = tablemoe_lookup_mode(config) == "none" or (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
                               config.tablemoe_decode_keep_k == mc.num_experts_per_tok and
                               config.tablemoe_implementation == "optimized")
         self.device = torch.device("cuda", torch.cuda.current_device())
@@ -186,10 +194,29 @@ class TableMoeRuntime:
         if config.tablemoe_convert_bf16_weights:
             logger.info("TableMoE converted BF16 source experts into FP16 CPU banks")
 
+    def offline_enabled(self, prefill=None):
+        policy = getattr(self.config, "moe_policy", "native")
+        phase_enabled = (prefill is None or policy == "native" or
+                         (getattr(self.config, "modes_prefill_policy", "modes") == "tablemoe"
+                          if prefill else policy != "modes"))
+        return (not getattr(self, "bypass_tables", False) and phase_enabled and
+                tablemoe_lookup_mode(self.config) in ("all", "offline"))
+
+    def online_enabled(self):
+        return (not getattr(self, "bypass_tables", False) and
+                tablemoe_lookup_mode(self.config) in ("all", "online") and
+                self.config.tablemoe_online_cache_size > 0)
+
+    def lookup_enabled(self, prefill):
+        return self.offline_enabled(prefill) or (not prefill and self.online_enabled())
+
     def _load_assets(self) -> None:
         cfg = self.config
         if getattr(self, "bypass_tables", False):
-            self.asset_provenance = "skip_lookup" if getattr(cfg, "tablemoe_skip_lookup", False) else "full_expert_bypass"
+            self.asset_provenance = "skip_lookup" if tablemoe_lookup_mode(cfg) == "none" else "full_expert_bypass"
+            return
+        if not self.offline_enabled():
+            self.asset_provenance = "online_only"
             return
         for root in (cfg.tablemoe_pca_dir, cfg.tablemoe_cache_dir):
             marker = Path(root) / "complete.json"
@@ -249,9 +276,9 @@ class TableMoeRuntime:
                 self.offline_paths[layer, int(match[2]), match[3]] = path
 
     def _prepare_gpu_assets(self):
-        if getattr(self, "bypass_tables", False):
-            return
         self.gpu_keys, self.gpu_counts, self.host_values = {}, {}, {}
+        if not self.offline_enabled():
+            return
         for layer in range(self.num_layers):
             files = [(key, path) for key, path in self.offline_paths.items() if key[0] == layer]
             data = [(key, torch.load(path, map_location="cpu", weights_only=True, mmap=True))
@@ -330,6 +357,8 @@ class TableMoeRuntime:
         return values.masked_fill(~hit[:, :, None], 0), hit
 
     def _update_online(self, uid, layer, x, ids, outputs, survived):
+        if not self.online_enabled():
+            return
         capacity = self.config.tablemoe_online_cache_size
         if capacity == 0:
             return
@@ -487,7 +516,7 @@ class TableMoeRuntime:
                 pending = self.executor.decode_submit(
                     layer_id, x, weights[start:end], eid.masked_fill(~cpu_keep, -1))
             online_hit = torch.zeros_like(eid, dtype=torch.bool)
-            if not batch.is_prefill:
+            if not batch.is_prefill and self.online_enabled():
                 for uid, lo, hi in spans:
                     a, b = max(start, lo), min(end, hi)
                     if a < b:
@@ -495,15 +524,16 @@ class TableMoeRuntime:
                         hit &= ~exact[a:b]
                         outputs[a:b] = values.masked_fill(~hit[:, :, None], 0)
                         online_hit[a - start:b - start] = hit
-            descriptor = self._search(
+            descriptor = (self._search(
                 layer_id, x, eid, None if modality is None else modality[start:end],
                 ~keep & ~online_hit, batch.is_prefill,
-            )
+            ) if self.offline_enabled(batch.is_prefill) else torch.full_like(eid, -1))
             offline_hit = descriptor >= 0
             gpu_outputs = None
             if self.expert_cache is not None:
                 gpu_outputs = self._gpu_important(x, slots, batch.is_prefill)
-            self._fetch_values(layer_id, descriptor, outputs[start:end])
+            if self.offline_enabled(batch.is_prefill):
+                self._fetch_values(layer_id, descriptor, outputs[start:end])
             if gpu_outputs is not None:
                 outputs[start:end] = torch.where((slots >= 0)[:, :, None], gpu_outputs, outputs[start:end])
             if pending is not None:

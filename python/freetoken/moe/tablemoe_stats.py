@@ -21,11 +21,13 @@ SHARED = ("fetched_experts", "expert_weight_h2d_bytes", "padding_activation_d2h_
           "cpu_flag_mapped_read_h2d_bytes", "padding_request_slot_h2d_bytes")
 
 
-def reconcile(c, lookup_enabled=True):
+def reconcile(c, lookup_enabled=True, offline_enabled=None):
+    if offline_enabled is None:
+        offline_enabled = lookup_enabled
     exact = c["cpu_exact_routes"] + c["gpu_exact_routes"]
     checks = [c["routes"] == exact + c["online_hits"] + c["offline_hits"] + c["dropped_routes"],
               c["offline_queries"] == (c.get("lookup_eligible_routes", c["routes"] - exact)
-                                       - c["online_hits"] if lookup_enabled else 0),
+                                       - c["online_hits"] if offline_enabled else 0),
               c["offline_queries"] == c["offline_hits"] + c["offline_misses"],
               c["online_queries"] == c["online_hits"] + c["online_misses"],
               c["gpu_cache_queries"] == c["gpu_cache_hit_routes"] + c["gpu_cache_miss_routes"],
@@ -77,6 +79,9 @@ class RequestAudit:
                            (cache._copy_dst_ptrs, cache._copy_feat_bytes, *cache._copy_src_ptrs))
         self.write(dict(type="startup", scope="moe", explicit_copy_h2d_bytes=startup,
                         gpu_expert_slots=cache.cache_size if cache is not None else 0,
+                        lookup_mode=getattr(runtime, "lookup_mode", "all"),
+                        online_enabled=runtime.online_enabled(),
+                        offline_enabled=any(runtime.offline_enabled(prefill) for prefill in (True, False)),
                         requested_graph_max_bs=getattr(runtime.config, "cuda_graph_max_bs", None),
                         asset_provenance=getattr(runtime, "asset_provenance", "full_expert_bypass"),
                         asset_fingerprints=getattr(runtime, "asset_fingerprints", None),
@@ -114,13 +119,14 @@ class RequestAudit:
     def record(self, layer, ids, ws, slots, gpu_k, prefill, has_cpu):
         rt, phase = self.runtime, 0 if prefill else 1
         bypass = not rt.lookup_enabled(prefill)
+        offline = rt.offline_enabled(prefill)
         shared = self.shared[layer, phase]
         _audit_routes[(ids.shape[0],)](
             ids, ws["keep"], ws["cpu_ids"], ws["cache_hit"], ws["on"], ws["off"],
-            ws["request_slots"], ws["modality"], rt.gpu_counts[layer] if not rt.bypass_tables else ids,
+            ws["request_slots"], ws["modality"], rt.gpu_counts.get(layer, ids),
             self.counts, shared, rt.top_k, rt.hidden, layer, rt.num_layers, phase, rt.dummy_slot,
-            rt.expert_cache is not None, has_cpu, not prefill and rt.capacity > 0 and not bypass,
-            bypass, triton.next_power_of_2(rt.top_k))
+            rt.expert_cache is not None, has_cpu, not prefill and rt.online_enabled() and not bypass,
+            bypass, triton.next_power_of_2(rt.top_k), offline)
         flag = has_cpu and rt.executor._flag_sync and (layer, len(ids)) in rt.executor._flag_slots
         _audit_shared[(1,)](shared, rt.expert_cache.num_indices if rt.expert_cache is not None else ids,
                             rt.expert_bytes, rt.expert_cache is not None, flag)
@@ -156,17 +162,21 @@ class RequestAudit:
                     for name, value in c.items():
                         total[name] += value
                     lookup = rt.lookup_enabled(phase == 0)
+                    offline = rt.offline_enabled(phase == 0)
                     rows.append(dict(layer=layer, phase=("prefill", "decode")[phase], modality=("vision", "text")[mod],
                                      routing_policy="modes" if rt.uses_modes_routing(phase == 0) else "tablemoe",
                                      counters=c, lookup_enabled=lookup,
-                                     reconciled=reconcile(c, lookup), io=io_rows(c)))
+                                     lookup_mode=getattr(rt, "lookup_mode", "all"),
+                                     online_enabled=phase == 1 and rt.online_enabled() and lookup,
+                                     offline_enabled=offline,
+                                     reconciled=reconcile(c, lookup, offline), io=io_rows(c)))
         slot_phase_bytes = self.metadata.pop(slot)
         slot_bytes = sum(slot_phase_bytes)
         total["request_slot_h2d_bytes"] = slot_bytes
+        total["lookup_eligible_routes"] = sum(
+            row["counters"]["routes"] - row["counters"]["cpu_exact_routes"] - row["counters"]["gpu_exact_routes"]
+            for row in rows if row["offline_enabled"])
         if getattr(rt, "external_mask", False):
-            total["lookup_eligible_routes"] = sum(
-                row["counters"]["routes"] - row["counters"]["cpu_exact_routes"] - row["counters"]["gpu_exact_routes"]
-                for row in rows if row["lookup_enabled"])
             total["modes_skipped_routes"] = sum(
                 row["counters"]["routes"] - row["counters"]["cpu_exact_routes"] - row["counters"]["gpu_exact_routes"]
                 for row in rows if row["routing_policy"] == "modes")
@@ -178,7 +188,10 @@ class RequestAudit:
             self.totals[name] = self.totals.get(name, 0) + value
         prompt = values[0, 0, :, 0].tolist()
         self.write(dict(type="request", uid=uid, response_id=f"chatcmpl-{uid}", aborted=aborted, counters=total,
-                        rows=rows, lookup_enabled=not getattr(rt, "skip_lookup", False),
+                        rows=rows, lookup_enabled=any(row["lookup_enabled"] for row in rows),
+                        lookup_mode=getattr(rt, "lookup_mode", "all"),
+                        online_enabled=any(row["online_enabled"] for row in rows),
+                        offline_enabled=any(row["offline_enabled"] for row in rows),
                         prompt_vision_tokens=prompt[0], prompt_nonvision_tokens=prompt[1],
                         reconciled=all(row["reconciled"] for row in rows), io=io_rows(total),
                         request_slot_io_by_phase=[dict(phase=phase, io=io_rows(dict(request_slot_h2d_bytes=value)))

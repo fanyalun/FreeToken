@@ -10,7 +10,7 @@ import triton
 
 from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
 from freetoken.kernel.triton import tablemoe as kernels
-from freetoken.moe.tablemoe import TableMoeRuntime, prefill_keep_mask
+from freetoken.moe.tablemoe import TableMoeRuntime, prefill_keep_mask, tablemoe_lookup_mode
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -43,7 +43,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
     def _prepare_gpu_assets(self):
         self.gpu_keys, self.gpu_counts, self.host_values = {}, {}, {}
         self.value_offsets, self.value_addresses = {}, {}
-        if getattr(self, "bypass_tables", False):
+        if not self.offline_enabled():
             return
         for layer in range(self.num_layers):
             data = [(key, torch.load(path, map_location="cpu", weights_only=True, mmap=True))
@@ -80,14 +80,15 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
     def _init_optimized_state(self):
         self.top_k = self.config.model_config.num_experts_per_tok
         self.dummy_slot = self.config.max_running_req
-        self.capacity = self.config.tablemoe_online_cache_size
         self.stats_enabled = self.config.tablemoe_stats or bool(getattr(self.config, "tablemoe_report_path", None))
-        self.skip_lookup = getattr(self.config, "tablemoe_skip_lookup", False)
+        self.lookup_mode = tablemoe_lookup_mode(self.config)
+        self.skip_lookup = self.lookup_mode == "none"
         self.external_mask = getattr(self.config, "moe_policy", "native") != "native"
         self.prefill_uses_tablemoe = (not self.external_mask or
                                     getattr(self.config, "modes_prefill_policy", "modes") == "tablemoe")
         self.bypass_tables = self.skip_lookup or (not self.external_mask and self.config.tablemoe_prefill_keep_rate == 1 and
                               self.config.tablemoe_decode_keep_k == self.top_k)
+        self.capacity = self.config.tablemoe_online_cache_size if self.online_enabled() else 0
         self._owners, self._uid_slots, self.workspaces = {}, {}, {}
         self.batch_slots = torch.empty(max(128, self.config.max_extend_tokens + self.dummy_slot),
                                        device=self.device, dtype=torch.int32)
@@ -192,9 +193,9 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             update_counts=empty(bs, dtype=torch.int32), modality=torch.ones(bs, device=self.device, dtype=torch.int32),
             gathered=empty(bs, max(1, self.capacity), h), scores=empty(bs, 1, max(1, self.capacity)),
             query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
-                   if not self.bypass_tables},
+                   if self.offline_enabled()},
             vision_query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
-                          if not self.bypass_tables},
+                          if self.offline_enabled()},
             gpu_weights=torch.ones(bs, gk, device=self.device, dtype=torch.float32),
             gpu_workspace=(empty(bs, gk, 2 * inter), empty(bs * gk, inter), empty(bs, gk, h)),
         )
@@ -305,7 +306,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         return self.external_mask and not (prefill and self.prefill_uses_tablemoe)
 
     def lookup_enabled(self, prefill):
-        if self.bypass_tables:
+        if not super().lookup_enabled(prefill):
             return False
         return self.prefill_uses_tablemoe if prefill else getattr(self.config, "moe_policy", "native") != "modes"
 
@@ -391,28 +392,32 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                     ids, ws["keep"], ws["values"], ws["on"], k, self.hidden, self.capacity,
                     self.dummy_slot, triton.next_power_of_2(self.capacity),
                     triton.next_power_of_2(self.hidden), triton.next_power_of_2(k), threshold)
-            proj, bias = self.pca[layer, "text"]
-            query = ws["query"][layer]
-            torch.addmm(bias, x, proj, out=query)
-            if prefill:
-                proj, bias = self.pca[layer, "vision"]
-                vq = ws["vision_query"][layer]
-                torch.addmm(bias, x, proj, out=vq)
-                torch.where((ws["modality"] == 0)[:, None], vq, query, out=query)
-                F.normalize(query, dim=-1, eps=1e-6, out=query)
+            if self.offline_enabled(prefill):
+                proj, bias = self.pca[layer, "text"]
+                query = ws["query"][layer]
+                torch.addmm(bias, x, proj, out=query)
+                if prefill:
+                    proj, bias = self.pca[layer, "vision"]
+                    vq = ws["vision_query"][layer]
+                    torch.addmm(bias, x, proj, out=vq)
+                    torch.where((ws["modality"] == 0)[:, None], vq, query, out=query)
+                    F.normalize(query, dim=-1, eps=1e-6, out=query)
             self.lookup_ready.record()
             self.lookup_stream.wait_event(self.lookup_ready)
             with torch.cuda.stream(self.lookup_stream):
-                keys = self.gpu_keys[layer]
-                kernels._mapped_offline[(ids.numel(),)](
-                    query, keys, self.gpu_counts[layer], self.value_offsets[layer], self.value_addresses[layer],
-                    ids, ws["modality"], ws["keep"], ws["on"], ws["request_slots"], ws["values"],
-                    ws["off"], ws["descriptor"], k, self.hidden, query.shape[1], keys.shape[2], self.dummy_slot,
-                    triton.next_power_of_2(query.shape[1]), triton.next_power_of_2(keys.shape[2]),
-                    triton.next_power_of_2(self.hidden), prefill,
-                    self.config.tablemoe_offline_cosine_threshold_vision,
-                    self.config.tablemoe_offline_cosine_threshold_text,
-                    getattr(self.config, "tablemoe_decode_offline_cosine_threshold", None))
+                if self.offline_enabled(prefill):
+                    keys = self.gpu_keys[layer]
+                    kernels._mapped_offline[(ids.numel(),)](
+                        query, keys, self.gpu_counts[layer], self.value_offsets[layer], self.value_addresses[layer],
+                        ids, ws["modality"], ws["keep"], ws["on"], ws["request_slots"], ws["values"],
+                        ws["off"], ws["descriptor"], k, self.hidden, query.shape[1], keys.shape[2], self.dummy_slot,
+                        triton.next_power_of_2(query.shape[1]), triton.next_power_of_2(keys.shape[2]),
+                        triton.next_power_of_2(self.hidden), prefill,
+                        self.config.tablemoe_offline_cosine_threshold_vision,
+                        self.config.tablemoe_offline_cosine_threshold_text,
+                        getattr(self.config, "tablemoe_decode_offline_cosine_threshold", None))
+                else:
+                    ws["off"].zero_()
                 self.lookup_done.record()
         gpu_values = ws["values"]
         if cache is not None:
