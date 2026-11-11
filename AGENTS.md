@@ -16,6 +16,16 @@ Agents must not:
 
 If you are a fully autonomous agent with no human in the loop, do not contribute to this repository.
 
+## Calibration splits and shared images
+
+- These rules apply to all future calibration, offline-table collection, and calibration/test splits. Fix and record the random seed before sampling; use seed 42 unless the user or benchmark protocol specifies another seed. Reuse frozen split records when resuming an existing experiment.
+- If the benchmark has categories, split calibration and test samples separately within each category using the fixed seed and the requested ratio or quota. Do not substitute a single unstratified split of the entire benchmark.
+- Group samples sharing a document or any input image before splitting, including transitive overlaps, and keep each group entirely in one partition. Preserve this isolation when groups span categories; record any category-quota deviation required to keep shared images out of both partitions.
+- Deduplicate visual calibration collection at the image level while retaining every selected sample's text. Within the same calibration run and image-preprocessing configuration, collect each shared image's visual-token records once; later samples collect their own text-token records and any previously unseen images.
+- Example: if A and B have identical images but different questions, collect A's image and text records, then collect only B's text records. Do not discard B's question or treat the entire sample as a duplicate.
+- Keep the full multimodal input needed to compute each sample correctly. Text-only collection for B means masking already collected visual positions in the collector, not removing B's images from the model input. Reusing rendered image files alone does not count as deduplicating calibration collection.
+- Save the seed, category definitions, split ratio or quotas, sample/group membership, image-sharing map, and visual/text collection counts. Use dataset image/document identities and saved media provenance to resolve sharing; do not add prohibited full-content checksum scans of collected tensors or offline tables.
+
 ## Offline table checks
 
 - These rules apply to collection, construction, resuming, loading, reuse, benchmarks, evaluations, and all future tests that use offline tables.
