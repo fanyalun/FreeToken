@@ -39,8 +39,8 @@ def _is_fused_experts(name: str) -> bool:
 
 
 def _linear_layout(tensor: torch.Tensor) -> torch.Tensor:
-    # the checkpoint stacks experts as [E, in, out]; the banks and fused kernels take [E, out, in] and copy from the strided view
-    return tensor.transpose(1, 2)
+    # Resident fused kernels require contiguous [E, out, in] expert weights.
+    return tensor.transpose(1, 2).contiguous()
 
 
 def iter_weights(

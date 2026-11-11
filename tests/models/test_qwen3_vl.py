@@ -17,6 +17,18 @@ from freetoken.models.qwen3_vl import deepstack_add, parse_config
 ROPE = {"rope_theta": 5_000_000, "rope_type": "default", "mrope_section": [24, 20, 20], "mrope_interleaved": True}
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 5, 7), (3, 7, 5)])
+def test_expert_layout_is_contiguous_and_preserves_checkpoint_values(dtype, shape):
+    from freetoken.models.qwen3_vl.weight import _linear_layout
+
+    raw = torch.arange(shape[0] * shape[1] * shape[2]).reshape(shape).to(dtype)
+    actual = _linear_layout(raw)
+    assert actual.is_contiguous()
+    assert actual.dtype == raw.dtype
+    assert torch.equal(actual, raw.transpose(1, 2))
+
+
 def _hf_config(num_experts=0, arch="Qwen3VLForConditionalGeneration"):
     text = SimpleNamespace(
         hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
