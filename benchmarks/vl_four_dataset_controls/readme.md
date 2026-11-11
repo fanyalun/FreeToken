@@ -94,6 +94,8 @@ it is not evaluated as a single HTML completion.
 | `vision_image_transport_probe.py` | Capture a real official CLI Read-image tool result using a local mock endpoint |
 | `vision_component_probe.py` | Check actual GPU image inference and native visual-judge parsing before formal admission |
 | `vision_validate.py` | Validate commands, project isolation and visual-score denominators on CPU |
+| `validation/visual_coverage_candidate/repair_doc_visual.py` | Collect Doc visual coverage separately, merge modalities and publish repaired assets after verification |
+| `validation/visual_coverage_candidate/merge_modalities.py` | Combine completed main text and independent visual sources without changing either collection |
 
 The small calibration implementation files
 `sources/calibrate_source.py` and `calibration_support/modes_search.py` are frozen
@@ -158,12 +160,12 @@ those records with its actual owned jobs or remove that adoption path. Never
 adopt unrelated PIDs.
 
 `scheduling_policy.json` may override job priorities and command arrays. This
-task prioritizes the three offline builds and new-dataset comparisons in
-BabyVision, MMLongBench-Doc and Vision2Web order, with an early Doc fused run to
-measure output cost. Optional MMMU additions follow the new datasets; scoring
-the existing completed MMMU baseline keeps its immediate priority. The Vision2Web
-component probe runs on the next idle GPU before formal admission. The policy
-does not change frozen
+task prioritizes fused and full TableMoE comparisons across the requested new
+datasets before deeper ablations; it does not finish all five BabyVision methods
+before starting other datasets. Optional MMMU additions remain last; scoring the
+existing completed MMMU baseline keeps its immediate priority. Dependencies can
+defer a high-priority job until its calibration or coverage repair is ready.
+The policy does not change frozen
 sample membership or generation limits. Repeated manager attempts use separate
 control logs. A manager restart adopts its live owned workers.
 
@@ -188,6 +190,65 @@ The task-specific wrappers retain references to the original MMMU assets and the
 historical checkpoint binding directory. Do not change those references while
 resuming this task. Rebinding them for another experiment requires a new frozen
 protocol and source snapshot.
+
+## Doc visual coverage repair
+
+The original Doc visual sampler exhausted its 50000-token budget after selecting
+records for 157 of 193 unique calibration images. First-seen identities were not
+proof of positive visual coverage. Repeated-document questions contributed zero
+new visual candidates to the adaptive history, and the per-sample minimum did
+not guarantee a minimum for each image in a multi-image sample.
+
+The independent repair keeps the original collection's text for all 655
+calibration samples and selects 78 frozen calibration rows by first-cover order
+to cover all 193 images. Every selected row retains its full multimodal input.
+The visual-only pass uses one fixed output token, zero decode-input tokens,
+zero sampled text tokens and a 50000 visual-token upper bound. The opt-in
+`min_vision_tokens_per_image=1` reserves at least one token for every future
+unique image and samples each newly seen image at least once. Duplicate image
+positions remain masked. The actual visual count is reported rather than forced
+to equal the upper bound. Omitting the flag preserves the existing collector
+configuration and sampling behavior.
+
+`merge_modalities.py` verifies complete text coverage, positive coverage of all
+193 images, no repeated visual selections, heldout isolation and source protocol
+agreement. It links the main text banks/index/phase files and the independent
+visual files into a new collection. Its manifest explicitly records
+`collection_kind=modality_union`, two source manifests and separate coverage
+proofs; it does not fabricate an ordinary single-pass 655-request progress file.
+Native PCA, clustering and materialization consume that union. Raw collections
+remain under `/data`; cluster/cache directories can point to persistent NVMe
+storage through symlinks. Both original source collections are retained, and
+validation uses metadata, lengths and required computation without tensor hashes.
+
+After successful repair and cache verification, the driver preserves the old
+canonical build record as `complete_before_visual_repair.json` before switching
+the completion record. `table_assets.json` supplies the repaired Doc asset root.
+The manager's `scheduling_policy.json.additional_dependencies` blocks the Doc
+`table` and `tablemoe` cells until `validation/doc_visual_coverage_ready.json`
+proves completion. Source availability or a completed CPU fixture never opens
+that gate. The main build must have stopped before the canonical switch.
+
+The published package contains the narrow `builder_visual_coverage.patch`, not
+the full experimental builder. The clean repository implementation adds only
+the opt-in coverage rule and retains its existing global RNG behavior. It must
+not be substituted for the measured snapshot's source hash. To run this task's
+repair driver and candidate tests, first restore the exact experimental helper
+from the separately preserved frozen runtime:
+
+```bash
+cp "$TABLEMOE_RUN_ROOT/runtime_snapshot_visual_coverage/python/freetoken/moe/tablemoe_builder.py" \
+  "$TABLEMOE_RUN_ROOT/validation/visual_coverage_candidate/tablemoe_builder.py"
+```
+
+`files_manifest.json.required_external_source_bindings` records the required
+source hash. The full snapshots, captured data and result JSON are not published.
+The candidate patch is relative to the task's buffered experimental source;
+the clean repository adaptation is separately tested and is not an identical
+experimental snapshot. Queue the repair through the owning manager, or use its
+`--gpu N --snapshot PATH --deadline UNIX --execute` interface when no manager owns
+that GPU. Repair completion requires actual collection and native table build
+receipts; publication alone establishes neither.
 
 ## Execute and inspect
 
@@ -243,9 +304,10 @@ and the admission marker `validation/vision_pipeline_ready.json`. They record
 `readiness_kind=component_infrastructure`, `fixture_only=true`,
 `benchmark_score=false` and `completed_official_webpage=false`. CPU receipts
 alone never create GPU readiness. A source-review release marker only admits the
-queued GPU check; it is not a GPU readiness marker. The component sources and CPU fixtures are
-ready in this publication; the actual GPU probe is queued and is not claimed
-complete. Request bodies, raw SSE, judge requests/responses, native screenshots
+queued GPU check; it is not a GPU readiness marker. This task's actual GPU
+component probe has now passed. It establishes image transport/inference and
+native judge parsing on fixtures, not an official webpage result or benchmark
+score. Request bodies, raw SSE, judge requests/responses, native screenshots
 and owned-process identities remain in persistent validation directories. The
 probe honors the earlier of its 1200-second limit and the absolute experiment
 deadline, preserves incomplete receipts, and stops only its own worker/server.

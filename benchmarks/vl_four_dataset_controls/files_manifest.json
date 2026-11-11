@@ -18,7 +18,7 @@
     {
       "source": "run_cell.py",
       "destination": "run_cell.py",
-      "sha256": "312133c8fb093c4b15191f10022ad2d0d77ecf42bc2534bf07309b81e2d55b94"
+      "sha256": "4cad39f64086ddbe5670cae108dd78e9b407f84ddc711683507f8b7a51879b47"
     },
     {
       "source": "build_table.py",
@@ -33,7 +33,7 @@
     {
       "source": "manager.py",
       "destination": "manager.py",
-      "sha256": "5cb48d3356dd8f7cf8fe07cf3dd58f1d972f27b338f2b34364c926ccd4d398fd"
+      "sha256": "51fcba8daa63f46b9c51298e5ec8bf2844eedcfa89e867dd703b3691db6beb27"
     },
     {
       "source": "score_native.py",
@@ -91,6 +91,21 @@
       "source": "calibration_support/modes_search.py",
       "destination": "calibration_support/modes_search.py",
       "sha256": "66abf0a61726697a8a13617a748dd68c98ab145fca792d2a5f3c897836ac6b78"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/repair_doc_visual.py",
+      "destination": "validation/visual_coverage_candidate/repair_doc_visual.py",
+      "sha256": "9767e86600a1b29ab86a6af9b20371e0ac406154a2abdcbdaa8837a06dbb9711"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/merge_modalities.py",
+      "destination": "validation/visual_coverage_candidate/merge_modalities.py",
+      "sha256": "610abf7aa1987b79490ca0b8ed6aa1eae1f771fe63e52a2e531eb8ddfc929e83"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/builder_visual_coverage.patch",
+      "destination": "validation/visual_coverage_candidate/builder_visual_coverage.patch",
+      "sha256": "a7a99c16d5516d67012b77d0cdb10993ce3f9c77d6df2a274f3bb3f6c030a0e8"
     }
   ],
   "optional_validation_sources": [
@@ -158,6 +173,26 @@
       "source": "validation/vision_formal_adapter_candidate.py",
       "destination": "validation/vision_formal_adapter_candidate.py",
       "sha256": "2d217e8b9fc99a537b62711991477366e90544d5bc82aa5fcf00d68393ba0ed9"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/test_repair_doc_visual.py",
+      "destination": "validation/visual_coverage_candidate/test_repair_doc_visual.py",
+      "sha256": "a3cd103c6902a4abfe9d2bfa5240ed375839e00de93344a196beb665584a47cb"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/test_merge_modalities.py",
+      "destination": "validation/visual_coverage_candidate/test_merge_modalities.py",
+      "sha256": "bb3e3455e2772b7f696bad5f27a52084c52bb8cf4dd7affd750685e514cedbdf"
+    },
+    {
+      "source": "validation/visual_coverage_candidate/test_visual_coverage.py",
+      "destination": "validation/visual_coverage_candidate/test_visual_coverage.py",
+      "sha256": "06821886701e85f43fc5ec2f94f9317dde50dafd8c23d30ea95b128efc86f450"
+    },
+    {
+      "source": "validation/doc_coverage_control_cpu.py",
+      "destination": "validation/doc_coverage_control_cpu.py",
+      "sha256": "a9edbd5b2cee0e36f7d29a6689da1db1a04c91b20b11c2dfd12791206f8ee19b"
     }
   ],
   "package_metadata": [
@@ -177,7 +212,8 @@
     "scheduling_policy.json for task priorities and verified resume commands",
     "runtime_snapshot_compact and runtime_snapshot_buffered for indexed/resumed collection",
     "buffered writer and resume CPU validation receipts for the exact source hashes",
-    "prepared native Vision2Web runtime plus CPU browser/image fixtures and successful GPU component admission receipts"
+    "prepared native Vision2Web runtime plus CPU browser/image fixtures and successful GPU component admission receipts",
+    "For Doc repair, prepare validation/visual_coverage_candidate/tablemoe_builder.py from the exact frozen runtime_snapshot_visual_coverage builder; the full experimental candidate is intentionally not published."
   ],
   "excluded": [
     "runtime_snapshot/**",
@@ -210,5 +246,12 @@
   "copied_source_files": true,
   "result_data_included": false,
   "offline_tensor_content_scans": false,
-  "source_revision": "705b74bfa98bfa1c675d83565cb30651759703d1"
+  "source_revision": "705b74bfa98bfa1c675d83565cb30651759703d1",
+  "required_external_source_bindings": {
+    "validation/visual_coverage_candidate/tablemoe_builder.py": {
+      "source": "runtime_snapshot_visual_coverage/python/freetoken/moe/tablemoe_builder.py",
+      "sha256": "0a2e9205948fac0dff494158cef173295337279ff01c33ae327f44caacf02387",
+      "published": false
+    }
+  }
 }

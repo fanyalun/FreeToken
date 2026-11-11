@@ -621,3 +621,67 @@ def test_collection_flush_error_does_not_publish_new_request(tmp_path, monkeypat
             assert collector.requests == [0]
     finally:
         collector.close()
+
+
+def _collect_image_coverage(root, images, storage="indexed", restart=False):
+    from types import SimpleNamespace
+
+    config = dict(seed=4, raw_storage=storage, export_inputs=False,
+        sampling_policy="tablemoe_default", sample_count=len(images), collection_image_ids=images,
+        min_vision_tokens_per_image=1, max_vision_tokens=len({key for keys in images for key in keys}),
+        min_text_per_sample=0, max_text_per_sample=0, max_text_tokens=0)
+    collector = InputCollector(root, config, 4, 1)
+    try:
+        for ordinal, keys in enumerate(images):
+            if restart and ordinal == 1:
+                collector.close()
+                collector = InputCollector(root, config, 4, 1)
+            length = 4 * len(keys) + 1
+            req = SimpleNamespace(uid=ordinal, input_ids=torch.arange(length), cached_len=0,
+                extend_len=length, mm_items=[SimpleNamespace(offsets=[(1 + i * 4, 4 + i * 4)])
+                                            for i in range(len(keys))])
+            batch = SimpleNamespace(is_prefill=True, padded_reqs=[req],
+                                    prompt_admissions=[(ordinal, length, 0)])
+            collector.snapshot(0, torch.arange(length * 4).reshape(-1, 4).half(),
+                               torch.zeros(length, 1, dtype=torch.long), batch)
+            collector.flush(ordinal)
+    finally:
+        collector.close()
+    manifest = finalize_collection(root, dict(sample_count=len(images)), 1, 1)
+    return read_json(root / "progress.json"), manifest
+
+
+def test_per_image_minimum_and_finalize_coverage(tmp_path):
+    progress, manifest = _collect_image_coverage(tmp_path, [["a", "b"]])
+    assert progress["sample_state"]["records"][0]["selected_visual_tokens_per_image"] == [1, 1]
+    assert manifest["image_coverage"] == dict(expected_images=2, covered_images=2,
+                                            min_tokens_per_image=1, selected_visual_tokens=2)
+    progress["sample_state"]["records"][0]["selected_visual_tokens_per_image"] = [0, 2]
+    write_json(tmp_path / "progress.json", progress)
+    with pytest.raises(ValueError, match="uncovered image identities"):
+        finalize_collection(tmp_path, dict(sample_count=1), 1, 1)
+
+
+@pytest.mark.parametrize("storage", ["dense", "indexed"])
+def test_per_image_future_reserve_shared_images_and_resume(tmp_path, storage):
+    from freetoken.moe.tablemoe_builder import load_inputs
+
+    images = [["a", "b"], ["b", "c"], ["c", "d"], ["a", "d"]]
+    continuous, _ = _collect_image_coverage(tmp_path / "continuous", images, storage)
+    resumed, _ = _collect_image_coverage(tmp_path / "resumed", images, storage, restart=True)
+    assert continuous == resumed
+    assert [record["selected_visual_tokens_per_image"] for record in resumed["sample_state"]["records"]] == [
+        [1, 1], [0, 1], [0, 1], [0, 0]]
+    for key, state in continuous["buckets"].items():
+        assert torch.equal(load_inputs(tmp_path / "continuous", key, state, 4, prefer_exported=False),
+                           load_inputs(tmp_path / "resumed", key, state, 4, prefer_exported=False))
+
+
+def test_per_image_budget_rejection_and_absent_default():
+    assert "min_vision_tokens_per_image" not in algorithm_config({})
+    config = dict(sampling_policy="tablemoe_default", sample_count=2,
+                  collection_image_ids=[["a", "b"], ["c"]], min_vision_tokens_per_image=1)
+    with pytest.raises(ValueError, match="global visual budget"):
+        algorithm_config(dict(config, max_vision_tokens=2))
+    with pytest.raises(ValueError, match="per-sample visual budget"):
+        algorithm_config(dict(config, max_vision_per_sample=1))

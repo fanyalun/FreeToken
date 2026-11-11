@@ -56,6 +56,20 @@ def algorithm_config(config):
         if any(not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys)
                for keys in result["collection_image_ids"]):
             raise ValueError("collection image identities must be nonempty strings")
+    minimum = result.get("min_vision_tokens_per_image", 0)
+    if type(minimum) is not int or minimum < 0:
+        raise ValueError("min_vision_tokens_per_image must be a nonnegative integer")
+    if minimum:
+        if "collection_image_ids" not in result:
+            raise ValueError("per-image coverage requires ordered collection image identities")
+        seen = set()
+        for keys in result["collection_image_ids"]:
+            new = set(keys) - seen
+            if len(new) * minimum > result["max_vision_per_sample"]:
+                raise ValueError("per-sample visual budget cannot cover every new image")
+            seen.update(new)
+        if len(seen) * minimum > result["max_vision_tokens"]:
+            raise ValueError("global visual budget cannot cover every unique image")
     return result
 
 
@@ -66,6 +80,24 @@ def adaptive_quota(avail, remaining_budget, remaining_samples, history_lengths, 
     weight = np.sqrt(max(float(avail), 1.0) / median_len)
     quota = int(round(remaining_budget / max(1, remaining_samples) * weight))
     return max(0, min(avail, remaining_budget, max_per_sample, max(min_per_sample, quota)))
+
+
+def image_coverage_selection(positions, groups, quota, minimum, available, reserve, maximum, generator):
+    if any(len(group) < minimum for group in groups):
+        raise ValueError("new image has fewer visual positions than its coverage minimum")
+    required = len(groups) * minimum
+    limit = min(len(positions), maximum, available - reserve)
+    if limit < required:
+        raise ValueError("remaining visual budget cannot preserve current and future image coverage")
+    count = min(max(quota, required), limit)
+    if count == len(positions):
+        return positions
+    if not groups:
+        return positions[:0]
+    mandatory = np.concatenate([generator.choice(group, minimum, replace=False) for group in groups])
+    remaining = positions[~np.isin(positions, mandatory)]
+    extra = generator.choice(remaining, count - required, replace=False)
+    return np.concatenate((mandatory, extra))
 
 
 def _draw(seed, count):
@@ -142,6 +174,8 @@ class InputCollector:
                 self.sample_rng.bit_generator.state = self.sample_state["rng_state"]
         self.collected_image_ids = {key for record in self.sample_state["records"]
                                     for key in record.get("image_ids", [])}
+        if self.config.get("min_vision_tokens_per_image", 0):
+            self.all_image_ids = {key for keys in self.config["collection_image_ids"] for key in keys}
         self.error = None
         self.handles = {}
         self.bank_handles = {}
@@ -212,6 +246,7 @@ class InputCollector:
                         vision[lo:hi] = True
                 collect_vision = vision.copy()
                 image_ids, new_image_ids = [], []
+                image_groups = []
                 if "collection_image_ids" in self.config:
                     image_ids = self.config["collection_image_ids"][ordinal]
                     items = getattr(req, "mm_items", None) or []
@@ -224,6 +259,11 @@ class InputCollector:
                         else:
                             self.collected_image_ids.add(key)
                             new_image_ids.append(key)
+                            if self.config.get("min_vision_tokens_per_image", 0):
+                                image_mask = np.zeros(length, dtype=bool)
+                                for lo, hi in item.offsets:
+                                    image_mask[lo:hi] = True
+                                image_groups.append(np.flatnonzero(image_mask))
                 record = dict(uid=req.uid, ordinal=ordinal, prompt_tokens=length,
                               candidates={}, selected={}, positions={}, decode_seen=0,
                               image_ids=image_ids, new_image_ids=new_image_ids,
@@ -237,7 +277,15 @@ class InputCollector:
                         self.config[f"max_{mod}_tokens"] - self.sample_state["counts"][mod],
                         self.config["sample_count"] - ordinal, self.sample_state["history"][mod],
                         self.config[f"min_{mod}_per_sample"], self.config[f"max_{mod}_per_sample"])
-                    chosen = positions if count == len(positions) else self.sample_rng.choice(positions, count, replace=False)
+                    minimum = self.config.get("min_vision_tokens_per_image", 0)
+                    if mod == "vision" and minimum:
+                        future = len(self.all_image_ids - self.collected_image_ids)
+                        chosen = image_coverage_selection(positions, image_groups, count, minimum,
+                            self.config["max_vision_tokens"] - self.sample_state["counts"][mod],
+                            future * minimum, self.config["max_vision_per_sample"], self.sample_rng)
+                        count = len(chosen)
+                    else:
+                        chosen = positions if count == len(positions) else self.sample_rng.choice(positions, count, replace=False)
                     record["positions"][mod] = sorted(chosen.tolist())
                     record["candidates"][mod], record["selected"][mod] = len(positions), count
                     self.sample_state["counts"][mod] += count
@@ -449,6 +497,7 @@ def finalize_collection(root, inputs, num_layers, num_experts):
     expected = inputs["sample_count"]
     if len(progress["requests"]) != expected:
         raise ValueError("collection request coverage mismatch")
+    coverage = {}
     if progress["config"]["sampling_policy"] == "tablemoe_default":
         state = progress["sample_state"]
         decode = progress["config"].get("sample_decode_tokens", 0)
@@ -460,6 +509,20 @@ def finalize_collection(root, inputs, num_layers, num_experts):
                 if (progress["sampling"][str(layer)][mod]["selected"] != state["counts"][mod] or
                         state["counts"][mod] > progress["config"][f"max_{mod}_tokens"]):
                     raise ValueError("per-sample selections are incomplete or exceed the budget")
+        minimum = progress["config"].get("min_vision_tokens_per_image", 0)
+        if minimum:
+            counts = {key: 0 for keys in progress["config"]["collection_image_ids"] for key in keys}
+            for record, keys in zip(state["records"], progress["config"]["collection_image_ids"]):
+                selected = record.get("selected_visual_tokens_per_image", [])
+                if (record.get("image_ids") != keys or len(selected) != len(keys)
+                        or sum(selected) != record["selected"]["vision"]):
+                    raise ValueError("per-image visual coverage records are inconsistent")
+                for key, count in zip(keys, selected):
+                    counts[key] += count
+            if any(count < minimum for count in counts.values()):
+                raise ValueError("collection has uncovered image identities")
+            coverage["image_coverage"] = dict(expected_images=len(counts), covered_images=len(counts),
+                min_tokens_per_image=minimum, selected_visual_tokens=sum(counts.values()))
     if progress["config"].get("vision_budget"):
         for layer in range(num_layers):
             state = progress["sampling"][str(layer)]["vision"]
@@ -492,7 +555,7 @@ def finalize_collection(root, inputs, num_layers, num_experts):
     return finish_stage(root, inputs, outputs, hash_outputs=False, buckets=progress["buckets"], tokens=progress["tokens"],
                         hidden=progress["hidden"], num_layers=num_layers, num_experts=num_experts,
                         sampling=progress.get("sampling", {}), raw_storage=progress["config"].get("raw_storage", "dense"),
-                        token_banks=progress.get("token_banks", {}))
+                        token_banks=progress.get("token_banks", {}), **coverage)
 
 
 def load_inputs(root, key, state, hidden, *, prefer_exported=True):

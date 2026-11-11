@@ -36,6 +36,11 @@ def processor(name):
 
 
 def asset_root(name):
+    overrides = ROOT / 'table_assets.json'
+    if overrides.exists():
+        paths = json.loads(overrides.read_text())
+        if name in paths:
+            return Path(paths[name])
     if name=='MMMU_DEV_VAL':
         return Path('/data/fanya/tablemoe/mmmu_offline_bs16_seed42_split60_20261110_3_ks1wmc/build_bs16/assets')
     return Path('/data/fanya/tablemoe/vl_four_dataset_bs1_20261111')/name/'assets'

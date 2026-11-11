@@ -73,9 +73,11 @@ def jobs():
         values=read_json(policy)
         priorities=values.get('priorities',{})
         commands=values.get('commands',{})
+        dependencies=values.get('additional_dependencies',{})
         for job in result:
             job['priority']=priorities.get(job['id'],job['priority'])
             job['command']=commands.get(job['id'],job['command'])
+            job['dependencies'] += dependencies.get(job['id'],[])
     return sorted(result,key=lambda j:j['priority'])
 
 
