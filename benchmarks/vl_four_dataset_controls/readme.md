@@ -30,7 +30,7 @@ pipelines, with at most one owned pipeline on each GPU.
 | --- | --- |
 | `fused` | All experts resident on the GPU; full expert computation |
 | `tablemoe` | Prefill keep rate 0.6; decode top-4 plus expert-cache hits; 3072 expert slots; offline and online lookup |
-| `modes` | Original MoDES for prefill and decode, calibrated to target 40% skipped routes; 3072 expert slots |
+| `modes` | MoDES masks for prefill and decode, with shared thresholds calibrated to a pooled 40% skip target; 3072 expert slots |
 | `schedule` | Same 0.6/top-4-plus-hit exact-route scheduling, with approximate lookup disabled |
 | `table` | Same 0.6/top-4-plus-hit scheduling, with offline lookup only |
 
@@ -39,6 +39,13 @@ TableMoE retains original router weights. Its online capacity is 128 in the
 combined method and zero in the two lookup ablations. The native offline builder
 uses seed 42, layer PCA dimension 64 and at most 256 clusters per expert/modality.
 Sparse expert/modality combinations remain explicitly recorded.
+
+The MoDES 40% target pools calibration routes across prefill and decode. It does
+not guarantee a 40% skip rate in either phase or on heldout samples; report the
+measured phase counts separately when available. `schedule` and `table` replace
+MoDES routing with TableMoE routing. They are routing/lookup ablations, not extra
+features applied on top of a MoDES mask. Original router weights means no
+renormalization after routes are dropped; MoDES retains its FP16 weight rounding.
 
 Default dataset splitting is 60% calibration and 40% test, with seed 42. Where
 categories exist, category quotas are applied while keeping the transitive
@@ -82,6 +89,10 @@ it is not evaluated as a single HTML completion.
 | `score_native.py` | Apply dataset scoring with preserved predictions and a local full-route fused judge |
 | `score_with_server.py` | Own a fused judge server for one or more completed cells |
 | `vision_pipeline.py` | Own official Vision2Web generation, independent fused visual judging and report stages |
+| `vision_formal_adapter.py` | Preserve the official 40-project / 120-viewport denominator, including proven terminal no-start model failures as zero |
+| `vision_browser_fixture.py` | Run an unscored CPU fixture through native deployment and all three screenshot workflows |
+| `vision_image_transport_probe.py` | Capture a real official CLI Read-image tool result using a local mock endpoint |
+| `vision_component_probe.py` | Check actual GPU image inference and native visual-judge parsing before formal admission |
 | `vision_validate.py` | Validate commands, project isolation and visual-score denominators on CPU |
 
 The small calibration implementation files
@@ -141,15 +152,18 @@ reuse its prepared manifests instead of rerunning split preparation.
 
 Before starting the manager, provide `execution_policy.json`, the required
 prepared/validation markers, and `additional_jobs.json` for scoring and the
-Vision2Web GPU smoke. Current manager adoption records refer to this task's
+Vision2Web GPU component probe. Current manager adoption records refer to this task's
 already-running MMMU fused and BabyVision build jobs; a new run must replace
 those records with its actual owned jobs or remove that adoption path. Never
 adopt unrelated PIDs.
 
 `scheduling_policy.json` may override job priorities and command arrays. This
-task prioritizes the three offline builds and complete BabyVision comparisons,
-with an early Doc fused run to measure output cost. Remaining Doc comparisons
-precede optional MMMU additions. The policy does not change frozen
+task prioritizes the three offline builds and new-dataset comparisons in
+BabyVision, MMLongBench-Doc and Vision2Web order, with an early Doc fused run to
+measure output cost. Optional MMMU additions follow the new datasets; scoring
+the existing completed MMMU baseline keeps its immediate priority. The Vision2Web
+component probe runs on the next idle GPU before formal admission. The policy
+does not change frozen
 sample membership or generation limits. Repeated manager attempts use separate
 control logs. A manager restart adopts its live owned workers.
 
@@ -192,8 +206,8 @@ CUDA_VISIBLE_DEVICES=1 "$TABLEMOE_RUNTIME_PYTHON" -B \
 "$TABLEMOE_RUNTIME_PYTHON" -B "$TABLEMOE_RUN_ROOT/score_with_server.py" \
   BabyVision --methods fused tablemoe modes schedule table --gpu 1
 
-"$TABLEMOE_RUNTIME_PYTHON" -B "$TABLEMOE_RUN_ROOT/vision_pipeline.py" \
-  Vision2Web_Level1 fused 1 smoke --deadline "$TABLEMOE_DEADLINE_UNIX"
+"$TABLEMOE_RUNTIME_PYTHON" -B "$TABLEMOE_RUN_ROOT/vision_component_probe.py" \
+  1 --deadline "$TABLEMOE_DEADLINE_UNIX" --timeout 1200
 
 "$TABLEMOE_RUNTIME_PYTHON" -B "$TABLEMOE_RUN_ROOT/manager.py"
 ```
@@ -204,10 +218,43 @@ GPU has no compute processes and at least 76 GiB free. Generation, table buildin
 and scoring completion are separate records; startup or a CPU doctor result is
 not a completed benchmark.
 
-Vision2Web `smoke` uses one calibration task and must complete official inference,
-independent fused judging and the report before writing
-`validation/vision_pipeline_ready.json`. A passing CPU command check never
-creates that marker. Qwen3-VL Instruct generation and judging both use
+Vision2Web infrastructure readiness uses component checks and does not require
+the model to successfully generate a website. Before the manager's GPU probe,
+run the CPU browser fixture, image transport probe and component CPU check using
+the native kit interpreter:
+
+```bash
+"$TABLEMOE_KIT_PYTHON" -B "$TABLEMOE_RUN_ROOT/vision_browser_fixture.py"
+"$TABLEMOE_KIT_PYTHON" -B "$TABLEMOE_RUN_ROOT/vision_image_transport_probe.py"
+"$TABLEMOE_KIT_PYTHON" -B "$TABLEMOE_RUN_ROOT/validation/vision_component_cpu_test.py"
+```
+
+The GPU component probe keeps the FP16 fused server, 200000-token context,
+64000-token maximum output, 4096-token prefill chunk and one running request.
+It sequentially replays a real CLI request containing an image tool result,
+sends the three original aihw prototype JPEGs in one component-only user message
+with the captured CLI system/tool schema, and invokes the original VisualScorer
+on a pair of fixture screenshots. Images use the official processor without
+manual resizing. The judge must return valid component scores; a high score is
+not required. These fixtures are unscored and do not modify generated websites.
+
+A successful GPU component probe writes `validation/vision_components_ready.json`
+and the admission marker `validation/vision_pipeline_ready.json`. They record
+`readiness_kind=component_infrastructure`, `fixture_only=true`,
+`benchmark_score=false` and `completed_official_webpage=false`. CPU receipts
+alone never create GPU readiness. A source-review release marker only admits the
+queued GPU check; it is not a GPU readiness marker. The component sources and CPU fixtures are
+ready in this publication; the actual GPU probe is queued and is not claimed
+complete. Request bodies, raw SSE, judge requests/responses, native screenshots
+and owned-process identities remain in persistent validation directories. The
+probe honors the earlier of its 1200-second limit and the absolute experiment
+deadline, preserves incomplete receipts, and stops only its own worker/server.
+
+The older `vision_pipeline.py ... smoke` interface remains a strict one-task
+diagnostic requiring official inference, independent fused judging and the
+report. Its two failed attempts remain failures. Old smoke jobs use their own
+strict completion paths, so component readiness cannot relabel a failed attempt.
+Qwen3-VL Instruct generation and judging both use
 `--reasoning-parser off`; the Qwen tool parser remains enabled. The Instruct
 template does not open a thinking block, so forcing the Qwen3 thinking parser
 would hide its tool calls from the official CLI. Set `VISION2WEB_RUNS_ROOT` to a
@@ -218,7 +265,11 @@ Claude Code adapter against a local mock Anthropic endpoint in a fresh sandbox.
 It checks the model identifier, tool round trip, container-to-host networking
 and persistent `TMPDIR`, then removes its own container. It calls no real model,
 runs no webpage task and writes only `validation/vision_mock_protocol.json`;
-it cannot establish GPU or real model API readiness.
+it cannot establish GPU or real model API readiness. The component fixtures refer
+to this task's frozen official runtime under the preserved reasoning-off smoke
+directory. A new experiment must bind its own prepared runtime before freezing
+sources. Captured image requests, images, transcripts and output JSON are not
+part of this source package.
 The 200000-position FP16 KV pool needs about 18.31 GiB;
 the full fused model has little headroom on an A100 80GB, so real GPU validation
 is required before dispatching the 40-task heldout cells.
@@ -247,7 +298,23 @@ Ordinary results live under `cells/DATASET/METHOD/`, with per-request JSONL,
 `generation_complete.json`, and separate native score completion. Vision2Web
 maps its official completion to `vision/METHOD/generation_complete.json` and
 `vision/METHOD/score_complete.json`; its score denominator is all 40 projects
-and all 120 expected viewports. Missing screenshots/scores remain failures.
+and all 120 expected viewports. Formal inference requires exactly the frozen
+40 tasks and one completed attempt per task, without retries. The wrapper accepts
+success with a generated `start.sh`, or a normal CLI `end_turn` with the exact
+official no-start failure and no conflicting generated/evaluation artifacts.
+Matched Bash process errors such as an unavailable command can be ordinary
+agent outcomes. Unknown tool-host failures, SDK/API errors, CLI stderr signals,
+unparsed tool text, parser-induced thinking, missing records and conflicting
+attempt history remain unresolved. Whether the agent chose to use tools or read
+its images is not a quality-validity gate. A normal visible final response with
+no tool calls may also be a proven no-start model failure. When tools are present,
+every call and result must match.
+
+The native analyzer supplies no-start zero scores. Formal completion requires
+40 terminal records, 120 viewport scores, and valid native evaluation/judge
+results for every generated website. Missing or failed browser, judge or API
+records cannot be converted into quality zero. The coverage policy freezes the
+wrapper hash and protocol once and rejects drift between stages.
 The official agent workflow is a quality evaluation and is not formal serving
 throughput evidence. Inspect `status.json`, `resource_observations.jsonl` and
 `execution_end.json` for queue/resource state rather than inferring success from

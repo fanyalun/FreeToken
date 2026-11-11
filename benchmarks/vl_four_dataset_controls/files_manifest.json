@@ -48,7 +48,7 @@
     {
       "source": "vision_pipeline.py",
       "destination": "vision_pipeline.py",
-      "sha256": "cf8980bb0c7905ae6861138e324769410cb62336528e4b8d27eff9e3e6aa446c"
+      "sha256": "50495e3b4ed37947003915def98cc63a67ef0dff7585261cc0d5d6f37c07180e"
     },
     {
       "source": "vision_validate.py",
@@ -69,6 +69,16 @@
       "source": "resume_build_table.py",
       "destination": "resume_build_table.py",
       "sha256": "88c6a639ebcc13beff94cb9ff9e6520b9eb16a1c07bd974f00da3d5cac72a07c"
+    },
+    {
+      "source": "vision_formal_adapter.py",
+      "destination": "vision_formal_adapter.py",
+      "sha256": "2d217e8b9fc99a537b62711991477366e90544d5bc82aa5fcf00d68393ba0ed9"
+    },
+    {
+      "source": "vision_component_probe.py",
+      "destination": "vision_component_probe.py",
+      "sha256": "8fcf9883caa7c8e779d83fbd3b8e2fa4ec0de459fa26e384bb6cd1acbe87dee7"
     }
   ],
   "supporting_sources": [
@@ -102,7 +112,7 @@
     {
       "source": "vision_mock_probe.py",
       "destination": "vision_mock_probe.py",
-      "sha256": "f9e91b74a14668fe2e34b55927b2aac1a340e2f7b1769cc8f0ac8b667382e5b3"
+      "sha256": "ce0753446e75b190fed55d3770b0a478f995464b78457921195ff05e7801de42"
     },
     {
       "source": "validation/vision_deadline_selftest.py",
@@ -123,6 +133,31 @@
       "source": "validation/vision_tool_replay_selftest.py",
       "destination": "validation/vision_tool_replay_selftest.py",
       "sha256": "db63712abb76fdef578852dce2e893525e8b3505a8b2a26478b25dd6727d47d1"
+    },
+    {
+      "source": "vision_browser_fixture.py",
+      "destination": "vision_browser_fixture.py",
+      "sha256": "fff9137daf835eb7f6a38a4e1c6340e8607baecd42e5839703299ccfeb1f2b6e"
+    },
+    {
+      "source": "vision_image_transport_probe.py",
+      "destination": "vision_image_transport_probe.py",
+      "sha256": "4b6f61bdaa598e4628bd4dc0cafcf011d928613c0b9e21b599a522c0e9830499"
+    },
+    {
+      "source": "validation/vision_component_cpu_test.py",
+      "destination": "validation/vision_component_cpu_test.py",
+      "sha256": "96ee02c4d1fb823a2d1cf769e2c247564be943bc1b66e250bac413044fe9ac9e"
+    },
+    {
+      "source": "validation/test_vision_formal_candidate.py",
+      "destination": "validation/test_vision_formal_candidate.py",
+      "sha256": "16410e78359837d754de4e16ccc6fc9f1a87db53f2551790fdcb3d2cc8f593f0"
+    },
+    {
+      "source": "validation/vision_formal_adapter_candidate.py",
+      "destination": "validation/vision_formal_adapter_candidate.py",
+      "sha256": "2d217e8b9fc99a537b62711991477366e90544d5bc82aa5fcf00d68393ba0ed9"
     }
   ],
   "package_metadata": [
@@ -141,7 +176,8 @@
     "required CPU/GPU validation completion markers",
     "scheduling_policy.json for task priorities and verified resume commands",
     "runtime_snapshot_compact and runtime_snapshot_buffered for indexed/resumed collection",
-    "buffered writer and resume CPU validation receipts for the exact source hashes"
+    "buffered writer and resume CPU validation receipts for the exact source hashes",
+    "prepared native Vision2Web runtime plus CPU browser/image fixtures and successful GPU component admission receipts"
   ],
   "excluded": [
     "runtime_snapshot/**",

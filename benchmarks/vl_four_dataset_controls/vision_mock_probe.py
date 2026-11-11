@@ -41,6 +41,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.respond(dict(data=[dict(id=MODEL, type='model')]))
 
+    def tool_content(self, body):
+        bash = next((tool for tool in body.get('tools', [])
+                     if tool['name'].lower() == 'bash' and 'command' in tool.get('input_schema', {}).get('properties', {})), None)
+        if bash is None:
+            return None
+        return dict(type='tool_use', id=TOOL_ID, name=bash['name'], input=dict(
+            command='printf "PROBE_TMPDIR=%s\\n" "$TMPDIR"; cat /workspace/probe.txt',
+            description='Read the transport probe and persistent temporary path'))
+
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
         record = dict(path=self.path, model=body.get('model'), body=body,
@@ -57,12 +66,9 @@ class Handler(BaseHTTPRequestHandler):
         results = [block for message in body.get('messages', [])
             for block in (message.get('content', []) if isinstance(message.get('content'), list) else [])
             if block.get('type') == 'tool_result' and block.get('tool_use_id') == TOOL_ID]
-        bash = next((tool for tool in body.get('tools', [])
-                     if tool['name'].lower() == 'bash' and 'command' in tool.get('input_schema', {}).get('properties', {})), None)
-        if bash is not None and not results:
-            content = dict(type='tool_use', id=TOOL_ID, name=bash['name'], input=dict(
-                command='printf "PROBE_TMPDIR=%s\\n" "$TMPDIR"; cat /workspace/probe.txt',
-                description='Read the transport probe and persistent temporary path'))
+        tool = self.tool_content(body)
+        if tool is not None and not results:
+            content = tool
             reason = 'tool_use'
         else:
             content = dict(type='text', text='PROBE_OK')

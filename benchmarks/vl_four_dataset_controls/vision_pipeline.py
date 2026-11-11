@@ -137,7 +137,11 @@ def cleanup_own_containers(config, stage):
 
 def adapter_call(stage, path, folder, gpu, deadline=None):
     deadline_timeout(deadline, 1)
-    cmd = [KIT_PYTHON, '-B', str(ADAPTER), stage, '--config', str(path)]
+    formal = stage in ('inference', 'evaluate', 'report') and len(read(path)['projects']) == 40
+    adapter = ROOT / 'vision_formal_adapter.py' if formal else ADAPTER
+    cmd = [KIT_PYTHON, '-B', str(adapter), stage, '--config', str(path)]
+    if formal:
+        cmd += ['--experiment-root', str(ROOT)]
     log = folder / f'pipeline_{stage}.log'
     mode = 'a' if log.exists() else 'w'
     env = kit_environment(gpu)
@@ -246,6 +250,11 @@ def publish_completion(method, stage, config, folder, smoke):
     summary = score_summary(config, folder) if stage == 'evaluate' else {}
     record = dict(complete=True, samples=len(config['projects']), agent_workflow=True, batch_size=1,
         official_output=str(folder), source_marker=str(marker), formal_performance_eligible=False, **summary)
+    audit = folder / 'formal_generation_audit.json'
+    if audit.is_file():
+        formal = read(audit)
+        record['terminal_model_failure_zero_projects'] = formal['terminal_model_failure_zero_projects']
+        record['terminal_projects'] = formal['total_terminal_projects']
     name = 'generation_complete.json' if stage == 'inference' else 'score_complete.json'
     for root in (ROOT / 'cells' / DATASET / method, ROOT / 'vision' / method):
         write_json(root / name, record)
