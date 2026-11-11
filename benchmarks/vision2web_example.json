@@ -1,0 +1,21 @@
+{
+  "official_root": "/home/fanya/vision2web",
+  "official_revision": "d80a4a3d0ea7326541ad87314294269a633789e4",
+  "datasets_dir": "/data/fanya/datasets/vision2web_level1",
+  "output": "/data/fanya/experiments/vision2web_level1",
+  "sandbox_image": "vision2web-sandbox:freetoken-d80a4a3",
+  "projects": [],
+  "generation": {
+    "model": "Qwen3-VL-30B-A3B-Instruct",
+    "base_url": "http://host.docker.internal:23840",
+    "api_key_env": "VISION2WEB_GENERATION_API_KEY",
+    "max_workers": 1,
+    "timeout": 36000
+  },
+  "evaluation": {
+    "model": "Qwen3-VL-30B-A3B-Instruct",
+    "base_url": "http://127.0.0.1:23880/v1",
+    "api_key_env": "VISION2WEB_VISUAL_API_KEY",
+    "max_workers": 1
+  }
+}

@@ -1,5 +1,10 @@
 # benchmarks
 
+**`bench_vision2web.py`** connects FreeToken endpoints to the pinned official
+Vision2Web Level 1 generation, screenshot and visual-scoring pipeline. See
+[the setup and protocol](vision2web.md). It preserves official prompts and
+checks complete task/screenshot/score coverage before marking a run complete.
+
 **`bench_tablemoe_suite.py`** implements the five-dataset TableMoE pipeline:
 native VLMEvalKit prompts -> grouped calibration/evaluation split -> full-expert
 prefill/decode collection -> layer PCA and per-expert k-means -> FP16 cache
