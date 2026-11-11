@@ -10,6 +10,19 @@ import sys
 import traceback
 
 
+def configure_lookup(runner, job):
+    if 'online_cache_size' not in job:
+        return
+    original = runner.command
+
+    def command(definition, gpu):
+        args, port = original(definition, gpu)
+        args[args.index('--tablemoe-online-cache-size') + 1] = str(job['online_cache_size'])
+        return args, port
+
+    runner.command = command
+
+
 def run(root, gpu):
     import json
 
@@ -25,6 +38,7 @@ def run(root, gpu):
     runner.JUDGE_SNAPSHOT = Path(protocol['judge_runtime_snapshot'])
     sys.path[:0] = [str(runner.SNAPSHOT / 'python'), str(runner.SNAPSHOT / 'benchmarks')]
     job = dict(protocol['job'])
+    configure_lookup(runner, job)
     runner.STATE.clear()
     runner.STATE.update(status='starting', jobs={job['id']: job}, workers={str(gpu): dict(state='starting')})
     signal.signal(signal.SIGTERM, runner.shutdown)
@@ -40,6 +54,13 @@ def run(root, gpu):
                 runner.generate(job, gpu)
             if runner.generation_record(job) is None:
                 raise ValueError('generation lacks complete frozen-sample coverage')
+            if protocol.get('lookup_ablation'):
+                spec = importlib.util.spec_from_file_location('lookup_audit', root / 'lookup_audit_source.py')
+                audit = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(audit)
+                result = audit.ready_audit(root / 'cells' / job['id'], protocol['lookup_ablation'],
+                                           protocol['evaluation_samples'])
+                runner.save(root / 'cells' / job['id'] / 'lookup_audit.json', result)
             runner.STATE['status'] = 'scoring'
             runner.persist()
             runner.score_job(dict(parent=job['id'], dataset=job['dataset']), gpu)
