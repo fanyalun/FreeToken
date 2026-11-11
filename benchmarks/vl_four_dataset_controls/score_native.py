@@ -82,10 +82,22 @@ def bootstrap(name):
     return kit
 
 
+def score_options(dataset, judge_max_tokens=None, score_directory=None):
+    maximum = {'BabyVision': 16, 'MMLongBench_DOC': 128, 'MMMU_DEV_VAL': 2048}[dataset]
+    if judge_max_tokens is not None:
+        if type(judge_max_tokens) is not int or judge_max_tokens < 1:
+            raise ValueError('judge_max_tokens must be a positive integer')
+        maximum = judge_max_tokens
+    directory = 'score_local_fused_native' if score_directory is None else score_directory
+    if not isinstance(directory, str) or not re.fullmatch(r'score_[A-Za-z0-9_-]+', directory):
+        raise ValueError('score_directory must be a single score_ directory name')
+    return maximum, directory
+
+
 class StrictJudge:
-    def __init__(self, port, dataset, folder):
+    def __init__(self, port, dataset, folder, judge_max_tokens=None):
         self.port, self.dataset, self.folder = port, dataset, folder
-        self.max_tokens = {'BabyVision': 16, 'MMLongBench_DOC': 128, 'MMMU_DEV_VAL': 2048}[dataset]
+        self.max_tokens, _ = score_options(dataset, judge_max_tokens)
         self.sample_id = None
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -142,9 +154,10 @@ def check_coverage(expected, predictions):
         raise ValueError('empty model prediction; preserve failure instead of completing the cell')
 
 
-def score(name, method, port):
+def score(name, method, port, *, judge_max_tokens=None, score_directory=None):
     import pandas as pd
 
+    maximum, directory = score_options(name, judge_max_tokens, score_directory)
     folder = ROOT/'cells'/name/method
     completion = read(folder/'generation_complete.json')
     if not completion.get('complete'):
@@ -152,19 +165,19 @@ def score(name, method, port):
     expected = rows(ROOT/'prepare'/name/'evaluation.jsonl')
     predictions = rows(folder/'requests.jsonl')
     check_coverage(expected, predictions)
-    destination = folder/'score_local_fused_native'
+    destination = folder/directory
     destination.mkdir(exist_ok=True)
     kit = bootstrap(name)
     from vlmeval.smp import dump, load
     source_files = ['vlmeval/dataset/utils/multiple_choice.py'] if name == 'MMMU_DEV_VAL' else [
         'vlmeval/dataset/babyvision.py' if name == 'BabyVision' else 'vlmeval/dataset/mmlongbenchdoc.py']
     source_files += ['vlmeval/utils/matching_util.py'] if name == 'MMMU_DEV_VAL' else []
-    protocol = dict(schema='native_local_fused_judge_v1', dataset=name, method=method,
+    protocol = dict(schema='native_local_fused_judge_v2', dataset=name, method=method,
         scorer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         judge_model=MODEL, judge_checkpoint='/data/fanya/models/'+MODEL, judge_dtype='float16',
         judge_moe_strategy='fused', judge_batch_size=1, local_judge_differs_from_public_benchmark_judge=True,
         sample_count=len(expected), prediction_protocol='full_response_v1',
-        judge_max_tokens={'BabyVision':16,'MMLongBench_DOC':128,'MMMU_DEV_VAL':2048}[name],
+        judge_max_tokens=maximum, score_directory=directory, score_output_path=str(destination),
         empty_judge_is_failure=True, malformed_judge_is_failure=True, random_choice_fallback_forbidden=True,
         inputs_sha256=fingerprint(dict(rows=expected, predictions=predictions)),
         kit_manifest=read(kit/'source_manifest.json'),
@@ -181,7 +194,7 @@ def score(name, method, port):
                for row, prediction in zip(expected, predictions)]
     frame = pd.DataFrame(records)
     dump(frame, str(destination/'predictions.xlsx'))
-    judge = StrictJudge(port, name, destination)
+    judge = StrictJudge(port, name, destination, judge_max_tokens=maximum)
     checkpoint = destination/'records.json'
     done = read(checkpoint) if checkpoint.exists() else {}
     if set(done) - {row['id'] for row in expected}:
@@ -252,5 +265,8 @@ if __name__=='__main__':
     parser.add_argument('dataset',choices=['MMMU_DEV_VAL','BabyVision','MMLongBench_DOC'])
     parser.add_argument('method')
     parser.add_argument('--port',type=int,required=True)
+    parser.add_argument('--judge-max-tokens',type=int)
+    parser.add_argument('--score-directory')
     args=parser.parse_args()
-    score(args.dataset,args.method,args.port)
+    score(args.dataset,args.method,args.port,judge_max_tokens=args.judge_max_tokens,
+          score_directory=args.score_directory)

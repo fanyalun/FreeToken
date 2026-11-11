@@ -38,12 +38,12 @@
     {
       "source": "score_native.py",
       "destination": "score_native.py",
-      "sha256": "1e9ba67cc9124f4b081934118aaa927334e0894f7d63337cb5e8ce55a79264f9"
+      "sha256": "11d91047ef7acafcafc87daa389a914058aa1c32e9d3d3d72127e35c1ea802c2"
     },
     {
       "source": "score_with_server.py",
       "destination": "score_with_server.py",
-      "sha256": "b72d125c0b9bb37694391cd32432497ae26ca302bf9c9500de98d1d74af457b5"
+      "sha256": "a9f15a2beec8be6294f5ebe687945bf477f947fcb0ae21515a7dcf0f9ea9c4f4"
     },
     {
       "source": "vision_pipeline.py",
@@ -58,7 +58,7 @@
     {
       "source": "report_results.py",
       "destination": "report_results.py",
-      "sha256": "3d12a7c2a1a71ea226b0b41db3941ccdb23ae6904619e36c1a3d1cc9507ff89b"
+      "sha256": "9c94cd87109bd9dc18a8f9f7de384986a6d1240e3b4bfb53d00bbffe10bd5e79"
     },
     {
       "source": "pause_collection.py",
@@ -73,12 +73,27 @@
     {
       "source": "vision_formal_adapter.py",
       "destination": "vision_formal_adapter.py",
-      "sha256": "2d217e8b9fc99a537b62711991477366e90544d5bc82aa5fcf00d68393ba0ed9"
+      "sha256": "4ddb35d947765391834161bf2df494ac38a9652b9c17b1655bc7ddcb5417711a"
     },
     {
       "source": "vision_component_probe.py",
       "destination": "vision_component_probe.py",
       "sha256": "8fcf9883caa7c8e779d83fbd3b8e2fa4ec0de459fa26e384bb6cd1acbe87dee7"
+    },
+    {
+      "source": "score_exact_matching.py",
+      "destination": "score_exact_matching.py",
+      "sha256": "3f92b9a38edde24455d20b7fdcc80e5e08db8e9054e5af4f8a23d08b2c175e49"
+    },
+    {
+      "source": "score_mmmu_bounded.py",
+      "destination": "score_mmmu_bounded.py",
+      "sha256": "dcd0038f9e6cf70b6238464b33381c59ab0e7bf01cc86cde4db90e92c0ae108f"
+    },
+    {
+      "source": "score_mmmu_bounded_with_server.py",
+      "destination": "score_mmmu_bounded_with_server.py",
+      "sha256": "aa1437eaf291074c057e9ce264d3924f077269787dfbe7573ff07cc0f2bde30a"
     }
   ],
   "supporting_sources": [
@@ -106,6 +121,11 @@
       "source": "validation/visual_coverage_candidate/builder_visual_coverage.patch",
       "destination": "validation/visual_coverage_candidate/builder_visual_coverage.patch",
       "sha256": "a7a99c16d5516d67012b77d0cdb10993ce3f9c77d6df2a274f3bb3f6c030a0e8"
+    },
+    {
+      "source": "validation/judge_budget_8192_1794435547736921570/score_native.py.before",
+      "destination": "validation/judge_budget_8192_1794435547736921570/score_native.py.before",
+      "sha256": "1e9ba67cc9124f4b081934118aaa927334e0894f7d63337cb5e8ce55a79264f9"
     }
   ],
   "optional_validation_sources": [
@@ -193,6 +213,26 @@
       "source": "validation/doc_coverage_control_cpu.py",
       "destination": "validation/doc_coverage_control_cpu.py",
       "sha256": "a9edbd5b2cee0e36f7d29a6689da1db1a04c91b20b11c2dfd12791206f8ee19b"
+    },
+    {
+      "source": "validation/judge_budget_8192_1794435547736921570/test_score_budget.py",
+      "destination": "validation/judge_budget_8192_1794435547736921570/test_score_budget.py",
+      "sha256": "766df4769a600ff156f206ff394ca70fac8c538c5f3e7e1c097f282af7c109d7"
+    },
+    {
+      "source": "validation/mmmu_bounded_continuation/test_bounded.py",
+      "destination": "validation/mmmu_bounded_continuation/test_bounded.py",
+      "sha256": "34d0429ee0285921a67224ea5e7757872216a9bfddf35b75ab86a17ed01de902"
+    },
+    {
+      "source": "validation/test_report_results_v2.py",
+      "destination": "validation/test_report_results_v2.py",
+      "sha256": "c6746c0623d3730133d4bc23157524b53f7326c0a2ebc8cb8cf0d9e54496593c"
+    },
+    {
+      "source": "validation/test_vision_formal_progress.py",
+      "destination": "validation/test_vision_formal_progress.py",
+      "sha256": "f465a41f4eeb4be90a8af2533fc9e35dfe6ffd95f600ed7589fc7b751bd610dc"
     }
   ],
   "package_metadata": [
@@ -213,7 +253,9 @@
     "runtime_snapshot_compact and runtime_snapshot_buffered for indexed/resumed collection",
     "buffered writer and resume CPU validation receipts for the exact source hashes",
     "prepared native Vision2Web runtime plus CPU browser/image fixtures and successful GPU component admission receipts",
-    "For Doc repair, prepare validation/visual_coverage_candidate/tablemoe_builder.py from the exact frozen runtime_snapshot_visual_coverage builder; the full experimental candidate is intentionally not published."
+    "For Doc repair, prepare validation/visual_coverage_candidate/tablemoe_builder.py from the exact frozen runtime_snapshot_visual_coverage builder; the full experimental candidate is intentionally not published.",
+    "Bounded MMMU CPU replay requires the preserved original 298 native records, judge requests, full 420 predictions and frozen native scorer sources; these result records are not published.",
+    "Vision progress CPU replay requires the preserved official runtime, heldout membership and failed aihw smoke record; these dependencies are not published."
   ],
   "excluded": [
     "runtime_snapshot/**",

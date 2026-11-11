@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import time
 
 
 NO_START = 'Agent completed but start.sh was not generated'
@@ -116,6 +117,11 @@ class FormalCoverage:
     def __init__(self, adapter, config, experiment_root):
         self.adapter, self.config = adapter, config
         self.root = Path(config['output'])
+        self.experiment_root = Path(experiment_root)
+        self.abort_reason = None
+        self.blocked_before_start = []
+        self.started_projects = []
+        self.latest_audit = None
         rows = [json.loads(line) for line in
                 (Path(experiment_root) / 'prepare/Vision2Web_Level1/evaluation.jsonl').read_text().splitlines()]
         self.expected = [row['metadata']['task'] for row in rows]
@@ -166,7 +172,79 @@ class FormalCoverage:
             frozen_attempt_count=1, frozen_retry_count=0,
             official_denominator_projects=40, official_denominator_viewports=120)
         self.adapter.save(self.root / 'formal_generation_audit.json', receipt)
+        self.latest_audit = receipt
         return receipt
+
+    def publish_progress(self, active_project=None):
+        audit = self.latest_audit if self.latest_audit is not None else self.audit()
+        terminal_records = [project['name'] for project, workspace in self.adapter.workspaces(self.config)
+                     if (workspace / 'results' / f'{project["name"]}.json').is_file()]
+        started = list(dict.fromkeys(self.started_projects + ([active_project] if active_project else [])))
+        failures = {name: reason for name, reason in audit['unresolved'].items() if name in terminal_records}
+        value = dict(complete=bool(audit['complete'] and not self.abort_reason), stage='inference',
+            completed=audit['total_terminal_projects'], total=len(self.expected),
+            attempted=len(started), attempted_projects=started,
+            terminal_records=len(terminal_records), terminal_record_projects=terminal_records,
+            successful_projects=audit['terminal_success_projects'],
+            quality_zero_projects=audit['terminal_model_failure_zero_projects'],
+            infrastructure_failures=failures, active_project=active_project,
+            not_started_projects=[name for name in self.expected if name not in started],
+            blocked_before_start=list(self.blocked_before_start), abort_reason=self.abort_reason,
+            official_output=str(self.root), updated_unix=time.time(),
+            scoring_complete=False, formal_performance_eligible=False)
+        method = self.root.name
+        if method not in ('fused', 'tablemoe', 'modes', 'schedule', 'table'):
+            raise ValueError('formal progress output must name a supported comparison method')
+        self.adapter.save(self.root / 'formal_progress.json', value)
+        for folder in (self.experiment_root / 'cells/Vision2Web_Level1' / method,
+                       self.experiment_root / 'vision' / method):
+            self.adapter.save(folder / 'progress.json', value)
+        return value
+
+    def install_inference_guard(self, engine_class=None):
+        if engine_class is None:
+            from vision2web.inference.engine import InferenceEngine
+            engine_class = InferenceEngine
+        original = engine_class.run_single_project
+        policy = self
+
+        async def guarded(engine, project):
+            if policy.abort_reason is not None:
+                policy.blocked_before_start.append(project.name)
+                policy.publish_progress()
+                raise RuntimeError('formal inference stopped after an unresolved infrastructure failure')
+            if engine.config.inference.max_workers != 1:
+                policy.abort_reason = dict(project=project.name, reason='frozen_bs1_concurrency_changed')
+                policy.publish_progress()
+                raise ValueError('formal inference requires one project worker')
+            try:
+                policy.publish_progress(active_project=project.name)
+                policy.started_projects.append(project.name)
+                result = await original(engine, project)
+                audit = policy.audit()
+                reason = audit['unresolved'].get(project.name)
+                if reason is not None:
+                    policy.abort_reason = dict(project=project.name, reason=reason)
+                    raise RuntimeError(f'formal project {project.name} has an unresolved infrastructure failure: {reason}')
+                policy.publish_progress()
+                return result
+            except BaseException as error:
+                if policy.abort_reason is None:
+                    policy.abort_reason = dict(project=project.name, reason=f'project_exception:{type(error).__name__}')
+                try:
+                    policy.audit()
+                    policy.publish_progress()
+                except Exception as evidence_error:
+                    engine.logger.error(f'Could not persist aborted formal progress: {evidence_error}')
+                raise
+
+        engine_class.run_single_project = guarded
+        self.publish_progress()
+
+        def restore():
+            engine_class.run_single_project = original
+
+        return restore
 
     def generation_coverage(self, config):
         if config != self.config:
@@ -242,7 +320,14 @@ def main():
             complete=True, missing=[], recovered_from_terminal_records=True))
         policy.annotate_stage('inference')
         return
-    asyncio.run(adapter.run_stage(config, args.stage))
+    restore = policy.install_inference_guard() if args.stage == 'inference' else None
+    try:
+        asyncio.run(adapter.run_stage(config, args.stage))
+    finally:
+        if restore is not None:
+            restore()
+            policy.audit()
+            policy.publish_progress()
     policy.annotate_stage(args.stage)
 
 

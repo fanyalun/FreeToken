@@ -88,6 +88,10 @@ it is not evaluated as a single HTML completion.
 | `resume_build_table.py` | Verify the complete collection prefix and append the remaining frozen samples |
 | `score_native.py` | Apply dataset scoring with preserved predictions and a local full-route fused judge |
 | `score_with_server.py` | Own a fused judge server for one or more completed cells |
+| `score_exact_matching.py` | Produce a separate deterministic MMMU exact-matching auxiliary score |
+| `score_mmmu_bounded.py` | Continue native MMMU extraction while retaining exhausted matches as UNKNOWN and reporting bounds |
+| `score_mmmu_bounded_with_server.py` | Own the fused server for the separate bounded MMMU traversal |
+| `report_results.py` | Follow each cell's selected native score file and keep auxiliary bounds separate from primary completion |
 | `vision_pipeline.py` | Own official Vision2Web generation, independent fused visual judging and report stages |
 | `vision_formal_adapter.py` | Preserve the official 40-project / 120-viewport denominator, including proven terminal no-start model failures as zero |
 | `vision_browser_fixture.py` | Run an unscored CPU fixture through native deployment and all three screenshot workflows |
@@ -279,6 +283,50 @@ GPU has no compute processes and at least 76 GiB free. Generation, table buildin
 and scoring completion are separate records; startup or a CPU doctor result is
 not a completed benchmark.
 
+Native scoring accepts optional `--judge-max-tokens` and `--score-directory`
+arguments. Without them, the original budgets remain BabyVision 16, Doc 128 and
+MMMU 2048, and the directory remains `score_local_fused_native`. A changed budget
+uses a separate directory and scores the full frozen denominator; partial
+records from another budget are not mixed into it. This task's Doc comparison
+uses 512 judge tokens for every method, in `score_local_fused_native_512`, while
+preserving the earlier 128-token records. Generation prompts and outputs are
+unchanged. A cell becomes scored only when that full scoring run completes;
+`report_results.py` resolves the authoritative `score_file` from its completion
+record instead of assuming the original directory.
+
+The proposed MMMU 8192-token retry was held before execution. Static replay of
+the failing 2048-token responses found all four option labels in their prefixes.
+The native parser inspects the whole response and rejects long answer-text
+matches, so appending a final choice cannot remove the existing labels or
+shorten that prefix. The 8192 option remains available as an explicit control;
+it is not a completed or validated remedy for that failure.
+
+MMMU bounded continuation keeps the original 2048-token budget and native
+three-attempt matcher. It imports the 298 prior successful records only after
+checking the original protocol, native parser replay and matching judge request
+evidence. An exhausted native matcher becomes `UNKNOWN`, with neither a random
+answer nor a zero score; infrastructure errors still fail. Full-denominator
+accuracy bounds include unknown and pending items. The separate
+`score_local_fused_native_bounded_2048/traversal_complete.json` means auxiliary
+traversal completion, with `strict_primary_complete=false`; it does not create
+primary cell completion. `score_exact_matching.py` is also auxiliary and cannot
+replace the local native judge result. Multilabel judge text is preserved rather
+than rewritten into a single chosen option.
+
+The bounded importer depends on the small original control source at
+`validation/judge_budget_8192_1794435547736921570/score_native.py.before`. That exact
+relative path and source hash are published; real predictions, judge requests,
+records and protocols remain external. CPU checks are available in
+`validation/judge_budget_8192_1794435547736921570/test_score_budget.py`,
+`validation/mmmu_bounded_continuation/test_bounded.py`,
+`validation/test_report_results_v2.py` and
+`validation/test_vision_formal_progress.py`. Run them with the recorded native
+kit interpreter and persistent `TMPDIR` after preparing the experiment layout.
+The bounded and Vision checks need this task's preserved input records and
+official runtime; they are not standalone fixtures shipped with the package.
+Their CPU success does not establish completion of the ongoing GPU scoring or
+formal Vision2Web runs.
+
 Vision2Web infrastructure readiness uses component checks and does not require
 the model to successfully generate a website. Before the manager's GPU probe,
 run the CPU browser fixture, image transport probe and component CPU check using
@@ -371,6 +419,14 @@ attempt history remain unresolved. Whether the agent chose to use tools or read
 its images is not a quality-validity gate. A normal visible final response with
 no tool calls may also be a proven no-start model failure. When tools are present,
 every call and result must match.
+
+During formal inference, the wrapper publishes matching per-project progress to
+`cells/Vision2Web_Level1/METHOD/progress.json` and `vision/METHOD/progress.json`.
+The first infrastructure or unresolved terminal failure stops further project
+admission and preserves the attempted, completed and not-started sets. Normal
+terminal no-start model failures remain native zero-score outcomes and allow
+the next project to run. Partial progress never creates a generation completion
+marker or changes the frozen 40-project denominator.
 
 The native analyzer supplies no-start zero scores. Formal completion requires
 40 terminal records, 120 viewport scores, and valid native evaluation/judge
