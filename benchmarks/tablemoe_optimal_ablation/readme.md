@@ -21,6 +21,15 @@ reconciliation to finish. A known missing alpha-sweep judge score does not
 prevent startup after `primary_workflow_complete` is recorded. The deferred
 RealWorldQA mixed MoDES/TableMoE evaluation stays deferred.
 
+When the user authorizes independent ablations while the previous judge is
+still running, set `allow_overlap_previous_scoring` in the protocol. This mode
+requires complete previous generations and uses available GPUs without waiting
+for the previous scores or controller exit. A GPU assigned to a live previous
+job remains reserved even during a server reload. Existing ablation workers
+are adopted only when their PID, script and full worker arguments match the
+saved launch record, preventing duplicate starts. This mode does not hold the
+previous controller's manager lock.
+
 After this barrier, two GPU workers claim the schedule controls first. Once
 both are claimed, an available worker may run an independent offline-table
 control, prioritizing the longer MMLongBench-Write task. Each job has separate

@@ -83,3 +83,40 @@ def test_completed_score_recovery_initializes_parent_state(tmp_path, monkeypatch
     assert observed == [job['id']]
     restored = json.loads((folder / 'ablation_state.json').read_text())
     assert restored['complete'] and restored['restored_from_cache']
+
+
+def test_authorized_overlap_requires_generation_but_not_previous_scores(tmp_path, monkeypatch):
+    queue = load_queue()
+    root, base = tmp_path / 'ablation', tmp_path / 'base'
+    write_json(root / 'execution_ready.json', dict(complete=True))
+    write_json(base / 'status.json', dict(manager_pid=123, primary_workflow_complete=False))
+    counts = dict(mmw=48, rwqa=307)
+    after = ['mmw_evaluate_prefill_decode', 'rwqa_evaluate_prefill_decode']
+    for identifier in after:
+        write_json(base / 'cells' / identifier / 'generation_complete.json',
+                   dict(complete=True, samples=counts[identifier.split('_')[0]]))
+
+    def unexpected_score(*args):
+        raise AssertionError('independent ablations must not wait for judge scores')
+
+    runner = SimpleNamespace(ROOT=root, cached_score=unexpected_score,
+                             generation_record=lambda job: dict(complete=True))
+    protocol = dict(base_experiment=str(base), after_cells=after,
+                    dataset_counts=counts, allow_overlap_previous_scoring=True)
+    monkeypatch.setattr(queue, 'manager_alive', lambda directory, pid: True)
+    assert queue.prior_work_complete(root, protocol, runner) == (True, 'previous_generations_complete')
+    assert runner.ROOT == root
+    write_json(base / 'cells' / after[0] / 'generation_complete.json', dict(complete=True, samples=47))
+    assert queue.prior_work_complete(root, protocol, runner)[0] is False
+
+
+def test_previous_live_job_keeps_its_gpu_reserved_during_server_reload(tmp_path, monkeypatch):
+    queue = load_queue()
+    write_json(tmp_path / 'status.json', dict(manager_pid=123, jobs=dict(
+        judge=dict(state='running', gpu=0))))
+    protocol = dict(base_experiment=str(tmp_path))
+    monkeypatch.setattr(queue, 'manager_alive', lambda directory, pid: True)
+    assert queue.previous_gpu_busy(protocol, 0)
+    assert not queue.previous_gpu_busy(protocol, 1)
+    monkeypatch.setattr(queue, 'manager_alive', lambda directory, pid: False)
+    assert not queue.previous_gpu_busy(protocol, 0)

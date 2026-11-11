@@ -1,6 +1,7 @@
 """Run the best-parameter lookup ablations after the existing MoDES matrix."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -123,23 +124,79 @@ def prior_work_complete(root, protocol, runner):
         return False, 'waiting_for_execution_ready'
     base = Path(protocol['base_experiment'])
     state = read(base / 'status.json')
-    if manager_alive(base, state.get('manager_pid')):
+    overlap = protocol.get('allow_overlap_previous_scoring', False)
+    if not overlap and manager_alive(base, state.get('manager_pid')):
         return False, 'waiting_for_previous_manager_exit'
-    if not state.get('primary_workflow_complete'):
+    if not overlap and not state.get('primary_workflow_complete'):
         return False, 'waiting_for_previous_matrix_and_defer_reconciliation'
     original_root = runner.ROOT
     try:
         runner.ROOT = base
         for identifier in protocol['after_cells']:
-            marker = base / 'cells' / identifier / 'complete.json'
+            filename = 'generation_complete.json' if overlap else 'complete.json'
+            marker = base / 'cells' / identifier / filename
             if not marker.exists() or not read(marker).get('complete'):
                 return False, 'waiting_for_' + identifier
             name = identifier.split('_', 1)[0]
-            if runner.cached_score(name, marker.parent) is None:
+            if overlap:
+                if (read(marker).get('samples') != protocol['dataset_counts'][name] or
+                        runner.generation_record(dict(id=identifier, dataset=name)) is None):
+                    return False, 'waiting_for_complete_generation_' + identifier
+            elif runner.cached_score(name, marker.parent) is None:
                 return False, 'waiting_for_native_score_' + identifier
     finally:
         runner.ROOT = original_root
-    return True, 'previous_work_complete'
+    return True, 'previous_generations_complete' if overlap else 'previous_work_complete'
+
+
+class ExistingWorker:
+    def __init__(self, root, identifier, launch):
+        self.root = root
+        self.identifier = identifier
+        self.pid = int(launch['pid'])
+        self.gpu = int(launch['gpu'])
+        self.script = str(Path(launch.get('script', root / 'run_ablation_queue.py')).resolve())
+        self.returncode = None
+
+    def poll(self):
+        try:
+            args = Path(f'/proc/{self.pid}/cmdline').read_text().split('\0')
+            matches = self.script in args and all(
+                flag in args and args[args.index(flag) + 1] == value
+                for flag, value in [('--worker-job', self.identifier), ('--root', str(self.root)),
+                                    ('--gpu', str(self.gpu))])
+        except (OSError, IndexError):
+            matches = False
+        if matches:
+            return None
+        marker = self.root / 'cells' / self.identifier / 'complete.json'
+        self.returncode = 0 if marker.exists() and read(marker).get('complete') else 1
+        return self.returncode
+
+
+def existing_workers(root, protocol):
+    active, claimed = {}, set()
+    for _, job in protocol_jobs(protocol):
+        path = root / (job['id'] + '_launch.json')
+        if not path.exists():
+            continue
+        process = ExistingWorker(root, job['id'], read(path))
+        if process.poll() is not None:
+            continue
+        if process.gpu not in (0, 1) or process.gpu in active:
+            raise ValueError('existing ablation workers have conflicting GPU ownership')
+        active[process.gpu] = dict(process=process, job=job['id'], adopted=True)
+        claimed.add(job['id'])
+    return active, claimed
+
+
+def previous_gpu_busy(protocol, gpu):
+    base = Path(protocol['base_experiment'])
+    state = read(base / 'status.json')
+    if not manager_alive(base, state.get('manager_pid')):
+        return False
+    return any(job.get('state') == 'running' and job.get('gpu') == gpu
+               for job in state.get('jobs', {}).values())
 
 
 def job_binding(root, protocol, runner, job):
@@ -327,14 +384,16 @@ def main(root):
                 break
             STOP.wait(5)
         base = Path(protocol['base_experiment'])
-        with (base / '.manager.lock').open('a+') as base_lock:
-            fcntl.flock(base_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ownership = nullcontext() if protocol.get('allow_overlap_previous_scoring') else (base / '.manager.lock').open('a+')
+        with ownership as base_lock:
+            if base_lock is not None:
+                fcntl.flock(base_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             ready, reason = prior_work_complete(root, protocol, runner)
             if not ready:
                 raise RuntimeError('previous experiment ownership changed: ' + reason)
-            pending = protocol_jobs(protocol)
-            active = {}
-            claimed = set()
+            active, claimed = existing_workers(root, protocol)
+            adopted = [value['process'] for value in active.values()]
+            pending = [(stage, job) for stage, job in protocol_jobs(protocol) if job['id'] not in claimed]
             try:
                 while pending or active:
                     for gpu, value in list(active.items()):
@@ -344,6 +403,11 @@ def main(root):
                         if value['process'].poll() is not None:
                             del active[gpu]
                     for gpu in sorted({0, 1} - set(active)):
+                        if previous_gpu_busy(protocol, gpu):
+                            continue
+                        observation = runner.resource(gpu)
+                        if observation['free_mib'] < 74 * 1024:
+                            continue
                         schedules = {job['id'] for stage, job in protocol_jobs(protocol) if stage['id'] == 'schedule'}
                         candidates = [(stage, job) for stage, job in pending
                                       if stage.get('confirmed') and stage.get('ready') and not deferred(root, job['id'])
@@ -360,17 +424,19 @@ def main(root):
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
                         CHILDREN.add(process)
                         active[gpu] = dict(process=process, job=job['id'])
-                        save(root / (job['id'] + '_launch.json'), dict(pid=process.pid, gpu=gpu, started_utc=now()))
+                        save(root / (job['id'] + '_launch.json'), dict(pid=process.pid, gpu=gpu,
+                             job=job['id'], script=str(Path(__file__).resolve()), started_utc=now()))
                     save(root / 'queue_status.json', dict(state='running', manager_pid=os.getpid(),
                          workers={gpu: dict(pid=value['process'].pid, job=value['job']) for gpu, value in active.items()},
                          pending=[job['id'] for _, job in pending], updated_utc=now()))
-                    if not active:
+                    if not active and not any(stage.get('confirmed') and stage.get('ready') and
+                            not deferred(root, job['id']) for stage, job in pending):
                         break
                     STOP.wait(5)
                 write_comparison(root, protocol)
                 complete = read(root / 'comparison.json')['complete']
                 save(root / 'queue_status.json', dict(state='complete' if complete else 'incomplete', complete=complete,
-                     manager_pid=os.getpid(), workers=[dict(pid=p.pid, returncode=p.returncode) for p in CHILDREN], updated_utc=now()))
+                     manager_pid=os.getpid(), workers=[dict(pid=p.pid, returncode=p.poll()) for p in [*CHILDREN, *adopted]], updated_utc=now()))
             finally:
                 for process in list(CHILDREN):
                     if process.poll() is None:
