@@ -102,6 +102,7 @@ it is not evaluated as a single HTML completion.
 | `vision_validate.py` | Validate commands, project isolation and visual-score denominators on CPU |
 | `validation/visual_coverage_candidate/repair_doc_visual.py` | Collect Doc visual coverage separately, merge modalities and publish repaired assets after verification |
 | `validation/visual_coverage_candidate/merge_modalities.py` | Combine completed main text and independent visual sources without changing either collection |
+| `validation/hf_baby_prefix_probe/probe.py` | Prepare and, after source-bound release, run a two-sample HF greedy prefix diagnostic |
 
 The small calibration implementation files
 `sources/calibrate_source.py` and `calibration_support/modes_search.py` are frozen
@@ -358,6 +359,38 @@ sources in another directory, bind the imported `score_doc_bounded.ROOT` to the
 original experiment before replaying the untouched records; the test then uses
 its own persistent fixture root for mocked continuation. This path binding
 does not change the frozen sources or copied primary records.
+
+The optional HF prefix diagnostic uses only frozen BabyVision samples 464 and
+638 and their preserved fused responses. Running
+`validation/hf_baby_prefix_probe/probe.py` without flags performs CPU preparation
+only. It verifies the checkpoint chat template, image processing, normalized
+image-token expansion and the historical API prompt lengths of 730 and 702.
+Historical input token IDs were not saved; exact input-ID comparison is against
+the reconstruction, not a historical token trace. The reference uses the HF
+Qwen3-VL model in FP16 with SDPA and matches FreeToken's pixel cast chain
+FP32 -> BF16 -> FP16. It is not native-HF default end-to-end preprocessing.
+
+The existing HF calibration interpreter runs each sample separately with
+`do_sample=False` and at most 32 new tokens. One generate call per sample saves
+both text/token prefixes, their matching prefix length, and first-step top-five
+logits plus the fused first token's HF logit/rank. Full-vocabulary tensors are
+not saved. A prefix mismatch alone is not a runtime bug verdict; different FP16
+kernels, near-tied logits and reconstruction of output token IDs from saved
+text limit that inference. This diagnostic changes no benchmark output, prompt,
+score or frozen runtime and does not establish full-response numerical parity.
+
+GPU execution requires `--execute --gpu N`, a successful CPU preparation receipt,
+and a `release.json` in the diagnostic directory with `complete=true` and the
+exact script `source_sha256`. Enqueue the independently reviewed job through
+the manager at priority 4.2 instead of competing with an active GPU owner. The
+supervisor bounds the entire job to 300 seconds and the earlier global deadline,
+reserves five seconds for cleanup, records its worker PID/start ticks, and
+signals only that owned process. It preserves failures and rejects implicit
+reruns in an existing diagnostic directory. The six CPU supervisor checks in
+`test_probe_cpu.py` use short CPU workers and do not load model weights. The
+fixed deadline belongs to this task; future work needs a new authorized window
+and a newly frozen diagnostic. Input receipts, raw prefixes, logits and GPU
+results remain outside this source package.
 
 Vision2Web infrastructure readiness uses component checks and does not require
 the model to successfully generate a website. Before the manager's GPU probe,

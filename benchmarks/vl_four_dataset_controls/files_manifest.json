@@ -248,6 +248,16 @@
       "source": "validation/doc_bounded_continuation/test_doc_bounded.py",
       "destination": "validation/doc_bounded_continuation/test_doc_bounded.py",
       "sha256": "8127900625905ac50670613c2d5b01d7453d09bd225563b1edd373e9a9ef8cef"
+    },
+    {
+      "source": "validation/hf_baby_prefix_probe/probe.py",
+      "destination": "validation/hf_baby_prefix_probe/probe.py",
+      "sha256": "9371d581f02d739b19495b96a14223311cfc32792f15515984ef8113fc5b3470"
+    },
+    {
+      "source": "validation/hf_baby_prefix_probe/test_probe_cpu.py",
+      "destination": "validation/hf_baby_prefix_probe/test_probe_cpu.py",
+      "sha256": "a41374e4fb720f98db0b74393c310f9e0906a61ead8637f87eef18276cd357fb"
     }
   ],
   "package_metadata": [
@@ -271,7 +281,8 @@
     "For Doc repair, prepare validation/visual_coverage_candidate/tablemoe_builder.py from the exact frozen runtime_snapshot_visual_coverage builder; the full experimental candidate is intentionally not published.",
     "Bounded MMMU CPU replay requires the preserved original 298 native records, judge requests, full 420 predictions and frozen native scorer sources; these result records are not published.",
     "Vision progress CPU replay requires the preserved official runtime, heldout membership and failed aihw smoke record; these dependencies are not published.",
-    "Doc bounded512 CPU replay requires preserved tablemoe339 and fused436 judge records, requests, predictions, native scorer sources and original absolute score_output_path bindings; no result data is published."
+    "Doc bounded512 CPU replay requires preserved tablemoe339 and fused436 judge records, requests, predictions, native scorer sources and original absolute score_output_path bindings; no result data is published.",
+    "HF Baby prefix diagnostic requires the two preserved BabyVision464/638 inputs and fused responses, exact runtime snapshot, checkpoint and existing HF environment, source-matched root release, and a currently authorized absolute deadline; no GPU result or media is published."
   ],
   "excluded": [
     "runtime_snapshot/**",
