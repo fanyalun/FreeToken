@@ -62,14 +62,15 @@ def report(root, protocol):
         path = Path(definition['record'])
         record = read(path) if path.exists() else {}
         score = record.get('quality_metric') if record.get('complete') else None
+        row_baseline = read(definition['baseline_record'])['quality_metric'] if definition.get('baseline_record') else baseline
         rows.append(dict(definition, score=score, complete=score is not None,
-                         difference_from_baseline=score - baseline if score is not None and baseline is not None else None))
+                         difference_from_baseline=score - row_baseline if score is not None and row_baseline is not None else None))
     save(root / 'comparison.json', dict(complete=len(results) == len(protocol['comparison_records']),
          scores=results, alpha=protocol.get('alpha', .7), decode_top_h=protocol.get('decode_top_h', 4),
          expert_slots=protocol.get('expert_slots', 3072), baseline_score=baseline, comparison_rows=rows,
          quality_only=True, formal_performance_eligible=False, updated_utc=now()))
     if rows:
-        lines = ['| alpha | method | overall score | vs lossless baseline |',
+        lines = [f"| alpha | method | {protocol.get('score_label', 'overall score')} | vs lossless baseline |",
                  '|---|---|---:|---:|']
         for row in rows:
             score = f"{row['score']:.4f}" if row['score'] is not None else 'pending'
@@ -128,8 +129,9 @@ def main(root):
                 if pending or active:
                     time.sleep(5)
             report(root, protocol)
-            save(root / 'queue_status.json', dict(state='complete' if not failures else 'failed',
-                 complete=not failures, workers={}, pending=[], failed=failures, updated_utc=now()))
+            complete = not failures and read(root / 'comparison.json')['complete']
+            save(root / 'queue_status.json', dict(state='complete' if complete else 'incomplete',
+                 complete=complete, workers={}, pending=[], failed=failures, updated_utc=now()))
         finally:
             for process in list(CHILDREN):
                 if process.poll() is None:

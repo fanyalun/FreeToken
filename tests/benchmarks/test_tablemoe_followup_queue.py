@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def queue_module():
@@ -44,3 +45,31 @@ def test_legacy_alpha07_queue_keeps_its_report_metadata(tmp_path):
     result = json.loads((tmp_path / 'comparison.json').read_text())
     assert result['complete'] and result['alpha'] == .7
     assert result['decode_top_h'] == 4 and result['expert_slots'] == 3072
+
+
+def test_mixed_dataset_report_uses_each_rows_own_baseline(tmp_path):
+    module = queue_module()
+    rwqa, mmmu, baseline = [tmp_path / name for name in ['rwqa.json', 'mmmu.json', 'baseline.json']]
+    for path, value in [(rwqa, 74.), (mmmu, 58.), (baseline, 76.)]:
+        module.save(path, dict(complete=True, quality_metric=value))
+    protocol = dict(alpha=None, score_label='accuracy (%)', comparison_records=dict(rwqa=str(rwqa), mmmu=str(mmmu)),
+                    comparison_rows=[dict(label='RealWorldQA', alpha=.6, record=str(rwqa), baseline_record=str(baseline)),
+                                     dict(label='MMMU', alpha=.6, record=str(mmmu))])
+    module.report(tmp_path, protocol)
+    result = module.read(tmp_path / 'comparison.json')
+    assert result['comparison_rows'][0]['difference_from_baseline'] == -2.
+    assert result['comparison_rows'][1]['difference_from_baseline'] is None
+    assert 'accuracy (%)' in (tmp_path / 'comparison.md').read_text()
+
+
+def test_mmmu_followup_keeps_256_token_limit_and_rwqa_keeps_1024():
+    path = Path(__file__).resolve().parents[2] / 'benchmarks/tablemoe_sensitivity_controls/run_single_cell.py'
+    spec = importlib.util.spec_from_file_location('single_cell_dataset_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    runner = SimpleNamespace(ALIASES={'rwqa': 'RealWorldQA'}, LIMITS={'rwqa': 1024})
+    module.configure_dataset(runner, dict(dataset='rwqa'))
+    assert runner.LIMITS == {'rwqa': 1024}
+    module.configure_dataset(runner, dict(dataset='mmmu'))
+    assert runner.ALIASES == {'mmmu': 'MMMU_DEV_VAL'}
+    assert runner.LIMITS == {'mmmu': 256}

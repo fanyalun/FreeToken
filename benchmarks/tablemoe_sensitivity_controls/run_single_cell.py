@@ -23,6 +23,21 @@ def configure_lookup(runner, job):
     runner.command = command
 
 
+def configure_dataset(runner, job):
+    if job['dataset'] == 'mmmu':
+        runner.ALIASES = {'mmmu': 'MMMU_DEV_VAL'}
+        runner.LIMITS = {'mmmu': 256}
+
+
+def score_mmmu(runner, root, cell, gpu):
+    spec = importlib.util.spec_from_file_location('frozen_mmmu_scoring', root / 'mmmu_runner_source.py')
+    scorer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scorer)
+    scorer.CHILDREN = runner.CHILDREN
+    runner.wait_capacity(gpu, 76)
+    scorer.score(root, runner, cell, gpu)
+
+
 def run(root, gpu):
     import json
 
@@ -38,6 +53,7 @@ def run(root, gpu):
     runner.JUDGE_SNAPSHOT = Path(protocol['judge_runtime_snapshot'])
     sys.path[:0] = [str(runner.SNAPSHOT / 'python'), str(runner.SNAPSHOT / 'benchmarks')]
     job = dict(protocol['job'])
+    configure_dataset(runner, job)
     configure_lookup(runner, job)
     runner.STATE.clear()
     runner.STATE.update(status='starting', jobs={job['id']: job}, workers={str(gpu): dict(state='starting')})
@@ -63,8 +79,12 @@ def run(root, gpu):
                 runner.save(root / 'cells' / job['id'] / 'lookup_audit.json', result)
             runner.STATE['status'] = 'scoring'
             runner.persist()
-            runner.score_job(dict(parent=job['id'], dataset=job['dataset']), gpu)
             folder = root / 'cells' / job['id']
+            if job['dataset'] == 'mmmu':
+                if runner.cached_score(job['dataset'], folder) is None:
+                    score_mmmu(runner, root, job['id'], gpu)
+            else:
+                runner.score_job(dict(parent=job['id'], dataset=job['dataset']), gpu)
             score = runner.cached_score(job['dataset'], folder)
             if score is None:
                 raise ValueError('native scoring did not finish all samples')
