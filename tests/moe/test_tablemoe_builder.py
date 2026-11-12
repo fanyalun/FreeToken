@@ -427,17 +427,23 @@ def test_fixed_decode_sampling_rejects_incomplete_generation(tmp_path):
         finalize_collection(tmp_path, dict(sample_count=1), 1, 1)
 
 
-def test_gemma_checkpoint_expert_layout_is_not_transposed(tmp_path):
+@pytest.mark.parametrize("architecture", ["Gemma4ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM", "Qwen3VLMoeForConditionalGeneration"])
+def test_checkpoint_expert_layout_matches_model(tmp_path, architecture):
     from safetensors.torch import save_file
     from freetoken.moe.tablemoe_builder import iter_checkpoint_experts
 
-    write_json(tmp_path / "config.json", dict(architectures=["Gemma4ForConditionalGeneration"],
-               text_config=dict(num_hidden_layers=1, num_experts=2)))
+    geometry = dict(num_hidden_layers=1, num_experts=2)
+    write_json(tmp_path / "config.json", dict(architectures=[architecture],
+               **(geometry if architecture.endswith("ForCausalLM") else dict(text_config=geometry))))
     gate = torch.arange(2 * 6 * 4).reshape(2, 6, 4).bfloat16()
     down = torch.arange(2 * 4 * 3).reshape(2, 4, 3).bfloat16()
-    save_file({"model.language_model.layers.0.experts.gate_up_proj": gate},
+    qwen_vl = architecture == "Qwen3VLMoeForConditionalGeneration"
+    prefix = "model.language_model.layers.0." + ("experts" if architecture.startswith("Gemma") else "mlp.experts")
+    save_file({prefix + ".gate_up_proj": gate.transpose(1, 2).contiguous() if qwen_vl else gate,
+               "mtp.layers.0.mlp.experts.gate_up_proj": torch.zeros_like(gate)},
               tmp_path / "model-00001-of-00002.safetensors")
-    save_file({"model.language_model.layers.0.experts.down_proj": down},
+    save_file({prefix + ".down_proj": down.transpose(1, 2).contiguous() if qwen_vl else down},
               tmp_path / "model-00002-of-00002.safetensors")
     pieces = list(iter_checkpoint_experts(tmp_path))
     assert len(pieces) == 2
@@ -467,8 +473,34 @@ def test_bf16_collection_roundtrip_resume_and_dtype_guard(tmp_path, export):
     assert torch.isfinite(actual).all() and actual.max() > 65504
 
 
+def test_shared_image_collection_masks_visual_positions_and_preserves_question_text(tmp_path):
+    from types import SimpleNamespace
+
+    config = dict(dtype="bfloat16", sampling_policy="tablemoe_default", sample_count=2,
+                  collection_image_ids=[["shared-image"], ["shared-image"]],
+                  min_vision_per_sample=0, max_vision_per_sample=64,
+                  min_text_per_sample=0, max_text_per_sample=128)
+    for ordinal in range(2):
+        collector = InputCollector(tmp_path, config, 4, 1, identity="shared")
+        req = SimpleNamespace(uid=ordinal, cached_len=0, extend_len=5, input_ids=list(range(5)),
+                              mm_items=[SimpleNamespace(offsets=[(1, 3)])])
+        batch = SimpleNamespace(padded_reqs=[req], prompt_admissions=[(ordinal, 5, None)])
+        indices, modalities, _ = collector._sample_prefill(batch, 5)
+        assert indices[modalities == 1].tolist() == [0, 3, 4]
+        assert indices[modalities == 0].tolist() == ([1, 2] if ordinal == 0 else [])
+        assert req.mm_items[0].offsets == [(1, 3)] and len(req.input_ids) == 5
+        collector.flush(ordinal)
+        collector.close()
+    saved = read_json(tmp_path / "progress.json")["sample_state"]
+    assert saved["counts"] == dict(vision=2, text=6)
+    assert saved["records"][1]["duplicate_visual_tokens"] == 2
+    assert saved["records"][1]["new_image_ids"] == []
+
+
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_gemma_bf16_offline_build_end_to_end(tmp_path, batch_size):
+@pytest.mark.parametrize("architecture,activation", [("Gemma4ForConditionalGeneration", "gelu_tanh"),
+    ("Qwen3_5MoeForConditionalGeneration", "silu")])
+def test_native_bf16_offline_build_end_to_end(tmp_path, batch_size, architecture, activation):
     from types import SimpleNamespace
 
     torch.manual_seed(53)
@@ -487,8 +519,8 @@ def test_gemma_bf16_offline_build_end_to_end(tmp_path, batch_size):
     assert clustered["dtype"] == "bfloat16"
     gate, down = torch.randn(2, 6, 4).bfloat16(), torch.randn(2, 4, 3).bfloat16()
     cached = materialize(tmp_path, config, [(0, 0, 2, dict(gate_up=gate, down=down))],
-                         SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"]))
-    assert cached["dtype"] == "bfloat16" and cached["activation"] == "gelu_tanh"
+                         SimpleNamespace(architectures=[architecture]))
+    assert cached["dtype"] == "bfloat16" and cached["activation"] == activation
     assert not cached["missing_tables"]
     for mod in ("vision", "text"):
         pca = torch.load(tmp_path / "cluster/layer_0" / f"L0_{mod}_pca.pt", weights_only=True)
@@ -499,5 +531,7 @@ def test_gemma_bf16_offline_build_end_to_end(tmp_path, batch_size):
             cache = torch.load(tmp_path / "cache/layer_0" / f"{name}_cache.pt", weights_only=True)
             assert data["key"].dtype == data["centroid"].dtype == cache["value"].dtype == torch.bfloat16
             g, u = torch.nn.functional.linear(data["centroid"], gate[expert]).chunk(2, -1)
-            expected = torch.nn.functional.linear(torch.nn.functional.gelu(g, approximate="tanh") * u, down[expert])
+            act = (torch.nn.functional.gelu(g, approximate="tanh") if activation == "gelu_tanh"
+                   else torch.nn.functional.silu(g))
+            expected = torch.nn.functional.linear(act * u, down[expert])
             torch.testing.assert_close(cache["value"], expected, atol=0, rtol=0)

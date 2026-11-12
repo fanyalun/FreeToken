@@ -1351,14 +1351,17 @@ def test_integrity_declared_images_must_match_prompt_media(tmp_path):
         validate_manifest([record])
 
 
-def test_gemma_suite_defaults_to_native_bf16_for_inference_and_building(tmp_path):
+@pytest.mark.parametrize("architecture", ["Gemma4ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration"])
+def test_suite_defaults_to_native_bf16_for_inference_and_building(tmp_path, architecture):
     from bench_tablemoe_suite import server_command
 
-    (tmp_path / "config.json").write_text(json.dumps(dict(architectures=["Gemma4ForConditionalGeneration"])))
+    (tmp_path / "config.json").write_text(json.dumps(dict(architectures=[architecture])))
     base = dict(model=str(tmp_path), output=str(tmp_path / "run"), vlmeval_python="python")
     config = effective_config(base)
     assert config["dtype"] == config["builder"]["dtype"] == "bfloat16"
     assert config["convert_bf16"] is False and config["processor"] == {}
+    if architecture.startswith("Qwen3_5Moe"):
+        assert config["calibration_fraction"] == .6 and config["seed"] == 42
     command = server_command(config, "table_hybrid_graph", tmp_path / "assets")
     assert command[command.index("--dtype") + 1] == "bfloat16"
     assert "--tablemoe-convert-bf16-weights" not in command
@@ -1366,3 +1369,25 @@ def test_gemma_suite_defaults_to_native_bf16_for_inference_and_building(tmp_path
         effective_config({**base, "builder": {"dtype": "float16"}})
     with pytest.raises(ValueError, match="does not use"):
         effective_config({**base, "convert_bf16": True})
+
+
+def test_stratified_split_preserves_categories_and_transitive_documents():
+    def sample(index, category, images, document=None):
+        return dict(id=str(index), index=index, dataset="AI2D_TEST",
+                    images=[dict(sha256=image) for image in images],
+                    metadata=dict(category=category, question=str(index), document_id=document))
+
+    rows = [sample(i, "a" if i < 10 else "b", [str(i)]) for i in range(20)]
+    left, right = split_rows(rows, seed=42, fraction=.6, stratified=True)
+    assert [sum(r["metadata"]["category"] == category for r in left) for category in ("a", "b")] == [6, 6]
+    assert [r["id"] for r in left] == [r["id"] for r in split_rows(rows, 42, .6, stratified=True)[0]]
+    shared = [sample(100, "a", ["x"], "doc"), sample(101, "b", ["y"], "doc"),
+              sample(102, "b", ["y", "z"]), sample(103, "b", ["z"])]
+    combined = group_rows(rows + shared)
+    assert len({r["group_id"] for r in combined[-4:]}) == 1
+    left, right = split_rows(combined, 42, .6, stratified=True)
+    verify_disjoint(left, right)
+    unequal = [sample(200 + i, "a", ["group4" if i < 4 else "group3" if i < 7 else "group2"])
+               for i in range(9)]
+    left, right = split_rows(unequal, 42, 5 / 9, stratified=True)
+    assert len(left) == 5 and len(right) == 4

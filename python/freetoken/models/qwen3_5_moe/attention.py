@@ -91,6 +91,12 @@ class Qwen3_5Attention(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
         q, k, v, gate = self._project(x)
+        if (getattr(ctx, "tablemoe_runtime", None) is not None and ctx.batch.is_prefill
+                and getattr(ctx.tablemoe_runtime, "prefill_uses_tablemoe", True)):
+            from freetoken.moe.tablemoe import last_token_attention_scores
+
+            ctx.batch.tablemoe_attn_scores[self.layer_id] = last_token_attention_scores(
+                q, k.view(-1, self.num_kv, self.head_dim), ctx.batch.padded_reqs)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return self._combine(o, gate)
 

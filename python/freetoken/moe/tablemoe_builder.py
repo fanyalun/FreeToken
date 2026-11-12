@@ -48,6 +48,12 @@ def algorithm_config(config):
                 raise ValueError("invalid per-sample sampling bounds")
             if result[f"max_{mod}_tokens"] < 0:
                 raise ValueError("negative collection budget")
+    if "collection_image_ids" in result:
+        if result["sampling_policy"] != "tablemoe_default" or len(result["collection_image_ids"]) != result["sample_count"]:
+            raise ValueError("image deduplication requires one identity list per calibration sample")
+        if any(not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys)
+               for keys in result["collection_image_ids"]):
+            raise ValueError("collection image identities must be nonempty strings")
     return result
 
 
@@ -125,6 +131,8 @@ class InputCollector:
             self.sample_state = saved.get("sample_state", self.sample_state)
             if "rng_state" in self.sample_state:
                 self.sample_rng.bit_generator.state = self.sample_state["rng_state"]
+        self.collected_image_ids = {key for record in self.sample_state["records"]
+                                    for key in record.get("image_ids", [])}
         self.error = None
         self.handles = {}
         self.pending = queue.Queue(maxsize=4)
@@ -187,9 +195,25 @@ class InputCollector:
                 for item in getattr(req, "mm_items", None) or []:
                     for lo, hi in item.offsets:
                         vision[lo:hi] = True
+                collect_vision = vision.copy()
+                image_ids, new_image_ids = [], []
+                if "collection_image_ids" in self.config:
+                    image_ids = self.config["collection_image_ids"][ordinal]
+                    items = getattr(req, "mm_items", None) or []
+                    if len(items) != len(image_ids):
+                        raise ValueError("collection image identities differ from model image inputs")
+                    for key, item in zip(image_ids, items):
+                        if key in self.collected_image_ids:
+                            for lo, hi in item.offsets:
+                                collect_vision[lo:hi] = False
+                        else:
+                            self.collected_image_ids.add(key)
+                            new_image_ids.append(key)
                 record = dict(uid=req.uid, ordinal=ordinal, prompt_tokens=length,
-                              candidates={}, selected={}, positions={}, decode_seen=0)
-                for mod, mask in (("vision", vision), ("text", ~vision)):
+                              candidates={}, selected={}, positions={}, decode_seen=0,
+                              image_ids=image_ids, new_image_ids=new_image_ids,
+                              duplicate_visual_tokens=int((vision & ~collect_vision).sum()))
+                for mod, mask in (("vision", collect_vision), ("text", ~vision)):
                     positions = np.flatnonzero(mask)
                     if mod == "text" and self.config["sample_decode_tokens"]:
                         # Fixed-length generation makes the future decode-input positions known.
@@ -707,8 +731,9 @@ def iter_checkpoint_experts(model):
     geometry = read_json(Path(model) / "config.json")
     activation = tablemoe_activation(geometry["architectures"])
     gemma = activation == "gelu_tanh"
+    transpose = "Qwen3VLMoeForConditionalGeneration" in geometry["architectures"]
     rename = _rename_language_key if gemma else rename_vl_prefix
-    text = geometry["text_config"]
+    text = geometry.get("text_config", geometry)
     if not text.get("num_experts", 0):
         raise ValueError("builder requires a routed MoE checkpoint")
     sources = {}
@@ -737,7 +762,7 @@ def iter_checkpoint_experts(model):
             for expert in range(text["num_experts"]):
                 piece = {role: view[expert:expert + 1] for role, view in tensors.items()}
                 yield layer, expert, expert + 1, {
-                    role: (value if gemma else _linear_layout(value)).contiguous()
+                    role: (_linear_layout(value) if transpose else value).contiguous()
                     for role, value in piece.items()}
 
 

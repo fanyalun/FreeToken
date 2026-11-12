@@ -1,4 +1,4 @@
-"""FP16/BF16 experts and request-local TableMoE lookup for Qwen3-VL-MoE and Gemma 4."""
+"""FP16/BF16 experts and request-local TableMoE lookup for Qwen and Gemma MoE."""
 
 from __future__ import annotations
 
@@ -19,9 +19,11 @@ _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
 def tablemoe_activation(architectures) -> str:
     if "Gemma4ForConditionalGeneration" in architectures:
         return "gelu_tanh"
-    if "Qwen3VLMoeForConditionalGeneration" in architectures:
+    if any(name in architectures for name in (
+            "Qwen3VLMoeForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5MoeForCausalLM")):
         return "silu"
-    raise ValueError("tablemoe requires Qwen3VLMoeForConditionalGeneration or Gemma4ForConditionalGeneration")
+    raise ValueError("tablemoe requires Qwen3-VL-MoE, Qwen3.5/3.6-MoE or Gemma4ForConditionalGeneration")
 
 
 def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False, dtype=torch.float16) -> None:

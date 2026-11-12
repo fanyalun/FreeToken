@@ -21,7 +21,7 @@ from freetoken.moe.tablemoe_artifacts import (
     checkpoint_identity, digest, file_hash, finish_stage, read_json, verify_stage, write_json,
 )
 from tablemoe_common import FreeTokenAPIAdapter, METRIC_VERSION, PREDICTION_PROTOCOL, compare_runs, running_server, stream_request
-from tablemoe_data import fixed_rows, read_rows, split_rows, validate_manifest, verify_disjoint, verify_native_evaluation, write_rows
+from tablemoe_data import calibration_category, fixed_rows, read_rows, split_rows, validate_manifest, verify_disjoint, verify_native_evaluation, write_rows
 
 DATASETS = ("MMBench_DEV_EN_V11", "ScienceQA_TEST", "AI2D_TEST", "POPE", "RealWorldQA")
 GROUPS = ("table_hybrid_eager", "table_hybrid_graph", "full_hybrid_eager", "full_hybrid_graph")
@@ -51,8 +51,12 @@ def asset_root_for(config, dataset, smoke=False):
 def effective_config(config):
     defaults = dict(DEFAULTS)
     model_config = Path(config.get("model", defaults["model"])) / "config.json"
-    if model_config.is_file() and "Gemma4ForConditionalGeneration" in read_json(model_config).get("architectures", []):
+    architectures = read_json(model_config).get("architectures", []) if model_config.is_file() else []
+    if any(name in architectures for name in ("Gemma4ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")):
         defaults.update(dtype="bfloat16", convert_bf16=False, processor={})
+    if any(name.startswith("Qwen3_5Moe") for name in architectures):
+        defaults.update(calibration_fraction=.6, stratified_calibration=True, deduplicate_visual_collection=True)
     config = {**defaults, **config}
     if config["dtype"] not in ("float16", "bfloat16"):
         raise ValueError("TableMoE suite dtype must be float16 or bfloat16")
@@ -191,7 +195,8 @@ def prepare(config, manifest):
         rows = read_rows(all_path)
         validate_manifest(rows)
         if config["protocol"] == "holdout":
-            calibration, evaluation = split_rows(rows, config["seed"], config["calibration_fraction"])
+            calibration, evaluation = split_rows(rows, config["seed"], config["calibration_fraction"],
+                                                 stratified=config.get("stratified_calibration", False))
         else:
             independent = config.get("independent", {}).get(dataset)
             if not independent:
@@ -207,11 +212,28 @@ def prepare(config, manifest):
             write_rows(path, data)
             outputs.append(path)
         split = dict(dataset=dataset, protocol=config["protocol"], seed=config["seed"],
+                     calibration_fraction_requested=config["calibration_fraction"],
                      calibration_samples=len(calibration), evaluation_samples=len(evaluation),
                      calibration_fraction_actual=len(calibration) / (len(calibration) + len(evaluation)),
                      calibration_ids=[r["id"] for r in calibration], evaluation_ids=[r["id"] for r in evaluation],
                      calibration_groups=sorted({r["group_id"] for r in calibration}),
                      evaluation_groups=sorted({r["group_id"] for r in evaluation}), fixed_ids=[r["id"] for r in fixed])
+        if config.get("stratified_calibration"):
+            categories = {}
+            for row in calibration + evaluation:
+                category = categories.setdefault(calibration_category(row), dict(samples=0, calibration=0))
+                category["samples"] += 1
+                category["calibration"] += int(row["group_id"] in split["calibration_groups"])
+            for category in categories.values():
+                category["target"] = int(category["samples"] * config["calibration_fraction"])
+                category["deviation"] = category["calibration"] - category["target"]
+            sharing = {}
+            for row in calibration + evaluation:
+                for image in row["images"]:
+                    sharing.setdefault(image["sha256"], []).append(row["id"])
+            split.update(categories=categories, category_source="metadata.category, metadata.subject, category, __all__",
+                         category_deviation_reason="whole document/image groups retained within one partition",
+                         image_sharing=sharing)
         write_json(folder / "split.json", split)
         splits[dataset] = split
         outputs.extend((all_path, all_path.with_suffix(".kit.json"), folder / "split.json"))
@@ -262,13 +284,18 @@ def build(config, manifest, smoke=False, collect_only=False):
     from freetoken.moe.tablemoe_builder import algorithm_config, cluster, finalize_collection, materialize
 
     verify_stage(data_root(config))
-    geometry = read_json(Path(config["model"]) / "config.json")["text_config"]
+    geometry = read_json(Path(config["model"]) / "config.json")
+    geometry = geometry.get("text_config", geometry)
     for dataset in config["datasets"]:
         asset_root = asset_root_for(config, dataset, smoke)
         calibration = read_rows(data_root(config) / dataset / "calibration.jsonl")
         if smoke:
             calibration = calibration[:config["smoke_calibration_limit"]]
-        algorithm = algorithm_config({**config["builder"], **(config.get("smoke_builder", {}) if smoke else {})})
+        algorithm = {**config["builder"], **(config.get("smoke_builder", {}) if smoke else {})}
+        if config.get("deduplicate_visual_collection"):
+            algorithm.update(sampling_policy="tablemoe_default", sample_count=len(calibration),
+                             collection_image_ids=[[image["sha256"] for image in row["images"]] for row in calibration])
+        algorithm = algorithm_config(algorithm)
         if dataset in config.get("smoke_asset_roots" if smoke else "asset_roots", {}):
             existing = verify_stage(asset_root / "cache", hash_outputs=False)
             provenance = existing["provenance"]

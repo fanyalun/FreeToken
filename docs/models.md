@@ -44,7 +44,8 @@ These families accept image input by default; pass `--text-model-only` to skip t
 - **cpu** — misses are computed on the CPU instead of fetched.
 - **hybrid** — per step, fetches some misses over PCIe and computes the rest on
   CPU, overlapped. Run `ft bench bw` once per machine to calibrate the split.
-- **tablemoe** — approximate Qwen3-VL-MoE FP16, TP=1 path. Select important-route
+- **tablemoe** — approximate FP16/BF16, TP=1 path for Qwen3-VL-MoE,
+  [Qwen3.5/3.6-MoE](qwen36_tablemoe.md) and [Gemma 4 MoE](gemma4_tablemoe.md). Select important-route
   execution with `--tablemoe-expert-mode`: `offload` (default) uses the shared GPU
   expert slot cache; `hybrid` uses GPU prefill and computes decode overflow misses
   on CPU; `cpu` computes all important routes on CPU. The offload/hybrid modes
@@ -55,7 +56,8 @@ These families accept image input by default; pass `--text-model-only` to skip t
   retain their original router weights by default. Use
   `--tablemoe-renormalize-weights` to opt into survivor-weight renormalization.
   Requires `--tablemoe-pca-dir` and `--tablemoe-cache-dir`.
-  Prefill importance uses the current chunk's last-token attention only. Decode
+  Prefill importance uses the current chunk's last-token attention, or absolute
+  recurrent value influence in Qwen's Gated DeltaNet layers. Decode
   uses the `optimized` implementation by default. It enables fixed request-slot GPU
   online storage and decode CUDA Graphs for offload/hybrid;
   hybrid Graph requires the CPU executor's flag handshake. `--tablemoe-stats` enables
@@ -73,8 +75,8 @@ These families accept image input by default; pass `--text-model-only` to skip t
   and block of at most 128 tokens. Optimized merges CPU overflow directly from pinned
   output after the ready/done handshake. Prefill uses offline cosine lookup;
   decode tries online raw-dot lookup then offline positive-dot lookup, matching
-  the reference defaults. This path reads raw FP16 checkpoint
-  experts, or explicitly converts BF16 source weights with
+  the reference defaults. This path reads matching raw FP16/BF16 checkpoint
+  experts, or explicitly converts BF16 source weights for FP16 execution with
   `--tablemoe-convert-bf16-weights`. Conversion changes numeric behavior and has
   no established quality or speed guarantee.
 - **auto** — dense models always resolve to `fused`; MoE models resolve to

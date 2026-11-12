@@ -378,6 +378,61 @@ def test_tablemoe_rejects_wrong_model_dtype_and_tp(tmp_path):
         validate_tablemoe_config(cfg)
 
 
+@pytest.mark.parametrize("architecture", ["Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"])
+def test_qwen35_moe_activation_and_dense_guard(architecture):
+    from freetoken.moe.tablemoe import tablemoe_activation
+
+    assert tablemoe_activation([architecture]) == "silu"
+    cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=[architecture],
+                          num_experts=0, num_experts_per_tok=0),
+                          dtype=torch.bfloat16, tp_info=SimpleNamespace(size=1))
+    with pytest.raises(ValueError, match="routed MoE"):
+        validate_tablemoe_config(cfg)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dim", [8, 128])
+def test_gdn_prefill_scores_match_independent_value_basis_recurrence(dtype, dim):
+    from freetoken.kernel.triton.tablemoe_gdn import last_token_gdn_scores
+
+    torch.manual_seed(42)
+    lengths, hk, hv = [1, 0, 7 if dim == 8 else 65, 3], 2, 4
+    total = sum(lengths)
+    q = torch.randn(total, hk, dim, device="cuda", dtype=dtype)
+    k = torch.randn_like(q)
+    g = -torch.rand(total, hv, device="cuda") * 2
+    beta = torch.rand(total, hv, device="cuda")
+    beta[1] = 0
+    beta[3] = 1
+    boundaries = [0]
+    for n in lengths:
+        boundaries.append(boundaries[-1] + n)
+    cu = torch.tensor(boundaries, device="cuda", dtype=torch.int32)
+    actual = last_token_gdn_scores(q, k, g, beta, cu)
+    expected, start = [], 0
+    for n in lengths:
+        if n == 0:
+            continue
+        keys = k[start:start + n].float()
+        keys = (keys * torch.rsqrt(keys.square().sum(-1, keepdim=True) + 1e-6)).to(dtype).float()
+        keys = keys.repeat_interleave(hv // hk, dim=1)
+        query = q[start + n - 1].float()
+        query = (query * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)).to(dtype).float()
+        query = query.repeat_interleave(hv // hk, dim=0) * dim ** -.5
+        state = torch.zeros(hv, dim, n, device="cuda")
+        basis = torch.eye(n, device="cuda")
+        for t in range(n):
+            state = state * g[start + t].exp()[:, None, None]
+            predicted = torch.einsum("hd,hdv->hv", keys[t], state)
+            delta = beta[start + t, :, None] * (basis[t] - predicted)
+            state = state + keys[t, :, :, None] * delta[:, None, :]
+        coefficients = torch.einsum("hd,hdv->hv", query, state)
+        expected.append(coefficients.abs().mean(0))
+        start += n
+    torch.testing.assert_close(actual, torch.cat(expected), atol=2e-6, rtol=2e-5)
+    assert (actual >= 0).all() and torch.isfinite(actual).all()
+
+
 @pytest.mark.parametrize("dense", [False, True])
 def test_gemma_rejects_dense_models_and_scale_renormalization(dense):
     cfg = SimpleNamespace(model_config=SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"],

@@ -1,6 +1,8 @@
 # TableMoE offline builder and benchmark suite
 
-The suite uses FreeToken's FP16 Qwen3-VL-MoE expert banks and optimized runtime.
+The suite uses FreeToken's FP16/BF16 expert banks and optimized TableMoE runtime.
+See the model-specific guides for [Qwen3.6 MoE](../docs/qwen36_tablemoe.md)
+and [Gemma 4 MoE](../docs/gemma4_tablemoe.md).
 VLMEvalKit runs in a separately configured Python process. It supplies the native
 `build_prompt()` and `evaluate()` methods; no VLMEvalKit checkout files are edited.
 The [official development interface](https://github.com/open-compass/VLMEvalKit/blob/main/docs/en/Development.md)

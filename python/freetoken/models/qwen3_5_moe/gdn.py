@@ -175,6 +175,12 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             g, beta = self._gate_params(a, b)
             g = g.reshape(1, total, self.num_v_heads)
             beta = beta.float().reshape(1, total, self.num_v_heads)
+            if (getattr(ctx, "tablemoe_runtime", None) is not None
+                    and getattr(ctx.tablemoe_runtime, "prefill_uses_tablemoe", True)):
+                from freetoken.kernel.triton.tablemoe_gdn import last_token_gdn_scores
+
+                batch.tablemoe_attn_scores[self.layer_id] = last_token_gdn_scores(
+                    q[0], k[0], g[0], beta[0], fla.cu_seqlens)
             # The chunk kernel reads + writes back initial_state[cache_indices] in place;
             # fresh sequences (cached_len==0) must start from a zeroed slot.
             if fla.fresh_state_indices is not None:
