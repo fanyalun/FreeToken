@@ -31,6 +31,7 @@ from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, r
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
+from .baseline_sd import is_native_sd, resolve_capacity, plan_static_memory
 from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from .spec_protocol import SpecRuntime
@@ -472,16 +473,39 @@ class Engine:
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        if is_native_sd(config):
+            from .speculative_config import resolve_draft_method
+            from .speculative_prefetch_profile import prepare_prefetch_profile
+            self.draft_method = resolve_draft_method(config)
+            if config.active_encoders:
+                raise ValueError("three_level_gpu currently requires text-only input")
+            prepare_prefetch_profile(config, self.device)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
         self._pool_cls = resolve_pool_class(config.model_config)
+        if is_native_sd(config):
+            from freetoken.kvcache.qwen_mtp_pool import QwenMTPKVCache
+            self._pool_cls = QwenMTPKVCache
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
-        init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
+        physical_baseline_free = free_min
+        self._physical_baseline_free = free_min
+        self._baseline_allocated = torch.cuda.memory_allocated(self.device)
+        self.baseline_sd_memory_plan = None
+        self._budget_initial_used = 0
+        init_free_memory = free_max
+        if config.gpu_memory_budget_bytes is not None:
+            total = torch.cuda.mem_get_info(self.device)[1]
+            self._budget_initial_used = total - free_min
+            free_min = min(free_min, config.gpu_memory_budget_bytes - self._budget_initial_used)
+            if free_min <= 0:
+                raise ValueError("absolute GPU budget is already consumed before model load")
+            init_free_memory = free_min
+            torch.cuda.set_per_process_memory_fraction(free_min / total, self.device)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
@@ -490,6 +514,11 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self._load_weights(config)
+        self.mtp = None
+        self.draft_feature_size = config.model_config.hidden_size
+        if is_native_sd(config):
+            from .draft_adapter import create_draft
+            self.mtp = create_draft(self, config)
         if config.active_encoders:
             from freetoken.models.blocks import SupportsMultimodal
 
@@ -503,7 +532,7 @@ class Engine:
         # draft weights load before any pool is sized, so every free-memory read below counts them
         self.spec: SpecRuntime | None = _spec_runner()(config, self) if config.speculative_algorithm is not None else None
         post_weights_free = self._sync_get_memory()[0]
-        self._weights_bytes = self._baseline_free - post_weights_free
+        self._weights_bytes = physical_baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -524,6 +553,9 @@ class Engine:
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
+        if is_native_sd(config):
+            from .speculative_prefetch_profile import validate_prefetch_profile
+            validate_prefetch_profile(self)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -550,6 +582,8 @@ class Engine:
 
         # ======================= KV cache initialization ========================
         new_free = self._sync_get_memory()[1]
+        if config.gpu_memory_budget_bytes is not None:
+            new_free = init_free_memory - (physical_baseline_free - new_free)
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
@@ -559,9 +593,13 @@ class Engine:
             spec_fixed, draft_page = self._spec_budget(config)
             page_bytes, fixed_bytes = self._pool_cls.kv_cost(config)[:2]
             available_memory = fixed_bytes + (available_memory - spec_fixed - fixed_bytes) * page_bytes // (page_bytes + draft_page)
+        if is_native_sd(config):
+            per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
+            available_memory = (config.num_page_override + 1) * per_page + fixed
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kv_pool(
+        factory = self._pool_cls.create if is_native_sd(config) else create_kv_pool
+        self.ctx.kv_cache = self.kv_cache = factory(
             config, self.num_pages, device=self.device, dtype=self.dtype
         )
 
@@ -631,9 +669,37 @@ class Engine:
 
         # ======================= Graph capture initialization ========================
         self.graph_runner = self._make_graph_runner(config.cuda_graph_bs, init_free_memory, aligned_max_seq_len)
-        if config.attention_backend.split(",")[0] == "triton":
+        if config.attention_backend.split(",")[0] == "triton" and not is_native_sd(config):
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self.speculative_runner = None
+        if is_native_sd(config):
+            from .qwen_mtp import QwenMTPRunner
+            self.speculative_runner = QwenMTPRunner(self)
+
+    def generate_speculative(self, input_ids, *, max_tokens, eos_ids=(), cancel=None, prompt_chunk_size=None):
+        if self.speculative_runner is None:
+            raise ValueError("enable speculative_mode=three_level_gpu")
+        return self.speculative_runner.generate(input_ids, max_tokens=max_tokens,
+            eos_ids=tuple(eos_ids), cancel=cancel, prompt_chunk_size=prompt_chunk_size)
+
+    def _plan_speculative_memory(self, *, minimum=0, maximum=0, slot_bytes=0, cache_cost=None):
+        from .cache_budget import speculative_gdn_workspace_bytes, speculative_hybrid_workspace_bytes
+        config = self.config
+        capacity, pages = resolve_capacity(config)
+        per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
+        budget = int(config.memory_ratio * self._baseline_free)
+        plan = plan_static_memory(capacity_tokens=capacity, kv_pages=pages, budget_bytes=budget,
+            weights_bytes=self._weights_bytes, kv_bytes=(pages + 1) * per_page,
+            state_bytes=state_pool_bytes(config),
+            workspace_bytes=fixed + speculative_gdn_workspace_bytes(config) + speculative_hybrid_workspace_bytes(config),
+            runtime_reserve_bytes=self._baseline_free - budget,
+            expert_slot_bytes=slot_bytes, minimum_slots=minimum, maximum_slots=maximum,
+            slots=0 if config.moe_cache_auto or not slot_bytes else config.moe_cache_size,
+            cache_bytes_for_slots=cache_cost)
+        self.baseline_sd_memory_plan = plan
+        logger.info_rank0(f"three-level static memory plan: {plan.as_dict()}")
+        return plan.final_slots
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -677,6 +743,9 @@ class Engine:
             self.model.load_state_dict(self._load_weight_state_dict(config, host_keys))
         if config.speculative_algorithm is not None:
             _spec_runner().prepare_target(config, self.model)
+        if is_native_sd(config):
+            from freetoken.spec.mtp.proposer import MTPProposer
+            MTPProposer.prepare_target(config, self.model)
         finalize_quant(self.model)
         if resident:
             self._load_resident_experts(config, resident)
@@ -869,7 +938,17 @@ class Engine:
         # with GPU decode, a pool below num_experts slots bounds the batch; the startup split keeps room for one request's decode step
         pools = self._moe_pools(config.decode_rows_per_req if decode_target == "gpu" else 1)
         size_cap = sum(p.max_num_slots for p in pools)
-        if config.moe_cache_auto:
+        if config.moe_cache_auto and is_native_sd(config):
+            from .cache_budget import minimum_staging_slots, expert_pool_bytes
+            minimum = minimum_staging_slots(banks.sources, pools, config.model_config.num_experts,
+                buffers=2 if config.moe_prefill_overlap else 1, counts=self._moe_expert_counts,
+                row_tail_bytes=banks.row_tail_bytes, layer_tags=layer_tags)
+            cost = lambda slots: expert_pool_bytes(banks.sources, pools,
+                split_slots(slots, pools, self._moe_expert_counts), banks.row_tail_bytes, layer_tags) + slots * 20
+            size = self._plan_speculative_memory(minimum=minimum, maximum=size_cap,
+                slot_bytes=expert_bytes_per_slot(banks.sources) + 20, cache_cost=cost)
+            object.__setattr__(config, "moe_cache_size", size)
+        elif config.moe_cache_auto:
             size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks, method, max_slots=size_cap)
             object.__setattr__(config, "moe_cache_size", size)
             object.__setattr__(config, "moe_prefill_overlap", overlap)
@@ -899,6 +978,11 @@ class Engine:
                 f"--moe-cache-mem {mem_GB(config.moe_cache_mem)} resolved moe_cache_size={size} "
                 f"({per_slot / 2**20:.2f} MiB per slot, prefill_overlap={overlap})"
             )
+        if is_native_sd(config) and self.baseline_sd_memory_plan is None:
+            from .cache_budget import expert_pool_bytes
+            cost = lambda slots: expert_pool_bytes(banks.sources, pools,
+                split_slots(slots, pools, self._moe_expert_counts), banks.row_tail_bytes, layer_tags) + slots * 20
+            self._plan_speculative_memory(slot_bytes=expert_bytes_per_slot(banks.sources) + 20, cache_cost=cost)
         _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
         pool_sizes = split_slots(config.moe_cache_size, pools, self._moe_expert_counts)
         if len(pools) > 1:
@@ -1085,6 +1169,7 @@ class Engine:
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
         sample = layers[0]
+        self.speculative_hybrid_layer = sample
         required = ("top_k", "activation", "apply_router_weight_on_input")
         if not all(hasattr(sample, attr) for attr in required):
             raise NotImplementedError(
@@ -1095,6 +1180,15 @@ class Engine:
         # round a batch up to the largest captured size; cover both.
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, *(config.cuda_graph_bs or []), 1)
         max_tokens *= config.decode_rows_per_req
+        grouped_widths = ()
+        if is_native_sd(config):
+            from .speculative_window import three_level_max_rows
+            width = three_level_max_rows(config.speculative_mtp_depth, config.speculative_max_loops,
+                                         config.speculative_skip_last_preverify)
+            width = min(config.speculative_submit_tokens or width, width, config.speculative_max_output_tokens)
+            width = max(config.speculative_mtp_depth + 1, width)
+            max_tokens = max(max_tokens, width)
+            grouped_widths = tuple(range(1, width + 1))
         # Match GraphRunner's explicit-size precedence, including an empty list.
         if config.cuda_graph_bs is not None:
             graph_enabled = bool(config.cuda_graph_bs)
@@ -1112,6 +1206,7 @@ class Engine:
             device=self.device,
             activation_dtype=self.dtype,
             graph_enabled=graph_enabled,
+            grouped_widths=grouped_widths,
             swiglu_alpha=float(sample.alpha),
             swiglu_limit=sample.limit,
             layer_formats=layer_formats,
@@ -1196,6 +1291,8 @@ class Engine:
         guarantee no in-flight prefill/decode.
         """
         config = self.config
+        if is_native_sd(config):
+            raise CacheRebuildRejected("restart the three-level engine to change cache or Graph capacity")
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
@@ -1345,8 +1442,8 @@ class Engine:
             device=self.device,
             forward=self.model.forward,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=[] if is_native_sd(config) else cuda_graph_bs,
+            cuda_graph_max_bs=0 if is_native_sd(config) else config.cuda_graph_max_bs,
             free_memory=free_memory,
             max_seq_len=max_seq_len,
             dummy_req=self.dummy_req,
@@ -1380,6 +1477,8 @@ class Engine:
 
     def forward_logits(self, batch: Batch) -> torch.Tensor:
         """The batch's logits from its captured graph, or eagerly when none fits."""
+        if is_native_sd(self.config) and not batch.three_level_runtime:
+            raise ValueError("three_level_gpu uses Engine.generate_speculative, not the scheduler batch API")
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
         with self.ctx.forward_batch(batch), self.model.forward_host_ctx(batch, use_graph):
             logits = self.graph_runner.replay(batch) if use_graph else self.model.forward()
@@ -1473,6 +1572,11 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        runner = getattr(self, "speculative_runner", None)
+        if runner is not None:
+            runner.invalidate()
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.close()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -1984,7 +2088,7 @@ def _adjust_config(config: EngineConfig):
     if has_linear_attention:
         override(
             "cache_type",
-            _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
+            "naive" if is_native_sd(config) else _resolve_cache_type(True, getattr(config, "cache_type", "radix")),
         )
 
     # Type x backend capability matrix: resolve auto from the per-type priority
@@ -2209,6 +2313,11 @@ def _adjust_config(config: EngineConfig):
                 f"{(config.num_token_override // config.page_size + 1) * config.page_size}"
             )
         override("num_page_override", config.num_token_override // config.page_size)
+
+    if is_native_sd(config):
+        capacity, pages = resolve_capacity(config)
+        override("max_seq_len_override", capacity)
+        override("num_page_override", pages)
 
     # The rope cos/sin table covers rotary_config.table_positions, and neither rope kernel
     # bounds-checks the position it gathers with -- a longer ceiling reads past the table.

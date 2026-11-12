@@ -1,4 +1,5 @@
 #include "../format.h"
+#include <type_traits>
 
 namespace freetoken::cpu_moe {
 namespace {
@@ -123,10 +124,20 @@ dot_fn select_dot() {
   return dot_scalar;
 }
 
+#include "bf16_grouped.h"
+
 class Bf16Format final : public MoeFormat {
  public:
   Bf16Format(const MoeParams& p, const FormatArgs& a)
-      : MoeFormat(p), dot_(select_dot()), gate_up_(a.bank("gate_up")), down_(a.bank("down")) {}
+      : MoeFormat(p), dot_(select_dot()), gate_up_(a.bank("gate_up")), down_(a.bank("down")) {
+#if CPU_MOE_X86
+    if (dot_ == dot_avx512f) { tile_dot_ = tile_dot_compat_avx512f; tile_rows_ = 4; }
+    else if (dot_ == dot_avx2) { tile_dot_ = tile_dot_compat_avx2; tile_rows_ = 2; }
+#ifdef CPU_MOE_HAS_AVX512BF16
+    else if (dot_ == dot_avx512bf16) { tile_dot_ = tile_dot_compat_avx512bf16; tile_rows_ = 4; }
+#endif
+#endif
+  }
 
   std::string isa_name() const override { return tier_name(pick_isa()); }
 
@@ -138,13 +149,53 @@ class Bf16Format final : public MoeFormat {
 
   void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const override {
     const bf16_t* w = static_cast<const bf16_t*>(tbl_at(down_, layer));
+    const bf16_t* inputs[64];
+    float values[64];
     for (int h = h0; h < h1; ++h)
-      for (int j = 0; j < n; ++j)
-        out[j * kRowBlock + h - h0] = dot_(w + ((size_t)routes[j].e * p.H + h) * p.I, routes[j].g, p.I);
+      for (int j = 0; j < n;) {
+        int end = j + 1;
+        while (end < n && routes[end].e == routes[j].e) ++end;
+        for (int r = j; r < end; ++r) inputs[r - j] = routes[r].g;
+        grouped_dot(w + ((size_t)routes[j].e * p.H + h) * p.I, inputs, values, p.I, end - j);
+        for (int r = j; r < end; ++r) out[r * kRowBlock + h - h0] = values[r - j];
+        j = end;
+      }
+  }
+
+  void gate_up_group(int layer, int e, int i0, int i1, const GroupRoute* routes,
+                     int n, bool gpu_rounding) const override {
+    const bf16_t* w = static_cast<const bf16_t*>(tbl_at(gate_up_, layer)) + (size_t)e * 2 * p.I * p.H;
+    const bf16_t* inputs[64];
+    float gate[64], up[64];
+    for (int j = 0; j < n; ++j) inputs[j] = routes[j].x;
+    for (int i = i0; i < i1; ++i) {
+      grouped_dot(w + (size_t)i * p.H, inputs, gate, p.H, n);
+      grouped_dot(w + (size_t)(p.I + i) * p.H, inputs, up, p.H, n);
+      for (int j = 0; j < n; ++j) {
+        const auto& r = routes[j];
+        gated_rows(p, i, i + 1, 1.0f, r.g, [&](int row) {
+          const float v = (row < p.I ? gate[j] : up[j]) * r.w_in;
+          return gpu_rounding ? bf16_to_f32(f32_to_bf16(v)) : v;
+        });
+      }
+    }
   }
 
  private:
   dot_fn dot_;
+  using tile_dot_fn = void (*)(const bf16_t*, const bf16_t* const*, float*, int, int);
+  tile_dot_fn tile_dot_ = nullptr;
+  int tile_rows_ = 1;
+
+  void grouped_dot(const bf16_t* w, const bf16_t* const* x, float* out, int k, int rows) const {
+    for (int first = 0; first < rows;) {
+      const int left = rows - first;
+      const int count = tile_rows_ >= 4 && left >= 4 ? 4 : tile_rows_ >= 2 && left >= 2 ? 2 : 1;
+      if (count == 1) out[first] = dot_(w, x[first], k);
+      else tile_dot_(w, x + first, out + first, k, count);
+      first += count;
+    }
+  }
   // bf16 rows: gate_up [E, 2I, H], down [E, H, I].
   const uint64_t* gate_up_;
   const uint64_t* down_;

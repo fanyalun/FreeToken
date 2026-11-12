@@ -105,6 +105,12 @@ struct CpuMoeExecutor {
   const float* io_w;
   bf16_t* io_y;
   AlignedVector<bf16_t> g_scratch;   // [max_tokens * top_k * I] intermediate
+  struct Group { int expert; std::vector<int64_t> routes; };
+  std::vector<Group> groups;
+  std::vector<bool> grouped_widths;
+  bool grouped_compat = true, task_grouped = false;
+  AlignedVector<float> route_output;
+  std::atomic<int64_t> reduce_next{0};
 
   // Worker pool.
   int num_threads;
@@ -116,6 +122,7 @@ struct CpuMoeExecutor {
   std::condition_variable sync_cv;
 
   std::atomic<bool> stop{false};  // spinning workers read it without the lock
+  std::atomic<bool> closing{false};
   uint64_t cur_gen = 0;
   MoeTask cur_task{};
   // Separate cache lines: idle workers poll `submitted` while busy workers hit p1_next/p2_next.
@@ -136,8 +143,8 @@ struct CpuMoeExecutor {
   std::vector<int64_t> active_routes;  // intermediate rows tok * top_k + k whose route names an expert
   std::vector<int> active_tokens;      // tokens with at least one such route
   std::atomic<int> done_count{0};
-  std::atomic<int> bar_count{0};
-  std::atomic<int> bar_sense{0};
+  alignas(64) std::atomic<int> bar_count{0};
+  alignas(64) std::atomic<int> bar_sense{0};
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // The GPU rings the doorbell with a task word at submit; this coordinator thread busy-polls it, runs the task on the worker pool, and completes it, which the GPU waits on at sync.
@@ -177,6 +184,7 @@ struct CpuMoeExecutor {
     n_iblk = (params.I + kRowBlock - 1) / kRowBlock;
     n_hblk = (params.H + kRowBlock - 1) / kRowBlock;
     g_scratch.assign(static_cast<size_t>(params.max_tokens) * params.top_k * params.I, 0);
+    grouped_widths.assign(params.max_tokens + 1, false);
     active_routes.reserve(static_cast<size_t>(params.max_tokens) * params.top_k);
     active_tokens.reserve(params.max_tokens);
     for (int t = 0; t < num_threads; ++t)
@@ -187,9 +195,16 @@ struct CpuMoeExecutor {
     if (!core_ids.empty()) pin_this_thread(core_ids[tid % static_cast<int>(core_ids.size())]);
   }
 
-  ~CpuMoeExecutor() {
+  ~CpuMoeExecutor() { shutdown(); }
+
+  void shutdown() {
+    {
+      std::lock_guard<std::mutex> lk(task_mtx);
+      if (closing.exchange(true)) return;
+    }
     coord_stop.store(true);
     if (coord_thread.joinable()) coord_thread.join();
+    sync();
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
@@ -216,6 +231,65 @@ struct CpuMoeExecutor {
   }
 
   const MoeFormat& format_of(const MoeTask& t) const { return *fmts[layer_fmt[t.layer]]; }
+
+  void configure_grouped(const std::vector<int>& widths, bool compat) {
+    std::lock_guard<std::mutex> lk(task_mtx);
+    if (submitted.load() != completed.load()) throw std::logic_error("CPU MoE task is in flight");
+    std::fill(grouped_widths.begin(), grouped_widths.end(), false);
+    for (int width : widths) {
+      if (width < 1 || width > params.max_tokens) throw std::out_of_range("grouped width exceeds CPU MoE capacity");
+      grouped_widths[width] = true;
+    }
+    grouped_compat = compat;
+    route_output.resize(static_cast<size_t>(params.max_tokens) * params.top_k * params.H);
+  }
+
+  void do_group_pass(const MoeTask& t, int64_t item, bool down) {
+    const int blocks = down ? n_hblk : n_iblk;
+    const auto& group = groups[item / blocks];
+    const int first = (item % blocks) * kRowBlock;
+    const int last = std::min(down ? params.H : params.I, first + kRowBlock);
+    const auto& f = format_of(t);
+    for (size_t begin = 0; begin < group.routes.size(); begin += kMaxTopK) {
+      const int n = std::min<size_t>(kMaxTopK, group.routes.size() - begin);
+      if (down) {
+        DownRoute routes[kMaxTopK];
+        float part[kMaxTopK * kRowBlock];
+        for (int j = 0; j < n; ++j) {
+          const int64_t r = group.routes[begin + j];
+          routes[j] = {group.expert, r, g_scratch.data() + r * params.I};
+        }
+        f.down(t.layer, first, last, routes, n, part);
+        for (int j = 0; j < n; ++j)
+          for (int h = first; h < last; ++h)
+            route_output[routes[j].r * params.H + h] = part[j * kRowBlock + h - first];
+      } else {
+        GroupRoute routes[kMaxTopK];
+        for (int j = 0; j < n; ++j) {
+          const int64_t r = group.routes[begin + j];
+          const int tok = r / params.top_k;
+          routes[j] = {tok, r, io_x + (size_t)tok * params.H,
+                       apply_on_input ? io_w[r] : 1.0f, g_scratch.data() + r * params.I};
+        }
+        f.gate_up_group(t.layer, group.expert, first, last, routes, n, !grouped_compat);
+      }
+    }
+  }
+
+  void reduce_group(const MoeTask& t, int64_t item) {
+    const int tok = item / n_hblk, first = (item % n_hblk) * kRowBlock;
+    const bool round = !grouped_compat || format_of(t).rounds_routes();
+    for (int h = first; h < std::min(params.H, first + kRowBlock); ++h) {
+      float sum = 0;
+      for (int k = 0; k < params.top_k; ++k) {
+        const int64_t r = (int64_t)tok * params.top_k + k;
+        if (io_ids[r] < 0 || io_ids[r] >= num_experts) continue;
+        const float value = route_output[r * params.H + h] * (apply_on_input ? 1.0f : io_w[r]);
+        sum += round ? bf16_to_f32(f32_to_bf16(value)) : value;
+      }
+      io_y[(size_t)tok * params.H + h] = f32_to_bf16(sum);
+    }
+  }
 
   // Whether any route of the task names an expert; submit gives the others no work.
   bool has_routes(const MoeTask& t) const {
@@ -288,7 +362,8 @@ struct CpuMoeExecutor {
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
-      do_pass1(t, p);
+      if (task_grouped) do_group_pass(t, p, false);
+      else do_pass1(t, p);
     }
     barrier(local_sense);
     // Prepare the intermediate rows (per token,route) for the down GEMV, see prep_inter.
@@ -306,7 +381,16 @@ struct CpuMoeExecutor {
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
-      do_pass2(t, p);
+      if (task_grouped) do_group_pass(t, p, true);
+      else do_pass2(t, p);
+    }
+    if (task_grouped) {
+      barrier(local_sense);
+      for (;;) {
+        const int64_t p = reduce_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= static_cast<int64_t>(t.num_tokens) * n_hblk) break;
+        reduce_group(t, p);
+      }
     }
   }
 
@@ -348,6 +432,11 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask t) {
+    std::lock_guard<std::mutex> lk(task_mtx);
+    // Failed CUDA contexts can still retire queued host callbacks after shutdown.
+    if (closing.load(std::memory_order_relaxed)) return;
+    if (submitted.load(std::memory_order_acquire) != completed.load(std::memory_order_acquire))
+      throw std::logic_error("CPU MoE executor supports one in-flight task");
     const int num_tokens = static_cast<int>(t.num_tokens);
     MoeFormat& fmt = *fmts[layer_fmt[t.layer]];
     active_routes.clear();
@@ -366,6 +455,23 @@ struct CpuMoeExecutor {
     p1_total = static_cast<int64_t>(active_routes.size()) * n_iblk;
     p2_total = static_cast<int64_t>(active_tokens.size()) * n_hblk;
     prt_total = fmt.preps_inter() ? static_cast<int64_t>(active_routes.size()) : 0;
+    task_grouped = grouped_widths[num_tokens];
+    if (task_grouped) {
+      groups.clear();
+      std::vector<int> group_index(num_experts, -1);
+      for (int64_t r = 0; r < static_cast<int64_t>(num_tokens) * params.top_k; ++r) {
+        const int e = io_ids[r];
+        if (e < 0 || e >= num_experts) continue;
+        if (group_index[e] < 0) {
+          group_index[e] = groups.size();
+          groups.push_back({e, {}});
+        }
+        groups[group_index[e]].routes.push_back(r);
+      }
+      p1_total = static_cast<int64_t>(groups.size()) * n_iblk;
+      p2_total = static_cast<int64_t>(groups.size()) * n_hblk;
+      reduce_next.store(0, std::memory_order_relaxed);
+    }
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
@@ -375,12 +481,9 @@ struct CpuMoeExecutor {
     // Prepare the per-token input once, up front.
     // Single-threaded: tiny for decode, and done before the workers are woken below.
     for (const int tok : active_tokens) fmt.prep_input(tok, io_x + (size_t)tok * params.H);
-    {
-      std::lock_guard<std::mutex> lk(task_mtx);
-      cur_task = t;
-      ++cur_gen;
-      submitted.store(cur_gen, std::memory_order_release);
-    }
+    cur_task = t;
+    ++cur_gen;
+    submitted.store(cur_gen, std::memory_order_release);
     task_cv.notify_all();
   }
 
@@ -506,6 +609,7 @@ struct CpuMoeExecutor {
 
   // Eager (non-graph) path: run one task to completion on the pool.
   void run(int layer_id, int num_tokens) {
+    if (closing.load()) throw std::logic_error("CPU MoE executor is closed");
     submit(task(layer_id, num_tokens));
     sync();
   }
@@ -542,6 +646,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("stream"), py::call_guard<py::gil_scoped_release>())
       .def("run", &CpuMoeExecutor::run, py::arg("layer_id"), py::arg("num_tokens"),
            py::call_guard<py::gil_scoped_release>())
+      .def("configure_grouped", &CpuMoeExecutor::configure_grouped, py::arg("widths"), py::arg("compat") = true)
       .def("flag_served", [](const CpuMoeExecutor& e) { return e.flag_served.load(); })
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator, py::arg("pin_core"))
       .def("flag_signal", &CpuMoeExecutor::flag_signal, py::arg("stream"), py::arg("layer_id"),
@@ -555,6 +660,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("accumulate"))
       .def("poison_flag", &CpuMoeExecutor::poison_flag)
       .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("shutdown", &CpuMoeExecutor::shutdown, py::call_guard<py::gil_scoped_release>())
       .def("set_spin_wait",
            [](CpuMoeExecutor& e, bool v) { e.spin_wait.store(v, std::memory_order_relaxed); },
            py::arg("enabled"))

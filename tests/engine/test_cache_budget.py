@@ -11,6 +11,42 @@ from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budg
 from freetoken.engine.engine import _pin_budget_bytes
 
 
+@pytest.mark.parametrize("depth,skip_last,expected_rows,pre_loops", [
+    (3, False, 17, 4), (3, True, 16, 3), (5, False, 25, 4), (5, True, 24, 3),
+])
+def test_three_level_budget_covers_complete_accepted_window(depth, skip_last, expected_rows, pre_loops):
+    from freetoken.engine.speculative_window import SpeculativeWindow, WindowBudget
+
+    budget = WindowBudget.resolve(4096, 40, 8, 256, max_loops=4, depth=depth,
+                                  runtime_admission=True, skip_last_preverify=skip_last)
+    window = SpeculativeWindow(1, 0, budget.candidates, skip_last_preverify=skip_last)
+    while len(window.loops) < 4:
+        tail = window.tail_count(depth, 4)
+        if tail:
+            window.append_tail(tail)
+            break
+        width = window.next_width(depth, 100)
+        # Full inner acceptance returns the drafts plus the correction token.
+        assert width == depth + 1
+        window.append(list(range(width)), {})
+    assert len(window.loops) == pre_loops
+    assert window.candidate_count + 1 == expected_rows == budget.submit_rows
+    assert budget.reachable_widths(depth) == (depth + 1, expected_rows)
+
+
+def test_three_level_static_budget_covers_short_tail_with_shared_experts():
+    from freetoken.engine.speculative_window import SpeculativeWindow, WindowBudget
+
+    budget = WindowBudget.resolve(1280, 40, 8, 256, max_loops=4, depth=3)
+    window = SpeculativeWindow(1, 0, 7)
+    for count in (4, 3):
+        width = window.next_width(3, 8)
+        assert width == count
+        assert budget.before_loop(len(window.loops), 320 if window.loops else 0, width) is None
+        window.append(list(range(count)), {})
+    assert window.candidate_count + 1 <= budget.reachable_widths(3)[1]
+
+
 def test_moe_priority_fills_experts_up_to_total():
     # budget large enough to cache every expert; KV gets the remainder.
     # per_expert=100, cache_per_page=10, total=8 experts (L*E), E=4.

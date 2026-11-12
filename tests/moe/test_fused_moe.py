@@ -72,9 +72,14 @@ def test_fused_topk_accepts_triton_kernel_tuple_output():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_size, dtype):
+@pytest.mark.parametrize("three_level", [False, True])
+def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_size, dtype, three_level, monkeypatch):
+    from types import SimpleNamespace
+
+    import freetoken.core as core
     from freetoken.moe.fused import fused_experts_decode_impl
 
+    monkeypatch.setattr(core, "get_active_batch", lambda: SimpleNamespace(rowwise_linear=three_level))
     device = torch.device("cuda")
     cache_size = 37
     hidden_size = 32
@@ -107,6 +112,40 @@ def test_fused_experts_decode_matches_reference_for_non_contiguous_slots(batch_s
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("rows", [4, 5, 17])
+def test_three_level_decode_graph_clears_inactive_routes(monkeypatch, rows):
+    from types import SimpleNamespace
+
+    import freetoken.core as core
+    from freetoken.moe.fused import fused_experts_decode_impl
+
+    monkeypatch.setattr(core, "get_active_batch", lambda: SimpleNamespace(rowwise_linear=True))
+    torch.manual_seed(19)
+    hidden = torch.randn(rows, 96, device="cuda", dtype=torch.bfloat16) * 0.25
+    gate = torch.randn(8, 160, 96, device="cuda", dtype=hidden.dtype) * 0.03
+    down = torch.randn(8, 96, 80, device="cuda", dtype=hidden.dtype) * 0.03
+    ids = torch.zeros(rows, 4, device="cuda", dtype=torch.int32)
+    weights = torch.ones(rows, 4, device="cuda")
+    for _ in range(3):
+        fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fused_experts_decode_impl(hidden, gate, down, weights, ids)
+    for step in range(8):
+        ids.copy_(torch.randint(-1, 8, ids.shape, device="cuda", dtype=ids.dtype))
+        weights.copy_(torch.rand_like(weights))
+        weights[:, step % 4] = 0
+        if step % 3 == 0:
+            weights.zero_()
+        graph.replay()
+        expected = fused_experts_decode_impl(hidden, gate, down, weights, ids)
+        assert torch.equal(actual, expected)
+        if step % 3 == 0:
+            assert torch.count_nonzero(actual) == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

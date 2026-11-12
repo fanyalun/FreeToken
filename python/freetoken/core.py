@@ -214,6 +214,11 @@ class Batch:
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
     # per-row hidden states a draft model reads from this forward; None when nothing reads them
     features: "FeatureSink | None" = field(default=None, init=False)
+    gdn_verify_state: object | None = field(default=None, init=False)
+    rowwise_linear: bool = field(default=False, init=False)
+    speculative_valid_rows: torch.Tensor | None = field(default=None, init=False)
+    speculative_reference_math: bool = field(default=False, init=False)
+    three_level_runtime: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.rows_per_req is None and self.phase == "decode":
@@ -306,3 +311,7 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+def get_active_batch() -> Batch | None:
+    return None if _GLOBAL_CTX is None else _GLOBAL_CTX._batch

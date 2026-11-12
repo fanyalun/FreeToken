@@ -65,3 +65,72 @@ def test_kernel_verify_stash_replay_matches_decode_bitwise(layers, bs, h, hv, di
         gdn_state_replay(st, stash, meta)
         assert torch.equal(st[:, slots], per_step[n - 1][:, slots]), f"n={n}"
         assert torch.equal(st[:, bs], state0[:, bs])  # the slot no row commits to
+
+
+@cuda
+@pytest.mark.parametrize("count", [0, 1, 3, 5])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
+def test_private_verify_commit_matches_sequential_decode(count, graph_mode, ssm_dtype):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kernel.causal_conv1d import causal_conv1d_decode
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update as fused
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.layers.linear_attn import GatedDeltaNet
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+    from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
+    from freetoken.utils import torch_dtype
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    torch.manual_seed(83)
+    device = torch.device("cuda")
+    width, heads, value_heads, dim = 5, 2, 4, 128
+    channels = (2 * heads + value_heads) * dim
+    group = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0,), num_key_heads=heads, num_value_heads=value_heads,
+        key_head_dim=dim, value_head_dim=dim, conv_kernel_dim=4, output_gate="silu",
+    )
+    pool = LinearStatePool(group, 2, torch.bfloat16, device, tp_size=1)
+    pool.recurrent_states = torch.randn_like(pool.recurrent_states).to(ssm_dtype) * 0.1
+    pool.conv_states.normal_(std=0.1)
+    with torch.device(device), torch_dtype(torch.bfloat16):
+        layer = GatedDeltaNet(64, heads, value_heads, dim, dim, 4, 1e-6, 0)
+    layer.conv1d.weight.normal_(std=0.1)
+    layer.A_log.zero_()
+    layer.dt_bias.zero_()
+    raw = torch.randn(width, channels, device=device, dtype=torch.bfloat16)
+    a, b = [torch.randn(width, value_heads, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    before_ssm, before_conv = pool.recurrent_states.clone(), pool.conv_states.clone()
+    verify = QwenGDNVerifyState(pool, [layer], width, 1)
+    verify.verify_layer(layer, raw, a, b)
+    assert torch.equal(pool.recurrent_states, before_ssm)
+    assert torch.equal(pool.conv_states, before_conv)
+
+    expected_ssm, expected_conv = before_ssm[0].clone(), before_conv[0].clone()
+    indices = torch.tensor([1], dtype=torch.int32, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    for row in range(count):
+        mixed = causal_conv1d_decode(raw[row:row + 1], expected_conv, layer._conv_weight(), indices)
+        q, k, v = torch.split(mixed, [heads * dim, heads * dim, value_heads * dim], dim=-1)
+        fused(A_log=layer.A_log, dt_bias=layer.dt_bias, a=a[row:row + 1], b=b[row:row + 1],
+              q=q.reshape(1, 1, heads, dim), k=k.reshape(1, 1, heads, dim),
+              v=v.reshape(1, 1, value_heads, dim), initial_state_source=expected_ssm,
+              initial_state_indices=indices, cu_seqlens=cu, scale=dim ** -0.5,
+              softplus_beta=1.0, softplus_threshold=20.0, use_qk_l2norm_in_kernel=True)
+    for stash in verify.replay_inputs:
+        stash[:, count:].fill_(float("nan"))
+    accepted = torch.tensor(count, dtype=torch.int32, device=device)
+    if graph_mode:
+        verify.commit(torch.zeros_like(accepted))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            verify.commit(accepted)
+        graph.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+    else:
+        verify.commit(accepted)
+    assert torch.equal(pool.recurrent_states[0], expected_ssm)
+    assert torch.equal(pool.conv_states[0], expected_conv)

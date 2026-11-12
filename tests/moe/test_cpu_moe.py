@@ -38,7 +38,8 @@ def _make_cache(L, E, H, I, scale=0.1):
 
 
 @pytest.mark.parametrize("bs", [1, 2, 5, 16])
-def test_cpu_decode_matches_gpu_decode_kernel(bs):
+@pytest.mark.parametrize("grouped", [False, True])
+def test_cpu_decode_matches_gpu_decode_kernel(bs, grouped):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.fused import fused_experts_decode_impl
 
@@ -56,6 +57,7 @@ def test_cpu_decode_matches_gpu_decode_kernel(bs):
         num_threads=0,
         max_tokens=bs,
         device=dev,
+        grouped_widths=(bs,) if grouped else (),
     )
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -73,6 +75,7 @@ def test_cpu_decode_matches_gpu_decode_kernel(bs):
 
     rel = (cpu_out - gpu_out).abs().max() / (gpu_out.abs().max() + 1e-6)
     assert rel < 2e-2, f"bs={bs} rel err {rel.item()}"
+    ex.close()
 
 
 def _pack_nvfp4(codes: torch.Tensor) -> torch.Tensor:
@@ -815,7 +818,8 @@ assert shim.probe_test_injected() > 0
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_cpu_moe_decode_cuda_graph_replay():
+@pytest.mark.parametrize("grouped", [False, True])
+def test_cpu_moe_decode_cuda_graph_replay(grouped):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     torch.manual_seed(0)
@@ -836,6 +840,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
         num_threads=8,
         max_tokens=bs,
         device=dev,
+        grouped_widths=(bs,) if grouped else (),
     )
 
     hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
@@ -881,6 +886,7 @@ def test_cpu_moe_decode_cuda_graph_replay():
         ex.raise_if_unhealthy()
 
     print("cpu moe cuda graph replay OK")
+    ex.close()
 
 
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():

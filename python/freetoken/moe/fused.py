@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -212,13 +213,26 @@ def fused_experts_impl(
     act_limit: float = float("inf"),
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
+    *,
+    skip_invalid_routes: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Returns ``hidden_states`` itself, overwritten with the routed output. A caller that
+    """Overwrites ``hidden_states`` unless a distinct ``out`` buffer is supplied. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
     not shared; the resident bf16 path routes decode through here too."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
+
+    from freetoken.core import get_active_batch
+    if getattr(get_active_batch(), "speculative_reference_math", False) and hidden_states.shape[0] > 1:
+        # Use identical one-row GEMM geometry for the resident arithmetic control only.
+        for row in range(hidden_states.shape[0]):
+            fused_experts_impl(hidden_states[row:row+1], w1, w2, topk_weights[row:row+1],
+                topk_ids[row:row+1], activation, apply_router_weight_on_input, act_alpha, act_limit,
+                w1_bias=w1_bias, w2_bias=w2_bias,
+                skip_invalid_routes=skip_invalid_routes, out=None if out is None else out[row:row+1])
+        return hidden_states if out is None else out
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -229,6 +243,9 @@ def fused_experts_impl(
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
     # both bias adds assume the router weight scales the expert output
     assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
+    if out is not None:
+        assert out.shape == hidden_states.shape and out.dtype == hidden_states.dtype
+        assert out.device == hidden_states.device and out.is_contiguous()
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -258,7 +275,7 @@ def fused_experts_impl(
     )
     compute_type = hidden_states.dtype
 
-    out_hidden_states = hidden_states
+    out_hidden_states = hidden_states if out is None else out
     curr_hidden_states = hidden_states
     tokens_num, _ = curr_hidden_states.shape
     begin_token_idx, end_token_idx = 0, num_tokens
@@ -271,9 +288,14 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        curr_topk_ids, config["BLOCK_SIZE_M"], E
-    )
+    if skip_invalid_routes:
+        from freetoken.kernel.triton.moe_align import moe_align_decode_routes
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_decode_routes(
+            curr_topk_ids, curr_topk_weights, config["BLOCK_SIZE_M"], E)
+        intermediate_cache1.zero_()
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            curr_topk_ids, config["BLOCK_SIZE_M"], E)
 
     fused_moe_kernel_triton(
         curr_hidden_states,
@@ -293,6 +315,9 @@ def fused_experts_impl(
         # gpt-oss: the expert's gate/up bias is added before the gated activation
         intermediate_cache1 += w1_bias[curr_topk_ids]
     gated_act_and_mul(activation, intermediate_cache1.view(-1, N), intermediate_cache2, alpha=act_alpha, limit=act_limit)
+    if skip_invalid_routes:
+        # Invalid routes have no GEMM writer and must contribute zero to the final reduction.
+        intermediate_cache3.zero_()
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -316,6 +341,27 @@ def fused_experts_impl(
         # the down bias is weighted like the expert's output: sum_k w_k * bias_k
         out_hidden_states[begin_token_idx:end_token_idx] += (curr_topk_weights.unsqueeze(-1) * w2_bias[curr_topk_ids]).sum(1)
     return out_hidden_states
+
+
+_GROUPED_DECODE = os.getenv("FREETOKEN_MOE_GROUPED_DECODE", "1") != "0"
+_SORTED_DECODE_MIN_ROWS = 16
+_THREE_LEVEL_DECODE = ContextVar("freetoken_three_level_moe_decode", default=False)
+
+
+def prepare_decode_groups(topk_ids, topk_weights):
+    import triton
+    from freetoken.kernel.triton.decode_moe import group_decode_routes
+
+    rows, top_k = topk_ids.shape
+    slots = torch.empty(rows * top_k, dtype=torch.int32, device=topk_ids.device)
+    routes = torch.empty(rows * top_k, rows, dtype=torch.int32, device=topk_ids.device)
+    count = torch.empty((), dtype=torch.int32, device=topk_ids.device)
+    group_decode_routes[(1,)](
+        topk_ids, topk_weights, slots, routes, count,
+        ROWS=rows, TOP_K=top_k, BLOCK=triton.next_power_of_2(rows * top_k),
+        TABLE=triton.next_power_of_2(rows * rows * top_k), num_warps=4,
+    )
+    return slots, routes, count
 
 
 def fused_experts_decode_impl(
@@ -351,6 +397,15 @@ def fused_experts_decode_impl(
     # both bias adds assume the router weight scales the expert output
     assert (w1_bias is None and w2_bias is None) or not apply_router_weight_on_input, "per-expert biases need the router weight on the output"
     M, _ = hidden_states.shape
+    from freetoken.core import get_active_batch
+    grouped_decode = _GROUPED_DECODE and (
+        getattr(get_active_batch(), "rowwise_linear", False) or _THREE_LEVEL_DECODE.get())
+    if grouped_decode and M >= _SORTED_DECODE_MIN_ROWS:
+        # Hybrid's asynchronous CPU input copy may still read hidden_states.
+        return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
+            activation, apply_router_weight_on_input, act_alpha, act_limit,
+            w1_bias=w1_bias, w2_bias=w2_bias,
+            skip_invalid_routes=True, out=torch.empty_like(hidden_states))
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
     intermediate_size = gate_up_dim // 2
@@ -359,6 +414,9 @@ def fused_experts_decode_impl(
         "BLOCK_SIZE_K": 64,
         "num_warps": 8,
     }
+    route_groups = None
+    if grouped_decode and 2 <= M <= 4 and M * top_k <= 32:
+        route_groups = prepare_decode_groups(topk_ids, topk_weights)
 
     intermediate_cache1 = torch.empty(
         (M, top_k, gate_up_dim),
@@ -375,6 +433,7 @@ def fused_experts_decode_impl(
         False,
         config,
         compute_type=hidden_states.dtype,
+        route_groups=route_groups,
     )
 
     if w1_bias is not None:
@@ -401,6 +460,7 @@ def fused_experts_decode_impl(
         True,
         config,
         compute_type=hidden_states.dtype,
+        route_groups=route_groups,
     )
 
     out_hidden_states = torch.empty_like(hidden_states)

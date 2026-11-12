@@ -24,6 +24,7 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+_HYBRID_WINDOW = os.getenv("FREETOKEN_HYBRID_WINDOW", "1") != "0"
 
 
 class MoELayer(BaseOP):
@@ -275,6 +276,9 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        speculative = getattr(cache, "speculative_controller", None)
+        if speculative is not None:
+            return speculative.route(self, hidden_states, topk_weights, topk_ids)
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"

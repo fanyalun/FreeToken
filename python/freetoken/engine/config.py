@@ -89,6 +89,42 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    gpu_memory_budget_bytes: int | None = None
+    speculative_mode: str | None = None
+    speculative_depth: int | None = None
+    speculative_draft_method: str = "auto"
+    speculative_draft_model: str | None = None
+    speculative_graph: str | None = None
+    speculative_preverify_top_h: int | None = None
+    _speculative_legacy: bool | None = field(default=None, repr=False)
+    speculative_mtp_depth: int | None = None
+    speculative_max_input_tokens: int | None = None
+    speculative_max_output_tokens: int | None = None
+    speculative_three_level: bool | None = None
+    speculative_submit_tokens: int = 0
+    speculative_max_loops: int = 4
+    speculative_skip_last_preverify: bool = False
+    speculative_preverify_policy: str = "fixed_topk"
+    speculative_preverify_top_k: int | None = None
+    speculative_preverify_replacement: str = "zero"
+    speculative_modes_calibration: str | None = None
+    speculative_reference_math: bool = False
+    speculative_prefetch: bool | None = None
+    speculative_prefetch_profile: str | None = "auto"
+    _speculative_prefetch_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
+    speculative_prefetch_layer_experts: int | None = None
+    speculative_prefetch_layer_quotas: List[int] | None = None
+    speculative_prefetch_demand_fence: bool = False
+    speculative_prefetch_gap_capacity: int | None = None
+    speculative_verify_prefetch_layer_experts: int | None = None
+    speculative_verify_prefetch_layer_quotas: List[int] | None = None
+    speculative_audit: bool = False
+    speculative_expert_scheduler: str = "host"
+    speculative_compact_control: bool = True
+    speculative_execution_implementation: str = "reference"
+    speculative_graph_implementation: str = "reference"
+    speculative_hybrid_phases: tuple[str, ...] | None = None
+    speculative_hybrid_profile: str | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -122,6 +158,8 @@ class EngineConfig:
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     def __post_init__(self):
+        from .speculative_config import resolve_speculative_config
+        resolve_speculative_config(self)
         if not (self.moe_locked_fetch == -1 or 0.0 <= self.moe_locked_fetch <= 1.0):
             raise ValueError(f"moe_locked_fetch must be -1 (auto) or in [0, 1], got {self.moe_locked_fetch}")
         if self.moe_locked_fetch > 0 and round(self.moe_locked_fetch * (1 << 16)) == 0:

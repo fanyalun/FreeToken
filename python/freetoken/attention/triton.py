@@ -134,7 +134,13 @@ class TritonAttentionBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TritonMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if getattr(batch, "speculative_valid_rows", None) is None:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        else:
+            from freetoken.kernel.store import store_cache_masked
+
+            store_cache_masked(self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id),
+                               batch.out_loc, k, v, batch.speculative_valid_rows)
 
         k_raw = self.kvcache.k_cache(layer_id)
         v_raw = self.kvcache.v_cache(layer_id)
@@ -149,7 +155,8 @@ class TritonAttentionBackend(BaseAttnBackend):
         if spec.sliding_window is not None and metadata.swa_indices is not None:
             indices = metadata.swa_indices
         scale = spec.sm_scale if spec.sm_scale is not None else q.shape[-1] ** -0.5
-        if metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
+        reference_math = getattr(batch, "speculative_reference_math", False)
+        if not reference_math and metadata.is_decode and q.dtype in (torch.float16, torch.bfloat16):
             bs = metadata.indptr.numel() - 1
             self._ensure_decode_scratch(metadata, bs, q.shape[1], q.shape[-1])
             assert metadata.attn_logits is not None
@@ -168,7 +175,8 @@ class TritonAttentionBackend(BaseAttnBackend):
                 sinks=spec.sinks,
             )
         if (
-            (not metadata.is_decode)
+            not reference_math
+            and (not metadata.is_decode)
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
         ):

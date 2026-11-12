@@ -40,6 +40,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stash_v,
     stash_g,
     stash_beta,
+    replay_k,
+    replay_v,
+    replay_g,
+    replay_beta,
     # ================================================
     scale,
     T,
@@ -65,6 +69,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
     STASH_INPUTS: tl.constexpr = False,
+    CACHE_REPLAY_INPUTS: tl.constexpr = False,
+    ROUND_STATE_EACH_STEP: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -198,6 +204,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Compute beta = sigmoid(b)
         b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
+        if CACHE_REPLAY_INPUTS:
+            if i_v == 0 and i_hv % (HV // H) == 0:
+                tl.store(replay_k + (step_idx * H + i_h) * K + o_k, b_k, mask=mask_k)
+            tl.store(replay_v + (step_idx * HV + i_hv) * V + o_v, b_v, mask=mask_v)
+            if i_v == 0:
+                tl.store(replay_g + step_idx * HV + i_hv, b_g)
+                tl.store(replay_beta + step_idx * HV + i_hv, b_beta)
+
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
             b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
@@ -251,6 +265,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             ps_g += HV
             ps_beta += HV
 
+        if ROUND_STATE_EACH_STEP:
+            b_h = b_h.to(h0_source.dtype.element_ty).to(tl.float32)
+
         step_idx += 1
 
         # Update pointers for next timestep
@@ -301,6 +318,9 @@ def fused_sigmoid_gating_delta_rule_update(
     ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
     retrieve_parent_token: Optional[torch.Tensor] = None,
     input_stash: Optional[tuple] = None,
+    replay_inputs: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    round_state_each_step: bool = False,
+    small_value_tile: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -327,7 +347,7 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_a = a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 16 if small_value_tile else 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
@@ -351,6 +371,14 @@ def fused_sigmoid_gating_delta_rule_update(
     NP2_T = triton.next_power_of_2(T)
 
     grid = (NK, NV, N * HV)
+    if replay_inputs is not None:
+        assert N == 1 and not is_kda and disable_state_update and input_stash is None
+        replay_k, replay_v, replay_g, replay_beta = replay_inputs
+        assert replay_k.shape == (T, H, K) and replay_v.shape == (T, HV, V)
+        assert replay_g.shape == replay_beta.shape == (T, HV)
+        assert all(t.is_contiguous() for t in replay_inputs)
+    else:
+        replay_k = replay_v = replay_g = replay_beta = None
 
     # Per-req stride must match the buffer's allocated dim, not runtime steps
     # (they can differ under --speculative-adaptive).
@@ -391,6 +419,10 @@ def fused_sigmoid_gating_delta_rule_update(
         stash_v=stash_v,
         stash_g=stash_g,
         stash_beta=stash_beta,
+        replay_k=replay_k,
+        replay_v=replay_v,
+        replay_g=replay_g,
+        replay_beta=replay_beta,
         scale=scale,
         T=T,
         stride_a=stride_a,
@@ -414,6 +446,8 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         STASH_INPUTS=input_stash is not None,
+        CACHE_REPLAY_INPUTS=replay_inputs is not None,
+        ROUND_STATE_EACH_STEP=round_state_each_step,
         num_warps=num_warps,
         num_stages=num_stages,
     )

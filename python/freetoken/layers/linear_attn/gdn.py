@@ -161,7 +161,9 @@ class GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if not batch.is_prefill:
+        if (verify_state := getattr(batch, "gdn_verify_state", None)) is not None:
+            core_out = verify_state.verify_layer(self, conv_in, a, b)
+        elif not batch.is_prefill:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from freetoken.utils import div_ceil
+from .speculative_window import three_level_max_rows
 
 if TYPE_CHECKING:
     import torch
@@ -138,3 +139,121 @@ def resolve_moe_cache_auto(
         kv_reserve_pages=kv_reserve_pages,
         max_slots=max_slots,
     )
+
+
+def speculative_gdn_workspace_bytes(config) -> int:
+    depth = getattr(config, "speculative_mtp_depth", 0) or 0
+    if not depth or getattr(config, "speculative_reference_math", False):
+        return 0
+    group = config.model_config.linear_attention_group()
+    if group is None:
+        return 0
+    from freetoken.kvcache.linear_state_pool import ssm_state_dtype
+    from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNVerifyState
+
+    if not QwenGDNVerifyState.chunk_enabled:
+        return 0
+
+    inner = depth + 1
+    three_level = bool(getattr(config, "speculative_three_level", False))
+    if three_level:
+        maximum = three_level_max_rows(depth, config.speculative_max_loops,
+                                       getattr(config, "speculative_skip_last_preverify", False))
+        width = min(getattr(config, "speculative_submit_tokens", 0) or maximum, maximum)
+    else:
+        width = inner
+    width = min(width, getattr(config, "speculative_max_output_tokens", None) or width)
+    tp = config.tp_info.size
+    costs = [QwenGDNVerifyState.chunk_temporary_bytes_for_geometry(
+        rows, div_ceil(group.num_key_heads, tp), div_ceil(group.num_value_heads, tp),
+        group.key_head_dim, group.value_head_dim, activation_dtype=config.dtype,
+        state_dtype=ssm_state_dtype())
+        for rows in range(1, min(width, QwenGDNVerifyState.chunk_max_width) + 1)]
+    if not costs:
+        return 0
+    pooled = three_level and getattr(config, "speculative_graph_implementation", "reference") in ("coarse", "full")
+    eager = getattr(config, "cuda_graph_max_bs", None) == 0 or getattr(config, "cuda_graph_bs", None) == []
+    # Full three-level graphs share a pool; legacy per-width graphs retain separate pools.
+    if eager or pooled:
+        return max(costs)
+    return sum(costs) + (sum(costs[:inner]) if three_level else 0)
+
+
+def speculative_hybrid_workspace_bytes(config, *, include_cpu_partials=True) -> int:
+    if (getattr(config, "moe_strategy", "offload") != "hybrid"
+            or getattr(config, "speculative_expert_scheduler", "host") != "gpu"
+            or not getattr(config, "speculative_hybrid_phases", ())):
+        return 0
+    mc = config.model_config
+    inner = config.speculative_mtp_depth + 1
+    loops = config.speculative_max_loops
+    maximum = loops * inner + 1
+    if getattr(config, "speculative_three_level", False):
+        maximum = three_level_max_rows(config.speculative_mtp_depth, config.speculative_max_loops,
+                                       getattr(config, "speculative_skip_last_preverify", False))
+    outer = min(config.speculative_submit_tokens or maximum, maximum)
+    limit = getattr(config, "speculative_max_output_tokens", None) or outer
+    inner, outer = min(inner, limit), min(outer, limit)
+    maximum = max(inner, outer)
+    widths = maximum * (maximum + 1) // 2
+    routes = maximum * mc.num_experts_per_tok
+    tables = 4 * (2 * (maximum + 1) * (routes + 1) + 4 * (maximum + 1) + routes + 1)
+    routing = widths * mc.num_experts_per_tok * 8
+    # The CPU branch joins before merge; the next layer forks after that merge.
+    partials = 2 * widths * mc.hidden_size if include_cpu_partials else 0
+    return tables + routing + partials + 7 * 8
+
+
+def expert_pool_bytes(sources, pools, sizes, row_tail_bytes=None, layer_tags=None):
+    from freetoken.moe.legacy_format import canonical_role
+    from freetoken.moe.offload_cache import bank_layouts
+
+    layouts = bank_layouts(sources, layer_tags)
+    tails = {canonical_role(name): values for name, values in (row_tail_bytes or {}).items()}
+    total = 0
+    for name, layers in sources.items():
+        pads = {}
+        for layout, tail in zip(layouts, tails.get(canonical_role(name), [0] * len(layers))):
+            pads[layout] = max(pads.get(layout, 0), -(-tail // 16) * 16)
+        total += max(pads.values())
+        for pool, size in zip(pools, sizes):
+            layer = pool.layers[0]
+            total += size * layers[layer][0].numel() * layers[layer].element_size() + pads[layouts[layer]]
+    return total
+
+
+def minimum_staging_slots(sources, pools, num_experts, *, buffers, counts=None, row_tail_bytes=None, layer_tags=None):
+    """Smallest split-slot allocation that fits every bank's complete prefill buffers."""
+    from freetoken.moe.legacy_format import canonical_role
+    from freetoken.moe.offload_cache import bank_layouts
+    from freetoken.moe.pool_policy import split_slots
+
+    layouts = bank_layouts(sources, layer_tags)
+    tails = {canonical_role(name): values for name, values in (row_tail_bytes or {}).items()}
+    banks = []
+    for name, layers in sources.items():
+        rows = [t[0].numel() * t.element_size() for t in layers]
+        pads_by_layout = {}
+        for layout, tail in zip(layouts, tails.get(canonical_role(name), [0] * len(layers))):
+            pads_by_layout[layout] = max(pads_by_layout.get(layout, 0), -(-tail // 16) * 16)
+        pads = [pads_by_layout[layout] for layout in layouts]
+        banks.append((rows, pads, buffers * (num_experts * max(rows) + max(pads))))
+
+    def fits(total):
+        sizes = split_slots(total, pools, counts)
+        return all(sum(size * rows[pool.layers[0]] + pads[pool.layers[0]]
+                       for size, pool in zip(sizes, pools)) + max(pads) >= required
+                   for rows, pads, required in banks)
+
+    low = max(num_experts, sum(pool.min_num_slots for pool in pools))
+    high = sum(pool.max_num_slots for pool in pools)
+    if low > high or not fits(high):
+        raise ValueError(f"expert slot pools cannot hold {buffers} complete prefill staging buffers")
+    # Both split policies allocate a fixed ordered sequence of slots, so each bank grows monotonically.
+    while low < high:
+        middle = (low + high) // 2
+        if fits(middle):
+            high = middle
+        else:
+            low = middle + 1
+    return low

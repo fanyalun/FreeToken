@@ -74,6 +74,14 @@ struct DownRoute {
   const bf16_t* g;
 };
 
+struct GroupRoute {
+  int tok;
+  int64_t r;
+  const bf16_t* x;
+  float w_in;
+  bf16_t* g;
+};
+
 // g[i] for i in [i0, i1) from the gate row i and the up row I + i; dot(row) is the row's GEMV.
 // ACT_SWIGLUOAI and ACT_SWIGLU_CLAMP clamp both inputs; the other kinds go through act_apply.
 template <class RowDot>
@@ -121,6 +129,11 @@ class MoeFormat {
   // Pass 2: out[j * kRowBlock + h - h0] for h in [h0, h1) (at most kRowBlock rows) and each of the n routes, before the router weight.
   // Visiting the routes' rows h together keeps n weight streams in flight, which the down GEMV needs to reach DRAM bandwidth.
   virtual void down(int layer, int h0, int h1, const DownRoute* routes, int n, float* out) const = 0;
+  virtual void gate_up_group(int layer, int e, int i0, int i1, const GroupRoute* routes,
+                             int n, bool /*gpu_rounding*/) const {
+    for (int j = 0; j < n; ++j)
+      gate_up(layer, e, routes[j].tok, i0, i1, routes[j].x, routes[j].w_in, routes[j].g);
+  }
   // Round each router-weighted down output to bf16 before the sum over routes.
   virtual bool rounds_routes() const { return false; }
 
