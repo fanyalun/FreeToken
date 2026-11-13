@@ -10,7 +10,7 @@ import triton
 
 from freetoken.kernel.pinned import alloc_pinned_tensor, device_ptr
 from freetoken.kernel.triton import tablemoe as kernels
-from freetoken.moe.tablemoe import TableMoeRuntime, prefill_keep_mask
+from freetoken.moe.tablemoe import TableMoeRuntime, decode_top_h, prefill_keep_mask
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
@@ -87,7 +87,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         self.prefill_uses_tablemoe = (not self.external_mask or
                                     getattr(self.config, "modes_prefill_policy", "modes") == "tablemoe")
         self.bypass_tables = self.skip_lookup or (not self.external_mask and self.config.tablemoe_prefill_keep_rate == 1 and
-                              self.config.tablemoe_decode_keep_k == self.top_k)
+                              self.config.tablemoe_decode_keep_k == self.top_k and
+                              getattr(self.config, "tablemoe_decode_switch_after", None) is None)
         self._owners, self._uid_slots, self.workspaces = {}, {}, {}
         self.batch_slots = torch.empty(max(128, self.config.max_extend_tokens + self.dummy_slot),
                                        device=self.device, dtype=torch.int32)
@@ -95,6 +96,9 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         self.fixed_online = {}
         cap = self.capacity if self.external_mask else max(1, self.capacity)
         slots = self.dummy_slot + 1
+        self.decode_top_h = (torch.full((slots,), self.config.tablemoe_decode_keep_k,
+                                       device=self.device, dtype=torch.int32)
+                             if getattr(self.config, "tablemoe_decode_switch_after", None) is not None else None)
         for layer in range(self.num_layers):
             self.fixed_online[layer] = dict(
                 keys=torch.empty(slots, cap, self.hidden, device=self.device, dtype=torch.float16),
@@ -141,7 +145,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
     def resident_gpu_bytes(self, target_cache_size=None):
         objects = [self.pca, self.gpu_keys, self.gpu_counts, self.value_offsets,
                    self.fixed_online, self.workspaces, self._route_counts, self._gpu_counts,
-                   self.batch_slots, self.graph_slots]
+                   self.batch_slots, self.graph_slots, self.decode_top_h]
         if self.audit is not None:
             objects.extend((self.audit.counts, self.audit.shared))
         excluded = ()
@@ -229,6 +233,19 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             slots.extend([slot] * (req.extend_len if batch.is_prefill else 1))
         if len(slots) > self.batch_slots.numel():
             raise ValueError("TableMoE batch exceeds the prepared request-slot capacity")
+        if self.decode_top_h is not None and not batch.is_prefill:
+            values = [self.config.tablemoe_decode_keep_k] * (self.dummy_slot + 1)
+            for req in reqs:
+                if req.uid != -1:
+                    values[req.table_idx] = decode_top_h(self.config, req)
+                    generated = req.output_len - req.remain_len
+                    switch = self.config.tablemoe_decode_switch_after
+                    if self.audit is not None and abs(generated - switch) <= 1:
+                        self.audit.write(dict(type="decode_top_h_boundary", uid=req.uid,
+                                              generated_tokens=generated, output_position=generated + 1,
+                                              top_h=values[req.table_idx]))
+            # Graphs read the same request-slot buffer on every replay.
+            self.decode_top_h.copy_(torch.tensor(values, dtype=torch.int32), non_blocking=True)
         batch.tablemoe_slots = self.batch_slots[:len(slots)]
         batch.tablemoe_slots.copy_(torch.tensor(slots, device="cpu", dtype=torch.int32), non_blocking=True)
         if self.audit is not None:
@@ -353,7 +370,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             ids, slots, ws["keep"], ws["cpu_ids"], ws["cache_hit"],
             cache.slot_for_id if cache is not None else ids, ws["request_slots"],
             k, self.config.tablemoe_decode_keep_k, self.num_experts, layer, self.dummy_slot,
-            prefill, cache is not None, 256, ids.numel(), self.uses_modes_routing(prefill))
+            prefill, cache is not None, 256, ids.numel(), self.uses_modes_routing(prefill),
+            self.decode_top_h, self.decode_top_h is not None)
         if not prefill:
             ws["slots"].copy_(slots[:, :gpu_k])
             slots = ws["slots"]

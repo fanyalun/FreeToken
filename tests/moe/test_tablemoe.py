@@ -82,6 +82,93 @@ def test_tablemoe_config_defaults_preserve_original_weights():
     assert ServerArgs.tablemoe_renormalize_weights is False
 
 
+@pytest.mark.parametrize("prompt_len", [1, 4096])
+def test_staged_top_h_counts_generated_tokens_at_boundary(prompt_len):
+    from freetoken.core import Req, SamplingParams
+    from freetoken.moe.tablemoe import decode_top_h
+
+    cfg = SimpleNamespace(tablemoe_decode_keep_k=4, tablemoe_decode_switch_after=512,
+                          tablemoe_decode_late_top_h=6)
+    req = Req(torch.zeros(prompt_len, dtype=torch.int32), 0, 0, 8192, 7, SamplingParams(), None)
+    for generated, expected in [(0, 4), (1, 4), (511, 4), (512, 6), (513, 6)]:
+        req.device_len = prompt_len + generated
+        assert decode_top_h(cfg, req) == expected
+    cfg.tablemoe_decode_switch_after = None
+    assert decode_top_h(cfg, req) == 4
+
+
+@pytest.mark.parametrize("switch,late", [(512, None), (None, 6), (0, 6), (512, 9)])
+def test_staged_top_h_rejects_incomplete_or_invalid_schedule(switch, late):
+    cfg = SimpleNamespace(model_config=SimpleNamespace(num_experts_per_tok=8),
+                          tablemoe_decode_switch_after=switch, tablemoe_decode_late_top_h=late)
+    with pytest.raises(ValueError, match="TableMoE decode"):
+        validate_tablemoe_config(cfg)
+
+
+def test_staged_top_h_cli():
+    from freetoken.server.args import parse_args
+
+    args, _ = parse_args(["--model", "/models/unused", "--dtype", "float16",
+                          "--tool-call-parser", "llama3", "--reasoning-parser", "off",
+                          "--tablemoe-decode-top-h", "4", "--tablemoe-decode-switch-after", "512",
+                          "--tablemoe-decode-late-top-h", "6"])
+    assert (args.tablemoe_decode_keep_k, args.tablemoe_decode_switch_after, args.tablemoe_decode_late_top_h) == (4, 512, 6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_staged_top_h_graph_tracks_mixed_requests_and_slot_reuse():
+    from freetoken.kernel.triton.tablemoe import _prepare_routes
+    from freetoken.moe.tablemoe_optimized import TableMoeOptimizedRuntime
+
+    rt = TableMoeOptimizedRuntime.__new__(TableMoeOptimizedRuntime)
+    rt.config = SimpleNamespace(tablemoe_decode_keep_k=4, tablemoe_decode_switch_after=512,
+                                tablemoe_decode_late_top_h=6)
+    rt.device, rt.dummy_slot = torch.device("cuda"), 2
+    rt.decode_top_h = torch.full((3,), 4, device="cuda", dtype=torch.int32)
+    rt.batch_slots = torch.empty(3, device="cuda", dtype=torch.int32)
+    rt._owners, rt._uid_slots, rt.fixed_online, rt.audit = {}, {}, {}, None
+    reqs = [SimpleNamespace(uid=10, table_idx=0, output_len=8192, remain_len=8192 - 511),
+            SimpleNamespace(uid=11, table_idx=1, output_len=8192, remain_len=8192 - 512),
+            SimpleNamespace(uid=-1)]
+    batch = SimpleNamespace(padded_reqs=reqs, is_prefill=False)
+    rt.prepare_batch(batch)
+    ids = torch.arange(8, device="cuda", dtype=torch.int32).repeat(3, 1)
+    slots, cpu_ids = torch.empty_like(ids), torch.empty_like(ids)
+    keep = torch.empty_like(ids, dtype=torch.bool)
+    hits = torch.empty_like(keep)
+    resident = torch.full((8,), -1, device="cuda", dtype=torch.int32)
+    resident[7] = 0
+
+    def run():
+        _prepare_routes[(1,)](ids, slots, keep, cpu_ids, hits, resident, batch.tablemoe_slots,
+                              8, 4, 8, 0, 2, False, True, 256, ids.numel(), False,
+                              rt.decode_top_h, True)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for generated in [(511, 512), (512, 511), (513, 700)]:
+        for req, count in zip(reqs, generated):
+            req.remain_len = req.output_len - count
+        rt.prepare_batch(batch)
+        graph.replay()
+        expected = torch.zeros_like(keep)
+        for row, count in enumerate(generated):
+            expected[row, :6 if count >= 512 else 4] = True
+            expected[row, 7] = True
+        assert torch.equal(keep, expected)
+        assert torch.equal(slots, ids.masked_fill(~expected, -1))
+        assert torch.equal(cpu_ids, slots)
+        assert not hits[2].any()
+    rt._owners.pop(0)
+    rt._uid_slots.pop(10)
+    reqs[0].uid, reqs[0].remain_len = 12, 8191
+    rt.prepare_batch(batch)
+    graph.replay()
+    assert keep[0].tolist() == [True, True, True, True, False, False, False, True]
+
+
 @pytest.mark.parametrize("flags,expected", [
     ([], False), (["--tablemoe-no-renormalize-weights"], False),
     (["--tablemoe-renormalize-weights"], True),

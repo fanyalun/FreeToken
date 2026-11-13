@@ -54,7 +54,8 @@ def _prepare_routes(ids, slots, keep, cpu_ids, cache_hit, slot_for_id, request_s
                     TOP_K: tl.constexpr, KEEP_K: tl.constexpr, EXPERTS: tl.constexpr,
                     LAYER: tl.constexpr, DUMMY: tl.constexpr, PREFILL: tl.constexpr,
                     HAS_CACHE: tl.constexpr, BLOCK: tl.constexpr, N: tl.constexpr,
-                    EXTERNAL_MASK: tl.constexpr = False):
+                    EXTERNAL_MASK: tl.constexpr = False,
+                    decode_top_h=None, STAGED_TOP_H: tl.constexpr = False):
     r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     eid = tl.load(ids + r, r < N, 0).to(tl.int32)
     req = tl.load(request_slots + r // TOP_K, r < N, DUMMY)
@@ -65,7 +66,8 @@ def _prepare_routes(ids, slots, keep, cpu_ids, cache_hit, slot_for_id, request_s
     if PREFILL or EXTERNAL_MASK:
         exact = tl.load(keep + r, r < N, False) & valid
     else:
-        exact = ((r % TOP_K < KEEP_K) | hit) & valid
+        h = tl.load(decode_top_h + req, valid, 0) if STAGED_TOP_H else KEEP_K
+        exact = ((r % TOP_K < h) | hit) & valid
     tl.store(keep + r, exact, r < N)
     tl.store(cache_hit + r, exact & hit, r < N)
     tl.store(slots + r, tl.where(exact, eid, -1), r < N)

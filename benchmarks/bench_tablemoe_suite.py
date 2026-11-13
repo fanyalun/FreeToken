@@ -224,6 +224,9 @@ def server_command(config, group, asset_root, audit_path=None, collect_path=None
                "--tablemoe-prefill-keep-rate", str(1 if method == "full" else config["prefill_keep_rate"]),
                "--tablemoe-decode-keep-k", str(8 if method == "full" else config["decode_keep_k"])]
     if method == "table":
+        for name in ("decode_switch_after", "decode_late_top_h"):
+            if config.get(name) is not None:
+                command.extend(["--tablemoe-" + name.replace("_", "-"), str(config[name])])
         command.extend(["--tablemoe-pca-dir", str(asset_root / "cluster"), "--tablemoe-cache-dir", str(asset_root / "cache")])
         for kind in ("offline", "online"):
             threshold = config.get(f"decode_{kind}_cosine_threshold")

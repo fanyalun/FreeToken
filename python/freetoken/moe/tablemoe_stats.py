@@ -81,6 +81,9 @@ class RequestAudit:
                         asset_provenance=getattr(runtime, "asset_provenance", "full_expert_bypass"),
                         asset_fingerprints=getattr(runtime, "asset_fingerprints", None),
                         moe_policy=getattr(runtime.config, "moe_policy", "native"),
+                        decode_top_h=runtime.config.tablemoe_decode_keep_k,
+                        decode_switch_after=getattr(runtime.config, "tablemoe_decode_switch_after", None),
+                        decode_late_top_h=getattr(runtime.config, "tablemoe_decode_late_top_h", None),
                         modes_prefill_policy=getattr(runtime.config, "modes_prefill_policy", "modes"),
                         modes_calibration=getattr(runtime, "calibration", None),
                         physical_pcie_bytes=None, coverage="FP16 optimized MoE logical transfers; excludes attention/encoder/KV and allocator setup"))
