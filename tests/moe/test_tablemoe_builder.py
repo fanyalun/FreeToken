@@ -95,7 +95,8 @@ def test_cuda_centroids_repeat_at_reservoir_capacity():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, dtype, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from freetoken.moe import tablemoe_artifacts, tablemoe_builder
@@ -110,15 +111,16 @@ def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypa
     monkeypatch.setattr(tablemoe_builder, "file_hash", metadata_hash)
     torch.manual_seed(42)
     collect = tmp_path / "collect"
-    collector = InputCollector(collect, dict(reservoir_size=30), 4, 2)
-    inputs = dict(sample_count=1, checkpoint={"path": "fixture"}, convert_bf16=True, processor={})
-    x = torch.randn(24, 4).half()
+    dtype_name = str(dtype).removeprefix("torch.")
+    collector = InputCollector(collect, dict(reservoir_size=30, dtype=dtype_name), 4, 2)
+    inputs = dict(sample_count=1, checkpoint={"path": "fixture"}, convert_bf16=dtype == torch.float16, processor={})
+    x = torch.randn(24, 4).to(dtype)
     ids = torch.zeros(24, 1, dtype=torch.int64)
     collector.add(0, x, ids, torch.arange(24) % 2, "prefill")
     collector.flush(1)
     collector.close()
     finalize_collection(collect, inputs, 1, 2)
-    config = dict(pca_dim=2, clusters=8, device=device)
+    config = dict(pca_dim=2, clusters=8, device=device, dtype=dtype_name)
     cluster(tmp_path, config)
     gate = torch.randn(2, 6, 4).bfloat16()
     down = torch.randn(2, 4, 3).bfloat16()
@@ -129,9 +131,9 @@ def test_full_builder_sparse_assets_and_expert_values(tmp_path, device, monkeypa
     path = tmp_path / "cache/layer_0/L0_E0_text_cache.pt"
     data = torch.load(path, weights_only=True)
     centroids = torch.load(tmp_path / "cluster/layer_0/L0_E0_text_clusters.pt", weights_only=True)["centroid"]
-    expected = expert_values(centroids.to(device), gate[0].to(device).half(), down[0].to(device).half())
+    expected = expert_values(centroids.to(device), gate[0].to(device, dtype=dtype), down[0].to(device, dtype=dtype))
     torch.testing.assert_close(data["value"], expected, atol=0, rtol=0)
-    assert data["key"].dtype == data["value"].dtype == torch.float16
+    assert data["key"].dtype == data["value"].dtype == dtype
     assert data["id"].tolist() == list(range(len(data["key"])))
     assert materialize(tmp_path, config, pieces=pieces)["input_sha256"] == manifest["input_sha256"]
     write_json(tmp_path / "cluster/complete.json", dict(complete=False))

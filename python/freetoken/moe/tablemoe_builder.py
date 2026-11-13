@@ -1,4 +1,4 @@
-"""Collect routed inputs, train layer PCA, and materialize FP16 expert tables."""
+"""Collect routed inputs, train layer PCA, and materialize FP16/BF16 expert tables."""
 
 from __future__ import annotations
 
@@ -48,7 +48,30 @@ def algorithm_config(config):
                 raise ValueError("invalid per-sample sampling bounds")
             if result[f"max_{mod}_tokens"] < 0:
                 raise ValueError("negative collection budget")
+    if "collection_image_ids" in result:
+        if result["sampling_policy"] != "tablemoe_default" or len(result["collection_image_ids"]) != result["sample_count"]:
+            raise ValueError("image deduplication requires one identity list per calibration sample")
+        if any(not isinstance(keys, list) or any(not isinstance(key, str) or not key for key in keys)
+               for keys in result["collection_image_ids"]):
+            raise ValueError("collection image identities must be nonempty strings")
     return result
+
+
+
+def storage_dtype(name):
+    if name not in ("float16", "bfloat16"):
+        raise ValueError("TableMoE storage dtype must be float16 or bfloat16")
+    return getattr(torch, name)
+
+
+
+def stage_dtype(source, config):
+    name = source.get("dtype", "float16")
+    if config.get("dtype", name) != name:
+        raise ValueError("TableMoE stage dtype mismatch; rebuild from collection")
+    config["dtype"] = name
+    return storage_dtype(name)
+
 
 
 def adaptive_quota(avail, remaining_budget, remaining_samples, history_lengths, min_per_sample, max_per_sample):
@@ -77,10 +100,16 @@ def _collection_file(path, size):
 class InputCollector:
     """Bounded writer queue with disk reservoirs; never retains mutable engine views."""
 
-    def __init__(self, root, config, hidden, num_experts, identity=None):
+    def __init__(self, root, config, hidden, num_experts, identity=None, dtype=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.config = algorithm_config(config)
+        self.dtype = storage_dtype(config.get("dtype", "float16")) if dtype is None else dtype
+        name = str(self.dtype).removeprefix("torch.")
+        storage_dtype(name)
+        if config.get("dtype", name) != name:
+            raise ValueError("collector dtype differs from the inference dtype")
+        self.config["dtype"] = name
         self.hidden, self.num_experts = hidden, num_experts
         self.buckets, self.tokens, self.requests = {}, {"prefill": 0, "decode": 0}, []
         self.sampling = {}
@@ -92,7 +121,7 @@ class InputCollector:
         self.identity = identity
         if (self.root / "progress.json").exists():
             saved = read_json(self.root / "progress.json")
-            if saved["identity"] != identity or saved["config"] != self.config or saved["hidden"] != hidden:
+            if saved["identity"] != identity or {"dtype": "float16", **saved["config"]} != self.config or saved["hidden"] != hidden:
                 raise ValueError("collection resume configuration mismatch")
             for key, state in saved["buckets"].items():
                 folder = self.root / f"layer_{state['layer']}"
@@ -104,6 +133,8 @@ class InputCollector:
             self.sample_state = saved.get("sample_state", self.sample_state)
             if "rng_state" in self.sample_state:
                 self.sample_rng.bit_generator.state = self.sample_state["rng_state"]
+        self.collected_image_ids = {key for record in self.sample_state["records"]
+                                    for key in record.get("image_ids", [])}
         self.error = None
         self.handles = {}
         self.pending = queue.Queue(maxsize=4)
@@ -136,12 +167,12 @@ class InputCollector:
         # D2H owns its storage before expert kernels can mutate x or rewrite ids.
         ready = None
         if x.is_cuda:
-            inputs = torch.empty((n, self.hidden), dtype=torch.float16, pin_memory=True)
+            inputs = torch.empty((n, self.hidden), dtype=self.dtype, pin_memory=True)
             routes = torch.empty(source_routes.shape, dtype=ids.dtype, pin_memory=True)
             inputs.copy_(source_inputs.detach(), non_blocking=True)
             routes.copy_(source_routes.detach(), non_blocking=True)
         else:
-            inputs = source_inputs.detach().to("cpu", dtype=torch.float16, copy=True)
+            inputs = source_inputs.detach().to("cpu", dtype=self.dtype, copy=True)
             routes = source_routes.detach().to("cpu", copy=True)
         if x.is_cuda:
             ready = torch.cuda.Event()
@@ -166,9 +197,25 @@ class InputCollector:
                 for item in getattr(req, "mm_items", None) or []:
                     for lo, hi in item.offsets:
                         vision[lo:hi] = True
+                collect_vision = vision.copy()
+                image_ids, new_image_ids = [], []
+                if "collection_image_ids" in self.config:
+                    image_ids = self.config["collection_image_ids"][ordinal]
+                    items = getattr(req, "mm_items", None) or []
+                    if len(items) != len(image_ids):
+                        raise ValueError("collection image identities differ from model image inputs")
+                    for key, item in zip(image_ids, items):
+                        if key in self.collected_image_ids:
+                            for lo, hi in item.offsets:
+                                collect_vision[lo:hi] = False
+                        else:
+                            self.collected_image_ids.add(key)
+                            new_image_ids.append(key)
                 record = dict(uid=req.uid, ordinal=ordinal, prompt_tokens=length,
-                              candidates={}, selected={}, positions={}, decode_seen=0)
-                for mod, mask in (("vision", vision), ("text", ~vision)):
+                              candidates={}, selected={}, positions={}, decode_seen=0,
+                              image_ids=image_ids, new_image_ids=new_image_ids,
+                              duplicate_visual_tokens=int((vision & ~collect_vision).sum()))
+                for mod, mask in (("vision", collect_vision), ("text", ~vision)):
                     positions = np.flatnonzero(mask)
                     if mod == "text" and self.config["sample_decode_tokens"]:
                         # Fixed-length generation makes the future decode-input positions known.
@@ -240,8 +287,10 @@ class InputCollector:
                 self.pending.task_done()
 
     def add(self, layer, x, ids, modality, phase, sampled_counts=None):
-        inputs, routes = x.numpy(), ids.numpy()
-        if not np.isfinite(inputs).all() or (routes < 0).any() or (routes >= self.num_experts).any():
+        if x.dtype != self.dtype:
+            raise ValueError("raw collection input dtype differs from the collector")
+        inputs, routes = x.contiguous().view(torch.uint16).numpy(), ids.numpy()
+        if not torch.isfinite(x).all() or (routes < 0).any() or (routes >= self.num_experts).any():
             raise ValueError("invalid raw collection input/routes")
         if layer == 0:
             self.tokens[phase] += (sum(s["candidates"] for s in sampled_counts.values())
@@ -350,9 +399,11 @@ class InputCollector:
         self.handles.clear()
 
 
+
 def finalize_collection(root, inputs, num_layers, num_experts):
     root = Path(root)
     progress = read_json(root / "progress.json")
+    dtype = storage_dtype(progress["config"].get("dtype", "float16"))
     expected = inputs["sample_count"]
     if len(progress["requests"]) != expected:
         raise ValueError("collection request coverage mismatch")
@@ -385,7 +436,7 @@ def finalize_collection(root, inputs, num_layers, num_experts):
             outputs.extend(folder / f"{key}.{suffix}" for suffix in ("bin", "phase"))
             continue
         x = torch.from_file(str(folder / f"{key}.bin"), size=state["kept"] * progress["hidden"],
-                            dtype=torch.float16).reshape(-1, progress["hidden"]).clone()
+                            dtype=dtype).reshape(-1, progress["hidden"]).clone()
         phases = torch.from_file(str(folder / f"{key}.phase"), size=state["kept"], dtype=torch.uint8).clone()
         path = folder / f"{key}_inputs.pt"
         temp = path.with_suffix(".partial")
@@ -394,19 +445,26 @@ def finalize_collection(root, inputs, num_layers, num_experts):
         outputs.append(path)
     return finish_stage(root, inputs, outputs, hash_outputs=False, buckets=progress["buckets"], tokens=progress["tokens"],
                         hidden=progress["hidden"], num_layers=num_layers, num_experts=num_experts,
+                        dtype=str(dtype).removeprefix("torch."),
                         sampling=progress.get("sampling", {}))
 
 
-def load_inputs(root, key, state, hidden):
+
+def load_inputs(root, key, state, hidden, dtype=torch.float16):
     path = Path(root) / f"layer_{state['layer']}"
     exported = path / f"{key}_inputs.pt"
     if exported.exists():
-        return torch.load(exported, weights_only=True)["inputs"]
+        inputs = torch.load(exported, weights_only=True)["inputs"]
+        if inputs.dtype != dtype or inputs.shape != (state["kept"], hidden):
+            raise ValueError(f"incompatible collected input shape/dtype: {exported}")
+        return inputs
     return torch.from_file(str(path / f"{key}.bin"), size=state["kept"] * hidden,
-                           dtype=torch.float16).reshape(-1, hidden)
+                           dtype=dtype).reshape(-1, hidden)
+
 
 
 def train_pca(x, dim):
+    dtype = torch.bfloat16 if x.dtype == torch.bfloat16 else torch.float16
     x = x.float()
     if len(x) <= dim or x.shape[1] < dim or not torch.isfinite(x).all():
         raise ValueError(f"PCA coverage gap: {tuple(x.shape)} cannot train {dim} dimensions")
@@ -418,7 +476,8 @@ def train_pca(x, dim):
     proj = vectors[:, -dim:].flip(1)
     largest = proj.abs().argmax(0)
     proj *= proj[largest, torch.arange(dim)].sign()
-    return dict(mean=mean.cpu().half(), proj=proj.cpu().half())
+    return dict(mean=mean.cpu().to(dtype), proj=proj.cpu().to(dtype))
+
 
 
 def _assign(x, centers, chunk):
@@ -439,6 +498,7 @@ def _cluster_means(values, labels, counts):
 
 
 def kmeans(x, high, config):
+    dtype = torch.bfloat16 if high.dtype == torch.bfloat16 else torch.float16
     x, high = x.float(), high.float()
     n, k = len(x), min(config["clusters"], len(x))
     if not n:
@@ -463,11 +523,13 @@ def kmeans(x, high, config):
     labels, _ = _assign(x, centers, config["distance_chunk"])
     counts = torch.bincount(labels, minlength=len(centers))
     active = counts > 0
-    return dict(key=_cluster_means(x, labels, counts).cpu().half(),
-                centroid=_cluster_means(high, labels, counts).cpu().half(), counts=counts[active].cpu())
+    return dict(key=_cluster_means(x, labels, counts).cpu().to(dtype),
+                centroid=_cluster_means(high, labels, counts).cpu().to(dtype), counts=counts[active].cpu())
+
 
 
 def batched_kmeans(samples, config):
+    dtype = torch.bfloat16 if samples[0][1].dtype == torch.bfloat16 else torch.float16
     device = samples[0][1].device
     batch, maximum = len(samples), max(len(high) for _, high, _ in samples)
     k = min(config["clusters"], maximum)
@@ -515,14 +577,16 @@ def batched_kmeans(samples, config):
     centroids = torch.zeros(batch * k, high.shape[-1], device=device)
     centroids[counts > 0] = _cluster_means(high_flat, ids, counts)
     centroids = centroids.reshape(batch, k, -1)
-    return {key: dict(key=centers[i, active[i]].cpu().half(), centroid=centroids[i, active[i]].cpu().half(),
+    return {key: dict(key=centers[i, active[i]].cpu().to(dtype), centroid=centroids[i, active[i]].cpu().to(dtype),
                       counts=counts.reshape(batch, k)[i, active[i]].cpu())
             for i, (_, _, key) in enumerate(samples)}
+
 
 
 def cluster(root, config):
     root, config = Path(root), algorithm_config(config)
     source = verify_stage(root / "collect", hash_outputs=False)
+    dtype = stage_dtype(source, config)
     target = root / "cluster"
     inputs = dict(collect=source["input_sha256"], collect_outputs=source["outputs"], algorithm=config,
                   builder_sha256=file_hash(__file__), torch_version=torch.__version__, cuda_version=torch.version.cuda)
@@ -545,7 +609,7 @@ def cluster(root, config):
                        if v["layer"] == layer and v["modality"] == mod]
             samples = []
             for key, state in sorted(buckets):
-                x = load_inputs(root / "collect", key, state, source["hidden"])
+                x = load_inputs(root / "collect", key, state, source["hidden"], dtype=dtype)
                 generator = torch.Generator().manual_seed(config["seed"] ^ int(digest(key)[:8], 16))
                 samples.append(x[torch.randperm(len(x), generator=generator)[:config["pca_per_expert"]]])
             if not samples:
@@ -560,8 +624,8 @@ def cluster(root, config):
                 if key not in source["buckets"]:
                     missing.append(key)
                     continue
-                high = load_inputs(root / "collect", key, source["buckets"][key], source["hidden"]).to(device)
-                # Fit the clustering against the FP16 assets that inference will load.
+                high = load_inputs(root / "collect", key, source["buckets"][key], source["hidden"], dtype=dtype).to(device)
+                # Fit the clustering against the saved assets that inference will load.
                 low = (high.float() - pca["mean"].to(device).float()) @ pca["proj"].to(device).float()
                 pending.append((low, high, key))
                 if len(pending) == config.get("cluster_batch_size", 1) or expert == source["num_experts"] - 1:
@@ -579,7 +643,8 @@ def cluster(root, config):
                     torch.save(data, path)
                     outputs.append(path)
     return finish_stage(target, inputs, outputs, hash_outputs=False, missing_tables=missing, source_inputs=source["inputs"],
-                        num_layers=source["num_layers"], num_experts=source["num_experts"])
+                        num_layers=source["num_layers"], num_experts=source["num_experts"], dtype=config["dtype"])
+
 
 
 def expert_values(x, gate_up, down, chunk=64):
@@ -587,13 +652,16 @@ def expert_values(x, gate_up, down, chunk=64):
     for part in x.split(chunk):
         gate, up = F.linear(part, gate_up).chunk(2, -1)
         result.append(F.linear(F.silu(gate) * up, down).cpu())
-    return torch.cat(result).half()
+    return torch.cat(result).to(x.dtype)
 
 
 def materialize(root, config, pieces=None, model_config=None):
     root, config = Path(root), algorithm_config(config)
     source = verify_stage(root / "cluster", hash_outputs=False)
+    dtype = stage_dtype(source, config)
     provenance = source["source_inputs"]
+    if dtype == torch.bfloat16 and provenance["convert_bf16"]:
+        raise ValueError("BF16 tables require native BF16 checkpoint weights")
     if pieces is None:
         model = Path(provenance["checkpoint"]["path"])
         if not model.is_dir() or any(not (model / name).is_file()
@@ -616,7 +684,7 @@ def materialize(root, config, pieces=None, model_config=None):
     write_json(target / "complete.json", dict(complete=False))
     outputs, visited = [stage_input], set()
     for layer, e0, e1, piece in pieces:
-        allowed = {torch.float16, torch.bfloat16} if provenance["convert_bf16"] else {torch.float16}
+        allowed = {torch.float16, torch.bfloat16} if provenance["convert_bf16"] else {dtype}
         if not {piece["gate_up"].dtype, piece["down"].dtype} <= allowed:
             raise ValueError("checkpoint conversion policy mismatch")
         folder = target / f"layer_{layer}"
@@ -625,14 +693,16 @@ def materialize(root, config, pieces=None, model_config=None):
             if (layer, expert) in visited:
                 raise ValueError("duplicate checkpoint expert")
             visited.add((layer, expert))
-            gate = piece["gate_up"][expert - e0].to(config["device"], dtype=torch.float16)
-            down = piece["down"][expert - e0].to(config["device"], dtype=torch.float16)
+            gate = piece["gate_up"][expert - e0].to(config["device"], dtype=dtype)
+            down = piece["down"][expert - e0].to(config["device"], dtype=dtype)
             for mod in ("vision", "text"):
                 key = f"L{layer}_E{expert}_{mod}"
                 path = root / "cluster" / f"layer_{layer}" / f"{key}_clusters.pt"
                 if str(path.relative_to(root / "cluster")) not in source["outputs"]:
                     continue
                 data = torch.load(path, weights_only=True)
+                if data["key"].dtype != dtype or data["centroid"].dtype != dtype:
+                    raise ValueError(f"incompatible cluster dtype: {path}")
                 value = expert_values(data["centroid"].to(config["device"]), gate, down, config["value_chunk"])
                 out = folder / f"{key}_cache.pt"
                 torch.save(dict(id=torch.arange(len(value)), key=data["key"], value=value), out)
@@ -640,7 +710,7 @@ def materialize(root, config, pieces=None, model_config=None):
     if len(visited) != source["num_layers"] * source["num_experts"]:
         raise ValueError("checkpoint expert coverage gap")
     return finish_stage(target, inputs, outputs, hash_outputs=False, pca_root=str((root / "cluster").resolve()),
-                        missing_tables=source["missing_tables"], provenance=provenance,
+                        missing_tables=source["missing_tables"], provenance=provenance, dtype=config["dtype"],
                         pca_outputs={name: h for name, h in source["outputs"].items() if name.endswith("_pca.pt")})
 
 
