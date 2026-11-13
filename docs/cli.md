@@ -85,7 +85,9 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--modes-prefill-policy` | modes | `modes` uses MoDES in prefill; `tablemoe` uses TableMoE attention-ranked experts, offline lookup and survivor renormalization. Decode follows `--moe-policy` |
 | `--quant-backend` | auto | Kernel per quantized layer type, `layer[.kind]=name` entries: `linear=marlin,moe=b12x` or `moe.nvfp4=triton`. A layer-level entry applies to every kind whose table lists the name |
 | `--nvfp4-backend` | — | Deprecated: stands in for `--quant-backend moe.nvfp4=<marlin\|b12x\|triton>` (`flashinfer` means b12x); cannot be combined with `--quant-backend` |
-| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family strategies) |
+| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-mem` / `--moe-cache-auto` | auto | Total GPU expert-cache budget as slots / fraction of all experts / bytes such as `12GiB` / sized from free VRAM (mutually exclusive). Native offload-family strategies enable auto by default; TableMoE requires explicit slots |
+| `--moe-cache-scope` | unified | `unified` shares slots across layers with the same bank layout; `per-layer` gives each MoE layer its own LRU pool. `--moe-cache-size` is the total across pools |
+| `--moe-cache-split` | equal | Divide the total slots equally by layer count, or use `profile:<path>` with per-layer `expert_counts` from `ft bench bw`. Each pool must meet its Decode batch capacity |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid/tablemoe executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, a fraction, or `auto`). `auto` is for Windows/WSL only, where CUDA pinned memory is capped; every value needs an expert format the CPU executor serves (bf16, nvfp4, mxfp4), so fp8 experts cannot use it |
@@ -101,12 +103,35 @@ See [models.md](models.md#moe-strategies) for what each strategy does.
 | `--tablemoe-collect-config` | off | Full-expert eager calibration only: collect original routed inputs using a builder JSON with `output`, `builder`, and `input_sha256`; performance runs omit this flag |
 | `--tablemoe-convert-bf16-weights` | off | Explicitly allow a BF16 source checkpoint and convert its CPU expert banks to FP16 |
 | `--tablemoe-prefill-keep-rate` | 0.6 | Fraction of active experts computed exactly in each request's current prefill chunk |
-| `--tablemoe-prefill-chunk-size` | 0 | Optimized TableMoE subchunk size; 0 uses the scheduler prefill chunk without extra splitting. CPU execution remains bounded by its executor capacity |
-| `--tablemoe-decode-keep-k` | 4 | Number of leading decode routes computed exactly |
+| `--tablemoe-prefill-chunk-size` | 0 | Compatibility option; only 0 is accepted. TableMoE executes each scheduled prefill batch without internal splitting. CPU executor capacity is sized for `max-extend-tokens` |
+| `--tablemoe-prefill-experts-per-group` | 16 | Optimized offload/hybrid TableMoE prefill only: load missing exact experts in groups while GPU computes ready groups in the same layer. Tokens are not split; table routes do not load weights. 0 selects the serial path. Falls back to serial when mapped fused expert copies are unavailable |
+| `--tablemoe-decode-top-h`, `--tablemoe-decode-keep-k` | 1 | Decode computes the first h router-ranked experts plus all routed GPU expert-cache hits exactly. Hits are sampled before this step's fetch/eviction. Other routes query online then offline tables; table misses follow the existing drop policy. Independent of the prefill keep rate; CPU mode has no GPU hits. The old keep-k flag is an alias for h |
 | `--tablemoe-online-cache-size` | 64 | Maximum prior token entries per request and MoE layer |
 | `--tablemoe-offline-cosine-threshold-vision`, `--tablemoe-offline-cosine-threshold-text` | 0.6, 0.7 | Minimum prefill PCA cosine similarity for offline reuse; decode uses the reference positive-dot rule |
 | `--tablemoe-decode-offline-cosine-threshold` | unset | Optional minimum decode PCA cosine similarity for offline reuse; unset preserves the positive-dot rule |
 | `--tablemoe-decode-online-cosine-threshold` | unset | Optional minimum decode hidden-state cosine similarity for online reuse; normalizes queries and cached keys; unset preserves the positive-dot rule |
+
+For Qwen3-VL-30B-A3B's 48 MoE layers and 128 experts per layer,
+`--moe-cache-size 3072 --moe-cache-scope per-layer --moe-cache-split equal`
+gives each layer 64 persistent Decode slots. TableMoE Prefill uses a sparse
+full-layer staging view when per-layer pools are enabled, so its exact expert
+selection can exceed 64 without evicting weights still needed by that forward.
+Only selected exact experts are copied; table routes retain their existing lookup
+behavior. After computation, TableMoE preserves only existing residents that were
+activated by a real router route in this scheduled Prefill batch, including
+routes served by tables rather than exact computation. Those residents keep
+their slots and LRU usage. Empty slots and slots belonging to inactive old
+residents are filled from the exact experts, ranked by the sum of router weight
+times last-token attention; ties use ascending expert ID. Admission stops at
+capacity or when candidates run out; unused reclaimed slots remain invalid.
+Staging reuses the front of the allocated expert-bank arena. Pools outside this
+area receive device-to-device copies after their layer finishes. Pools that
+overlap staging are restored from their Host banks after the last MoE layer,
+including only the protected active residents and admitted experts. Inactive
+old experts are not restored. This adds Host-to-GPU restoration
+traffic, recorded separately from staging loads and device-to-device admission.
+No additional expert-weight GPU buffer is allocated. The default `unified`
+TableMoE path retains its existing Prefill behavior.
 
 ### API behaviour
 

@@ -181,7 +181,8 @@ def main():
     protocol.update(page_size=1, kv_capacity_tokens=65536, kv_storage_bytes=6 << 30)
     protocol.update(requested_gpu_expert_slots={g: 3072 for g in args.groups},
                     actual_gpu_expert_slots={g: 256 if g == "main_cpu_eager" else 3072 for g in args.groups},
-                    tablemoe_implementation="optimized", prefill_keep_rate=.6, decode_keep_k=4,
+                    tablemoe_implementation="optimized", prefill_keep_rate=.6, decode_keep_k=1,
+                    decode_policy="top_h_plus_gpu_cache_hits",
                     full_control=dict(prefill_keep_rate=1, decode_keep_k=8, bypass_tables=True),
                     online_capacity=64, prefill_thresholds=dict(vision=.6, text=.7))
     protocol["nsys"] = args.nsys

@@ -1,5 +1,33 @@
 # MMLongBench-Write
 
+Current standalone TableMoE scheduling uses the recomputation/keep ratio only for
+prefill. Decode computes the first h router-ranked experts and all routed GPU
+expert-cache hits exactly, with h=1 by default. Set `--tablemoe-decode-top-h`
+(legacy alias `--tablemoe-decode-keep-k`), or `decode_keep_k` in the suite config.
+Hits are sampled before the current step loads/evicts experts. Remaining routes
+query online then offline tables under the existing thresholds, miss/drop and
+weight rules. Historical frozen runs below retain their recorded fixed keep-k
+protocols; their results do not validate the current Top-h + hit policy.
+
+The current suite accepts `moe_cache_scope: "per-layer"` and
+`moe_cache_split: "equal"`; with `gpu_expert_slots: 3072` this assigns 64 Decode
+slots to each of the model's 48 MoE layers. Keep `prefill_keep_rate: 0.7` and
+`decode_keep_k: 1` to retain the current selection policy. Prefill uses sparse
+full-layer staging, so its exact expert count may exceed one layer's persistent
+quota. After Prefill computation, only old residents activated by real router
+routes in the current scheduled batch keep their slots and LRU usage, even if
+their current routes use tables. Inactive old residents are removed. Empty and
+reclaimed slots are filled from the exact experts in descending attention
+importance (sum of router weight times last-token attention, ties by ascending
+expert ID). Filling stops at capacity or when candidates run out; unused
+reclaimed slots remain invalid. Pools that
+overlap staging are restored after the last MoE layer, so later layers cannot
+overwrite newly admitted weights. Restoration adds separately recorded H2D
+traffic; other pools admit from staging with D2D copies. Historical frozen runs
+retain their original cache policy and cannot establish the quality or hit rate
+of this configuration. A rerun must use a fresh source snapshot and output
+directory.
+
 The MoDES heldout runner is `bench_modes_mmlongbench_evaluate.py --config <config.json>`. It accepts one policy per run: `methods=["modes"]` or `methods=["modes_tablemoe"]`. It reuses the completed calibration via `calibration_from` and keeps the original TableMoE split via `dataset_root` and `design2code_root`. It validates the checkpoint, calibrated runtime source, all 48 evaluation requests, existing baseline receipts, official rubric and VLMEvalKit sources before generation. Existing baseline, skip and TableMoE inference is not rerun. The baseline is read only for comparison.
 
 MoDES generation uses FP16, hybrid eager execution, concurrency 4 and natural EOS with the same 8192-token ceiling and processor settings. After generation, the local BF16 Qwen judge runs sequentially on the configured GPU using the original native scoring protocol. `progress.json` distinguishes prediction from judging; `complete.json` becomes true only when all 48 scores verify. `comparison.json` reports native quality, length and overall scores plus the 1..5 Accuracy dimension. The reused baseline used offload graphs, so this run does not claim a paired performance result. The `artifacts/modes_mmlongbench_write_20261004_test48` run freezes its sources under `source_snapshot` and uses the completed 30-sample calibration targeting an overall 50% skip rate.
@@ -16,7 +44,7 @@ The pinned THU-KEG/LongWriter-V corpus has 120 examples in six contiguous 20-exa
 
 The local VLMEvalKit checkout has no built-in MMLongBench-Write class. `mmlongbench_write.py` supplies a benchmark-side ImageBaseDataset extension, implements `build_prompt()` and `evaluate()`, and uses VLMEvalKit's native judge API. Its pinned official rubric includes all original images. Quality uses the six 1..5 dimensions; Accuracy is one dimension, not a classification percentage. Length and combined scores follow the official formulas. The local Qwen judge differs from the paper's GPT-4o judge, so scores are labelled accordingly. Missing predictions, unavailable judges and malformed grades fail the scoring stage.
 
-All three modes use Qwen3-VL-30B-A3B-Instruct, FP16 expert weights converted explicitly from the BF16 checkpoint, greedy decoding and natural EOS with an 8192-token ceiling. Baseline computes all top-8 experts. Skip and TableMoE use the same prefill keep rate 0.6 and decode keep-k 4; skip disables both table queries and online maintenance and drops other routes. TableMoE uses its request-isolated online table. The experiment uses the GPU offload backend with identical 6144 expert slots and KV budgets across modes, and captures decode graphs through batch size 4.
+The original frozen three-mode experiment uses Qwen3-VL-30B-A3B-Instruct, FP16 expert weights converted explicitly from the BF16 checkpoint, greedy decoding and natural EOS with an 8192-token ceiling. Baseline computes all top-8 experts. Skip and TableMoE use the same prefill keep rate 0.6 and decode keep-k 4; skip disables both table queries and online maintenance and drops other routes. TableMoE uses its request-isolated online table. The experiment uses the GPU offload backend with identical 6144 expert slots and KV budgets across modes, and captures decode graphs through batch size 4.
 
 One GPU collects actual full-expert prompt inputs and builds tables while the other can generate baseline and skip predictions. After construction, TableMoE prediction can overlap local vLLM judging on the other GPU. These concurrent inference durations are diagnostic rather than formal latency comparisons. The current rebuild is explicitly paused; changing its configuration does not resume it.
 

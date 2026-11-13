@@ -189,6 +189,10 @@ class OffloadMoELayer(MoELayer):
         )
         self.offload_cache: OffloadMoeCache | None = None
 
+    @property
+    def skips_inactive_slots(self) -> bool:
+        return self.quant_method is not None and self.quant_method.kernel.supports_inactive_slots
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -293,7 +297,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -340,7 +344,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.pool_bank_views(self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -380,16 +384,18 @@ class OffloadMoELayer(MoELayer):
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.stage_views(self.layer_id, 0),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+        cache.release_prefill_layer(self.layer_id)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

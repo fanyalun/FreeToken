@@ -43,6 +43,9 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
+    moe_cache_mem: int | None = None
+    moe_cache_scope: str = "unified"
+    moe_cache_split: str = "equal"
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
@@ -78,7 +81,8 @@ class EngineConfig:
     tablemoe_collect_config: str | None = None
     tablemoe_prefill_keep_rate: float = 0.6
     tablemoe_prefill_chunk_size: int = 0
-    tablemoe_decode_keep_k: int = 4
+    tablemoe_prefill_experts_per_group: int = 16
+    tablemoe_decode_keep_k: int = 1
     tablemoe_online_cache_size: int = 64
     tablemoe_offline_cosine_threshold_vision: float = 0.6
     tablemoe_offline_cosine_threshold_text: float = 0.7

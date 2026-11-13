@@ -131,6 +131,7 @@ def parse_args(
     from freetoken.attention import validate_attn_backend
     from freetoken.kvcache import SUPPORTED_CACHE_MANAGER
     from freetoken.moe import MOE_STRATEGIES
+    from freetoken.moe.pool_policy import SCOPES
 
     def _parse_quant_backend(value: str) -> str:
         from freetoken.layers.quantization import QuantBackend
@@ -158,6 +159,26 @@ def parse_args(
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
+
+    def _parse_mem_size(value: str) -> int:
+        units = {"b": 1, "k": 1 << 10, "kb": 1 << 10, "kib": 1 << 10,
+                 "m": 1 << 20, "mb": 1 << 20, "mib": 1 << 20,
+                 "g": 1 << 30, "gb": 1 << 30, "gib": 1 << 30}
+        text = value.strip().lower()
+        number = text.rstrip("abgikm")
+        unit = text[len(number):]
+        try:
+            size = int(float(number) * units[unit])
+        except (KeyError, ValueError, OverflowError) as exc:
+            raise argparse.ArgumentTypeError("must be a size with a unit, e.g. 12GiB or 800MiB") from exc
+        if size <= 0:
+            raise argparse.ArgumentTypeError("must be positive")
+        return size
+
+    def _parse_cache_split(value: str) -> str:
+        if value == "equal" or (value.startswith("profile:") and len(value) > len("profile:")):
+            return value
+        raise argparse.ArgumentTypeError("must be equal or profile:<path>")
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
@@ -652,13 +673,19 @@ def parse_args(
         "--moe-cache-size",
         type=int,
         default=ServerArgs.moe_cache_size,
-        help="The number of unified MoE expert slots on GPU.",
+        help="The total number of MoE expert slots on GPU, shared by the configured slot pools.",
     )
     moe_cache_group.add_argument(
         "--moe-cache-rate",
         type=_parse_moe_cache_rate,
         default=ServerArgs.moe_cache_rate,
         help="The fraction of all MoE experts to keep in GPU cache.",
+    )
+    moe_cache_group.add_argument(
+        "--moe-cache-mem",
+        type=_parse_mem_size,
+        default=ServerArgs.moe_cache_mem,
+        help="GPU memory for the MoE expert slot cache, e.g. 12GiB or 800MiB; G, GB and GiB all mean GiB.",
     )
     moe_cache_group.add_argument(
         "--moe-cache-auto",
@@ -678,10 +705,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cache-scope",
+        choices=SCOPES,
+        default=ServerArgs.moe_cache_scope,
+        help="How MoE layers share GPU expert slots: unified shares one LRU pool; per-layer gives each layer its own pool.",
+    )
+    parser.add_argument(
+        "--moe-cache-split",
+        type=_parse_cache_split,
+        default=ServerArgs.moe_cache_split,
+        help="How pools share the total slots: equal by layer count, or profile:<path> by per-layer expert use.",
+    )
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
-        help="The unified MoE cache eviction policy.",
+        help="The eviction policy within each MoE expert slot pool.",
     )
 
     parser.add_argument(
@@ -750,8 +789,13 @@ def parse_args(
     parser.add_argument("--tablemoe-prefill-keep-rate", type=float, default=ServerArgs.tablemoe_prefill_keep_rate)
     parser.add_argument("--tablemoe-prefill-chunk-size", type=int,
                         default=ServerArgs.tablemoe_prefill_chunk_size,
-                        help="Optimized TableMoE prefill subchunk size; 0 uses the scheduler chunk. CPU execution remains capacity limited.")
-    parser.add_argument("--tablemoe-decode-keep-k", type=int, default=ServerArgs.tablemoe_decode_keep_k)
+                        help="Compatibility option; must be 0. TableMoE executes each scheduled prefill batch without internal splitting.")
+    parser.add_argument("--tablemoe-prefill-experts-per-group", type=int,
+                        default=ServerArgs.tablemoe_prefill_experts_per_group,
+                        help="Optimized offload/hybrid prefill overlaps expert groups with weight loading; 0 uses serial execution. Tokens are not split.")
+    parser.add_argument("--tablemoe-decode-top-h", "--tablemoe-decode-keep-k", dest="tablemoe_decode_keep_k",
+                        type=int, default=ServerArgs.tablemoe_decode_keep_k,
+                        help="Decode computes the leading h routes plus GPU expert-cache hits exactly; other routes use tables.")
     parser.add_argument("--tablemoe-online-cache-size", type=int, default=ServerArgs.tablemoe_online_cache_size)
     parser.add_argument("--tablemoe-offline-cosine-threshold-vision", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_vision)
     parser.add_argument("--tablemoe-offline-cosine-threshold-text", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_text)
@@ -824,7 +868,7 @@ def parse_args(
         import sys
 
         provided = sys.argv[1:] if args is None else args
-        conflicts = {"--tablemoe-decode-keep-k"}
+        conflicts = {"--tablemoe-decode-top-h", "--tablemoe-decode-keep-k"}
         if kwargs["modes_prefill_policy"] == "modes":
             conflicts.add("--tablemoe-prefill-keep-rate")
         if any(flag.split("=", 1)[0] in conflicts for flag in provided):
@@ -887,6 +931,7 @@ def parse_args(
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0
         and not kwargs["moe_cache_auto"]
+        and kwargs["moe_cache_mem"] is None
         and (kwargs["moe_cache_rate"] is None or kwargs["moe_cache_rate"] == 0)
     )
     if (is_offload_moe_strategy(kwargs["moe_strategy"]) and kwargs["moe_strategy"] != "tablemoe"

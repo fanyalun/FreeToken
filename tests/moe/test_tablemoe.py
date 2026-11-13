@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -35,12 +36,14 @@ def test_survivor_renormalization_and_empty_row():
     assert torch.equal(result[1], torch.zeros(3))
 
 
-def _executor(g, d, top_k):
-    banks = SimpleNamespace(num_layers=1, num_experts=g.shape[0],
-                            bank_sources={"gate_up": [g], "down": [d]})
+def _executor(g, d, top_k, max_tokens=128):
+    gate_layers = g if isinstance(g, list) else [g]
+    down_layers = d if isinstance(d, list) else [d]
+    banks = SimpleNamespace(num_layers=len(gate_layers), num_experts=gate_layers[0].shape[0],
+                            bank_sources={"gate_up": gate_layers, "down": down_layers})
     return CpuMoeExecutor(
         banks, top_k=top_k, activation="silu", apply_router_weight_on_input=False,
-        num_threads=2, max_tokens=128, device=torch.device("cuda"), fmt="fp16_routes",
+        num_threads=2, max_tokens=max_tokens, device=torch.device("cuda"), fmt="fp16_routes",
     )
 
 
@@ -99,7 +102,7 @@ def runtime(tmp_path):
     rt.online, rt.counters = defaultdict(dict), defaultdict(int)
     rt._load_assets()
     rt._prepare_gpu_assets()
-    rt.executor = _executor(torch.zeros(2, 4, 4).half(), torch.zeros(2, 4, 2).half(), 2)
+    rt.executor = _executor(torch.zeros(2, 4, 4).half(), torch.zeros(2, 4, 2).half(), 2, max_tokens=512)
     rt._fetch_buffers = {}
     rt._route_counts = torch.zeros(5, dtype=torch.int64, device="cuda")
     rt._gpu_counts = torch.zeros(3, dtype=torch.int64, device="cuda")
@@ -177,6 +180,49 @@ def test_decode_offline_cosine_threshold_scale_and_graph(runtime, threshold):
         assert ws["off"][:, 1].tolist() == expected.tolist()
         assert not ws["off"][:, 0].any()
         torch.testing.assert_close(ws["values"][:, 1, 0], expected.half() * 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("hidden,capacity", [(4, 2), (128, 7), (2048, 64)])
+@pytest.mark.parametrize("cosine", [False, True])
+def test_online_scores_match_fp16_matmul_with_padding_empty_and_exact_rows(hidden, capacity, cosine):
+    from freetoken.kernel.triton.tablemoe import _online_scores
+    import triton
+
+    torch.manual_seed(43)
+    bs, top_k, dummy = 5, 8, 5
+    x = torch.randn(bs, hidden, device="cuda", dtype=torch.float16)
+    keys = torch.randn(bs + 1, capacity, hidden, device="cuda", dtype=torch.float16)
+    keys[:, -1] = keys[:, 0]
+    x[1].zero_()
+    original = x.clone()
+    request_slots = torch.tensor([2, 0, 1, 4, dummy], device="cuda", dtype=torch.int32)
+    sizes = torch.full((bs + 1,), capacity, device="cuda", dtype=torch.int32)
+    sizes[1] = 0
+    keep = torch.zeros(bs, top_k, device="cuda", dtype=torch.bool)
+    keep[3] = True
+    scores = torch.empty(bs, capacity, device="cuda", dtype=torch.float16)
+
+    def run():
+        _online_scores[(bs, capacity)](x, keys, scores, keep, request_slots, sizes,
+                                       hidden, top_k, capacity, dummy,
+                                       triton.next_power_of_2(hidden), top_k, cosine)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for scale in (.125, 1., 8.):
+        x.copy_(original * scale)
+        graph.replay()
+        q, gathered = x, keys[request_slots.long()]
+        if cosine:
+            q = F.normalize(q.float(), dim=-1, eps=1e-6).half()
+            gathered = F.normalize(gathered.float(), dim=-1, eps=1e-6).half()
+        expected = torch.bmm(q[:, None], gathered.transpose(1, 2)).squeeze(1)
+        torch.testing.assert_close(scores[:2], expected[:2], atol=2e-3, rtol=2e-3)
+        assert torch.equal(scores[:2].argmax(-1), expected[:2].argmax(-1))
+        assert torch.isneginf(scores[2:]).all()
 
 
 @pytest.mark.parametrize("use_graph", [False, True])
@@ -266,13 +312,13 @@ def test_gpu_concurrent_requests_do_not_share_online_entries(runtime):
     torch.testing.assert_close(result[:, 0], torch.tensor([2.25, 1.5], device="cuda").half())
 
 
-def test_gpu_chunk_larger_than_native_workspace_and_empty_survivors(runtime):
+def test_reference_prefill_above_128_rows_and_empty_survivors(runtime):
     n = 129
     ids = torch.tensor([[0, 1]] * n, device="cuda")
     x = torch.tensor([[1., 0., 0., 0.]] * n, device="cuda").half()
     result = runtime.forward(0, x, torch.tensor([[0.75, 0.25]] * n, device="cuda"), ids, _batch(n=n, prefill=True))
     torch.testing.assert_close(result[:, 0], torch.full((n,), 0.5, device="cuda").half())
-    assert runtime.stats()["lookup_host_waits"] == 2
+    assert runtime.stats()["lookup_host_waits"] == 1
     runtime.config.tablemoe_decode_keep_k = 0
     result = runtime.forward(0, x[:1], torch.ones(1, 2, device="cuda") / 2,
                              torch.zeros(1, 2, device="cuda", dtype=torch.long), _batch(uid=101))
@@ -330,6 +376,14 @@ def test_bf16_source_requires_explicit_conversion_flag(tmp_path):
         validate_tablemoe_config(cfg)
     cfg.tablemoe_convert_bf16_weights = True
     validate_tablemoe_config(cfg)
+    for chunk_size in (-1, 128):
+        cfg.tablemoe_prefill_chunk_size = chunk_size
+        with pytest.raises(ValueError, match="without internal splitting"):
+            validate_tablemoe_config(cfg)
+    cfg.tablemoe_prefill_chunk_size = 0
+    cfg.tablemoe_prefill_experts_per_group = -1
+    with pytest.raises(ValueError, match="experts per group must be nonnegative"):
+        validate_tablemoe_config(cfg)
 
 
 @pytest.mark.parametrize('prefill', [False, True])
@@ -356,7 +410,7 @@ def test_gpu_unweighted_routes_skip_masked_ids(prefill, num_experts):
     torch.testing.assert_close(x, original, atol=0, rtol=0)
 
 
-def _with_gpu_cache(runtime, mode, fetch=1):
+def _with_gpu_cache(runtime, mode, fetch=1, layers=1, pool_of_layer=None, pool_sizes=None):
     from freetoken.kernel.pinned import copy_to_pinned_tensor
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -364,15 +418,26 @@ def _with_gpu_cache(runtime, mode, fetch=1):
     hidden, inter = 128, 64
     runtime.expert_mode = mode
     runtime.hidden = hidden
+    runtime.num_layers = layers
     for mod in ('text', 'vision'):
         proj, bias = runtime.pca[0, mod]
         runtime.pca[0, mod] = (F.pad(proj, (0, 0, 0, hidden - 4)), bias)
     runtime.host_values[0] = F.pad(runtime.host_values[0], (0, hidden - 4))
-    gate = copy_to_pinned_tensor(torch.randn(2, 2 * inter, hidden).half() / 5)
-    down = copy_to_pinned_tensor(torch.randn(2, hidden, inter).half() / 5)
-    runtime.executor = _executor(gate, down, 2) if mode == 'hybrid' else None
-    runtime.expert_cache = OffloadMoeCache(1, 2, 2, torch.device('cuda'), quant_format='fp16')
-    runtime.expert_cache.set_bank_sources({'gate_up': [gate], 'down': [down]})
+    for layer in range(1, layers):
+        for mod in ('text', 'vision'):
+            runtime.pca[layer, mod] = runtime.pca[0, mod]
+        for name in ('gpu_keys', 'gpu_counts', 'host_values', 'value_offsets', 'value_addresses'):
+            if hasattr(runtime, name):
+                getattr(runtime, name)[layer] = getattr(runtime, name)[0]
+    gate = copy_to_pinned_tensor(torch.randn(runtime.num_experts, 2 * inter, hidden).half() / 5)
+    down = copy_to_pinned_tensor(torch.randn(runtime.num_experts, hidden, inter).half() / 5)
+    gate_layers = [gate] + [copy_to_pinned_tensor(gate * (1 + layer / 4)) for layer in range(1, layers)]
+    down_layers = [down] + [copy_to_pinned_tensor(down / (1 + layer / 4)) for layer in range(1, layers)]
+    runtime.executor = _executor(gate_layers, down_layers, 2) if mode == 'hybrid' else None
+    runtime.expert_cache = OffloadMoeCache(
+        layers, runtime.num_experts, sum(pool_sizes) if pool_sizes is not None else 2,
+        torch.device('cuda'), quant_format='fp16', pool_of_layer=pool_of_layer, pool_sizes=pool_sizes)
+    runtime.expert_cache.set_bank_sources({'gate_up': gate_layers, 'down': down_layers})
     runtime.expert_bytes = 3 * hidden * inter * 2
     runtime.hybrid_max_fetch = fetch
     return gate.cuda(), down.cuda()
@@ -400,21 +465,368 @@ def test_tablemoe_important_cache_and_hybrid_overflow(runtime, mode):
     assert stats['gpu_exact_routes'] + stats['cpu_exact_routes'] == 6
 
 
+@pytest.mark.parametrize("prefill_overlap", [False, True])
+def test_tablemoe_prefill_dispatch_bypasses_native_whole_layer_loading(monkeypatch, prefill_overlap):
+    from freetoken.layers import moe
+
+    batch, result = object(), object()
+    calls = []
+
+    def forward(layer, x, weights, ids, actual_batch):
+        calls.append((layer, len(x), actual_batch))
+        return result
+
+    def reject(*args):
+        pytest.fail("TableMoE must bypass native whole-layer weight loading")
+
+    cache = SimpleNamespace(prefill_overlap=prefill_overlap, materialize_layer=reject, copy_missing=reject)
+    layer = SimpleNamespace(layer_id=3, offload_cache=cache,
+                            tablemoe_runtime=SimpleNamespace(forward=forward), _wait_prefill_overlap=reject)
+    monkeypatch.setattr(moe, "get_global_ctx", lambda: SimpleNamespace(batch=batch))
+    actual = moe.OffloadMoELayer._prefill_routed(
+        layer, torch.zeros(257, 4), torch.ones(257, 2), torch.zeros(257, 2, dtype=torch.int32))
+    assert actual is result
+    assert calls == [(3, 257, batch)]
+
+
 @pytest.mark.parametrize('mode', ['offload', 'hybrid'])
-def test_tablemoe_prefill_fetches_only_important_experts(runtime, mode):
-    _with_gpu_cache(runtime, mode, fetch=0)
-    x = torch.zeros(129, 128, device='cuda', dtype=torch.float16)
+@pytest.mark.parametrize("implementation", ["reference", "optimized", "overlap"])
+def test_tablemoe_prefill_fetches_only_important_experts(runtime, mode, implementation, monkeypatch):
+    if implementation != "reference":
+        runtime = _optimized(runtime, mode, max_extend_tokens=257,
+                             experts_per_group=1 if implementation == "overlap" else 0)
+        batch = _optimized_batch(n=257, prefill=True)
+    else:
+        _with_gpu_cache(runtime, mode, fetch=0)
+        batch = _batch(n=257, prefill=True)
+    calls = []
+    ensure = runtime.expert_cache.ensure_experts_hybrid
+
+    def selected(layer, ids):
+        calls.append(ids.clone())
+        return ensure(layer, ids)
+
+    monkeypatch.setattr(runtime.expert_cache, "ensure_experts_hybrid", selected)
+    monkeypatch.setattr(runtime.expert_cache, "materialize_layer", lambda *_: pytest.fail("whole-layer loading"))
+    x = torch.zeros(257, 128, device='cuda', dtype=torch.float16)
     x[:, 0] = 1
-    ids = torch.tensor([[0, 1]] * 129, device='cuda')
-    w = torch.tensor([[.75, .25]] * 129, device='cuda')
-    runtime.forward(0, x, w, ids, _batch(n=129, prefill=True))
+    ids = torch.tensor([[0, 1]] * 257, device='cuda')
+    w = torch.tensor([[.75, .25]] * 257, device='cuda')
+    runtime.forward(0, x, w, ids, batch)
+    assert len(calls) == 1 and calls[0].shape == ids.shape
+    assert calls[0][:, 0].eq(0).all() and calls[0][:, 1].eq(-1).all()
     stats = runtime.stats()
     assert stats['fetched_experts'] == 1
-    assert stats['gpu_exact_routes'] == 129
+    assert stats['gpu_exact_routes'] == 257
     assert stats['cpu_exact_routes'] == 0
     assert runtime.expert_cache.slot_for_id[0, 1].item() == -1
-    assert stats['offline_hits'] == 129
+    assert stats['offline_hits'] == 257
     assert stats['expert_weight_h2d_bytes'] == runtime.expert_bytes
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized", "overlap"])
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+@pytest.mark.parametrize("initial", ["cold", "partial", "full"])
+def test_per_layer_prefill_more_exact_experts_than_pool_preserves_weights(runtime, implementation, mode, initial):
+    runtime.num_experts = 128
+    pool_args = dict(pool_of_layer=[2, 1, 0], pool_sizes=[64, 64, 64])
+    if implementation == "reference":
+        runtime._prepare_gpu_assets()
+        _with_gpu_cache(runtime, mode, layers=3, **pool_args)
+        rt = runtime
+    else:
+        rt = _optimized(runtime, mode, cache_layers=3,
+                        experts_per_group=16 if implementation == "overlap" else 0, **pool_args)
+    rt.config.tablemoe_prefill_keep_rate = .7
+    rt.config.tablemoe_renormalize_weights = False
+    cache = rt.expert_cache
+    resident = [] if initial == "cold" else ([100] if initial == "partial" else list(range(64, 128)))
+    cache.hybrid_max_fetch = 64
+    for layer in range(3):
+        if resident:
+            cache.ensure_experts_hybrid(layer, torch.tensor([resident], device="cuda", dtype=torch.int32))
+            cache.copy_missing()
+    old_slots, old_usage = cache.slot_for_id.clone(), cache.usage.clone()
+    ids = torch.stack((torch.arange(128), torch.arange(128).roll(-1)), dim=1).cuda()
+    weights = torch.tensor([[.75, .25]] * 128, device="cuda")
+    x = torch.randn(128, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    admitted = 64 - len(resident)
+    expected_resident = set(resident) | set(range(admitted))
+    for chunk in range(2):
+        batch = (_batch if implementation == "reference" else _optimized_batch)(n=128, prefill=True)
+        scores = torch.ones(128, device="cuda") / 128
+        if chunk:
+            scores.zero_()
+            scores[-1] = 1
+        batch.tablemoe_attn_scores = {layer: scores for layer in range(3)}
+        # The next chunk proposes expert 127, but full pools must keep their first-chunk owners.
+        exact = ids < 89 if not chunk else ((ids < 88) | (ids == 127))
+        for layer in range(3):
+            gate, down = (cache.bank_sources[name][layer].cuda().float() for name in ("gate_up", "down"))
+            g, u = torch.einsum("rh,rkih->rki", x.float(), gate[ids]).chunk(2, -1)
+            values = torch.einsum("rki,rkhi->rkh", F.silu(g) * u, down[ids])
+            expected = (values * (weights * exact)[:, :, None]).sum(1).half()
+            actual = rt.forward(layer, x, weights, ids, batch)
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        assert cache.num_indices.item() == 89
+        for layer in range(3):
+            mapping = cache.slot_for_id[layer]
+            assert set(torch.where(mapping >= 0)[0].tolist()) == expected_resident
+            slots = mapping[mapping >= 0].long()
+            assert slots.unique().numel() == 64 and slots.max().item() < 64
+            for expert in expected_resident:
+                slot = mapping[expert].item()
+                for (source, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                    torch.testing.assert_close(view[slot].cpu(), source[layer][expert], atol=0, rtol=0)
+            for expert in resident:
+                slot = old_slots[layer, expert].item()
+                assert mapping[expert].item() == slot
+                base = cache.pool_bases[cache.pool_of_layer[layer]]
+                assert cache.usage[base + slot].item() == old_usage[base + slot].item()
+        if not chunk:
+            first_slots, first_usage = cache.slot_for_id.clone(), cache.usage.clone()
+        else:
+            torch.testing.assert_close(cache.slot_for_id, first_slots, atol=0, rtol=0)
+            torch.testing.assert_close(cache.usage, first_usage, atol=0, rtol=0)
+    assert rt.stats()["fetched_experts"] == 89 * 3 * 2
+    assert rt.stats()["offline_hits"] == 0
+    expected_fill = torch.tensor([[admitted, 0, admitted, 0],
+                                  [0, 128, admitted, len(resident) + 64],
+                                  [0, 128, admitted, len(resident) + 64]], device="cuda")
+    torch.testing.assert_close(rt.prefill_cache_fill_stats, expected_fill, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized", "overlap"])
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+@pytest.mark.parametrize("candidates", ["ranked", "weighted", "single", "replace_inactive",
+                                        "protect_nonexact", "no_exact", "dummy_only_old", "all_dummy_guard"])
+def test_prefill_cache_fill_uses_batch_attention_importance_and_leaves_spare_slots(runtime, implementation, mode, candidates):
+    runtime.num_experts = 6
+    pool_args = dict(pool_of_layer=[2, 1, 0], pool_sizes=[3, 3, 3])
+    if implementation == "reference":
+        runtime._prepare_gpu_assets()
+        _with_gpu_cache(runtime, mode, layers=3, **pool_args)
+        rt = runtime
+    else:
+        rt = _optimized(runtime, mode, cache_layers=3,
+                        experts_per_group=2 if implementation == "overlap" else 0, **pool_args)
+    rt.config.tablemoe_prefill_keep_rate = 1
+    old = candidates in ("replace_inactive", "protect_nonexact", "no_exact", "dummy_only_old", "all_dummy_guard")
+    if old:
+        rt.expert_cache.hybrid_max_fetch = 3
+        for layer in range(3):
+            rt.expert_cache.ensure_experts_hybrid(layer, torch.tensor([[0, 1, 2]], device="cuda", dtype=torch.int32))
+            rt.expert_cache.copy_missing()
+    scores = torch.tensor([.08] * 12 + [.04, .5, .5, 1.], device="cuda")
+    x = torch.randn(16, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    for chunk in range(2 if candidates == "protect_nonexact" else 1):
+        previous_slots = rt.expert_cache.slot_for_id.clone()
+        previous_usage = rt.expert_cache.usage.clone()
+        batch = (_batch if implementation == "reference" else _optimized_batch)(n=16, prefill=True)
+        batch.padded_reqs = [SimpleNamespace(uid=100 + i, table_idx=i, extend_len=n)
+                             for i, n in enumerate((13, 2, 1))]
+        batch.tablemoe_attn_scores = {layer: scores for layer in range(3)}
+        ids = torch.tensor([[0, 1]] * 12 + [[2, 3]] + [[4, 5]] * 3, device="cuda")
+        weights = torch.full((16, 2), .5, device="cuda")
+        keep = torch.ones_like(ids, dtype=torch.bool)
+        protected = set()
+        if candidates in ("single", "replace_inactive", "no_exact", "dummy_only_old", "all_dummy_guard"):
+            ids.fill_(4)
+        if candidates == "weighted":
+            weights[:12] = torch.tensor([.01, .99], device="cuda")
+        if candidates == "protect_nonexact":
+            rt.config.tablemoe_prefill_keep_rate = .5
+            ids[:] = torch.tensor([5, 4] if chunk else [4, 0], device="cuda")
+            weights[:] = torch.tensor([.9, .1], device="cuda")
+            keep[:, 1] = False
+            protected = {4} if chunk else {0}
+        if candidates == "dummy_only_old":
+            ids[-3:-1] = torch.tensor([0, 1], device="cuda")
+            ids[-1] = 2
+            for req in batch.padded_reqs[1:]:
+                req.uid, req.table_idx = -1, getattr(rt, "dummy_slot", 4)
+        if candidates == "all_dummy_guard":
+            for req in batch.padded_reqs:
+                req.uid, req.table_idx = -1, getattr(rt, "dummy_slot", 4)
+            protected = {0, 1, 2}
+        for layer in range(3):
+            if candidates == "no_exact":
+                stage = rt._prefill_stage_for()
+                stage.cache_fill.record(layer, ids, torch.zeros_like(keep), weights, scores)
+                stage.prepare(layer, torch.full_like(ids, -1, dtype=torch.int32))
+                stage.copy()
+                stage.cache_fill.finish_layer(layer)
+                continue
+            gate, down = (rt.expert_cache.bank_sources[name][layer].cuda().float() for name in ("gate_up", "down"))
+            g, u = torch.einsum("rh,rkih->rki", x.float(), gate[ids]).chunk(2, -1)
+            values = torch.einsum("rki,rkhi->rkh", F.silu(g) * u, down[ids])
+            merged = weights * keep
+            merged = merged / merged.sum(-1, keepdim=True).clamp_min(1e-12)
+            expected = (values * merged[:, :, None]).sum(1).half()
+            if implementation != "reference":
+                if candidates == "dummy_only_old":
+                    expected[-3:] = 0
+                elif candidates == "all_dummy_guard":
+                    expected.zero_()
+            actual = rt.forward(layer, x, weights, ids, batch)
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+        # The ranked case makes frequency and attention disagree, with ID 0 winning a cutoff tie.
+        if candidates == "no_exact":
+            expected_ids = set()
+        elif candidates == "all_dummy_guard":
+            expected_ids = {0, 1, 2}
+        elif candidates == "protect_nonexact":
+            expected_ids = {4, 5} if chunk else {0, 4}
+        elif candidates in ("single", "replace_inactive", "dummy_only_old"):
+            expected_ids = {4}
+        else:
+            expected_ids = {1, 4, 5} if candidates == "weighted" else {0, 4, 5}
+        for layer in range(3):
+            mapping = rt.expert_cache.slot_for_id[layer]
+            assert set(torch.where(mapping >= 0)[0].tolist()) == expected_ids
+            assert mapping[mapping >= 0].unique().numel() == len(expected_ids)
+            owners, usage = rt.expert_cache.pool_state(layer)
+            assert set((owners[owners >= 0] % 6).tolist()) == expected_ids
+            assert usage[owners < 0].eq(0).all()
+            for expert in expected_ids:
+                for (source, _), view in zip(rt.expert_cache.banks, rt.expert_cache.pool_bank_views(layer)):
+                    torch.testing.assert_close(view[mapping[expert]].cpu(), source[layer][expert], atol=0, rtol=0)
+            for expert in protected:
+                slot = previous_slots[layer, expert].item()
+                base = rt.expert_cache.pool_bases[rt.expert_cache.pool_of_layer[layer]]
+                assert mapping[expert].item() == slot
+                assert usage[slot].item() == previous_usage[base + slot].item()
+    count = len(expected_ids)
+    expected_fill = torch.tensor([[count, 0, count, 0], [0, count, count, 0], [0, count, count, 0]], device="cuda")
+    if candidates == "protect_nonexact":
+        expected_fill = torch.tensor([[2, 0, 2, 0], [0, 4, 2, 2], [0, 4, 2, 2]], device="cuda")
+    elif candidates == "all_dummy_guard":
+        expected_fill = torch.tensor([[0, 0, 0, 0], [0, 3, 0, 3], [0, 3, 0, 3]], device="cuda")
+    torch.testing.assert_close(rt.prefill_cache_fill_stats, expected_fill, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("implementation,use_graph", [("reference", False), ("optimized", False), ("optimized", True)])
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+@pytest.mark.parametrize("top_h", [0, 1, 2])
+@pytest.mark.parametrize("cache_scope,warm_source", [("unified", "ensure"), ("per-layer", "ensure"),
+                                                       ("per-layer", "prefill"), ("per-layer", "prefill_evicted")])
+def test_decode_exact_routes_include_gpu_cache_hits(runtime, implementation, use_graph, mode, top_h, cache_scope, warm_source):
+    pool_args = dict(cache_layers=2, pool_of_layer=[1, 0], pool_sizes=[2, 2]) if cache_scope == "per-layer" else {}
+    if implementation == "optimized":
+        rt = _optimized(runtime, mode, **pool_args)
+        batch = _optimized_batch()
+    else:
+        rt = runtime
+        _with_gpu_cache(rt, mode, layers=pool_args.pop("cache_layers", 1), **pool_args)
+        batch = _batch()
+    rt.config.tablemoe_decode_keep_k = top_h
+    rt.hybrid_max_fetch = 0
+    cache = rt.expert_cache
+    if cache_scope == "per-layer":
+        for bank in cache.pool_bank_views(1):
+            bank.fill_(float("nan"))
+    warm = torch.tensor([[1]], device="cuda", dtype=torch.int32)
+    if warm_source in ("ensure", "prefill_evicted"):
+        cache.hybrid_max_fetch = 1
+        cache.ensure_experts_hybrid(0, warm)
+        cache.copy_missing()
+    x = torch.zeros(1, rt.hidden, device="cuda", dtype=torch.float16)
+    x[:, 0] = 1
+    ids = torch.tensor([[0, 1]], device="cuda")
+    weights = torch.tensor([[.75, .25]], device="cuda")
+    gate, down = (bank[0].cuda() for bank in (cache.bank_sources["gate_up"], cache.bank_sources["down"]))
+    expert_values = []
+    for expert in range(2):
+        g, u = F.linear(x, gate[expert]).chunk(2, -1)
+        expert_values.append(F.linear(F.silu(g) * u, down[expert]))
+    expected = expert_values[1] if top_h == 0 else (
+        expert_values[0].float() * .75 + expert_values[1].float() * .25).half()
+    if warm_source == "prefill_evicted" and top_h < 2:
+        table_value = torch.zeros_like(x)
+        table_value[:, 0] = 2
+        expected = (expert_values[0].float() * .75 + table_value.float() * .25).half()
+    if use_graph:
+        rt.prepare_batch(batch)
+        batch.tablemoe_slots.fill_(rt.dummy_slot)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            rt.forward(0, x, weights, ids, batch)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out = rt.forward(0, x, weights, ids, batch)
+        rt.reset_capture_state()
+        batch.tablemoe_slots.zero_()
+    if warm_source in ("prefill", "prefill_evicted"):
+        prefill_batch = (_optimized_batch if implementation == "optimized" else _batch)(n=1, prefill=True)
+        prefill_batch.tablemoe_attn_scores = {layer: torch.ones(1, device="cuda") for layer in range(rt.num_layers)}
+        for layer in range(rt.num_layers):
+            prefill_ids = torch.zeros_like(ids) if warm_source == "prefill_evicted" else torch.ones_like(ids)
+            rt.forward(layer, x, weights, prefill_ids, prefill_batch)
+        if warm_source == "prefill_evicted":
+            assert cache.slot_for_id[0, 0].item() >= 0
+            assert cache.slot_for_id[0, 1].item() == -1
+        if implementation == "optimized":
+            rt.reset_capture_state()
+        else:
+            rt._route_counts.zero_()
+            rt._gpu_counts.zero_()
+            rt.counters.clear()
+            rt.online.clear()
+    if use_graph:
+        graph.replay()
+        actual = out.clone()
+    else:
+        actual = rt.forward(0, x, weights, ids, batch).clone()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    stats = rt.stats()
+    assert stats["gpu_cache_hit_routes"] == 1
+    missing_exact = top_h == 2 if warm_source == "prefill_evicted" else top_h > 0
+    assert stats["gpu_exact_routes"] == (2 if missing_exact and mode == "offload" else 1)
+    assert stats["cpu_exact_routes"] == int(missing_exact and mode == "hybrid")
+    assert stats["fetched_experts"] == int(missing_exact and mode == "offload")
+    assert stats["online_hits"] == 0
+    assert stats["offline_hits"] == int(warm_source == "prefill_evicted" and top_h < 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("phase", ["decode", "prefill", "external"])
+@pytest.mark.parametrize("top_h", [0, 1, 4])
+def test_top_h_cache_hits_follow_live_graph_state_and_preserve_phase_masks(phase, top_h):
+    from freetoken.kernel.triton.tablemoe import _prepare_routes
+
+    ids = torch.tensor([[0, 2, 4, 6], [1, 3, 5, 7], [-1, -1, -1, -1]], device="cuda", dtype=torch.int32)
+    request_slots = torch.tensor([0, 1, 99], device="cuda", dtype=torch.int32)
+    slot_for_id = torch.full((2, 8), -1, device="cuda", dtype=torch.int32)
+    keep = torch.empty_like(ids, dtype=torch.bool)
+    hits = torch.empty_like(keep)
+    slots, cpu_ids = torch.empty_like(ids), torch.empty_like(ids)
+    phase_mask = torch.zeros_like(keep)
+    phase_mask[:, 1] = True
+
+    def prepare():
+        keep.copy_(phase_mask)
+        _prepare_routes[(1,)](ids, slots, keep, cpu_ids, hits, slot_for_id, request_slots,
+                              4, top_h, 8, 1, 99, phase == "prefill", True, 256, ids.numel(),
+                              phase == "external")
+
+    prepare()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepare()
+    for resident in ([], [4, 7], [0, 2, 4, 6, 1, 3, 5, 7], [3]):
+        slot_for_id.fill_(-1)
+        if resident:
+            slot_for_id[1, resident] = torch.arange(len(resident), device="cuda", dtype=torch.int32)
+        graph.replay()
+        hit = (slot_for_id[1, ids.long()] >= 0) & (ids >= 0)
+        expected = ((torch.arange(4, device="cuda") < top_h) | hit) if phase == "decode" else phase_mask.clone()
+        expected[-1] = False
+        assert torch.equal(keep, expected)
+        assert torch.equal(hits, expected & hit)
+        assert torch.equal(slots, ids.masked_fill(~expected, -1))
+        assert torch.equal(cpu_ids, slots)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -432,7 +844,8 @@ def test_masked_cache_eviction_does_not_protect_previous_layer():
         assert cache.slot_for_id[1 - layer].tolist() == [-1, -1]
 
 
-def _optimized(runtime, mode="cpu", stats=True, max_extend_tokens=128):
+def _optimized(runtime, mode="cpu", stats=True, max_extend_tokens=128, experts_per_group=0, cache_layers=1,
+               pool_of_layer=None, pool_sizes=None):
     from freetoken.moe.tablemoe_optimized import TableMoeOptimizedRuntime
 
     runtime.__class__ = TableMoeOptimizedRuntime
@@ -442,15 +855,17 @@ def _optimized(runtime, mode="cpu", stats=True, max_extend_tokens=128):
     runtime.config.cuda_graph_bs = [1, 2, 4]
     runtime.config.tablemoe_stats = stats
     runtime.config.tablemoe_prefill_keep_rate = .5
+    runtime.config.tablemoe_prefill_experts_per_group = experts_per_group
     runtime._prepare_gpu_assets()
     if mode != "cpu":
-        _with_gpu_cache(runtime, mode)
+        _with_gpu_cache(runtime, mode, layers=cache_layers, pool_of_layer=pool_of_layer, pool_sizes=pool_sizes)
         runtime.config.model_config.moe_intermediate_size = 64
         # _with_gpu_cache widens the fixture's CPU values, so restore mapped storage.
         from freetoken.kernel.pinned import copy_to_pinned_tensor, device_ptr
 
-        runtime.host_values[0] = copy_to_pinned_tensor(runtime.host_values[0])
-        runtime.value_addresses[0] = device_ptr(runtime.host_values[0])
+        for layer in range(runtime.num_layers):
+            runtime.host_values[layer] = copy_to_pinned_tensor(runtime.host_values[layer])
+            runtime.value_addresses[layer] = device_ptr(runtime.host_values[layer])
     runtime._init_optimized_state()
     return runtime
 
@@ -460,6 +875,179 @@ def _optimized_batch(uid=100, slot=0, n=1, prefill=False):
     batch.padded_reqs[0].table_idx = slot
     batch.tablemoe_slots = None
     return batch
+
+
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+@pytest.mark.parametrize("group_size", [1, 3])
+@pytest.mark.parametrize("resident", [0, 1, 2])
+def test_grouped_prefill_matches_serial_cache_routes_and_online_state(runtime, mode, group_size, resident):
+    rt = _optimized(runtime, mode, max_extend_tokens=257, experts_per_group=group_size)
+    rt.config.tablemoe_prefill_keep_rate = 1
+    cache = rt.expert_cache
+    assert rt.prefill_copy_plan is not None
+    for tokens in (257, 17):
+        x = torch.randn(tokens, rt.hidden, device="cuda", dtype=torch.float16) / 5
+        original = x.clone()
+        ids = torch.tensor([[0, 1]] * tokens, device="cuda")
+        weights = torch.tensor([[.25, .75]] * tokens, device="cuda")
+        states = []
+        for size in (0, group_size):
+            torch.cuda.synchronize()
+            cache.reset()
+            for name, bank in cache.bank_caches.items():
+                bank.fill_(float("nan"))
+                bank[:resident].copy_(cache.bank_sources[name][0][:resident])
+            if resident:
+                slots = torch.arange(resident, device="cuda", dtype=torch.int32)
+                cache.slot_for_id[0, :resident] = slots
+                cache.id_of_slot[:resident] = slots
+            for tensor in rt.fixed_online[0].values():
+                tensor.zero_()
+            rt._route_counts.zero_()
+            rt._gpu_counts.zero_()
+            rt.config.tablemoe_prefill_experts_per_group = size
+            output = rt.forward(0, x, weights, ids, _optimized_batch(n=tokens, prefill=True)).clone()
+            ws = rt._workspace(tokens)
+            state = {name: getattr(cache, name).clone() for name in
+                     ("slot_for_id", "id_of_slot", "usage", "step", "expert_recency", "num_indices")}
+            state.update({"route_" + name: ws[name].clone() for name in
+                          ("keep", "cpu_ids", "cache_hit", "on", "off", "full_slots")})
+            state.update({"online_" + name: value.clone() for name, value in rt.fixed_online[0].items()})
+            state["gpu_counts"] = rt._gpu_counts.clone()
+            states.append((output, state))
+        torch.testing.assert_close(states[0][0], states[1][0], atol=2e-2, rtol=2e-2)
+        assert torch.isfinite(states[1][0]).all()
+        for name in states[0][1]:
+            tolerance = 2e-2 if name == "online_values" else 0
+            torch.testing.assert_close(states[0][1][name], states[1][1][name], atol=tolerance, rtol=tolerance)
+        assert cache.num_indices.item() == 2 - resident
+        torch.testing.assert_close(x, original, atol=0, rtol=0)
+    assert rt.prefill_copy_plan.route_group_storage.numel() == 257 * 2
+
+
+@pytest.mark.parametrize("cache_size", [2, 3])
+@pytest.mark.parametrize("cache_scope", ["unified", "per-layer"])
+def test_grouped_prefill_uses_new_banks_after_cache_rebuild(runtime, cache_size, cache_scope):
+    pool_args = dict(cache_layers=2, pool_of_layer=[1, 0], pool_sizes=[1, 1]) if cache_scope == "per-layer" else {}
+    rt = _optimized(runtime, "offload", experts_per_group=1, **pool_args)
+    rt.config.tablemoe_prefill_keep_rate = 1
+    x = torch.randn(17, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    ids = torch.tensor([[0, 1]] * 17, device="cuda")
+    weights = torch.full((17, 2), .5, device="cuda")
+    batch = _optimized_batch(n=17, prefill=True)
+    batch.tablemoe_attn_scores = {layer: batch.tablemoe_attn_scores[0] for layer in range(rt.num_layers)}
+    expected = rt.forward(0, x, weights, ids, batch).clone()
+    for layer in range(1, rt.num_layers):
+        rt.forward(layer, x, weights, ids, batch)
+    previous = rt.prefill_copy_plan
+    before = rt.resident_gpu_bytes()
+    assert rt.resident_gpu_bytes(cache_size) - before == (cache_size - 2) * (20 if pool_args else 24)
+    old_banks = dict(rt.expert_cache.bank_caches)
+    old_storage = [weakref.ref(bank.untyped_storage()) for bank in old_banks.values()]
+    rt.expert_cache.rebuild(cache_size, [cache_size - 1, 1] if pool_args else None)
+    for name, bank in old_banks.items():
+        assert bank.data_ptr() != rt.expert_cache.bank_caches[name].data_ptr()
+        bank.fill_(float("nan"))
+    del bank, old_banks
+    assert all(storage() is None for storage in old_storage)
+    batch = _optimized_batch(n=17, prefill=True)
+    batch.tablemoe_attn_scores = {layer: batch.tablemoe_attn_scores[0] for layer in range(rt.num_layers)}
+    actual = rt.forward(0, x, weights, ids, batch).clone()
+    for layer in range(1, rt.num_layers):
+        rt.forward(layer, x, weights, ids, batch)
+    assert (rt.prefill_copy_plan is previous) == (cache_size == 2 and not pool_args)
+    assert rt.prefill_copy_plan.slot_groups.numel() == (2 if pool_args else cache_size)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert rt.expert_cache.num_indices.item() == 2
+    if pool_args:
+        for layer in range(rt.num_layers):
+            mapping = rt.expert_cache.slot_for_id[layer]
+            expected_ids = list(range(min(2, rt.expert_cache.pool_slots(layer))))
+            assert torch.where(mapping >= 0)[0].tolist() == expected_ids
+            for expert in expected_ids:
+                for (source, _), bank in zip(rt.expert_cache.banks, rt.expert_cache.pool_bank_views(layer)):
+                    torch.testing.assert_close(bank[mapping[expert]].cpu(), source[layer][expert], atol=0, rtol=0)
+    else:
+        slots = rt.expert_cache.slot_for_id[0].long()
+        for name, bank in rt.expert_cache.bank_caches.items():
+            torch.testing.assert_close(bank[slots].cpu(), rt.expert_cache.bank_sources[name][0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+def test_grouped_prefill_cross_layer_eviction_matches_serial(runtime, mode):
+    from freetoken.kernel.pinned import copy_to_pinned_tensor
+
+    rt = _optimized(runtime, mode, stats=False, experts_per_group=1, cache_layers=2)
+    rt.config.tablemoe_prefill_keep_rate = 1
+    cache = rt.expert_cache
+    cache.set_bank_sources({name: [layers[0], copy_to_pinned_tensor(-layers[0])]
+                            for name, layers in cache.bank_sources.items()})
+    rt.fixed_online[1] = {name: torch.zeros_like(value) for name, value in rt.fixed_online[0].items()}
+    for mod in ("text", "vision"):
+        rt.pca[1, mod] = rt.pca[0, mod]
+    for name in ("gpu_keys", "gpu_counts", "value_offsets", "value_addresses"):
+        getattr(rt, name)[1] = getattr(rt, name)[0]
+    for ws in rt.workspaces.values():
+        for name in ("query", "vision_query"):
+            ws[name][1] = torch.empty_like(ws[name][0])
+    x = torch.randn(17, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    ids = torch.tensor([[0, 1]] * 17, device="cuda")
+    weights = torch.full((17, 2), .5, device="cuda")
+    states = []
+    for group_size in (0, 1):
+        cache.reset()
+        rt.config.tablemoe_prefill_experts_per_group = group_size
+        sequence = []
+        for layer in (0, 1, 0):
+            batch = _optimized_batch(n=17, prefill=True)
+            batch.tablemoe_attn_scores[1] = batch.tablemoe_attn_scores[0]
+            output = rt.forward(layer, x, weights, ids, batch).clone()
+            sequence.append((output, cache.slot_for_id.clone(), cache.id_of_slot.clone(), cache.num_indices.clone()))
+        states.append(sequence)
+    for serial, grouped in zip(*states):
+        for expected, actual in zip(serial, grouped):
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        assert grouped[-1].item() == 2
+
+
+def test_grouped_prefill_drains_copy_stream_when_layer_is_interrupted(runtime, monkeypatch):
+    rt = _optimized(runtime, "offload", experts_per_group=1)
+    calls = []
+    rt.prefill_copy_stream = SimpleNamespace(synchronize=lambda: calls.append("drain"))
+
+    def interrupted(*args):
+        raise RuntimeError("interrupted layer")
+
+    monkeypatch.setattr(rt, "_run_impl", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted layer"):
+        rt._run(0, None, None, None, None, True)
+    assert calls == ["drain"]
+
+
+@pytest.mark.parametrize("mode", ["offload", "hybrid"])
+def test_grouped_prefill_normal_path_needs_no_host_sync_or_route_readback(runtime, monkeypatch, mode):
+    rt = _optimized(runtime, mode, stats=False, experts_per_group=1)
+    x = torch.randn(17, rt.hidden, device="cuda", dtype=torch.float16) / 5
+    ids = torch.tensor([[0, 1]] * 17, device="cuda")
+    weights = torch.full((17, 2), .5, device="cuda")
+    batch = _optimized_batch(n=17, prefill=True)
+    rt.prepare_batch(batch)
+    rt.forward(0, x, weights, ids, batch)
+    torch.cuda.synchronize()
+    rt.expert_cache.reset()
+
+    def reject(*args, **kwargs):
+        pytest.fail("normal grouped Prefill must not synchronize or read routes on the host")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "synchronize", reject)
+        patch.setattr(torch.cuda.Stream, "synchronize", reject)
+        patch.setattr(torch.cuda.Event, "synchronize", reject)
+        for name in ("item", "cpu", "tolist"):
+            patch.setattr(torch.Tensor, name, reject)
+        output = rt.forward(0, x, weights, ids, batch)
+    assert torch.isfinite(output).all()
 
 
 @pytest.mark.parametrize("implementation", ["reference", "optimized"])
@@ -514,7 +1102,7 @@ def test_tablemoe_prefill_modes_decode_phase_rules_and_request_masks(runtime, tm
     rt.tau.fill_(2.)
     rt.config.max_extend_tokens = 256
     rt._init_optimized_state()
-    assert (256 in rt.workspaces) == (mode != "cpu")
+    assert 256 in rt.workspaces
     path = tmp_path / "phase_audit.jsonl"
     rt.config.tablemoe_report_path = str(path)
     rt.audit = RequestAudit(rt)
@@ -534,9 +1122,9 @@ def test_tablemoe_prefill_modes_decode_phase_rules_and_request_masks(runtime, tm
     masks = []
     run = rt._run
 
-    def record_mask(layer, states, route_weights, route_ids, ws, prefill):
+    def record_mask(layer, states, route_weights, route_ids, ws, prefill, attention_scores=None):
         masks.append(ws["keep"].clone())
-        return run(layer, states, route_weights, route_ids, ws, prefill)
+        return run(layer, states, route_weights, route_ids, ws, prefill, attention_scores)
 
     rt._run = record_mask
     result = rt.forward(0, x, weights, ids, batch).clone()
@@ -890,7 +1478,7 @@ def test_optimized_prefill_last_capacity_and_stats_disabled(runtime):
 
 
 @pytest.mark.parametrize("mode", ["offload", "hybrid"])
-def test_optimized_gpu_prefill_unsplit_matches_subchunks(runtime, mode):
+def test_optimized_gpu_prefill_stays_unsplit_and_reuses_cached_exact_experts(runtime, mode):
     n = 257
     runtime.config.tablemoe_prefill_chunk_size = 0
     rt = _optimized(runtime, mode=mode, max_extend_tokens=n)
@@ -902,9 +1490,9 @@ def test_optimized_gpu_prefill_unsplit_matches_subchunks(runtime, mode):
     calls = []
     original_run = rt._run
 
-    def run(layer, inputs, route_weights, route_ids, workspace, prefill):
+    def run(layer, inputs, route_weights, route_ids, workspace, prefill, attention_scores=None):
         calls.append(inputs.shape[0])
-        return original_run(layer, inputs, route_weights, route_ids, workspace, prefill)
+        return original_run(layer, inputs, route_weights, route_ids, workspace, prefill, attention_scores)
 
     rt._run = run
     rt.config.tablemoe_prefill_chunk_size = 0
@@ -917,26 +1505,48 @@ def test_optimized_gpu_prefill_unsplit_matches_subchunks(runtime, mode):
     saved = {key: value.clone() for key, value in cache.items()}
     rt.reset_capture_state()
     calls.clear()
-    rt.config.tablemoe_prefill_chunk_size = 128
     expected = rt.forward(0, x, weights, ids, _optimized_batch(n=n, prefill=True)).clone()
     torch.cuda.synchronize()
-    assert calls == [128, 128, 1]
+    assert calls == [n]
+    assert rt.stats()["fetched_experts"] == 0
+    assert rt.expert_cache.slot_for_id[0, 1].item() == -1
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
     for key in ["keys", "ids", "values", "size", "pointer"]:
         torch.testing.assert_close(cache[key][0], saved[key][0], atol=2e-2, rtol=2e-2)
 
 
-def test_optimized_cpu_prefill_unsplit_respects_executor_capacity(runtime):
-    rt = _optimized(runtime)
-    rt.config.tablemoe_prefill_chunk_size = 0
-    n = rt.executor.max_tokens + 1
+def test_optimized_cpu_prefill_executes_whole_batch(runtime, monkeypatch):
+    n = 257
+    rt = _optimized(runtime, max_extend_tokens=n)
     x = torch.zeros(n, rt.hidden, device="cuda", dtype=torch.float16)
+    x[:, 0] = 1
     ids = torch.tensor([[0, 1]] * n, device="cuda")
     weights = torch.tensor([[.75, .25]] * n, device="cuda")
+    calls = []
+    submit = rt.executor.decode_submit
+
+    def whole(layer, inputs, route_weights, route_ids, **kwargs):
+        calls.append(len(inputs))
+        return submit(layer, inputs, route_weights, route_ids, **kwargs)
+
+    monkeypatch.setattr(rt.executor, "decode_submit", whole)
     actual = rt.forward(0, x, weights, ids, _optimized_batch(n=n, prefill=True))
     torch.cuda.synchronize()
-    assert actual.shape == x.shape
-    assert n not in rt.workspaces
+    assert calls == [n] and actual.shape == x.shape
+    assert n in rt.workspaces
+    torch.testing.assert_close(actual[:, 0], torch.full((n,), .5, device="cuda", dtype=torch.float16))
+
+
+@pytest.mark.parametrize("implementation", ["reference", "optimized"])
+def test_cpu_prefill_rejects_oversized_batch_instead_of_splitting(runtime, implementation):
+    runtime.executor.max_tokens = 128
+    rt = _optimized(runtime) if implementation == "optimized" else runtime
+    x = torch.zeros(129, rt.hidden, device="cuda", dtype=torch.float16)
+    ids = torch.tensor([[0, 1]] * 129, device="cuda")
+    weights = torch.ones(129, 2, device="cuda") / 2
+    batch = _optimized_batch(n=129, prefill=True) if implementation == "optimized" else _batch(n=129, prefill=True)
+    with pytest.raises(ValueError, match="CPU executor capacity"):
+        rt.forward(0, x, weights, ids, batch)
 
 
 def test_optimized_batch_metadata_has_no_gpu_allocation(runtime):
@@ -967,8 +1577,6 @@ def test_gpu_storage_account_deduplicates_views_and_excludes_experts():
 def test_optimized_important_routes_match_fp16_experts(runtime, mode, bs):
     rt = _optimized(runtime, mode)
     rt.config.tablemoe_decode_keep_k = 2
-    # Reallocate the small fixture workspaces for the changed keep-k geometry.
-    rt.workspaces.clear()
     x = torch.randn(bs, 128, device="cuda", dtype=torch.float16) / 5
     ids = torch.tensor([[0, 1]] * bs, device="cuda")
     weights = torch.tensor([[.25, .75]] * bs, device="cuda")
@@ -1056,17 +1664,25 @@ def test_optimized_sparse_threshold_tie_and_all_dropped(runtime):
     assert rt.stats()["all_dropped_tokens"] == 1
 
 
-def test_tablemoe_budget_rejected_before_graph_or_cache_teardown():
+@pytest.mark.parametrize("cache_scope,target,reason", [
+    ("unified", 4096, "old cache kept"), ("per-layer", 4096, "old cache kept"),
+    ("per-layer", 1000, "pools need"),
+])
+def test_tablemoe_budget_rejected_before_graph_or_cache_teardown(cache_scope, target, reason):
     from freetoken.engine.engine import Engine
     from freetoken.kvcache.base import CacheRebuildRejected
 
     engine = Engine.__new__(Engine)
-    engine.config = SimpleNamespace()
-    old_cache = SimpleNamespace(cache_size=3072, validate_rebuild=lambda size: None,
+    engine.config = SimpleNamespace(max_running_req=4,
+                                    model_config=SimpleNamespace(num_experts=128, num_experts_per_tok=8))
+    old_cache = SimpleNamespace(cache_size=3072, validate_rebuild=lambda size, pools: None,
                                 bank_sources={"weights": [torch.empty(1, 4, 4)]})
     engine.moe_offload_cache = old_cache
     engine.linear_state_pool = None
-    engine.tablemoe_runtime = SimpleNamespace(resident_gpu_bytes=lambda size: 123456)
+    engine.tablemoe_runtime = SimpleNamespace(expert_mode="offload", resident_gpu_bytes=lambda size: 123456)
+    engine._moe_pool_groups = [[layer] for layer in range(48)] if cache_scope == "per-layer" else [list(range(48))]
+    engine._moe_slot_limit = None
+    engine._moe_expert_counts, engine._moe_layer_slot_bytes = None, [64] * 48
     engine._baseline_free, engine._weights_bytes, engine.num_pages = 100, 20, 8
     touched = []
     engine.graph_runner = SimpleNamespace(destroy_cuda_graphs=lambda: touched.append("graphs"))
@@ -1076,8 +1692,8 @@ def test_tablemoe_budget_rejected_before_graph_or_cache_teardown():
         raise CacheRebuildRejected("old cache kept")
 
     engine.kv_cache = SimpleNamespace(validate_rebuild=reject)
-    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
-        engine.rebuild_runtime_cache(moe_cache_size=4096)
+    with pytest.raises(CacheRebuildRejected, match=reason):
+        engine.rebuild_runtime_cache(moe_cache_size=target)
     assert engine.moe_offload_cache is old_cache
     assert not touched and not getattr(engine, "rebuild_teardown_started", False)
 
@@ -1151,13 +1767,15 @@ def test_hybrid_graph_rejects_missing_flag_handshake():
                     tablemoe_runtime=runtime)
 
 
-@pytest.mark.parametrize("mode", ["cpu", "hybrid", "offload"])
+@pytest.mark.parametrize("mode,cache_scope", [("cpu", "unified"), ("hybrid", "unified"), ("offload", "unified"),
+                                               ("hybrid", "per-layer"), ("offload", "per-layer")])
 @pytest.mark.parametrize("fetch", [0, 1])
-def test_request_audit_reconciles_native_route_trace_and_slot_reuse(runtime, tmp_path, mode, fetch):
+def test_request_audit_reconciles_native_route_trace_and_slot_reuse(runtime, tmp_path, mode, fetch, cache_scope):
     import json
     from freetoken.moe.tablemoe_stats import RequestAudit, reconcile
 
-    rt = _optimized(runtime, mode)
+    pool_args = dict(cache_layers=3, pool_of_layer=[2, 1, 0], pool_sizes=[2, 2, 2]) if cache_scope == "per-layer" else {}
+    rt = _optimized(runtime, mode, **pool_args)
     rt.hybrid_max_fetch = fetch
     rt.config.tablemoe_report_path = str(tmp_path / "audit.jsonl")
     rt.audit = RequestAudit(rt)
@@ -1167,7 +1785,9 @@ def test_request_audit_reconciles_native_route_trace_and_slot_reuse(runtime, tmp
     weights = torch.tensor([[.25, .75]] * 3, device="cuda")
     batch = _optimized_batch(n=3, prefill=True)
     batch.mm_rows = torch.tensor([0], device="cuda")
-    rt.forward(0, x, weights, ids, batch)
+    batch.tablemoe_attn_scores = {layer: batch.tablemoe_attn_scores[0] for layer in range(rt.num_layers)}
+    for layer in range(rt.num_layers):
+        rt.forward(layer, x, weights, ids, batch)
     independent = dict(cpu=0, gpu=0, on=0, off=0, drop=0)
     for step in range(4):
         rt.forward(0, x[:1], weights[:1], ids[:1], _optimized_batch())
@@ -1188,7 +1808,7 @@ def test_request_audit_reconciles_native_route_trace_and_slot_reuse(runtime, tmp
     assert requests[1]["counters"]["routes"] == 2
     first = requests[0]
     assert first["prompt_vision_tokens"] == 1 and first["prompt_nonvision_tokens"] == 2
-    assert first["counters"]["routes"] == 14
+    assert first["counters"]["routes"] == 6 * rt.num_layers + 8
     assert reconcile(first["counters"])
     decode = next(r["counters"] for r in first["rows"] if r["phase"] == "decode")
     assert [decode[k] for k in ("cpu_exact_routes", "gpu_exact_routes", "online_hits", "offline_hits", "dropped_routes")] == list(independent.values())
@@ -1198,6 +1818,26 @@ def test_request_audit_reconciles_native_route_trace_and_slot_reuse(runtime, tmp
     assert summary["type"] == "run_summary"
     assert summary["total_io_bytes"] == sum(r["total_io_bytes"] for r in records if r["type"] in ("request", "batch_shared"))
     assert summary["shared_counters"]["expert_weight_h2d_bytes"] == summary["shared_counters"]["fetched_experts"] * rt.expert_bytes
+    if cache_scope == "per-layer":
+        shared = [r for r in records if r["type"] == "batch_shared"]
+        fills = [row for record in shared for row in record["rows"] if row["expert_fetch_target"] == "decode_cache_fill"]
+        for layer in range(3):
+            counters = [row["counters"] for row in fills if row["layer"] == layer]
+            assert sum(c["prefill_cache_new_admissions"] for c in counters) == 1
+            assert sum(c["prefill_cache_restored_experts"] for c in counters) == 0
+            assert sum(c["prefill_cache_fill_d2d_experts"] for c in counters) == int(layer < 2)
+            assert sum(c["prefill_cache_fill_h2d_experts"] for c in counters) == int(layer == 2)
+        assert {row["direction"] for fill in fills for row in fill["io"]} == {"h2d", "d2d"}
+        assert summary["shared_counters"]["prefill_cache_fill_h2d_bytes"] == rt.expert_bytes
+        assert summary["shared_counters"]["prefill_cache_fill_d2d_bytes"] == 2 * rt.expert_bytes
+        assert summary["total_device_io_bytes"] == sum(r["total_device_io_bytes"] for r in shared) == 2 * rt.expert_bytes
+        for row in shared[-1]["gpu_cache_occupancy"]:
+            layer, pool = row["layer"], row["pool"]
+            occupied = int((rt.expert_cache.pool_state(layer)[0] >= 0).sum())
+            assert pool == rt.expert_cache.pool_of_layer[layer]
+            assert row["resident_experts"] == int((rt.expert_cache.slot_for_id[layer] >= 0).sum())
+            assert row["pool_occupied_slots"] == occupied
+            assert row["pool_empty_slots"] == row["pool_slots"] - occupied
 
 
 @pytest.mark.parametrize("mode", ["offload", "hybrid"])

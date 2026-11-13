@@ -690,6 +690,81 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
         bf16.validate_rebuild(3)  # below the num_experts floor
 
 
+@pytest.mark.parametrize("cache_size,pool_sizes", [(3, [1, 2]), (8, [2, 2]), (8, [0, 8]), (8, [8])])
+def test_rejected_pool_rebuild_preserves_live_cache(cache_size, pool_sizes):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(2, 4, 8, torch.device("cpu"), pool_of_layer=[0, 1], pool_sizes=[4, 4])
+    cache.set_bank_sources({"gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+                            "down": [torch.randn(4, 8, 16) for _ in range(2)]})
+    cache.slot_for_id[1, 2] = 1
+    cache.id_of_slot[5] = 6
+    cache.usage[5] = 17
+    for bank in cache.bank_caches.values():
+        bank.fill_(.25)
+    banks = dict(cache.bank_caches)
+    state = [cache.slot_for_id.clone(), cache.id_of_slot.clone(), cache.usage.clone()]
+    with pytest.raises((ValueError, AssertionError)):
+        cache.rebuild(cache_size, pool_sizes)
+    assert cache.cache_size == 8 and cache.pool_sizes == [4, 4]
+    for name, before in banks.items():
+        assert cache.bank_caches[name] is before
+        assert cache.bank_caches[name].eq(.25).all()
+    for actual, before in zip((cache.slot_for_id, cache.id_of_slot, cache.usage), state):
+        torch.testing.assert_close(actual, before, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("target", ["gpu", "hybrid", "hybrid_cpu_ids"])
+def test_slot_pools_keep_each_layer_weights_and_invalidate_staging_overlap(target):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(19)
+    num_layers, num_experts, sizes = 3, 16, [5, 7, 20]
+    sources = {
+        "gate_up": [torch.randn(num_experts, 64, 32, dtype=torch.bfloat16).pin_memory() for _ in range(num_layers)],
+        "down": [torch.randn(num_experts, 32, 32, dtype=torch.bfloat16).pin_memory() for _ in range(num_layers)],
+    }
+    cache = OffloadMoeCache(
+        num_layers, num_experts, sum(sizes), torch.device("cuda"),
+        decode_target="gpu" if target == "gpu" else "hybrid", hybrid_max_fetch=num_experts,
+        pool_of_layer=[0, 1, 2], pool_sizes=sizes)
+    cache.set_bank_sources(sources)
+    for _ in range(8):
+        for layer in range(num_layers):
+            before = cache.slot_for_id.clone()
+            experts = torch.randperm(num_experts)[:2 if target == "gpu" else 8].to(torch.int32)
+            slots = experts.clone() if target == "hybrid_cpu_ids" else experts.cuda()
+            if target == "gpu":
+                cache.ensure_experts(layer, slots)
+            else:
+                cache.ensure_experts_hybrid(layer, slots)
+            cache.copy_missing()
+            for other in set(range(num_layers)) - {layer}:
+                torch.testing.assert_close(cache.slot_for_id[other], before[other], atol=0, rtol=0)
+            resident = [(e, s) for e, s in zip(experts.tolist(), slots.tolist()) if s >= 0]
+            assert len({s for _, s in resident}) == len(resident)
+            for expert, slot in resident:
+                assert slot < sizes[layer]
+                for (source, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                    torch.testing.assert_close(view[slot].cpu(), source[layer][expert], atol=0, rtol=0)
+    before = cache.slot_for_id.clone()
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    for (source, _), stage in zip(cache.banks, cache.stage_views(1, 0)):
+        torch.testing.assert_close(stage.cpu(), source[1], atol=0, rtol=0)
+    for layer in range(num_layers):
+        for expert, slot in enumerate(before[layer].tolist()):
+            if slot < 0:
+                continue
+            absolute = cache.pool_bases[layer] + slot
+            assert cache.slot_for_id[layer, expert].item() == (slot if absolute >= num_experts else -1)
+            if absolute >= num_experts:
+                for (source, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                    torch.testing.assert_close(view[slot].cpu(), source[layer][expert], atol=0, rtol=0)
+
+
 def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency

@@ -25,11 +25,12 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
     downstream GEMM depends on.
     """
+    id_of_slot, usage = cache.pool_state(layer_id)
     lru_ensure(
         expert_ids,
         cache.slot_for_id.view(-1),
-        cache.id_of_slot,
-        cache.usage,
+        id_of_slot,
+        usage,
         cache.step,
         expert_ids,
         cache.src_indices,
@@ -60,13 +61,13 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
-def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
+def prefill_hit_compact(cache, layer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
-    hit = slot_for_id[layer_id][e] >= 2 * num_experts (the double buffer owns the
+    hit = slot_for_id[layer_id][e] >= the pool's staging threshold (the double buffer owns the
     slots below, so those bytes are volatile within a prefill chunk and classify
     as miss). Writes fixed-shape ``_prefill_hit_dst``/``_prefill_hit_src`` (buffer
-    row / cache slot) and the count into ``_prefill_hit_num``; one launch on the
+    row / pool-local slot) and the count into ``_prefill_hit_num``; one launch on the
     current stream, no host sync. Safe against the concurrent buffer invalidation
     on the copy stream: that only rewrites entries already below the threshold."""
     num_experts = cache.num_experts
@@ -75,15 +76,23 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
         cache._prefill_hit_dst,
         cache._prefill_hit_src,
         cache._prefill_hit_num,
-        buffer_id * num_experts,
-        2 * num_experts,
+        cache._pool_stable_from[cache.pool_of_layer[layer_id]],
         num_experts,
         BLOCK=triton.next_power_of_2(num_experts),
     )
 
 
 def materialize_layer(cache, layer_id: int) -> None:
-    _materialize_layer_gpu(cache, layer_id)
+    if len(cache.pool_sizes) == 1:
+        _materialize_layer_gpu(cache, layer_id)
+        return
+    # staging buffer 0 may overlap several pools, so it only holds the layer for this forward and registers nothing
+    E = cache.num_experts
+    cache._invalidate_prefill_buffer(0)
+    rows = torch.arange(E, dtype=torch.int32, device=cache.device)
+    cache.evict_slots[:E].copy_(rows)
+    cache.src_indices[:E].copy_(rows)
+    cache.num_indices.fill_(E)
 
 
 def reset_cache(cache) -> None:
@@ -97,14 +106,16 @@ def reset_cache(cache) -> None:
 def _ensure_experts_hybrid_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
+    id_of_slot, usage = cache.pool_state(layer_id)
+    num_slots = id_of_slot.numel()
     block_e = triton.next_power_of_2(cache.num_experts)
-    block_c = triton.next_power_of_2(cache.cache_size)
+    block_c = triton.next_power_of_2(num_slots)
     num_warps = 8 if block_c >= 2048 else 4
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
-        cache.id_of_slot,
-        cache.usage,
+        id_of_slot,
+        usage,
         cache.step,
         cache.active_mask,
         cache.evict_slots,
@@ -117,7 +128,7 @@ def _ensure_experts_hybrid_gpu(
         int(max_fetch),
         int(frac_q16),
         cache.num_experts,
-        cache.cache_size,
+        num_slots,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
@@ -144,10 +155,12 @@ def _ensure_experts_hybrid_cpu(
     for expert in seen:
         cache.active_mask[expert] = 1
 
+    id_of_slot, pool_usage = cache.pool_state(layer_id)
+    num_slots = id_of_slot.numel()
     for expert in seen:
         slot = int(cache.slot_for_id[layer_id, expert].item())
         if slot != -1:
-            cache.usage[slot] = step
+            pool_usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
     if _HYBRID_FETCH_BY_RECENCY:
@@ -160,20 +173,24 @@ def _ensure_experts_hybrid_cpu(
         lo = (m * frac_q16) >> 16
         cost = lambda f: max(f * (q - frac_q16), (m - f) * frac_q16)  # noqa: E731
         max_fetch = lo if cost(lo) <= cost(lo + 1) else lo + 1
-    num_fetch = min(len(missing), int(max_fetch))
+    num_hits = len(seen) - len(missing)
+    num_fetch = min(len(missing), int(max_fetch), num_slots - num_hits)
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
 
-    usage = cache.usage.tolist()
+    usage = pool_usage.tolist()
+    active_ids = {layer_id * cache.num_experts + expert for expert in seen}
+    victims = [slot for slot in range(num_slots) if int(id_of_slot[slot].item()) not in active_ids]
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
-        old_id = int(cache.id_of_slot[victim].item())
+        victim = min(victims, key=lambda s: (usage[s], s))
+        victims.remove(victim)
+        old_id = int(id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
-        cache.id_of_slot[victim] = layer_id * cache.num_experts + expert
+        id_of_slot[victim] = layer_id * cache.num_experts + expert
         cache.slot_for_id[layer_id, expert] = victim
-        cache.usage[victim] = step
+        pool_usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = expert  # layer-local row
@@ -288,7 +305,7 @@ def _materialize_layer_kernel(
 
 
 
-@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
+@triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16", "cache_size", "id_of_slot_ptr", "usage_ptr"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
     slot_for_id_ptr,
@@ -306,7 +323,7 @@ def _ensure_experts_hybrid_kernel(
     max_fetch,
     fetch_frac_q16,
     num_experts: tl.constexpr,
-    cache_size: tl.constexpr,
+    cache_size,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
@@ -353,10 +370,11 @@ def _ensure_experts_hybrid_kernel(
             (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
         )
         max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
-    num_fetch = tl.minimum(num_missing, max_fetch)
+    is_hit = is_active & (slot >= 0)
+    # a pool smaller than num_experts may hold fewer free slots than misses
+    num_fetch = tl.minimum(tl.minimum(num_missing, max_fetch), cache_size - tl.sum(is_hit.to(tl.int32)))
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
     tl.store(num_indices_ptr, num_fetch.to(tl.int64))
-    is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
     # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
@@ -411,14 +429,13 @@ def _ensure_experts_hybrid_kernel(
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 
 
-@triton.jit(do_not_specialize=["buffer_base"])
+@triton.jit(do_not_specialize=["threshold"])
 def _prefill_hit_compact_kernel(
     slot_ptr,     # [num_experts] int32: this layer's slot_for_id row
-    dst_ptr,      # [num_experts] int32 out: buffer rows, compacted
-    src_ptr,      # [num_experts] int32 out: cache slots, compacted
+    dst_ptr,      # [num_experts] int32 out: buffer rows (expert ids), compacted
+    src_ptr,      # [num_experts] int32 out: pool-local slots, compacted
     num_ptr,      # [1] int64 out: hit count
-    buffer_base,  # buffer_id * num_experts
-    threshold,    # 2 * num_experts
+    threshold,    # first pool-local slot outside the staging buffers
     num_experts,
     BLOCK: tl.constexpr,
 ):
@@ -427,6 +444,6 @@ def _prefill_hit_compact_kernel(
     slots = tl.load(slot_ptr + offs, mask=lane, other=-1)
     is_hit = lane & (slots >= threshold)
     pos = tl.cumsum(is_hit.to(tl.int32)) - 1
-    tl.store(dst_ptr + pos, (buffer_base + offs).to(tl.int32), mask=is_hit)
+    tl.store(dst_ptr + pos, offs.to(tl.int32), mask=is_hit)
     tl.store(src_ptr + pos, slots, mask=is_hit)
     tl.store(num_ptr, tl.sum(is_hit.to(tl.int64)))

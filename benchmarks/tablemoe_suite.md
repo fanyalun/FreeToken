@@ -61,9 +61,66 @@ weight-layout rules; a whole expert layer is never loaded onto the GPU.
 
 Defaults: Qwen3-VL-30B-A3B-Instruct, FP16, TP=1; table/full hybrid eager/Graph;
 3,072 GPU expert slots, fetch cap 0, 65,536 KV pages, page size 1, Graph max batch 4;
-keep rate 0.6, decode keep-k 4, online capacity 64. Full control uses keep rate 1 and
+prefill keep rate 0.6, decode Top-h 1 plus GPU expert-cache hits, online capacity 64.
+The keep rate controls prefill only. Decode's `decode_keep_k` configuration field
+sets h independently; `--tablemoe-decode-top-h` and the legacy
+`--tablemoe-decode-keep-k` are aliases. Cache hits are sampled before the current
+step's fetch/eviction; remaining routes query online then offline tables and retain
+the existing miss/drop and weight rules. Full control uses keep rate 1 and
 keep-k 8, bypasses lookup/online maintenance and needs no PCA or offline assets.
 Budgets are explicit; the suite does not reduce them after an allocation failure.
+
+`moe_cache_scope` defaults to `unified`; set it to `per-layer` with
+`gpu_expert_slots: 3072` and `moe_cache_split: "equal"` for 64 persistent slots per
+MoE layer on this model. These settings are passed explicitly to the server and
+recorded with the run. `moe_cache_split: "profile:/path/profile.json"` uses the
+upstream per-layer expert-count allocation policy. The slot budget is total, not
+per layer; TableMoE continues to require explicit slots rather than auto, rate or
+byte sizing.
+
+TableMoE prefill bypasses native whole-layer expert materialization. It selects
+exact experts over each request's entire scheduled prefill span, masks table routes
+before cache planning, and fetches only missing exact experts. There is no internal
+128-token split or optional subchunking in either implementation. The legacy
+`--tablemoe-prefill-chunk-size` option accepts only 0. CPU execution reserves capacity
+for `max-extend-tokens`; the scheduler's token budget still controls admission.
+This removes table-routed expert-weight IO, while mapped offline-value reads remain.
+
+With `per-layer`, Prefill copies selected exact experts into a full-layer staging
+view rather than trying to retain the entire selection in the smaller Decode
+pool. For example, a 0.7 keep rate can select 89 of 128 active experts while a
+layer has 64 persistent slots. After each layer computes, residents activated
+by any real router route in the current scheduled batch keep their slots and
+LRU usage, including residents whose current routes use tables. Inactive old
+residents are removed. Empty slots and these reclaimed slots are filled from
+the exact experts in descending attention importance, defined as
+the sum of router weight times last-token attention over that scheduled batch.
+Ties use ascending expert ID. Admission stops at capacity; fewer candidates
+leave empty slots. Every subsequent chunk recomputes the protected active set
+and can reclaim old residents that it no longer activates. Dummy padding does
+not count as activation, and an all-dummy warmup does not evict the real cache.
+
+Staging reuses the front of the existing bank arena. Pools outside that area
+receive device-to-device admission copies after their layer. Any pool that
+overlaps staging is deferred until the last MoE layer releases the staging
+area, then restored from Host banks, preserving only its activated old residents
+and adding candidates into empty or reclaimed slots. Inactive old experts are
+not restored. This keeps the expert-weight
+GPU budget fixed. The audit distinguishes staging H2D, restoration/admission H2D
+and admission D2D traffic. Prefill group overlap remains available on the
+optimized path. This admission policy changes Decode cache hits and therefore
+can change Top-h-plus-hit outputs; use fresh results for quality comparisons.
+
+Decode online lookup scores request-owned keys directly on the GPU, fusing the
+optional FP16 cosine normalization without gathering a dense key workspace.
+Offload overlaps the full lookup chain with expert loading/computation and joins
+before output merge. Hybrid submits CPU routes before GPU lookup, overlaps offline
+value reads with GPU experts, and retains its flag-handshake Graph branch layout.
+No host synchronization or lookup-decision readback is added to the hot path.
+`--moe-hybrid-max-fetch 0` keeps missing Top-h routes on the CPU; cached routes run
+on the GPU. Offload always loads missing Top-h experts onto the GPU, including
+when that fetch-cap flag is zero. Offline values remain mapped CPU memory and
+their reads are logical PCIe traffic performed by the GPU lookup kernel.
 
 Dataset defaults: MMBench_DEV_EN_V11, ScienceQA_TEST, AI2D_TEST, POPE, RealWorldQA.
 The default seeded split assigns 70% of connected groups to calibration and the

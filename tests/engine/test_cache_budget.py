@@ -503,3 +503,25 @@ def test_uncapped_platform_stays_uncapped(monkeypatch):
     if hasattr(os, "uname") and "microsoft" in os.uname().release.lower():
         pytest.skip("WSL caps pinning")
     assert _pin_budget_bytes(reserved=2**30) is None
+
+
+def test_moe_slot_pool_split_respects_per_layer_capacity_and_profile(tmp_path):
+    import json
+
+    from freetoken.moe.pool_policy import group_layers, load_profile, make_pools, split_slots
+
+    pools = make_pools(group_layers("per-layer", [0] * 4, [1] * 4), 16, 8, None)
+    assert split_slots(41, pools) == [11, 10, 10, 10]
+    for total in (31, 65):
+        with pytest.raises(ValueError):
+            split_slots(total, pools)
+    counts = [[5] * 2 + [0] * 14, [3] * 8 + [1] * 8, [1] * 16, [1] * 16]
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({"model": "toy", "expert_counts": counts}))
+    profile = load_profile(path, 4, 16)
+    assert split_slots(48, pools, profile) == [8, 8, 16, 16]
+    torch.testing.assert_close(profile.sum(1), torch.ones(4, dtype=profile.dtype))
+    with pytest.raises(ValueError, match="needs"):
+        load_profile(path, 4, 32)
+    unified = make_pools(group_layers("unified", [0] * 4, [1] * 4), 16, 8, None)
+    assert split_slots(100, unified) == [100]

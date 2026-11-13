@@ -180,7 +180,7 @@ def test_policy_requires_calibration_and_explicit_backend():
         prepare_modes_config(SimpleNamespace(moe_policy="modes", moe_strategy="cpu", modes_config=None))
 
 
-@pytest.mark.parametrize("flag", ["--tablemoe-prefill-keep-rate", "--tablemoe-decode-keep-k"])
+@pytest.mark.parametrize("flag", ["--tablemoe-prefill-keep-rate", "--tablemoe-decode-keep-k", "--tablemoe-decode-top-h"])
 @pytest.mark.parametrize("policy", ["modes", "modes_tablemoe"])
 def test_cli_rejects_explicit_tablemoe_selection(policy, flag, capsys):
     from freetoken.server.args import parse_args
@@ -311,7 +311,8 @@ def test_modes_constructor_loads_checkpoint_and_policy_assets(tmp_path, monkeypa
         dtype=torch.float16, tp_info=SimpleNamespace(size=1), model_path=str(model),
         use_dummy_weight=False, moe_cache_size=0 if mode == "cpu" else 2,
         moe_cache_rate=None, moe_cache_auto=False, moe_cpu_layers=None, moe_cpu_threads=2,
-        moe_hybrid_max_fetch=0, moe_cache_policy="lru", max_running_req=2, max_extend_tokens=128,
+        moe_hybrid_max_fetch=0, moe_cache_policy="lru", max_running_req=2,
+        max_extend_tokens=257 if mode == "cpu" else 128,
         cuda_graph_bs=[], cuda_graph_max_bs=0,
         tablemoe_pca_dir=None, tablemoe_cache_dir=None, tablemoe_convert_bf16_weights=False,
         tablemoe_expert_mode=mode, tablemoe_implementation="optimized", tablemoe_skip_lookup=False,
@@ -346,6 +347,8 @@ def test_modes_constructor_loads_checkpoint_and_policy_assets(tmp_path, monkeypa
         assert rt.lookup_enabled(True) == (prefill_policy == "tablemoe")
         assert rt.lookup_enabled(False) == (policy == "modes_tablemoe")
         assert (rt.expert_cache is None) == (mode == "cpu")
+        if mode == "cpu":
+            assert rt.executor.max_tokens >= cfg.max_extend_tokens
         x = torch.randn(1, hidden, device="cuda", dtype=torch.float16) / 5
         ids = torch.tensor([[0, 1]], device="cuda")
         weights = torch.tensor([[.25, .75]], device="cuda")

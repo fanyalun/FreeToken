@@ -49,7 +49,8 @@ def validate_tablemoe_config(config) -> None:
     mode = getattr(config, "tablemoe_expert_mode", "cpu")
     if mode not in ("cpu", "offload", "hybrid"):
         raise ValueError("invalid TableMoE expert mode")
-    if config.moe_cache_rate is not None or config.moe_cache_auto:
+    if (config.moe_cache_rate is not None or config.moe_cache_auto or
+            getattr(config, "moe_cache_mem", None) is not None):
         raise ValueError("tablemoe requires explicit --moe-cache-size for GPU experts")
     if mode == "cpu" and config.moe_cache_size:
         raise ValueError("TableMoE CPU mode does not use a GPU expert slot cache")
@@ -75,10 +76,12 @@ def validate_tablemoe_config(config) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must name an existing directory")
     if not 0 < config.tablemoe_prefill_keep_rate <= 1:
         raise ValueError("tablemoe prefill keep rate must be in (0, 1]")
-    if getattr(config, "tablemoe_prefill_chunk_size", 0) < 0:
-        raise ValueError("tablemoe prefill chunk size must be nonnegative")
+    if getattr(config, "tablemoe_prefill_chunk_size", 0) != 0:
+        raise ValueError("TableMoE prefill runs without internal splitting; prefill chunk size must be 0")
+    if getattr(config, "tablemoe_prefill_experts_per_group", 0) < 0:
+        raise ValueError("TableMoE prefill experts per group must be nonnegative")
     if not 0 <= config.tablemoe_decode_keep_k <= mc.num_experts_per_tok:
-        raise ValueError("tablemoe decode keep k is out of range")
+        raise ValueError("tablemoe decode top h is out of range")
     if config.tablemoe_online_cache_size < 0:
         raise ValueError("tablemoe online cache size must be nonnegative")
     thresholds = [config.tablemoe_offline_cosine_threshold_vision,
@@ -160,19 +163,38 @@ class TableMoeRuntime:
             self.executor = CpuMoeExecutor(
                 banks, top_k=mc.num_experts_per_tok, activation="silu",
                 apply_router_weight_on_input=False, num_threads=config.moe_cpu_threads,
-                max_tokens=max(128, config.max_running_req), device=self.device, fmt="fp16_routes",
+                max_tokens=max(128, config.max_running_req,
+                               config.max_extend_tokens if self.expert_mode == "cpu" else 0),
+                device=self.device, fmt="fp16_routes",
             )
         self.expert_cache = None
+        self._prefill_stage_plan = None
+        self.prefill_cache_fill_stats = None
         self.hybrid_max_fetch = max(0, config.moe_hybrid_max_fetch)
         if self.expert_mode != "cpu":
-            from freetoken.moe.offload_cache import OffloadMoeCache
+            from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
+            from freetoken.moe.pool_policy import group_layers, make_pools, pool_of_layer, resolve_profile, split_slots
+
+            slot_bytes = [sum(bank[layer][0].numel() * bank[layer].element_size()
+                              for bank in banks.bank_sources.values()) for layer in range(self.num_layers)]
+            self.cache_pool_groups = group_layers(getattr(config, "moe_cache_scope", "unified"),
+                                                  bank_layouts(banks.bank_sources), slot_bytes)
+            batch = config.max_running_req if self.expert_mode == "offload" else 1
+            self.cache_pool_specs = make_pools(self.cache_pool_groups, self.num_experts,
+                                               min(self.num_experts, mc.num_experts_per_tok * batch), None)
+            self.cache_pool_counts = resolve_profile(getattr(config, "moe_cache_split", "equal"),
+                                                     config.model_path, self.num_layers, self.num_experts)
+            pool_sizes = split_slots(config.moe_cache_size, self.cache_pool_specs, self.cache_pool_counts)
 
             self.expert_cache = OffloadMoeCache(
                 self.num_layers, self.num_experts, config.moe_cache_size, self.device,
                 cache_policy=config.moe_cache_policy, quant_format="fp16",
-                prefill_overlap=False,
+                prefill_overlap=False, pool_of_layer=pool_of_layer(self.cache_pool_specs, self.num_layers),
+                pool_sizes=pool_sizes,
             )
             self.expert_cache.set_bank_sources(banks.bank_sources)
+            if self._uses_prefill_staging():
+                self._prefill_stage_for()
             if self.expert_mode == "hybrid" and config.moe_hybrid_max_fetch < 0:
                 self.hybrid_max_fetch = 1
                 logger.info("TableMoE hybrid FP16: automatic fetch cap falls back to 1; override --moe-hybrid-max-fetch")
@@ -422,7 +444,50 @@ class TableMoeRuntime:
                  "lookup_metadata_d2h_bytes", "lookup_host_waits")
         stats.update({name: self.counters[name] for name in names})
         stats["expert_weight_h2d_bytes"] = gpu[2] * self.expert_bytes
+        stats.update(self._prefill_cache_fill_counters())
+        stats["expert_weight_total_h2d_bytes"] = (stats["expert_weight_h2d_bytes"] +
+                                                  stats["prefill_cache_fill_h2d_bytes"])
         return stats
+
+    def _prefill_cache_fill_counters(self):
+        from freetoken.moe.tablemoe_stats import prefill_cache_fill_counters
+
+        stats = getattr(self, "prefill_cache_fill_stats", None)
+        values = stats.sum(0).cpu().tolist() if stats is not None else [0, 0, 0, 0]
+        return prefill_cache_fill_counters(values, self.expert_bytes)
+
+    def _uses_prefill_staging(self):
+        return self.expert_cache is not None and len(getattr(self.expert_cache, "pool_sizes", ())) > 1
+
+    def _prefill_cache_fill_enabled(self):
+        return self._uses_prefill_staging() and getattr(self, "prefill_uses_tablemoe", True)
+
+    def _prefill_stage_for(self):
+        from freetoken.moe.tablemoe_prefill_io import SparsePrefillStage
+
+        cache = self.expert_cache
+        plan = getattr(self, "_prefill_stage_plan", None)
+        pointers = tuple(bank.data_ptr() for bank in cache.bank_caches.values())
+        if plan is None or plan.cache is not cache or plan.bank_pointers != pointers:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("TableMoE prefill stage must be prepared before graph capture")
+            stats = getattr(self, "prefill_cache_fill_stats", None)
+            if stats is not None and tuple(stats.shape) != (cache.num_layers, 4):
+                stats = None
+            self._prefill_stage_plan = plan = SparsePrefillStage(cache, stats)
+            self.prefill_cache_fill_stats = plan.cache_fill.stats
+        return plan
+
+    def _finish_prefill_cache_fill(self, layer):
+        if self._prefill_cache_fill_enabled():
+            self._prefill_stage_for().cache_fill.finish_layer(layer)
+        else:
+            self.expert_cache.release_prefill_layer(layer)
+
+    def on_expert_cache_rebuild(self):
+        self._prefill_stage_plan = None
+        if self._uses_prefill_staging():
+            self._prefill_stage_for()
 
     def _split_important(self, layer, ids, keep, prefill):
         if self.expert_cache is None:
@@ -430,9 +495,12 @@ class TableMoeRuntime:
         cache = self.expert_cache
         slots = ids.masked_fill(~keep, -1).to(torch.int32).contiguous()
         hit = keep & (cache.slot_for_id[layer, ids.long()] >= 0)
-        cache.hybrid_max_fetch = (self.num_experts if prefill or self.expert_mode == "offload"
-                                  else self.hybrid_max_fetch)
-        cache.ensure_experts_hybrid(layer, slots)
+        if prefill and self._uses_prefill_staging():
+            self._prefill_stage_for().prepare(layer, slots)
+        else:
+            cache.hybrid_max_fetch = (self.num_experts if prefill or self.expert_mode == "offload"
+                                      else self.hybrid_max_fetch)
+            cache.ensure_experts_hybrid(layer, slots)
         on_gpu = keep & (slots >= 0)
         if self.stats_enabled:
             self._gpu_counts[0] += on_gpu.sum()
@@ -440,20 +508,28 @@ class TableMoeRuntime:
             self._gpu_counts[2] += cache.num_indices.squeeze()
         return slots, keep & ~on_gpu
 
-    def _gpu_important(self, x, slots, prefill):
+    def _gpu_important(self, layer, x, slots, prefill):
         from freetoken.moe.fused import fused_experts_impl, fused_experts_decode_impl
 
         cache = self.expert_cache
-        cache.copy_missing()
+        if prefill and self._uses_prefill_staging():
+            stage = self._prefill_stage_for()
+            stage.copy()
+            gate_up, down = stage.views
+        else:
+            cache.copy_missing()
+            gate_up, down = cache.pool_bank_views(layer)
         function = fused_experts_impl if prefill else fused_experts_decode_impl
         return function(
-            x.contiguous(), cache.bank_caches["gate_up"], cache.bank_caches["down"],
+            x.contiguous(), gate_up, down,
             torch.ones_like(slots, dtype=torch.float32), slots,
             return_routes=True,
         )
 
     def forward(self, layer_id: int, hidden_states: torch.Tensor, weights: torch.Tensor,
                 ids: torch.Tensor, batch) -> torch.Tensor:
+        if self.expert_mode == "cpu" and hidden_states.shape[0] > self.executor.max_tokens:
+            raise ValueError("TableMoE batch exceeds CPU executor capacity; increase --max-extend-tokens")
         ids = ids.long()
         exact = torch.zeros_like(ids, dtype=torch.bool)
         spans = []
@@ -471,6 +547,9 @@ class TableMoeRuntime:
             offset += n
         if offset != hidden_states.shape[0]:
             raise ValueError("TableMoE batch rows do not match requests")
+        if not batch.is_prefill and self.expert_cache is not None:
+            # Snapshot hits before this batch can fetch or evict expert weights.
+            exact |= self.expert_cache.slot_for_id[layer_id, ids] >= 0
         modality = None
         if batch.is_prefill and batch.mm_rows is not None:
             modality = torch.ones(offset, dtype=torch.int32, device=hidden_states.device)
@@ -478,52 +557,55 @@ class TableMoeRuntime:
 
         outputs = torch.zeros((*ids.shape, self.hidden), dtype=hidden_states.dtype, device=hidden_states.device)
         survived = exact.clone()
+        if batch.is_prefill and self._prefill_cache_fill_enabled():
+            real_rows = torch.ones(ids.shape[0], device=ids.device, dtype=torch.int32)
+            for uid, lo, hi in spans:
+                if uid == -1:
+                    real_rows[lo:hi] = 0
+            self._prefill_stage_for().cache_fill.record(
+                layer_id, ids, exact, weights, batch.tablemoe_attn_scores[layer_id],
+                request_slots=real_rows, dummy_slot=0)
         # Keep all decisions on GPU and submit experts before GPU table search.
-        for start in range(0, offset, 128):
-            end = min(start + 128, offset)
-            x, eid, keep = hidden_states[start:end], ids[start:end], exact[start:end]
-            slots, cpu_keep = self._split_important(layer_id, eid, keep, batch.is_prefill)
-            pending = None
-            if self.expert_mode == "cpu" or (self.expert_mode == "hybrid" and not batch.is_prefill):
-                pending = self.executor.decode_submit(
-                    layer_id, x, weights[start:end], eid.masked_fill(~cpu_keep, -1))
-            online_hit = torch.zeros_like(eid, dtype=torch.bool)
-            if not batch.is_prefill:
-                for uid, lo, hi in spans:
-                    a, b = max(start, lo), min(end, hi)
-                    if a < b:
-                        values, hit = self._online_search(uid, layer_id, hidden_states[a:b], ids[a:b])
-                        hit &= ~exact[a:b]
-                        outputs[a:b] = values.masked_fill(~hit[:, :, None], 0)
-                        online_hit[a - start:b - start] = hit
-            descriptor = self._search(
-                layer_id, x, eid, None if modality is None else modality[start:end],
-                ~keep & ~online_hit, batch.is_prefill,
-            )
-            offline_hit = descriptor >= 0
-            gpu_outputs = None
-            if self.expert_cache is not None:
-                gpu_outputs = self._gpu_important(x, slots, batch.is_prefill)
-            self._fetch_values(layer_id, descriptor, outputs[start:end])
-            if gpu_outputs is not None:
-                outputs[start:end] = torch.where((slots >= 0)[:, :, None], gpu_outputs, outputs[start:end])
-            if pending is not None:
-                cpu_outputs = self.executor.decode_sync(pending)
-                outputs[start:end] = torch.where(cpu_keep[:, :, None], cpu_outputs, outputs[start:end])
-                self.counters["activation_d2h_bytes"] += x.numel() * x.element_size() + eid.numel() * 4
-                self.counters["cpu_route_output_h2d_bytes"] += cpu_outputs.numel() * cpu_outputs.element_size()
-            survived[start:end] |= online_hit | offline_hit
-            if self.stats_enabled:
-                self._route_counts += torch.stack((
-                    cpu_keep.sum(), online_hit.sum(), offline_hit.sum(),
-                    (~survived[start:end]).sum(), (~survived[start:end].any(-1)).sum(),
-                ))
+        slots, cpu_keep = self._split_important(layer_id, ids, exact, batch.is_prefill)
+        pending = None
+        if self.expert_mode == "cpu" or (self.expert_mode == "hybrid" and not batch.is_prefill):
+            pending = self.executor.decode_submit(
+                layer_id, hidden_states, weights, ids.masked_fill(~cpu_keep, -1))
+        online_hit = torch.zeros_like(ids, dtype=torch.bool)
+        if not batch.is_prefill:
+            for uid, lo, hi in spans:
+                if lo < hi:
+                    values, hit = self._online_search(uid, layer_id, hidden_states[lo:hi], ids[lo:hi])
+                    hit &= ~exact[lo:hi]
+                    outputs[lo:hi] = values.masked_fill(~hit[:, :, None], 0)
+                    online_hit[lo:hi] = hit
+        descriptor = self._search(layer_id, hidden_states, ids, modality, ~exact & ~online_hit, batch.is_prefill)
+        offline_hit = descriptor >= 0
+        gpu_outputs = None
+        if self.expert_cache is not None:
+            gpu_outputs = self._gpu_important(layer_id, hidden_states, slots, batch.is_prefill)
+        self._fetch_values(layer_id, descriptor, outputs)
+        if gpu_outputs is not None:
+            outputs = torch.where((slots >= 0)[:, :, None], gpu_outputs, outputs)
+        if pending is not None:
+            cpu_outputs = self.executor.decode_sync(pending)
+            outputs = torch.where(cpu_keep[:, :, None], cpu_outputs, outputs)
+            self.counters["activation_d2h_bytes"] += hidden_states.numel() * hidden_states.element_size() + ids.numel() * 4
+            self.counters["cpu_route_output_h2d_bytes"] += cpu_outputs.numel() * cpu_outputs.element_size()
+        survived |= online_hit | offline_hit
+        if self.stats_enabled:
+            self._route_counts += torch.stack((
+                cpu_keep.sum(), online_hit.sum(), offline_hit.sum(),
+                (~survived).sum(), (~survived.any(-1)).sum(),
+            ))
         for uid, lo, hi in spans:
             self._update_online(uid, layer_id, hidden_states[lo:hi], ids[lo:hi], outputs[lo:hi], survived[lo:hi])
         merged_weights = (renormalize_weights(weights, survived)
                           if getattr(self.config, "tablemoe_renormalize_weights", True)
                           else weights.float() * survived)
         result = (outputs.float() * merged_weights[:, :, None]).sum(1)
+        if batch.is_prefill and self._uses_prefill_staging():
+            self._finish_prefill_cache_fill(layer_id)
         self._stats_event.record()
         return result.to(hidden_states.dtype)
 
@@ -532,6 +614,8 @@ class TableMoeRuntime:
 
         objects = [self.pca, self.gpu_keys, self.gpu_counts, self.online,
                    self._fetch_buffers, self._route_counts, self._gpu_counts]
+        if getattr(self, "_prefill_stage_plan", None) is not None:
+            objects.append(self._prefill_stage_plan.buffers)
         excluded = ()
         if self.expert_cache is not None:
             objects.append(vars(self.expert_cache))

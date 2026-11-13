@@ -1053,20 +1053,37 @@ def test_modes_matrix_smoke_gate_requires_timing_audit_identity(tmp_path, monkey
 
 
 @pytest.mark.parametrize("threshold", [None, 0.0, 0.7])
-def test_server_command_decode_cosine_thresholds(tmp_path, threshold):
+@pytest.mark.parametrize("cache_scope", ["unified", "per-layer"])
+def test_server_command_decode_cosine_thresholds(tmp_path, threshold, cache_scope):
     from bench_tablemoe_suite import server_command
 
     config = effective_config(dict(output=str(tmp_path), vlmeval_python=sys.executable,
                                    decode_offline_cosine_threshold=threshold,
-                                   decode_online_cosine_threshold=threshold))
+                                   decode_online_cosine_threshold=threshold,
+                                   moe_cache_scope=cache_scope, moe_cache_split="equal"))
     for group in ("table_offload_graph", "full_offload_graph"):
         command = server_command(config, group, tmp_path)
+        assert command[command.index("--moe-cache-scope") + 1] == cache_scope
+        assert command[command.index("--moe-cache-split") + 1] == "equal"
         for kind in ("offline", "online"):
             flag = f"--tablemoe-decode-{kind}-cosine-threshold"
             if group.startswith("table_") and threshold is not None:
                 assert command[command.index(flag) + 1] == str(threshold)
             else:
                 assert flag not in command
+
+
+@pytest.mark.parametrize("prefill_rate", [.4, .6, 1.])
+def test_long_writing_prefill_ratio_keeps_decode_top_h_independent(tmp_path, prefill_rate):
+    from bench_mmlongbench_write import command
+
+    config = effective_config(dict(output=str(tmp_path), vlmeval_python=sys.executable,
+                                   prefill_keep_rate=prefill_rate, max_seq_len=32768))
+    for mode in ("baseline", "skip", "tablemoe"):
+        args, _, _ = command(config, mode, 0)
+        full = mode == "baseline"
+        assert float(args[args.index("--tablemoe-prefill-keep-rate") + 1]) == (1 if full else prefill_rate)
+        assert int(args[args.index("--tablemoe-decode-keep-k") + 1]) == (8 if full else 1)
 
 
 def test_long_writing_official_metrics_and_strict_judge_scores():

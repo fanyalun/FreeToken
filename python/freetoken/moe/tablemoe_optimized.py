@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -104,6 +105,8 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 pointer=torch.zeros(slots, device=self.device, dtype=torch.int32),
             )
         self._route_counts = torch.zeros(8, device=self.device, dtype=torch.int64)
+        if self._uses_prefill_staging():
+            self._prefill_stage_for()
         self.audit = None
         if self.stats_enabled:
             from freetoken.moe.tablemoe_stats import RequestAudit
@@ -121,9 +124,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         self.lookup_ready, self.lookup_done = torch.cuda.Event(), torch.cuda.Event()
         prefill_size = 128
         if self.prefill_uses_tablemoe:
-            prefill_size = getattr(self.config, "tablemoe_prefill_chunk_size", 0) or self.config.max_extend_tokens
-        if self.expert_mode == "cpu":
-            prefill_size = min(prefill_size, self.executor.max_tokens)
+            prefill_size = self.config.max_extend_tokens
         sizes = {1, 2, 4, 128, prefill_size}
         from freetoken.engine.graph import _determine_cuda_graph_bs
 
@@ -133,6 +134,67 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             self._workspace(bs)
         for bs in range(1, self.dummy_slot + 1):
             self._workspace(bs)
+        self.prefill_copy_stream = None
+        self.prefill_copy_plan = None
+        self.prefill_plan_ready = None
+        self.prefill_group_ready = []
+        if self._prefill_overlap_enabled():
+            self._prefill_copy_plan_for(0, self._workspace(self.config.max_extend_tokens)["full_slots"])
+
+    def _prefill_overlap_enabled(self):
+        return (self.prefill_uses_tablemoe and self.expert_mode in ("offload", "hybrid") and
+                getattr(self.config, "tablemoe_prefill_experts_per_group", 0) > 0 and
+                self.expert_cache._copy_fused_ok and not self.expert_cache._unpinned_layers)
+
+    def _prefill_copy_plan_for(self, layer, slots):
+        from freetoken.moe.tablemoe_prefill_io import GroupPrefillCopyPlan
+
+        group_size = self.config.tablemoe_prefill_experts_per_group
+        stage = self._prefill_stage_for() if self._uses_prefill_staging() else None
+        slot_count = self.num_experts if stage is not None else self.expert_cache.cache_size
+        plan = self.prefill_copy_plan
+        if (plan is None or plan.cache is not self.expert_cache or plan.group_size != group_size or
+                plan.stage is not stage or plan.slot_groups.numel() != slot_count or
+                plan.route_group_storage.numel() < slots.numel()):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("TableMoE prefill copy plan must be prepared before graph capture")
+            if self.prefill_copy_stream is None:
+                self.prefill_copy_stream = torch.cuda.Stream(device=self.device)
+                self.prefill_plan_ready = torch.cuda.Event()
+            capacity = max(len(slots), self.config.max_extend_tokens)
+            self.prefill_copy_plan = plan = GroupPrefillCopyPlan(
+                self.expert_cache, layer, self._workspace(capacity)["full_slots"], group_size, stage=stage)
+            self.prefill_group_ready = [torch.cuda.Event() for _ in range(plan.num_groups)]
+        return plan.prepare(layer, slots)
+
+    def _start_prefill_experts(self, layer, x, ids, slots, ws):
+        from freetoken.moe.tablemoe_prefill import GroupedPrefillExperts
+
+        plan = self._prefill_copy_plan_for(layer, slots)
+        gate_up, down = (plan.stage.views if plan.stage is not None else
+                         self.expert_cache.pool_bank_views(layer))
+        runner = GroupedPrefillExperts(
+            x, gate_up, down,
+            slots, plan.route_groups, workspace=ws["gpu_workspace"],
+            logical_ids=ids, num_experts=self.num_experts)
+        self.prefill_plan_ready.record()
+        self.prefill_copy_stream.wait_event(self.prefill_plan_ready)
+        with torch.cuda.stream(self.prefill_copy_stream):
+            plan.copy_group(0)
+            self.prefill_group_ready[0].record()
+        return plan, runner
+
+    def _run_prefill_experts(self, pipeline):
+        plan, runner = pipeline
+        runner.run(-1)
+        for group in range(plan.num_groups):
+            if group + 1 < plan.num_groups:
+                with torch.cuda.stream(self.prefill_copy_stream):
+                    plan.copy_group(group + 1)
+                    self.prefill_group_ready[group + 1].record()
+            torch.cuda.current_stream().wait_event(self.prefill_group_ready[group])
+            runner.run(group)
+        return runner.outputs
 
     @property
     def graph_enabled(self):
@@ -142,6 +204,10 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         objects = [self.pca, self.gpu_keys, self.gpu_counts, self.value_offsets,
                    self.fixed_online, self.workspaces, self._route_counts, self._gpu_counts,
                    self.batch_slots, self.graph_slots]
+        if self.prefill_copy_plan is not None:
+            objects.append(self.prefill_copy_plan.buffers)
+        if getattr(self, "_prefill_stage_plan", None) is not None:
+            objects.append(self._prefill_stage_plan.buffers)
         if self.audit is not None:
             objects.extend((self.audit.counts, self.audit.shared))
         excluded = ()
@@ -152,9 +218,19 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         if target_cache_size is not None and self.expert_cache is not None:
             # id_of_slot, usage, evict_slots and src_indices each scale with cache_size.
             total += (target_cache_size - self.expert_cache.cache_size) * 20
+            if self.prefill_copy_plan is not None and self.prefill_copy_plan.stage is None:
+                total += (target_cache_size - self.prefill_copy_plan.slot_groups.numel()) * 4
         return total
 
+    def on_expert_cache_rebuild(self):
+        super().on_expert_cache_rebuild()
+        self.prefill_copy_plan = None
+        if self._prefill_overlap_enabled():
+            self._prefill_copy_plan_for(0, self._workspace(self.config.max_extend_tokens)["full_slots"])
+
     def _workspace(self, bs):
+        if self.expert_mode == "cpu" and bs > self.executor.max_tokens:
+            raise ValueError("TableMoE batch exceeds CPU executor capacity; increase --max-extend-tokens")
         if bs in self.workspaces:
             return self.workspaces[bs]
         if torch.cuda.is_current_stream_capturing():
@@ -171,7 +247,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 if isinstance(value, dict):
                     ws[name] = {layer: tensor[:bs] for layer, tensor in value.items()}
                 elif name == "gpu_workspace":
-                    gk = self.top_k if self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+                    gk = self.top_k
                     ws[name] = (value[0][:bs], value[1][:bs * gk], value[2][:bs])
                 else:
                     ws[name] = value[:bs]
@@ -180,17 +256,18 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         def empty(*shape, dtype=torch.float16):
             return torch.empty(shape, device=self.device, dtype=dtype)
         k, h = self.top_k, self.hidden
-        gk = self.top_k if self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+        # Cache hits can occupy any route, including positions after the leading h.
+        gk = self.top_k
         inter = self.config.model_config.moe_intermediate_size
         ws = dict(
-            slots=empty(bs, gk, dtype=torch.int32), full_slots=empty(bs, k, dtype=torch.int32),
+            full_slots=empty(bs, k, dtype=torch.int32),
             keep=empty(bs, k, dtype=torch.bool), cpu_ids=empty(bs, k, dtype=torch.int32),
             cache_hit=empty(bs, k, dtype=torch.bool), on=empty(bs, k, dtype=torch.bool),
             off=empty(bs, k, dtype=torch.bool), descriptor=empty(bs, k, dtype=torch.int64),
             values=empty(bs, k, h), result=empty(bs, h),
             request_slots=empty(bs, dtype=torch.int32), update_rows=empty(bs, dtype=torch.int32),
             update_counts=empty(bs, dtype=torch.int32), modality=torch.ones(bs, device=self.device, dtype=torch.int32),
-            gathered=empty(bs, max(1, self.capacity), h), scores=empty(bs, 1, max(1, self.capacity)),
+            scores=empty(bs, 1, max(1, self.capacity)),
             query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
                    if not self.bypass_tables},
             vision_query={layer: empty(bs, self.pca[layer, "text"][0].shape[1]) for layer in range(self.num_layers)
@@ -241,6 +318,10 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
         self._route_counts.zero_()
         self._gpu_counts.zero_()
         self.counters.clear()
+        stage = getattr(self, "_prefill_stage_plan", None)
+        if stage is not None:
+            stage.cache_fill.reset()
+            stage.cache_fill.stats.zero_()
         if self.audit is not None:
             self.audit.reset()
 
@@ -260,7 +341,7 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             logger.info("TableMoE request %s released; cumulative routes: %s", uid, self.stats())
 
     def close(self):
-        # Mapped allocations cannot be freed until both expert and lookup streams drain.
+        # Mapped allocations must outlive expert compute, grouped copies and lookup.
         torch.cuda.synchronize(self.device)
         if self.collector is not None:
             self.collector.close()
@@ -281,6 +362,9 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                       fetched_experts=gpu[2], expert_weight_h2d_bytes=gpu[2] * self.expert_bytes,
                       table_value_h2d_bytes=0, cpu_route_output_h2d_bytes=0,
                       lookup_metadata_d2h_bytes=0, lookup_host_waits=0)
+        result.update(self._prefill_cache_fill_counters())
+        result["expert_weight_total_h2d_bytes"] = (result["expert_weight_h2d_bytes"] +
+                                                   result["prefill_cache_fill_h2d_bytes"])
         if self.audit is not None:
             result["request_audit_totals"] = self.audit.totals
             result["last_request_audit"] = getattr(self.audit, "last_request", None)
@@ -321,85 +405,102 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
             count = min(n, self.capacity)
             if count and req.uid != -1:
                 update[offset + n - count:offset + n] = torch.arange(count, device=self.device)
-                advance[offset + n - 1] = count
+                advance[offset + n - 1:offset + n].fill_(count)
             offset += n
-        output = torch.empty_like(x)
-        chunk_size = getattr(self.config, "tablemoe_prefill_chunk_size", 0) or max(offset, 1)
-        if self.expert_mode == "cpu":
-            chunk_size = min(chunk_size, self.executor.max_tokens)
-        for start in range(0, offset, chunk_size):
-            end = min(start + chunk_size, offset)
-            ws = self._workspace(end - start)
-            ws["keep"].copy_(exact[start:end])
-            ws["request_slots"].copy_(batch.tablemoe_slots[start:end])
-            ws["update_rows"].copy_(update[start:end])
-            ws["update_counts"].copy_(advance[start:end])
-            ws["modality"].fill_(1)
-            if batch.mm_rows is not None:
-                rows = batch.mm_rows[(batch.mm_rows >= start) & (batch.mm_rows < end)] - start
-                ws["modality"][rows.long()] = 0
-            output[start:end].copy_(self._run(layer, x[start:end], weights[start:end], ids[start:end], ws, True))
-        return output
+        if not offset:
+            return torch.empty_like(x)
+        ws = self._workspace(offset)
+        ws["keep"].copy_(exact)
+        ws["request_slots"].copy_(batch.tablemoe_slots)
+        ws["update_rows"].copy_(update)
+        ws["update_counts"].copy_(advance)
+        ws["modality"].fill_(1)
+        if batch.mm_rows is not None:
+            ws["modality"].index_fill_(0, batch.mm_rows.long(), 0)
+        return self._run(layer, x, weights, ids, ws, True,
+                         attention_scores=batch.tablemoe_attn_scores.get(layer)).clone()
 
-    def _run(self, layer, x, weights, ids, ws, prefill):
+    def _run(self, layer, x, weights, ids, ws, prefill, attention_scores=None):
+        try:
+            return self._run_impl(layer, x, weights, ids, ws, prefill, attention_scores)
+        except BaseException:
+            # An interrupted layer must drain side streams before its buffers are reused.
+            if prefill and self.prefill_copy_stream is not None:
+                self.prefill_copy_stream.synchronize()
+                self.lookup_stream.synchronize()
+            if prefill and getattr(self, "_prefill_stage_plan", None) is not None:
+                self._prefill_stage_plan.cache_fill.reset()
+            raise
+
+    def _run_impl(self, layer, x, weights, ids, ws, prefill, attention_scores=None):
         bs, k = ids.shape
         cache = self.expert_cache
         online = self.fixed_online[layer]
-        gpu_k = k if prefill or self.external_mask else max(1, self.config.tablemoe_decode_keep_k)
+        gpu_k = k
+        lookup = self.lookup_enabled(prefill)
+        parallel_lookup = lookup and not prefill and self.expert_mode == "offload"
         slots = ws["full_slots"]
         kernels._prepare_routes[(triton.cdiv(ids.numel(), 256),)](
             ids, slots, ws["keep"], ws["cpu_ids"], ws["cache_hit"],
             cache.slot_for_id if cache is not None else ids, ws["request_slots"],
             k, self.config.tablemoe_decode_keep_k, self.num_experts, layer, self.dummy_slot,
             prefill, cache is not None, 256, ids.numel(), self.external_mask)
-        if not prefill:
-            ws["slots"].copy_(slots[:, :gpu_k])
-            slots = ws["slots"]
+        if parallel_lookup:
+            self.lookup_ready.record()
         if cache is not None:
-            cache.hybrid_max_fetch = self.num_experts if prefill or self.expert_mode == "offload" else self.hybrid_max_fetch
-            cache.ensure_experts_hybrid(layer, slots)
+            if prefill and self._uses_prefill_staging():
+                stage = self._prefill_stage_for()
+                if self._prefill_cache_fill_enabled():
+                    stage.cache_fill.record(layer, ids, ws["keep"], weights, attention_scores,
+                                            request_slots=ws["request_slots"], dummy_slot=self.dummy_slot)
+                stage.prepare(layer, slots)
+            else:
+                cache.hybrid_max_fetch = self.num_experts if prefill or self.expert_mode == "offload" else self.hybrid_max_fetch
+                cache.ensure_experts_hybrid(layer, slots)
         kernels._split_routes[(1,)](
             ids, ws["keep"], slots, ws["cpu_ids"], ws["cache_hit"], self._gpu_counts,
             cache.num_indices if cache is not None else ids,
             ids.numel(), k, gpu_k, cache is not None, self.stats_enabled,
             triton.next_power_of_2(ids.numel()))
+        pipeline = (self._start_prefill_experts(layer, x, ids, slots, ws)
+                    if prefill and self._prefill_overlap_enabled() else None)
         pending = None
         if self.expert_mode == "cpu" or (self.expert_mode == "hybrid" and not prefill):
             pending = self.executor.decode_submit(layer, x, weights, ws["cpu_ids"], mapped_output=True)
-        lookup = self.lookup_enabled(prefill)
         if not lookup:
             ws["on"].zero_()
             ws["off"].zero_()
         else:
-            if prefill or self.capacity == 0:
-                ws["on"].zero_()
-                ws["values"].zero_()
-            else:
-                kernels._gather_online_keys[(bs, self.capacity, triton.cdiv(self.hidden, 256))](
-                    online["keys"], ws["gathered"], ws["request_slots"], online["size"],
-                    self.hidden, self.capacity, self.dummy_slot, 256)
-                threshold = getattr(self.config, "tablemoe_decode_online_cosine_threshold", None)
-                online_query = x
-                if threshold is not None:
-                    online_query = F.normalize(x.float(), dim=-1, eps=1e-6).to(x.dtype)
-                    ws["gathered"].copy_(F.normalize(ws["gathered"].float(), dim=-1, eps=1e-6))
-                torch.bmm(online_query.view(bs, 1, self.hidden), ws["gathered"].transpose(1, 2), out=ws["scores"])
-                kernels._online_select[(ids.numel(),)](
-                    ws["scores"], online["ids"], online["values"], online["size"], ws["request_slots"],
-                    ids, ws["keep"], ws["values"], ws["on"], k, self.hidden, self.capacity,
-                    self.dummy_slot, triton.next_power_of_2(self.capacity),
-                    triton.next_power_of_2(self.hidden), triton.next_power_of_2(k), threshold)
-            proj, bias = self.pca[layer, "text"]
-            query = ws["query"][layer]
-            torch.addmm(bias, x, proj, out=query)
-            if prefill:
-                proj, bias = self.pca[layer, "vision"]
-                vq = ws["vision_query"][layer]
-                torch.addmm(bias, x, proj, out=vq)
-                torch.where((ws["modality"] == 0)[:, None], vq, query, out=query)
-                F.normalize(query, dim=-1, eps=1e-6, out=query)
-            self.lookup_ready.record()
-            self.lookup_stream.wait_event(self.lookup_ready)
+            if parallel_lookup:
+                self.lookup_stream.wait_event(self.lookup_ready)
+            # Keep the CPU handshake's existing Graph branch layout in hybrid mode.
+            with torch.cuda.stream(self.lookup_stream) if parallel_lookup else nullcontext():
+                if prefill or self.capacity == 0:
+                    ws["on"].zero_()
+                    ws["values"].zero_()
+                else:
+                    threshold = getattr(self.config, "tablemoe_decode_online_cosine_threshold", None)
+                    kernels._online_scores[(bs, self.capacity)](
+                        x, online["keys"], ws["scores"], ws["keep"], ws["request_slots"], online["size"],
+                        self.hidden, k, self.capacity, self.dummy_slot,
+                        triton.next_power_of_2(self.hidden), triton.next_power_of_2(k), threshold is not None)
+                    kernels._online_select[(ids.numel(),)](
+                        ws["scores"], online["ids"], online["values"], online["size"], ws["request_slots"],
+                        ids, ws["keep"], ws["values"], ws["on"], k, self.hidden, self.capacity,
+                        self.dummy_slot, triton.next_power_of_2(self.capacity),
+                        triton.next_power_of_2(self.hidden), triton.next_power_of_2(k), threshold)
+                proj, bias = self.pca[layer, "text"]
+                query = ws["query"][layer]
+                torch.addmm(bias, x, proj, out=query)
+                if prefill:
+                    proj, bias = self.pca[layer, "vision"]
+                    vq = ws["vision_query"][layer]
+                    torch.addmm(bias, x, proj, out=vq)
+                    torch.where((ws["modality"] == 0)[:, None], vq, query, out=query)
+                    F.normalize(query, dim=-1, eps=1e-6, out=query)
+                if not parallel_lookup:
+                    self.lookup_ready.record()
+                    self.lookup_stream.wait_event(self.lookup_ready)
             with torch.cuda.stream(self.lookup_stream):
                 keys = self.gpu_keys[layer]
                 kernels._mapped_offline[(ids.numel(),)](
@@ -414,15 +515,25 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                 self.lookup_done.record()
         gpu_values = ws["values"]
         if cache is not None:
-            cache.copy_missing()
-            if prefill:
+            if pipeline is not None:
+                gpu_values = self._run_prefill_experts(pipeline)
+            elif prefill:
                 from freetoken.moe.fused import fused_experts_impl
-                gpu_values = fused_experts_impl(x.contiguous(), cache.bank_caches["gate_up"], cache.bank_caches["down"],
+                if self._uses_prefill_staging():
+                    stage = self._prefill_stage_for()
+                    stage.copy()
+                    gate_up, down = stage.views
+                else:
+                    cache.copy_missing()
+                    gate_up, down = cache.pool_bank_views(layer)
+                gpu_values = fused_experts_impl(x.contiguous(), gate_up, down,
                                                torch.ones_like(slots, dtype=torch.float32), slots, return_routes=True)
             else:
                 from freetoken.moe.fused import fused_experts_decode_impl
+                cache.copy_missing()
+                gate_up, down = cache.pool_bank_views(layer)
                 gpu_values = fused_experts_decode_impl(
-                    x, cache.bank_caches["gate_up"], cache.bank_caches["down"], ws["gpu_weights"], slots,
+                    x, gate_up, down, ws["gpu_weights"], slots,
                     return_routes=True, workspace=ws["gpu_workspace"])
         cpu_addr = 0
         if pending is not None:
@@ -443,4 +554,6 @@ class TableMoeOptimizedRuntime(TableMoeRuntime):
                                            ws["update_counts"], self.capacity, self.dummy_slot)
         if self.audit is not None:
             self.audit.record(layer, ids, ws, slots, gpu_k, prefill, pending is not None)
+        if prefill and cache is not None and self._uses_prefill_staging():
+            self._finish_prefill_cache_fill(layer)
         return ws["result"]

@@ -56,10 +56,14 @@ if os.environ.get("TABLEMOE_AUDIT_DIR"):
                 snapshot = dict(x=x.cpu(), ids=ids.cpu(), weights=weights.cpu(),
                                 online={name: value.cpu() for name, value in saved.items()},
                                 layer=layer, config=dict(keep_k=self.config.tablemoe_decode_keep_k,
+                                                         decode_policy="top_h_plus_gpu_cache_hits",
                                                          capacity=self.capacity))
                 self.online[0][layer] = dict(keys=saved["keys"], ids=saved["ids"], values=saved["values"], size=size)
                 reference_values, hit = TableMoeRuntime._online_search(self, 0, layer, x, ids)
                 keep = torch.arange(ids.shape[1], device=x.device)[None, :] < self.config.tablemoe_decode_keep_k
+                if self.expert_cache is not None:
+                    keep = keep | (self.expert_cache.slot_for_id[layer, ids.long()] >= 0)
+                snapshot["exact_mask"] = keep.cpu()
                 hit &= ~keep
                 descriptor = TableMoeRuntime._search(self, layer, x, ids, None, ~keep & ~hit, False)
                 clusters = self.gpu_keys[layer].shape[2]

@@ -30,8 +30,9 @@ DEFAULTS = dict(model="/data/fanya/models/Qwen3-VL-30B-A3B-Instruct", python=str
                 protocol="holdout", calibration_fraction=.7, seed=42, concurrency=1, timing_rounds=3,
                 natural_max_tokens=128, fixed_tokens=[32, 128, 256], fixed_sample_limit=100,
                 warmup_samples=5, warmup_tokens=10, gpu=0, port=19760, gpu_expert_slots=3072,
+                moe_cache_scope="unified", moe_cache_split="equal",
                 fetch_cap=0, num_pages=65536, page_size=1, graph_max_bs=4, cpu_threads=16,
-                convert_bf16=True, online_capacity=64, prefill_keep_rate=.6, decode_keep_k=4,
+                convert_bf16=True, online_capacity=64, prefill_keep_rate=.6, decode_keep_k=1,
                 decode_offline_cosine_threshold=None, decode_online_cosine_threshold=None,
                 processor={"size": {"shortest_edge": 602112, "longest_edge": 4014080}},
                 judge=None, builder={}, server_env={}, vlmeval_env={}, startup_timeout=900,
@@ -66,6 +67,11 @@ def effective_config(config):
             raise ValueError(f"{key} must be a positive integer")
     if config["fetch_cap"] < 0 or not config["fixed_tokens"] or any(t < 1 for t in config["fixed_tokens"]):
         raise ValueError("invalid fetch cap or fixed token lengths")
+    if config["moe_cache_scope"] not in ("unified", "per-layer"):
+        raise ValueError("moe_cache_scope must be unified or per-layer")
+    split = config["moe_cache_split"]
+    if not isinstance(split, str) or not (split == "equal" or (split.startswith("profile:") and split[8:])):
+        raise ValueError("moe_cache_split must be equal or profile:<path>")
     if len(set(config["datasets"])) != len(config["datasets"]) or len(set(config["groups"])) != len(config["groups"]):
         raise ValueError("duplicate matrix selections")
     if "extra_server_args" in config:
@@ -209,7 +215,9 @@ def server_command(config, group, asset_root, audit_path=None, collect_path=None
     method, mode, execution = group.split("_")
     command = [config["python"], "-m", "freetoken.cli", "serve", "--model", config["model"], "--gpu", str(config["gpu"]),
                "--dtype", "float16", "--moe-strategy", "tablemoe", "--moe-cache-size",
-               str(0 if mode == "cpu" else config["gpu_expert_slots"]), "--moe-hybrid-max-fetch", str(config["fetch_cap"]),
+               str(0 if mode == "cpu" else config["gpu_expert_slots"]),
+               "--moe-cache-scope", config["moe_cache_scope"], "--moe-cache-split", config["moe_cache_split"],
+               "--moe-hybrid-max-fetch", str(config["fetch_cap"]),
                "--moe-cpu-threads", str(config["cpu_threads"]), "--cuda-graph-max-bs",
                str(0 if execution == "eager" else config["graph_max_bs"]),
                "--num-pages", str(config["num_pages"]), "--page-size", str(config["page_size"]), "--cache-type", "naive",

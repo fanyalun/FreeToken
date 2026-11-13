@@ -51,7 +51,8 @@ def main():
     parser.add_argument('--source-snapshot', type=Path)
     parser.add_argument('--command-json', type=Path)
     parser.add_argument('--prefill-keep-rate', type=float)
-    parser.add_argument('--decode-keep-k', type=int)
+    parser.add_argument('--decode-top-h', '--decode-keep-k', dest='decode_keep_k', type=int,
+                        help='Decode Top-h plus GPU expert-cache hits; independent of the prefill keep rate.')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--samples', type=int, default=48)
     parser.add_argument('--max-tokens', type=int, default=8192)
