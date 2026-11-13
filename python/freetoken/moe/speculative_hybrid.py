@@ -51,7 +51,8 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     c = tl.arange(0, C)
     cached = tl.load(owners + c, c < SLOTS, -1)
     age = tl.load(usage + c, c < SLOTS, 9223372036854775807)
-    protected = tl.load(refs + tl.maximum(cached, 0), (c < SLOTS) & (cached >= 0), 0) > 0
+    prediction_counts = tl.load(refs + tl.maximum(cached, 0), (c < SLOTS) & (cached >= 0), 0)
+    protected = prediction_counts > 0
     busy = tl.load(pending + c, c < SLOTS, 1) != 0
     local = cached - LAYER * EXPERTS
     active = (local >= 0) & (local < EXPERTS)
@@ -75,7 +76,7 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     clock = tl.load(clock_ptr)
     for i in range(chosen):
         expert = tl.sum(tl.where(index == i, ordered_ids, 0), 0)
-        slot = _prediction_victim(available, protected, age, c)
+        slot = _prediction_victim(available, tl.where(cached < 0, -1, prediction_counts), age, c)
         if slot != 2147483647:
             if PREVERIFY and cache_conflict is not None:
                 reclaimed = tl.sum(((c == slot) & protected).to(tl.int32), 0)

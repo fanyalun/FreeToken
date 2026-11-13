@@ -1,4 +1,4 @@
-# Six-loop GPU execution optimization
+# GPU execution optimization
 
 `speculative_execution_implementation="reference"` is the default. With GPU expert
 scheduling and the default compact control, this is the existing single-readback
@@ -12,22 +12,31 @@ rules. Optimized GPU Hybrid uses the same slot reclamation as GPU offload; its
 cost model and CPU/GPU partition remain unchanged. Fused decode metadata can also be
 used by native two-level SD for a matched comparison.
 
-The default six-Draft-segment limit, ready-or-top-4 selection, submission/output
+The configured Draft-segment limit, ready-or-top-4 selection, submission/output
 limits, and complete top-8 final verification remain in force. The planned last
 Draft segment skips Pre-Verify and is appended as a raw suffix for full Target
 verification. Earlier segments retain Pre-Verify and private-state updates so
 the next Draft can continue. Resource or EOS stops can submit an earlier prefix
-without an extra Draft. Optimized GPU scheduling
-admits loops at runtime instead of reserving their worst-case expert union.
-It first selects safe slots without prediction references, then safe slots with
-prediction references, ordered by `(usage, slot_id)` within each tier. Pending
-copies and current demand/GEMM slots are always excluded. Reclaiming a prediction
-slot sets a sticky device `cache_conflict` flag and preserves the evicted expert's
-references for rejection accounting and final-verify prefetch. The current loop
-finishes and commits its accepted private state before full Target verification;
-it does not begin another loop. `cache_conflict` takes priority over `loop_limit`,
-and the window records the conflict independently of EOS/output termination.
-Final Target verification may reclaim predictions without another submission.
+without an extra Draft. Optimized GPU scheduling admits loops at runtime instead
+of reserving their worst-case expert union. Empty safe slots are selected first;
+occupied safe slots are ordered by `(reference_count, usage, slot_id)`, so the
+least referenced expert is evicted first and LRU breaks ties. Pending copies and
+current demand/GEMM slots are always excluded. Demand loads may replace the
+coldest safe expert regardless of the incoming expert's reference count.
+Prefetch candidates are considered in descending reference count and may replace
+an occupied expert only when the incoming count is strictly greater; equal or
+colder candidates are skipped. Existing prefetch quotas remain upper bounds.
+Controllers that discard generation references retain their separate hint-based
+prefetch admission.
+
+Reclaiming a prediction slot preserves its logical references for rejection
+accounting and final-verify prefetch. It also sets a sticky device
+`cache_conflict` diagnostic flag, but does not stop the loop or override normal
+loop/output/EOS termination. The current loop commits its accepted private state
+and may continue until the configured window limit. The flag travels in the
+existing control readback without an additional synchronization. Final Target
+verification still uses every native top-8 route and loads missing weights on
+demand; it may reclaim predictions without another submission.
 MTP reconcile still executes the full batch width and writes the valid KV prefix;
 only its selected hidden row reaches the LM head. The separate coarse
 graph implementation below changes the graph pools and workspace layout.
@@ -137,10 +146,10 @@ encounters a pending resident expert.
 The final layer joins every layer-prefetch fork and retires pending flags in one
 kernel before the forward graph exits. Acceptance releases rejected references,
 then the GPU computes the continuation condition and plans gap slots before the
-single control readback. A gap reclamation updates the same conflict flag and
-stop reason before that readback. The host issues the planned copies even when
-they caused submission; they join before full Verify without another loop.
-Continuing gap copies overlap MTP and retire at the next target-forward entry.
+single control readback. A gap reclamation updates the same diagnostic flag before
+that readback without changing the continuation decision. The host issues the
+planned copies; continuing gap copies overlap MTP and retire at the next
+target-forward entry. Any remaining copies join before full Verify.
 Capture and warmup also finish and join each gap plan before another body can
 overwrite it. Close joins and retires copies, including partial-forward
 cancellation or exceptions; abort drains the stream
@@ -153,6 +162,20 @@ they capture private state and plan addresses. MTP, acceptance, and commit graph
 continue to share the same runner-owned buffers.
 
 ## Admission and preparation
+
+`speculative_verify_moe_overlap=True` enables hit/miss overlap for native BF16
+Offload Full Verify with optimized GPU scheduling and more than one input row.
+After demand admission, the compute stream snapshots ready routes and forks
+the demand weight copy onto the copy stream. Ready experts execute immediately;
+an event joins that copy before the missing experts execute. Current demand
+slots remain excluded from eviction, including during next-layer prefetch.
+Both branches retain per-route outputs and use one original-order top-k
+reduction, preserving the serial path's rounding. The additional route buffers
+are reserved by memory planning, and graph signatures include the switch.
+Set it to `False` for a serial A/B. Pre-Verify, Hybrid, quantized expert methods,
+CPU async, and ordinary AR/baseline SD retain their existing paths. Optional
+`FREETOKEN_SPECULATIVE_VERIFY_TRACE=1` adds hit/miss/copy NVTX ranges during
+capture for Nsight Systems graph-node tracing.
 
 Resident demand hits receive their original expert-order timestamps using a
 prefix sum. Only missing experts enter the victim-selection loop. Hits are

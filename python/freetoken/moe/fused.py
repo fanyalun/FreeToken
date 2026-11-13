@@ -213,16 +213,24 @@ def fused_experts_impl(
     *,
     skip_invalid_routes: bool = False,
     out: torch.Tensor | None = None,
+    return_routes: bool = False,
 ) -> torch.Tensor:
     """Overwrites ``hidden_states`` unless a distinct ``out`` buffer is supplied. A caller that
     still needs the input afterwards (a shared expert, a residual) must read it BEFORE this
     call or pass a copy. ``fused_experts_decode_impl`` allocates instead, so the contract is
-    not shared; the resident bf16 path routes decode through here too."""
+    not shared; the resident bf16 path routes decode through here too.
+    ``return_routes`` defers reduction and leaves the input unchanged."""
     from freetoken.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
 
     from freetoken.core import get_active_batch
     if getattr(get_active_batch(), "speculative_reference_math", False) and hidden_states.shape[0] > 1:
+        if return_routes:
+            return torch.cat([fused_experts_impl(hidden_states[row:row+1], w1, w2,
+                topk_weights[row:row+1], topk_ids[row:row+1], activation,
+                apply_router_weight_on_input, act_alpha, act_limit,
+                skip_invalid_routes=skip_invalid_routes, return_routes=True)
+                for row in range(hidden_states.shape[0])])
         # Use identical one-row GEMM geometry for the resident arithmetic control only.
         for row in range(hidden_states.shape[0]):
             fused_experts_impl(hidden_states[row:row+1], w1, w2, topk_weights[row:row+1],
@@ -324,6 +332,8 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
 
+    if return_routes:
+        return intermediate_cache3
     moe_sum_reduce_triton(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
@@ -361,6 +371,8 @@ def fused_experts_decode_impl(
     apply_router_weight_on_input: bool = False,
     act_alpha: float = 1.0,
     act_limit: float = float("inf"),
+    *,
+    return_routes: bool = False,
 ) -> torch.Tensor:
     from freetoken.kernel import fused_moe_decode_kernel_triton, moe_sum_reduce_triton
     from freetoken.layers import gated_act_and_mul
@@ -387,7 +399,7 @@ def fused_experts_decode_impl(
         # Hybrid's asynchronous CPU input copy may still read hidden_states.
         return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
             activation, apply_router_weight_on_input, act_alpha, act_limit,
-            skip_invalid_routes=True, out=torch.empty_like(hidden_states))
+            skip_invalid_routes=True, out=torch.empty_like(hidden_states), return_routes=return_routes)
     top_k = topk_ids.shape[1]
     gate_up_dim = w1.shape[1]
     intermediate_size = gate_up_dim // 2
@@ -443,6 +455,8 @@ def fused_experts_decode_impl(
         route_groups=route_groups,
     )
 
+    if return_routes:
+        return intermediate_cache3
     out_hidden_states = torch.empty_like(hidden_states)
     moe_sum_reduce_triton(intermediate_cache3, out_hidden_states)
     return out_hidden_states

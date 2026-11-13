@@ -153,6 +153,8 @@ class ThreeLevelCoordinator:
                 prefetch if fixed_prefetch else None,
                 getattr(self.experts, "verify_layer_quotas", None),
                 getattr(self.experts, "verify_prefetch_enabled", False),
+                getattr(c, "speculative_verify_moe_overlap", False),
+                getattr(self.experts, "verify_moe_overlap", False),
                 tuple(getattr(c, "speculative_hybrid_phases", ())),
                 getattr(c, "speculative_hybrid_profile", None), getattr(c, "moe_hybrid_max_fetch", -1),
                 getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1))
@@ -279,7 +281,8 @@ class ThreeLevelCoordinator:
                     capacity = dict(protected_experts=control[6], blocked_slots=control[7],
                                     available_slots=self.budget.cache_slots - control[6] - control[7])
                     stop_reason = (None, "loop_limit", "cache_pressure", "cache_conflict")[control[4]]
-                    cache_conflict |= stop_reason == "cache_conflict"
+                    cache_conflict |= (stop_reason == "cache_conflict"
+                                       or getattr(self.experts, "last_cache_conflict", False))
                 else:
                     width = window.next_width(engine.config.speculative_mtp_depth, remaining)
                     capacity = self.experts.ledger.capacity()

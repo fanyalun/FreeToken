@@ -266,6 +266,7 @@ def main():
                 reset()
                 control_reads[0] = 0
                 a = engine.generate_speculative(prompt, max_tokens=args.output_limit)
+                request_graphs = set(runner.graphs)
                 if args.three_level and args.scheduler == 'gpu':
                     assert control_reads[0] == sum(row['loop_count'] + 1 for row in a.rounds)
                 state = snapshot()
@@ -284,7 +285,9 @@ def main():
                     torch.testing.assert_close(before_state, after_state, atol=0, rtol=0)
                 request_outputs.append(a.token_ids)
                 assert len(a.token_ids) == args.output_limit and len(b.token_ids) == args.output_limit
-                assert set(runner.graphs) == graphs
+                assert set(runner.graphs) == request_graphs
+                if runner.full_graph:
+                    assert request_graphs == graphs
                 assert coarse is None or coarse.captures == captures
                 assert pointers == [runner.seed_hidden.data_ptr(), runner.seed_token.data_ptr(), runner.anchor_buffer.data_ptr()]
                 if args.three_level and runner.three_level.inner_width == 0:
@@ -292,8 +295,10 @@ def main():
                     assert all(not tensor.any() for tensor in runner.state_adapter.tensors(runner.three_level.private_pool))
                 if args.three_level and args.scheduler == 'gpu' and args.slots == 16 and args.layers == 10:
                     conflicts = [row for row in a.rounds if row['cache_conflict']]
-                    assert conflicts and all(row['loop_count'] == 1 for row in conflicts)
-                    assert all(row['loops'][-1]['stop_after_loop'] == 'cache_conflict' for row in conflicts)
+                    assert conflicts and all(row['draft_loop_count'] > 1 for row in conflicts)
+                    assert all(row['flush_reason'] in ('loop_limit', 'output_or_submit_limit') for row in conflicts)
+                    assert all(loop['stop_after_loop'] != 'cache_conflict'
+                               for row in conflicts for loop in row['loops'])
                     experts = runner.three_level.experts
                     assert not experts.cache_conflict.any() and not experts.pending.any()
                     assert not experts.gap_planned and not experts.gap_active
@@ -311,7 +316,8 @@ def main():
             cancelled.set()
             assert not engine.generate_speculative([1, 2, 3], max_tokens=args.output_limit, cancel=cancelled).token_ids
             assert len(engine.generate_speculative([1, 2, 3], max_tokens=1).token_ids) == 1
-            assert set(runner.graphs) == graphs
+            if runner.full_graph:
+                assert set(runner.graphs) == graphs
             before = engine.kv_cache._kv_buffer.data_ptr()
             try:
                 engine.rebuild_runtime_cache(num_pages=1)

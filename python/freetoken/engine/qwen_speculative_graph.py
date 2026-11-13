@@ -174,6 +174,8 @@ class QwenSpeculativeGraphSet:
                 getattr(c, "speculative_verify_prefetch_layer_experts", 0),
                 tuple(getattr(c, "speculative_verify_prefetch_layer_quotas", None) or ()),
                 self.experts.verify_layer_quotas,
+                getattr(c, "speculative_verify_moe_overlap", False),
+                getattr(self.experts, "verify_moe_overlap", False),
                 tuple(getattr(c, "speculative_hybrid_phases", ())),
                 getattr(c, "speculative_hybrid_profile", None), getattr(c, "moe_hybrid_max_fetch", -1),
                 getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1),

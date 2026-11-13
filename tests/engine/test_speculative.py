@@ -435,17 +435,24 @@ def test_graph_set_reuses_captures_and_survives_request_tails(monkeypatch, depth
             cache.slot_for_id.view(-1)[:24].copy_(owners)
             bank[:, 0].copy_((owners % 16).float())
             experts.refs.fill_(1)
+            experts.refs[1, 8] = 3
             experts.queue[1, 8] = 0
             graphs.seed.fill_(1)
             anchor.zero_()
             _, _, _, control = graphs.body(anchor, inner=True, start=2, rows=1,
                 limit=budget.submit_rows - 1, remaining=32)
-            assert control[4] == 3 and experts.counters[28].item() == 0
+            assert control[4] == 0 and experts.last_cache_conflict
+            assert control[7] == 0 and experts.counters[28].item() == 0
             assert experts.counters[29].item() == 1
             assert experts.gap_plan[3].item() == 1
             before = private.recurrent_states.clone()
-            graphs.tail(True, False)
+            graphs.tail(True, True)
             assert private.recurrent_states.item() == before.item() + 1
+            experts.set_phase("preverify", 1)
+            _, _, _, control = graphs.body(anchor, inner=True, start=3, rows=1, loop=1,
+                candidates=1, limit=budget.submit_rows - 1, remaining=32)
+            assert control[4] == 0 and experts.last_cache_conflict and control[7] == 0
+            graphs.tail(True, False)
             experts.set_phase("verify")
             _, _, _, control = graphs.body(anchor, inner=False, start=2, rows=1, remaining=1)
             assert control[:3] == [1, 0, 1] and control[4] == 0

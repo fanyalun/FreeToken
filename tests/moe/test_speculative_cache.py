@@ -147,6 +147,85 @@ def toy_layer(li):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("rows,slots", [(15, 128), (16, 128), (15, 16)])
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_full_verify_overlap_preserves_routes_rounding_and_cache(rows, slots, graph_mode, prefetch):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.speculative_gpu import GPUExpertCache
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    torch.manual_seed(42)
+    device, stream = torch.device("cuda"), torch.cuda.Stream()
+    ops = [OffloadMoELayer(li, 16, 8, 96, 80) for li in range(2 if prefetch else 1)]
+    sources = {"gate_up": [(torch.randn(16, 160, 96) * .05).bfloat16().pin_memory() for _ in ops],
+               "down": [(torch.randn(16, 96, 80) * .05).bfloat16().pin_memory() for _ in ops]}
+    cache = OffloadMoeCache(len(ops), 16, slots, device, prefill_overlap=False,
+                            layer_layouts=[op.quant_method.layout() for op in ops])
+    cache.set_bank_sources(sources)
+    hidden = torch.randn(rows, 96, device=device, dtype=torch.bfloat16) * .25
+    ids = (torch.arange(rows * 8, device=device).reshape(rows, 8) % 16).int()
+    weights = torch.rand(rows, 8, device=device)
+    weights /= weights.sum(-1, keepdim=True)
+    before = hidden.clone()
+    expected = {}
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for overlap in (False, True):
+            control = GPUExpertCache(cache, stream, max_loops=4, max_rows=rows,
+                prefetch=prefetch, compact_control=True, implementation="optimized", audit=True,
+                verify_moe_overlap=overlap, verify_layer_quota=2)
+            for warmup in range(2):
+                control.begin(warmup)
+                control.set_phase("verify")
+                if prefetch:
+                    control.refs[1].fill_(1)
+                for op in ops:
+                    control.route(op, hidden, weights, ids)
+                control.close()
+            if graph_mode:
+                control.begin(3)
+                control.set_phase("verify")
+                if prefetch:
+                    control.refs[1].fill_(1)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = torch.cat([control.route(op, hidden, weights, ids) for op in ops])
+                control.close(abort=True)
+            for hits in (4, 16, 0, 8):
+                cache.reset()
+                if hits:
+                    seed_ids = torch.arange(hits, device=device, dtype=torch.int32)
+                    cache.ensure_experts(0, seed_ids)
+                    cache.copy_missing()
+                control.begin(hits + 4)
+                control.set_phase("verify")
+                if prefetch:
+                    control.refs[1].fill_(1)
+                if graph_mode:
+                    graph.replay()
+                else:
+                    output = torch.cat([control.route(op, hidden, weights, ids) for op in ops])
+                control.close()
+                state = (output.clone(), cache.slot_for_id.clone(), cache.id_of_slot.clone(),
+                         cache.usage.clone(), dict(control.stats))
+                if not overlap:
+                    expected[hits] = state
+                else:
+                    for actual, reference in zip(state[:4], expected[hits][:4]):
+                        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                    assert state[4] == expected[hits][4]
+                    if prefetch and slots == 128:
+                        assert state[4]["verify_prefetch_loads"] == 2
+                    assert not control.pending.any()
+                    assert control.verify_route_ids
+                assert torch.equal(hidden, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("pool_mode", ["unified", "per_layer"])
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("graph", [False, True])
@@ -1433,6 +1512,8 @@ def test_optimized_admission_matches_reference_without_predictions_including_fai
         refs.zero_()
         if prefetch:
             demand.zero_()
+            refs[(queue < 2147483647) & (mapping < 0)] = 1
+        usage[owners < 0] = -1
         inputs = [mapping, owners, usage, torch.tensor(100, dtype=torch.int64), refs, pending,
                   demand, queue, *(torch.full((experts * layers,), -99, dtype=torch.int32) for _ in range(3)),
                   torch.zeros(1, dtype=torch.int64), torch.zeros(1, dtype=torch.int32),
@@ -1447,9 +1528,15 @@ def test_optimized_admission_matches_reference_without_predictions_including_fai
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("source", ["demand", "layer", "gap", "verify"])
+@pytest.mark.parametrize("source", ["demand", "layer", "gap", "verify", "verify_prefetch"])
 @pytest.mark.parametrize("graph", [False, True])
-def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
+@pytest.mark.parametrize("resident_refs,incoming_refs,empty", [
+    ([0, 1, 10], [1, 11, 2], False),
+    ([2, 2, 2], [2, 2, 2], False),
+    ([10, 1, 1], [3, 2, 1], False),
+    ([2, 2, 2], [0, 0, 0], True),
+])
+def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph, resident_refs, incoming_refs, empty):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     stream = torch.cuda.Stream()
@@ -1457,21 +1544,45 @@ def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
     with torch.cuda.stream(stream):
         cache = toy_cache(torch.device("cuda"), slots=6)
         control = GPUExpertCache(cache, stream, max_loops=8, max_rows=33, top_k=2,
-            compact_control=True, implementation="optimized", prefetch=False)
+            compact_control=True, implementation="optimized", prefetch=source == "verify_prefetch",
+            layer_quota=0, verify_layer_quota=3 if source == "verify_prefetch" else 0)
         control.begin(1)
-        control.set_phase("verify" if source == "verify" else "preverify")
-        owners = torch.tensor([0, 1, 16, 17, 18, 19], device="cuda", dtype=torch.int32)
+        control.set_phase("verify" if source in ("verify", "verify_prefetch") else "preverify")
+        initial_owners = [0, 1, 16, 17, 18, -1 if empty else 19]
+        owners = torch.tensor(initial_owners, device="cuda", dtype=torch.int32)
+        refs = [0] * 32
+        refs[2:5] = incoming_refs
+        refs[17:20] = resident_refs
+        initial_usage = [0, 0, 0, 100, 1, 0]
+        prefetch = source in ("layer", "gap", "verify_prefetch")
+        expected_owners = initial_owners.copy()
+        candidates = sorted(range(2, 5), key=lambda expert: (-refs[expert], expert)) if prefetch else range(2, 5)
+        available = {3, 4, 5}
+        expected_slots, expected_sources = [], []
+        for expert in candidates:
+            if source == "verify_prefetch" and refs[expert] == 0:
+                continue
+            victim = min(available, key=lambda slot: (
+                -1 if expected_owners[slot] < 0 else refs[expected_owners[slot]], initial_usage[slot], slot))
+            previous = expected_owners[victim]
+            if prefetch and previous >= 0 and refs[expert] <= refs[previous]:
+                continue
+            expected_owners[victim] = expert
+            available.remove(victim)
+            expected_slots.append(victim)
+            expected_sources.append(expert)
+        reclaims = sum(initial_owners[slot] >= 0 and refs[initial_owners[slot]] > 0 for slot in expected_slots)
         def reset():
             cache.slot_for_id.fill_(-1)
-            cache.slot_for_id.view(-1)[owners.long()] = torch.arange(6, device="cuda", dtype=torch.int32)
+            present = owners >= 0
+            cache.slot_for_id.view(-1)[owners[present].long()] = torch.arange(6, device="cuda", dtype=torch.int32)[present]
             cache.id_of_slot.copy_(owners)
-            cache.usage.copy_(torch.tensor([0, 0, 0, 100, 1, 1], device="cuda"))
+            cache.usage.copy_(torch.tensor(initial_usage, device="cuda"))
             control.pending.zero_()
             control.pending[2] = 1
-            if source == "gap":
+            if source in ("gap", "verify_prefetch"):
                 control.pending[:2] = 1
-            control.refs.zero_()
-            control.refs[1, 2:4] = 2
+            control.refs.copy_(torch.tensor(refs, device="cuda", dtype=torch.int32).reshape(2, 16))
             control.demand.zero_()
             control.demand[:2] = 1
             control.queue.fill_(2147483647)
@@ -1483,7 +1594,7 @@ def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
         reset()
         def allocate():
             control._allocate(-1 if source == "gap" else 0, control.plans[0],
-                prefetch=source in ("layer", "gap"), gap=source == "gap", quota=3)
+                prefetch=prefetch, gap=source == "gap", quota=3, verify_prefetch=source == "verify_prefetch")
         if graph:
             allocate()
             reset()
@@ -1496,15 +1607,24 @@ def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
         else:
             allocate()
         stream.synchronize()
-        assert control.plans[0][1][:3].tolist() == [3, 4, 5]
-        assert cache.id_of_slot[:3].tolist() == [0, 1, 16]
-        assert cache.slot_for_id[1, 1:4].tolist() == [-1, -1, -1]
-        assert control.refs[1, 2:4].tolist() == [2, 2]
-        assert control.cache_conflict.item() == (source != "verify")
-        assert control.counters[28:30].tolist() == ([2, 0] if source == "demand" else
-                                                   [0, 2] if source in ("layer", "gap") else [0, 0])
+        count = len(expected_slots)
+        assert control.plans[0][3].item() == count
+        assert control.plans[0][1][:count].tolist() == expected_slots
+        assert control.plans[0][0][:count].tolist() == expected_sources
+        assert cache.id_of_slot.tolist() == expected_owners
+        expected_mapping = [-1] * 32
+        for slot, owner in enumerate(expected_owners):
+            if owner >= 0:
+                expected_mapping[owner] = slot
+        assert cache.slot_for_id.flatten().tolist() == expected_mapping
+        assert control.refs.flatten().tolist() == refs
+        assert control.cache_conflict.item() == bool(reclaims and source not in ("verify", "verify_prefetch"))
+        assert control.counters[28:30].tolist() == ([reclaims, 0] if source == "demand" else
+                                                   [0, reclaims] if source in ("layer", "gap") else [0, 0])
         # Finish every planned copy before closing this synthetic admission.
         control._copy(0, control.plans[0])
+        if count:
+            assert cache.banks[0][1][expected_slots, 0].tolist() == expected_sources
         control.pending.zero_()
         control.close(abort=True)
         assert not control.cache_conflict.any()
@@ -1513,7 +1633,7 @@ def test_prediction_reclaim_orders_tiers_and_preserves_refs(source, graph):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("source", ["demand", "layer", "gap"])
 @pytest.mark.parametrize("abort", [False, True])
-def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
+def test_conflict_control_keeps_diagnostics_and_gap_copies_while_continuing(source, abort):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     stream = torch.cuda.Stream()
@@ -1526,7 +1646,7 @@ def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
         cache.id_of_slot.copy_(torch.arange(4, device="cuda", dtype=torch.int32))
         cache.slot_for_id[0, :4] = torch.arange(4, device="cuda", dtype=torch.int32)
         control.refs[0, :4] = 1
-        control.refs[0, 4] = 1
+        control.refs[0, 4] = 3
         control.queue[0, 4] = 0
         control.demand[:2] = 1
         if source != "gap":
@@ -1542,13 +1662,15 @@ def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
         control.widths[0, 0] = 2
         control.refs[0, 2:4] += 1
         status = control.read_control(tokens, commit, loop=0, candidate_limit=8, remaining=16)
-        assert status[4] == 3 and status[0] == 1
+        assert status[4] == 0 and status[0] == 1
+        assert status[7] == 0 and control.last_cache_conflict
+        assert control.cache_conflict.item() == 1
         assert len(status) == tokens.numel() + 8
         assert control.candidate_buffer[0].item() == 11
         assert control.refs[0, 2:4].tolist() == [1, 1]
         if source == "gap":
             assert control.gap_plan[3].item() == 1 and control.pending.any()
-        # Freeing all predictions cannot revoke an earlier conflict, even at loop limit/EOS.
+        # Reclamation remains observable without overriding a later loop limit or EOS.
         control.refs.zero_()
         if abort:
             control.close(abort=True)
@@ -1557,7 +1679,8 @@ def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
             control.join_gap()
             commit.terminal.fill_(True)
             status = control.read_control(tokens, commit, loop=7, candidate_limit=8, remaining=16)
-            assert status[4] == 3 and status[2] == 1
+            assert status[4] == 1 and status[2] == 1
+            assert status[7] == 0 and control.last_cache_conflict
             control.finish_loop(False)
             control.close()
         assert cache.banks[0][1][cache.slot_for_id[0, 4], 0].item() == 4
@@ -1567,6 +1690,7 @@ def test_conflict_control_is_sticky_and_gap_copies_survive_stop(source, abort):
         assert control.request_counters[30].item() == 1
         control.begin(2)
         assert not control.cache_conflict.any() and not control.pending.any()
+        assert not control.last_cache_conflict
         control.close()
         assert control.request_counters[30].item() == 1
 
@@ -1670,14 +1794,14 @@ def test_optimized_prefetch_joins_and_retires_on_compute_stream(graph_mode):
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("fixed_gpu_routes", [None, 4])
 @pytest.mark.parametrize("wait_mode", ["all", "layer"])
-@pytest.mark.parametrize("layers", [2, 3])
-def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_mode, fixed_gpu_routes, wait_mode, layers):
+@pytest.mark.parametrize("layers,slots", [(2, 64), (3, 64), (2, 24)])
+def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_mode, fixed_gpu_routes, wait_mode, layers, slots):
     from freetoken.moe.speculative_gpu import GPUExpertCache
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        cache = toy_cache(torch.device("cuda"), layers=layers, slots=64)
+        cache = toy_cache(torch.device("cuda"), layers=layers, slots=slots)
         control = GPUExpertCache(cache, stream, max_loops=1, max_rows=4,
             layer_quota=0, compact_control=True, implementation="optimized")
         control.retain_routes = False
@@ -1702,6 +1826,16 @@ def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_
             with torch.cuda.graph(graph, stream=stream):
                 output = control.route(toy_layer(1), hidden, weights, ids)
         stream.synchronize()
+        if slots == 24:
+            cold = torch.tensor([*range(24, 32), *range(4, 12)], device="cuda", dtype=torch.int32)
+            empty = (cache.id_of_slot < 0).nonzero().flatten()
+            assert empty.numel() == cold.numel()
+            cache.id_of_slot[empty] = cold
+            cache.slot_for_id.flatten()[cold.long()] = empty.int()
+            cache.banks[0][1][empty, 0] = cold.float()
+            cache.usage[empty] = torch.where(cold < 16, cache.step + 100, -1)
+            assert (cache.id_of_slot >= 0).all()
+        assert not control.refs.any()
         prefix_mapping = cache.slot_for_id[0].clone()
         cache.banks[0][1][cache.id_of_slot < 0] = float("nan")
         control.queue.fill_(123)
@@ -1712,6 +1846,7 @@ def test_suffix_prefetch_freezes_native_hints_and_joins_captured_consumer(graph_
             return original_copy(layer, plan, **kwargs)
         control._copy = delayed_copy
         control.prefetch_suffix(hints, 8)
+        assert control.external_plan_counts[1:].tolist() == [4] * (layers - 1)
         if graph_mode:
             graph.replay()
         else:

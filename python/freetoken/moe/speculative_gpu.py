@@ -28,9 +28,9 @@ BYTE_NAMES = ("preverify_demand_loads", "verify_demand_loads", "layer_prefetch_l
 
 
 @triton.jit
-def _prediction_victim(available, protected, usage, slots):
-    ordinary = available & ~protected
-    eligible = tl.where(tl.sum(ordinary.to(tl.int32), 0) > 0, ordinary, available)
+def _prediction_victim(available, counts, usage, slots):
+    coldest = tl.min(tl.where(available, counts, 2147483647), 0)
+    eligible = available & (counts == coldest)
     oldest = tl.min(tl.where(eligible, usage, 9223372036854775807), 0)
     return tl.min(tl.where(eligible & (usage == oldest), slots, 2147483647), 0)
 
@@ -291,7 +291,8 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
            C: tl.constexpr, E: tl.constexpr, PREVERIFY: tl.constexpr = False,
            VERIFY_PREFETCH: tl.constexpr = False, CURRENT_LAYER: tl.constexpr = -1,
            verify_prefetched=None, cache_conflict=None, control=None,
-           owner_pools=None, POOL: tl.constexpr = 0, quota_remaining=None):
+           owner_pools=None, POOL: tl.constexpr = 0, quota_remaining=None,
+           REF_ADMISSION: tl.constexpr = True):
     if control is not None:
         if (tl.load(control + 3) != 0) | (tl.load(control + 4) != 0) | (tl.load(control + 5) == 0) | (tl.load(control + 2) != 0):
             tl.store(plan_count, 0)
@@ -302,10 +303,10 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
     slots = tl.load(mapping + base + e, e < limit, -1)
     clock = tl.load(clock_ptr)
     if PREFETCH:
+        reference_counts = tl.load(refs + base + e, e < limit, 0)
         if VERIFY_PREFETCH:
-            counts = tl.load(refs + base + e, e < limit, 0)
-            order = -counts
-            desired = (e < limit) & (slots < 0) & (counts > 0)
+            order = e
+            desired = (e < limit) & (slots < 0) & (reference_counts > 0)
         else:
             order = tl.load(queue + base + e, e < limit, 2147483647)
             desired = (e < limit) & (slots < 0) & (order < 2147483647)
@@ -328,7 +329,9 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
         c = tl.arange(0, C)
         cached = tl.load(owners_ptr + c, c < SLOTS, -1)
         usage = tl.load(usage_ptr + c, c < SLOTS, 9223372036854775807)
-        protected = tl.load(refs + tl.maximum(cached, 0), (c < SLOTS) & (cached >= 0), 0) > 0
+        prediction_counts = tl.load(refs + tl.maximum(cached, 0), (c < SLOTS) & (cached >= 0), 0)
+        victim_counts = tl.where(cached < 0, -1, prediction_counts)
+        protected = prediction_counts > 0
         pending = tl.load(pending_ptr + c, c < SLOTS, 1) != 0
         active = tl.full((C,), False, tl.int1)
         if PREFETCH and not GAP:
@@ -344,12 +347,21 @@ def _admit_optimized(mapping, owners_ptr, usage_ptr, clock_ptr, refs, pending_pt
         if quota_remaining is not None:
             budget = tl.minimum(budget, tl.load(quota_remaining))
         while (tl.sum(desired.to(tl.int32), 0) > 0) & running & (count < budget):
-            priority = tl.min(tl.where(desired, order, 2147483647), 0)
-            expert = tl.min(tl.where(desired & (order == priority), e, 2147483647), 0)
+            candidates = desired
+            if PREFETCH and REF_ADMISSION:
+                hottest = tl.max(tl.where(desired, reference_counts, -1), 0)
+                candidates &= reference_counts == hottest
+            priority = tl.min(tl.where(candidates, order, 2147483647), 0)
+            expert = tl.min(tl.where(candidates & (order == priority), e, 2147483647), 0)
             rank = tl.sum(tl.where(e == expert, ranks, 0), 0)
             eligible = (c < SLOTS) & ~pending & ~active
-            slot = _prediction_victim(eligible, protected, usage, c)
-            if slot == 2147483647:
+            slot = _prediction_victim(eligible, victim_counts, usage, c)
+            admitted = slot != 2147483647
+            if PREFETCH and REF_ADMISSION:
+                incoming = tl.sum(tl.where(e == expert, reference_counts, 0), 0)
+                victim = tl.sum(tl.where(c == slot, victim_counts, 0), 0)
+                admitted &= incoming > victim
+            if not admitted:
                 if not PREFETCH:
                     tl.store(error, 1)
                     successful = rank - 1
@@ -423,6 +435,17 @@ def _ready(pending, slots, count, N: tl.constexpr):
     n = tl.load(count)
     s = tl.load(slots + k, k < n, 0)
     tl.store(pending + s, 0, k < n)
+
+
+@triton.jit
+def _split_verify_routes(slots, weights, pending, hit_ids, miss_ids,
+                         SIZE: tl.constexpr, N: tl.constexpr):
+    r = tl.arange(0, N)
+    slot = tl.load(slots + r, r < SIZE, 0)
+    active = (r < SIZE) & (tl.load(weights + r, r < SIZE, 0) != 0)
+    ready = tl.load(pending + tl.maximum(slot, 0), active & (slot >= 0), 1) == 0
+    tl.store(hit_ids + r, tl.where(active & ready, slot, -1), r < SIZE)
+    tl.store(miss_ids + r, tl.where(active & ~ready, slot, -1), r < SIZE)
 
 
 @triton.jit
@@ -551,8 +574,10 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
             failure = tl.where(blocked != 0, 2, failure)
         pressure = (total + width * ROUTES > SLOTS) & (not CPU_FALLBACK) & (not RUNTIME_ADMISSION)
         stop = tl.where(completed >= MAX_LOOPS, 1, tl.where(pressure, 2, 0))
-        if RUNTIME_ADMISSION:
-            stop = tl.where(tl.load(cache_conflict) != 0, 3, stop)
+    # Carry reclamation diagnostics in the existing control readback.
+    blocked = blocked.to(tl.int64)
+    if cache_conflict is not None:
+        blocked |= tl.load(cache_conflict).to(tl.int64) << 32
     tl.store(output + 0, count)
     tl.store(output + 1, tl.load(accepted))
     tl.store(output + 2, finished)
@@ -570,7 +595,8 @@ def _control(tokens, consumed, accepted, terminal, error, protected, pending, ou
 
 @triton.jit
 def _gap_control(cache_conflict, output):
-    tl.store(output + 4, tl.where(tl.load(cache_conflict) != 0, 3, tl.load(output + 4)))
+    blocked = tl.load(output + 7) & 0xffffffff
+    tl.store(output + 7, blocked | (tl.load(cache_conflict).to(tl.int64) << 32))
 
 
 class GPUExpertCache:
@@ -598,6 +624,8 @@ class GPUExpertCache:
             implementation=getattr(config, "speculative_execution_implementation", "reference"),
             hybrid_phases=tuple(config.speculative_hybrid_phases) if hybrid else (),
             hybrid_max_fetch=getattr(config, "moe_hybrid_max_fetch", -1),
+            verify_moe_overlap=(getattr(config, "speculative_verify_moe_overlap", False)
+                                and getattr(config, "speculative_three_level", False) and not hybrid),
         )
         options.update(overrides)
         return cls(engine.moe_offload_cache, engine.stream, **options)
@@ -607,7 +635,8 @@ class GPUExpertCache:
                  implementation="reference", keep_hits=True, renormalize=False, collect_signals=False,
                  inner_rows=4, layer_quotas=None, demand_fence=False,
                  verify_layer_quota=0, verify_layer_quotas=None,
-                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_policy=None, preverify_top_k=None):
+                 hybrid_phases=(), hybrid_max_fetch=-1, preverify_policy=None, preverify_top_k=None,
+                 verify_moe_overlap=False):
         from .preverify_policy import PreverifyPolicy
         if preverify_top_k is not None:
             if type(preverify_top_k) is not int or not 1 <= preverify_top_k <= top_k:
@@ -673,6 +702,10 @@ class GPUExpertCache:
         self.eos_mask = None
         self.plan_capacity = max(cache.num_experts, min(max(0, gap_capacity - 1), cache.num_layers * cache.num_experts))
         self.copy_stream = torch.cuda.Stream(device=cache.device)
+        self.verify_moe_overlap = verify_moe_overlap and cache.decode_target == "gpu" and optimized
+        self.verify_copy_done = torch.cuda.Event() if self.verify_moe_overlap else None
+        self.verify_route_ids = {}
+        self.profile_verify_overlap = os.getenv("FREETOKEN_SPECULATIVE_VERIFY_TRACE", "0") == "1"
         self.refs = torch.zeros_like(cache.slot_for_id, dtype=torch.int32)
         self.pending = torch.zeros_like(cache.id_of_slot)
         self.pool_pending = [self.pending[base:base + size]
@@ -688,6 +721,7 @@ class GPUExpertCache:
         self.cursor = torch.zeros(1, dtype=torch.int32, device=cache.device)
         self.error = torch.zeros_like(self.cursor)
         self.cache_conflict = torch.zeros_like(self.cursor)
+        self.last_cache_conflict = False
         self.request_counters = torch.zeros(len(STAT_NAMES), dtype=torch.int64, device=cache.device)
         self.protected = torch.zeros(cache.num_layers, dtype=torch.int32, device=cache.device)
         self.control_device = torch.empty(max(max_rows, inner_rows) + 8, dtype=torch.int64, device=cache.device)
@@ -921,6 +955,7 @@ class GPUExpertCache:
         self.layer_transfer_bytes.zero_()
         self.error.zero_()
         self.cache_conflict.zero_()
+        self.last_cache_conflict = False
         self.epoch, self.phase, self.loop = epoch, "preverify", 0
         self.records, self.stats, self.prefetched, self.used_prefetch = [], {}, set(), set()
         self.cache.speculative_controller = self
@@ -938,10 +973,11 @@ class GPUExpertCache:
         pool = c.pool_of_layer[layer] if pool is None else pool
         size = c.pool_sizes[pool]
         kernel = _admit_optimized if self.optimize_admission else _admit
+        # CPU lookahead uses separate hints instead of persistent window references.
         extra = dict(VERIFY_PREFETCH=verify_prefetch,
                      CURRENT_LAYER=layer - 1 if verify_prefetch else layer,
                      verify_prefetched=self.verify_prefetched, cache_conflict=self.cache_conflict,
-                     control=control) if self.optimize_admission else {}
+                     control=control, REF_ADMISSION=self.retain_routes) if self.optimize_admission else {}
         kernel[(1,)](c.slot_for_id, c._pool_id_of_slot[pool], c._pool_usage[pool], c.step,
             self.refs, self.pool_pending[pool],
             self.demand, self.queue if queue is None else queue, *plan, self.error, self.counters, self.prefetched_device,
@@ -1086,6 +1122,9 @@ class GPUExpertCache:
         pool = c.pool_of_layer[li]
         pending, pool_size = self.pool_pending[pool], c.pool_sizes[pool]
         hybrid = self.phase in self.hybrid_phases
+        from freetoken.layers.quantization.moe.unquantized import FusedMoEKernel
+        overlap = (self.verify_moe_overlap and self.phase == "verify" and rows > 1
+                   and isinstance(getattr(getattr(layer, "quant_method", None), "kernel", None), FusedMoEKernel))
         cpu_pending = None
         if hybrid:
             from .speculative_hybrid import _partition
@@ -1132,9 +1171,25 @@ class GPUExpertCache:
                 torch.cuda.nvtx.range_pop()
         else:
             self._allocate(li, self.plans[0])
-            self._copy(li, self.plans[0])
+            if not overlap:
+                self._copy(li, self.plans[0])
             _resolve[(1,)](c.slot_for_id, pending, ids, slots, selected, *self.plans[0][1::2],
                 li, c.num_experts, ids.numel(), triton.next_power_of_2(ids.numel()), valid_rows, self.top_k)
+            if overlap:
+                if rows not in self.verify_route_ids:
+                    self.verify_route_ids[rows] = torch.empty_like(slots), torch.empty_like(slots)
+                hit_ids, miss_ids = self.verify_route_ids[rows]
+                # Snapshot readiness before forking the copy; retirement stays on the compute stream.
+                _split_verify_routes[(1,)](slots, selected, pending, hit_ids, miss_ids,
+                    slots.numel(), triton.next_power_of_2(slots.numel()))
+                self.copy_stream.wait_stream(self.stream)
+                with torch.cuda.stream(self.copy_stream):
+                    if self.profile_verify_overlap:
+                        torch.cuda.nvtx.range_push("FULL_VERIFY/DEMAND_WEIGHT_IO")
+                    self._copy(li, self.plans[0], retire=False)
+                    if self.profile_verify_overlap:
+                        torch.cuda.nvtx.range_pop()
+                    self.verify_copy_done.record(self.copy_stream)
         quota = self.layer_quotas[li] if self.layer_quotas is not None else self.layer_quota
         if last and self.phase == "preverify" and self.prefetch and quota:
             plan = self.layer_plans[li] if self.cross_layer_prefetch else self.plans[1]
@@ -1153,8 +1208,39 @@ class GPUExpertCache:
                     self._copy(li + 1, plan, retire=False, kind="verify")
         if hybrid and self.profile_hybrid:
             torch.cuda.nvtx.range_push("HYBRID/GPU_EXPERT_COMPUTE")
-        result = layer._expert_gemm(c, hidden, selected, slots, views=c.pool_bank_views(li), n=None,
-                                    alphas=c.alphas_for_slots(li), is_prefill=False)
+        if overlap:
+            from freetoken.kernel import moe_sum_reduce_triton
+            from freetoken.layers.quantization.moe.base import limit_or_inf
+            from freetoken.moe.legacy_format import canonical_role
+            from freetoken.moe.fused import fused_experts_decode_impl
+
+            banks = {canonical_role(name): bank for name, bank in zip(c.bank_schema, c.pool_bank_views(li))}
+            gate_up, down = banks["gate_up"], banks["down"]
+            args = (layer.activation, layer.apply_router_weight_on_input, float(layer.alpha), limit_or_inf(layer))
+            if self.profile_verify_overlap:
+                torch.cuda.nvtx.range_push("FULL_VERIFY/HIT_EXPERTS")
+            try:
+                hit_routes = fused_experts_decode_impl(hidden, gate_up, down, selected, hit_ids,
+                                                       *args, return_routes=True)
+            finally:
+                self.stream.wait_event(self.verify_copy_done)
+                _ready[(1,)](pending, self.plans[0][1], self.plans[0][3],
+                              triton.next_power_of_2(self.plan_capacity))
+                if self.profile_verify_overlap:
+                    torch.cuda.nvtx.range_pop()
+            if self.profile_verify_overlap:
+                torch.cuda.nvtx.range_push("FULL_VERIFY/MISS_EXPERTS")
+            miss_routes = fused_experts_decode_impl(hidden, gate_up, down, selected, miss_ids,
+                                                    *args, return_routes=True)
+            if self.profile_verify_overlap:
+                torch.cuda.nvtx.range_pop()
+            # Preserve the original per-route rounding and top-k reduction order.
+            hit_routes.add_(miss_routes)
+            result = torch.empty_like(hidden)
+            moe_sum_reduce_triton(hit_routes, result)
+        else:
+            result = layer._expert_gemm(c, hidden, selected, slots, views=c.pool_bank_views(li), n=None,
+                                        alphas=c.alphas_for_slots(li), is_prefill=False)
         if hybrid and self.profile_hybrid:
             torch.cuda.nvtx.range_pop()
         if hybrid:
@@ -1217,6 +1303,8 @@ class GPUExpertCache:
         if self.hybrid_phases:
             self.cache.cpu_executor.raise_if_unhealthy()
         values = self.control_host[:size].tolist()
+        self.last_cache_conflict = bool(values[7] >> 32)
+        values[7] &= 0xffffffff
         if values[3] == 2:
             raise RuntimeError("pending expert copies at the loop admission boundary")
         if values[3] == 3:

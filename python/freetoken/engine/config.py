@@ -134,6 +134,7 @@ class EngineConfig:
     speculative_prefetch_gap_capacity: int | None = None
     speculative_verify_prefetch_layer_experts: int | None = None
     speculative_verify_prefetch_layer_quotas: List[int] | None = None
+    speculative_verify_moe_overlap: bool = True
     speculative_audit: bool = False
     speculative_expert_scheduler: str = "host"
     speculative_compact_control: bool = True
@@ -203,6 +204,8 @@ class EngineConfig:
                     raise ValueError(f"baseline SD requires explicit positive {name}")
         if self.speculative_submit_tokens < 0:
             raise ValueError("speculative_submit_tokens must be nonnegative (0 uses the loop limit)")
+        if type(self.speculative_verify_moe_overlap) is not bool:
+            raise ValueError("speculative_verify_moe_overlap must be boolean")
         if self.speculative_max_loops < 1:
             raise ValueError("speculative_max_loops must be positive")
         if type(self.speculative_overlap_loops) is not int or self.speculative_overlap_loops < 1:

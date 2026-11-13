@@ -85,6 +85,30 @@ def speculative_gdn_workspace_bytes(config) -> int:
     return sum(costs) + (sum(costs[:inner]) if three_level else 0)
 
 
+def speculative_verify_overlap_workspace_bytes(config) -> int:
+    if (not getattr(config, "speculative_verify_moe_overlap", False)
+            or not getattr(config, "speculative_three_level", False)
+            or getattr(config, "moe_strategy", "offload") != "offload"
+            or getattr(config, "speculative_expert_scheduler", "host") != "gpu"
+            or getattr(config, "speculative_execution_implementation", "reference") != "optimized"
+            or getattr(config, "speculative_mode", None) == "cpu_async"):
+        return 0
+    mc = config.model_config
+    if getattr(mc, "expert_quant", "none") != "none":
+        return 0
+    maximum = three_level_max_rows(config.speculative_mtp_depth, config.speculative_max_loops)
+    rows = min(config.speculative_submit_tokens or maximum, maximum)
+    rows = min(rows, getattr(config, "speculative_max_output_tokens", None) or rows)
+    # The hit route buffer survives the miss GEMMs; exact-width graphs share a pool.
+    widths = rows * (rows + 1) // 2
+    shared_pool = (getattr(config, "speculative_graph_implementation", "reference") in ("coarse", "full")
+                   or getattr(config, "cuda_graph_max_bs", None) == 0)
+    partial = (rows if shared_pool else widths) * mc.num_experts_per_tok * max(
+        mc.hidden_size, 2 * mc.moe_intermediate_size) * config.dtype.itemsize
+    ids = widths * mc.num_experts_per_tok * 8
+    return partial + ids
+
+
 def speculative_hybrid_workspace_bytes(config, *, include_cpu_partials=True) -> int:
     if (getattr(config, "moe_strategy", "offload") != "hybrid"
             or getattr(config, "speculative_expert_scheduler", "host") != "gpu"

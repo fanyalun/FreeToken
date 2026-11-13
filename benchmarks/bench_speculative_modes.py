@@ -305,6 +305,7 @@ def main():
     parser.add_argument("--layer-prefetch-experts", type=int)
     parser.add_argument("--gap-prefetch-capacity", type=int)
     parser.add_argument("--verify-prefetch-experts", type=int)
+    parser.add_argument("--verify-moe-overlap", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prefetch-profile", default="auto")
     parser.add_argument("--calibrate-prefetch", action="store_true")
     parser.add_argument("--profile-prefetch", action="store_true",
@@ -397,7 +398,8 @@ def main():
         mode_config = dict(speculative_mode=args.mode,
             speculative_depth=args.depth, speculative_draft_model=args.draft_model,
             speculative_graph=args.graph, speculative_preverify_top_h=args.preverify_top_h,
-            speculative_max_loops=args.max_loops, **prefetch_config_kwargs(args))
+            speculative_max_loops=args.max_loops, speculative_verify_moe_overlap=args.verify_moe_overlap,
+            **prefetch_config_kwargs(args))
         if args.mode == "ar":
             capacity = args.max_input_tokens + args.max_output_tokens
             mode_config = dict(speculative_mtp_depth=0, speculative_prefetch=False,

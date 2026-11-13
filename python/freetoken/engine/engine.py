@@ -511,9 +511,10 @@ class Engine:
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
-        from freetoken.engine.cache_budget import speculative_hybrid_workspace_bytes
+        from freetoken.engine.cache_budget import speculative_hybrid_workspace_bytes, speculative_verify_overlap_workspace_bytes
         # CPU partials already exist in the executor and are included in new_free.
         available_memory -= speculative_hybrid_workspace_bytes(config, include_cpu_partials=False)
+        available_memory -= speculative_verify_overlap_workspace_bytes(config)
         if is_native_sd(config):
             per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
             # The static plan already reserved KV; allocator slack uses the runtime reserve.
@@ -651,7 +652,7 @@ class Engine:
     def _plan_speculative_memory(self, *, minimum=0, maximum=0, slot_bytes=0, cache_cost=None):
         config = self.config
         from .cache_budget import (speculative_gdn_workspace_bytes, speculative_hybrid_workspace_bytes,
-                                   speculative_split_workspace_bytes)
+                                   speculative_split_workspace_bytes, speculative_verify_overlap_workspace_bytes)
         capacity, pages = resolve_capacity(config)
         per_page, fixed, _, _ = self._pool_cls.kv_cost(config)
         budget = int(config.memory_ratio * self._baseline_free)
@@ -659,7 +660,8 @@ class Engine:
             weights_bytes=self._weights_bytes, kv_bytes=(pages + 1) * per_page,
             state_bytes=state_pool_bytes(config),
             workspace_bytes=(fixed + speculative_hybrid_workspace_bytes(config)
-                             + speculative_gdn_workspace_bytes(config) + speculative_split_workspace_bytes(config)),
+                             + speculative_gdn_workspace_bytes(config) + speculative_split_workspace_bytes(config)
+                             + speculative_verify_overlap_workspace_bytes(config)),
             runtime_reserve_bytes=self._baseline_free - budget,
             expert_slot_bytes=slot_bytes, minimum_slots=minimum, maximum_slots=maximum,
             slots=0 if config.moe_cache_auto or not slot_bytes else config.moe_cache_size,
@@ -782,11 +784,13 @@ class Engine:
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto, speculative_hybrid_workspace_bytes
+        from freetoken.engine.cache_budget import (expert_bytes_per_slot, resolve_moe_cache_auto,
+                                                 speculative_hybrid_workspace_bytes, speculative_verify_overlap_workspace_bytes)
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         fixed_cache_size += speculative_hybrid_workspace_bytes(config)
+        fixed_cache_size += speculative_verify_overlap_workspace_bytes(config)
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
         return resolve_moe_cache_auto(

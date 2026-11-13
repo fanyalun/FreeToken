@@ -642,6 +642,8 @@ def test_hybrid_graph_partitions_routes_and_falls_back_under_slot_pressure(phase
             def gemm(cache, x, weights, slots, **kwargs):
                 return fused_experts_decode_impl(x, *cache.bank_views(), weights, slots, "silu", False)
             layer = SimpleNamespace(layer_id=0, _expert_gemm=gemm)
+            prediction_counts = [10, 1, 4, 1, 3, 3, 1, 8]
+            recency = [0, 9, 2, 1, 8, 0, 1, 3]
             def reset():
                 cache.slot_for_id.fill_(-1)
                 cache.id_of_slot.fill_(-1)
@@ -657,7 +659,8 @@ def test_hybrid_graph_partitions_routes_and_falls_back_under_slot_pressure(phase
                     for sources, bank in cache.banks:
                         bank.copy_(sources[li][:8])
                     if li:
-                        control.refs[li, :8] = 1
+                        control.refs[li, :8] = torch.tensor(prediction_counts, device="cuda")
+                        cache.usage.copy_(torch.tensor(recency, device="cuda"))
             reset()
             control.route(layer, hidden, weights, ids)
             stream.synchronize()
@@ -694,6 +697,11 @@ def test_hybrid_graph_partitions_routes_and_falls_back_under_slot_pressure(phase
                 expected_loads = 0 if cap == 0 or not prefer_gpu or cache_state == "hits" else min(8, len(missing))
                 assert control.plans[0][3].item() == expected_loads
                 assert control.plans[0][0][:expected_loads].tolist() == missing[:expected_loads]
+                expected_slots = (sorted(range(8), key=lambda slot: (prediction_counts[slot], recency[slot], slot))
+                                  if cache_state == "protected" else list(range(8)))
+                assert control.plans[0][1][:expected_loads].tolist() == expected_slots[:expected_loads]
+                if cache_state == "protected":
+                    assert control.refs[1, :8].tolist() == prediction_counts
                 assert not control.error.item()
                 assert not control.pending.any()
         finally:
