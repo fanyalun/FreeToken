@@ -1100,10 +1100,9 @@ class Engine:
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.
 
-        Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :
-        (cpu_bw - pcie_bw), i.e. fetching a pcie_bw / cpu_bw fraction of each decode
-        step's misses -- both sides then finish together instead of one idling. The
-        achieved bandwidths come from the cached `ft bench bw` profile, from the row of each
+        The overlapped pair gives pcie / (pcie + cpu); standalone measurements fall
+        back to pcie / cpu. The achieved bandwidths come from the cached `ft bench bw`
+        profile, from the row of each
         MoE layer's kind (format, options, expert shape, top_k, CPU worker threads); a layer
         without a row keeps the fixed cap of 1.
         """

@@ -114,13 +114,12 @@ class ThreeLevelCoordinator:
         if hybrid_phases:
             self.experts.execution_mode = (engine.config.speculative_graph_implementation
                                            if runner.use_graph else "eager")
-            profile_path = engine.config.speculative_hybrid_profile
             from freetoken.layers.moe import iter_moe_layers
             layouts = set()
             for layer in iter_moe_layers(engine.model):
                 layout = cache.layer_layout[layer.layer_id]
                 if layout not in layouts:
-                    self.experts.prepare_hybrid(layer, profile_path)
+                    self.experts.prepare_hybrid(layer)
                     layouts.add(layout)
         self.verify_prefetch_signature = self._verify_prefetch_signature()
         self.compact_control = getattr(self.experts, "compact_control", False)
@@ -176,7 +175,7 @@ class ThreeLevelCoordinator:
         if profile is not None and self.experts.phase == "preverify":
             profile.verify_start(self.experts.loop, len(inputs), self.engine.stream)
         with self.engine.model.forward_host_ctx(batch, False):
-            result = runner._target(batch)
+            result = runner._target(batch, preverify=self.experts.phase == "preverify")
         if profile is not None and self.experts.phase == "preverify":
             profile.verify_end(self.experts.loop, len(inputs), self.engine.stream)
         return result

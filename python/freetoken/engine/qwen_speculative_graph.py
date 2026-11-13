@@ -156,6 +156,7 @@ class QwenSpeculativeGraphSet:
         c, cache = self.engine.config, self.experts.cache
         return (c.speculative_mtp_depth, c.speculative_max_loops, c.speculative_submit_tokens,
                 c.speculative_skip_last_preverify,
+                c.speculative_preverify_token_map,
                 getattr(c, "speculative_reference_math", False),
                 c.speculative_graph_implementation, c.speculative_execution_implementation,
                 c.speculative_prefetch, c.speculative_prefetch_layer_experts,
@@ -178,6 +179,7 @@ class QwenSpeculativeGraphSet:
                 tuple(getattr(c, "speculative_hybrid_phases", ())),
                 getattr(c, "speculative_hybrid_profile", None), getattr(c, "moe_hybrid_max_fetch", -1),
                 getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1),
+                getattr(self.experts, "hybrid_fetch_fractions", ()),
                 id(getattr(self.runner, "three_level", self.coordinator)))
 
     def _batch(self, width, state):
@@ -260,7 +262,7 @@ class QwenSpeculativeGraphSet:
         if self.calibration is not None:
             self.calibration.mark("target_start")
         with self.engine.model.forward_host_ctx(lane.batch, True):
-            tokens, hidden = self.runner._target(lane.batch)
+            tokens, hidden = self.runner._target(lane.batch, preverify=inner)
         if self.calibration is not None:
             self.calibration.mark("target_end")
         lane.hidden.copy_(hidden)

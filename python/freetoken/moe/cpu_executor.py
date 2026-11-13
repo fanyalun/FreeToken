@@ -86,7 +86,25 @@ def compiled_extension_supports(activation: str) -> bool:
     return _ACT_IDS[activation] <= getattr(_cpu_moe, "max_generic_act_id", lambda: 2)()
 
 
-def physical_core_cpus() -> list[int]:
+def _allowed_cpus(device=None) -> list[int]:
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except AttributeError:
+        allowed = list(range(os.cpu_count() or 1))
+    if device is not None and device.type == "cuda":
+        from pathlib import Path
+        from .hybrid_profile import pcie_identity
+
+        info = pcie_identity(str(getattr(torch.cuda.get_device_properties(device), "uuid", "")))
+        node = (info or {}).get("numa_node", "-1")
+        if node != "-1":
+            local = [c for c in allowed if Path(f"/sys/devices/system/cpu/cpu{c}/node{node}").exists()]
+            if local:
+                allowed = local
+    return allowed
+
+
+def physical_core_cpus(device=None) -> list[int]:
     """One logical CPU per physical core, restricted to this process's affinity.
 
     MoE decode is memory-bandwidth-bound, so SMT siblings only contend for the
@@ -94,10 +112,7 @@ def physical_core_cpus() -> list[int]:
     physical core (and pinning to it) gives the best, most stable bandwidth.
     Falls back to the full affinity set when sysfs topology is unavailable.
     """
-    try:
-        allowed = sorted(os.sched_getaffinity(0))
-    except AttributeError:
-        allowed = list(range(os.cpu_count() or 1))
+    allowed = _allowed_cpus(device)
     reps: list[int] = []
     seen: set[str] = set()
     for cpu in allowed:
@@ -124,7 +139,7 @@ def _spin_wait_ok(core_ids: list[int], coord_core: int) -> bool:
     return len(spare) >= 2
 
 
-def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
+def resolve_threads_and_affinity(requested: int, device=None) -> tuple[int, list[int]]:
     """Return (num_threads, core_ids) for the worker pool.
 
     ``requested == 0`` -> one thread per physical core, pinned to it (best for the
@@ -133,13 +148,10 @@ def resolve_threads_and_affinity(requested: int) -> tuple[int, list[int]]:
     spreading first across physical cores, then across the remaining logical CPUs
     (so distinct hardware threads are used before any core is doubled up).
     """
-    reps = physical_core_cpus()
+    reps = physical_core_cpus(device)
     if requested and requested > 0:
         n = int(requested)
-        try:
-            allowed = sorted(os.sched_getaffinity(0))
-        except AttributeError:
-            allowed = list(range(os.cpu_count() or 1))
+        allowed = _allowed_cpus(device)
         # physical-core reps first, then the rest of the logical CPUs.
         order = reps + [c for c in allowed if c not in set(reps)]
         if not order:
@@ -294,14 +306,16 @@ class CpuMoeExecutor:
         # ROCm 7.14 returns wrong results when it replays host-function nodes, so there only the doorbell is graph-safe.
         self._graph_capture_safe = self._flag_sync or _cpu_moe.host_func_capture_safe()
 
-        nthreads, core_ids = resolve_threads_and_affinity(num_threads)
+        nthreads, core_ids = resolve_threads_and_affinity(num_threads, device)
         coord_core = -1
-        if self._flag_sync and num_threads == 0 and nthreads > 2:
-            # Auto sizing: give the coordinator the last physical core instead of
-            # oversubscribing (workers drop from N to N-1).
-            coord_core = core_ids[-1]
-            nthreads -= 1
-            core_ids = core_ids[:-1]
+        if self._flag_sync:
+            spare_cores = [c for c in physical_core_cpus(device) if c not in core_ids]
+            if spare_cores:
+                coord_core = spare_cores[-1]
+            elif num_threads == 0 and nthreads > 2:
+                coord_core = core_ids[-1]
+                nthreads -= 1
+                core_ids = core_ids[:-1]
         self._coord_core = coord_core
         alloc_io = (
             (lambda *shape, dtype: torch.empty(*shape, dtype=dtype))
@@ -342,7 +356,7 @@ class CpuMoeExecutor:
         self.spin_wait = _spin_wait_ok(core_ids, coord_core)
         self._ext.set_spin_wait(self.spin_wait)
 
-        spare = len(physical_core_cpus()) - nthreads - (1 if coord_core >= 0 else 0) - 1
+        spare = len(physical_core_cpus(device)) - nthreads - (1 if coord_core >= 0 else 0) - 1
         clamp = max(1, min(torch.get_num_threads(), spare))
         if clamp < torch.get_num_threads():
             logger.info_rank0(
@@ -402,7 +416,7 @@ class CpuMoeExecutor:
         fmt_label = "; ".join(f"{_format_label(name, opts)}: {n} layers" for (name, opts), n in layer_counts.items())
         logger.info_rank0(
             f"CPU MoE executor ready: threads={nthreads} (pinned to cores "
-            f"{core_ids[0]}..{core_ids[-1]}) isa={self.isa} "
+            f"{core_ids[0]}..{core_ids[-1]}, coordinator={coord_core}) isa={self.isa} "
             f"fmt={fmt_label} "
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens} "

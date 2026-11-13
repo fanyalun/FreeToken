@@ -28,6 +28,25 @@ _HYBRID_FETCH_SEED = 0
 _HYBRID_EVICT_CHUNK = 8192
 
 
+@triton.jit
+def _hybrid_fetch_count(missing, fraction_q16, fallback, step, seed, ROUND: tl.constexpr):
+    count = fallback
+    if fraction_q16 > 0:
+        lo = (missing * fraction_q16) >> 16
+        if ROUND == 1:
+            remainder = (missing * fraction_q16) & 0xFFFF
+            random = tl.rand(seed, (step & 0x7FFFFFFF).to(tl.int32))
+            count = lo + ((random * 65536.0) < remainder.to(tl.float32)).to(tl.int32)
+        elif ROUND == 2:
+            count = (missing * fraction_q16 + 0xFFFF) >> 16
+        else:
+            lower = tl.maximum(lo * ((1 << 16) - fraction_q16), (missing - lo) * fraction_q16)
+            upper = tl.maximum((lo + 1) * ((1 << 16) - fraction_q16),
+                               (missing - lo - 1) * fraction_q16)
+            count = tl.where(lower <= upper, lo, lo + 1)
+    return count
+
+
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
@@ -359,24 +378,7 @@ def _ensure_experts_hybrid_kernel(
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
     # Cap the fetches; the overflow misses are computed on the CPU (left non-resident).
-    if fetch_frac_q16 > 0:
-        # Bandwidth-matched split (fetch_frac = pcie_bw / cpu_bw): fetch time scales with
-        # F * (1 - frac), CPU time with (M - F) * frac; they balance at F = frac * M. Pick
-        # the integer neighbor that minimizes the slower (max) side of the overlap.
-        lo = (num_missing * fetch_frac_q16) >> 16
-        if ROUND == 1:
-            # step is unique per launch, so each (layer, step) draws its own number
-            rem = (num_missing * fetch_frac_q16) & 0xFFFF
-            u = tl.rand(seed, (step & 0x7FFFFFFF).to(tl.int32))
-            max_fetch = lo + ((u * 65536.0) < rem.to(tl.float32)).to(tl.int32)
-        elif ROUND == 2:
-            max_fetch = (num_missing * fetch_frac_q16 + 0xFFFF) >> 16
-        else:
-            cost_lo = tl.maximum(lo * ((1 << 16) - fetch_frac_q16), (num_missing - lo) * fetch_frac_q16)
-            cost_hi = tl.maximum(
-                (lo + 1) * ((1 << 16) - fetch_frac_q16), (num_missing - lo - 1) * fetch_frac_q16
-            )
-            max_fetch = tl.where(cost_lo <= cost_hi, lo, lo + 1)
+    max_fetch = _hybrid_fetch_count(num_missing, fetch_frac_q16, max_fetch, step, seed, ROUND)
     is_hit = is_active & (slot >= 0)
     # a pool smaller than num_experts may hold fewer free slots than misses
     num_fetch = tl.minimum(tl.minimum(num_missing, tl.minimum(max_fetch, fetch_cap)), cache_size - tl.sum(is_hit.to(tl.int32)))

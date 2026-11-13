@@ -74,8 +74,7 @@ class EngineConfig:
     moe_cpu_layers: str | None = None
     # Hybrid MoE backend (--moe-strategy hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
-    # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
-    # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
+    # -1 (default) = auto: use the ft bench bw fetch fraction for each step's misses;
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
     # Hybrid with locked layers (banks the pin quota could not take, OS-locked instead): a locked layer keeps GPU
@@ -105,6 +104,7 @@ class EngineConfig:
     speculative_max_loops: int = 4
     speculative_skip_last_preverify: bool = False
     speculative_preverify_policy: str = "fixed_topk"
+    speculative_preverify_token_map: bool = False
     speculative_preverify_top_k: int | None = None
     speculative_preverify_replacement: str = "zero"
     speculative_modes_calibration: str | None = None

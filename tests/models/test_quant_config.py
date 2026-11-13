@@ -509,6 +509,44 @@ def test_lm_head_keeps_the_requested_rows(make_scheme):
             assert not t[128:].float().any()
 
 
+def test_preverify_token_map_preserves_full_target_ids(monkeypatch):
+    from freetoken import core
+    from freetoken.core import Batch, Context
+    from freetoken.engine.qwen_mtp import QwenMTPRunner
+    from freetoken.layers.embedding import ParallelLMHead
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    ctx = Context(page_size=1)
+    monkeypatch.setattr(core, "_GLOBAL_CTX", ctx)
+    head = ParallelLMHead(256, 4)
+    head.weight = torch.zeros(256, 4)
+    head.weight[[91, 7, 35, 200, 210]] = torch.tensor([
+        [3., 1., 0., 0.], [1., 6., 0., 0.], [2., 2., 0., 0.],
+        [20., 0., 0., 0.], [0., 20., 0., 0.],
+    ])
+    ids = torch.tensor([91, 7, 35])
+    head.keep_rows(ids, None)
+    body = torch.nn.Embedding.from_pretrained(torch.eye(4)[:2])
+    config = SimpleNamespace(speculative_preverify_token_map=True)
+    engine = SimpleNamespace(ctx=ctx, config=config, model=SimpleNamespace(model=body, lm_head=head))
+    runner = SimpleNamespace(engine=engine, reference_ar=False)
+    batch = Batch(reqs=[], phase="decode")
+    batch.input_ids = torch.tensor([0, 1])
+    hidden = body(batch.input_ids)
+    full = torch.nn.functional.linear(hidden, head.weight)
+    expected_pre = ids[full[:, ids].argmax(-1)].to(torch.int32)
+    expected_full = full.argmax(-1).to(torch.int32)
+    assert not torch.equal(expected_pre, expected_full)
+    pre, pre_hidden = QwenMTPRunner._target(runner, batch, preverify=True)
+    target, target_hidden = QwenMTPRunner._target(runner, batch)
+    assert torch.equal(pre, expected_pre) and torch.equal(target, expected_full)
+    assert torch.equal(pre_hidden, hidden) and torch.equal(target_hidden, hidden)
+    config.speculative_preverify_token_map = False
+    disabled, _ = QwenMTPRunner._target(runner, batch, preverify=True)
+    assert torch.equal(disabled, expected_full)
+
+
 def test_compressed_tensors_target_classes_other_than_linear_fail_closed():
     q = {"quant_method": "compressed-tensors", "config_groups": {"group_0": {
         "targets": ["Embedding"], "weights": {"num_bits": 8, "type": "float", "strategy": "channel"}, "input_activations": {"dynamic": True}}}}

@@ -43,7 +43,8 @@ class CandidateRunner:
             experts.join_gap()
         else:
             runner.engine.stream.wait_stream(experts.copy_stream)
-        result = runner._execute(phase, batch, need_logits=need_logits)
+        result = runner._execute(phase, batch, need_logits=need_logits,
+                                 preverify=experts.phase == "preverify")
         if check_error:
             experts.check_error()
         return result

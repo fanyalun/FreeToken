@@ -34,7 +34,7 @@ target is `Qwen/Qwen3.6-35B-A3B` in BF16.
 CPU Async is excluded: there is no CPU-authoritative full Target worker,
 CPU-prefix/GPU-suffix split verifier, asynchronous candidate pipeline, or its
 installation/recovery protocol. Hybrid still requires the CPU expert executor,
-its grouped tasks, synchronization, and cost profile. Those are part of Hybrid
+its grouped tasks, synchronization, and bandwidth profile. Those are part of Hybrid
 MoE execution.
 
 The three-level mode does not use the normal HTTP scheduler, continuous batching,
@@ -82,8 +82,10 @@ capture behavior.
 | `speculative_preverify_replacement` | `"zero"`; `"identity"` is also available. |
 | `speculative_graph` | `"full"` unless CUDA Graphs are disabled; specify `"eager"` for eager execution. |
 | `speculative_hybrid_phases` | `("preverify", "verify")`; configurable by phase. |
+| `moe_hybrid_max_fetch` | `-1` uses `ft bench bw`; a missing row falls back to one fetch per layer call. Nonnegative values set a fixed cap per call. |
 | `speculative_max_input_tokens` / `speculative_max_output_tokens` | 4096 / 1024; determine initialized request capacity. |
 | `speculative_token_map` | `None`, disabled. |
+| `speculative_preverify_token_map` | `False`; opt in to sharing the Draft token map with Pre-Verify. |
 
 For the 35B geometry `(hidden_size, moe_intermediate_size, num_experts,
 num_moe_layers) = (2048, 512, 256, 40)`, the `"auto"` prefetch selection supplies
@@ -155,9 +157,28 @@ def generate(model_path, prompt_ids, eos_ids):
 The 32 GiB value is an explicit example budget. Keep it, the resolved expert slot
 count, KV capacity, and runtime reserve in any comparison's record. Switching to
 `moe_strategy="hybrid"` enables Hybrid expert execution; its CPU thread settings
-and matching `speculative_hybrid_profile` are independent of CPU Async. Switching
+and `ft bench bw` profile are independent of CPU Async. Switching
 to `speculative_graph="full"` selects the dedicated Graph family. Recreate the
 Engine in a new process when changing these settings.
+
+Native MTP, Pre-Verify and Full Verify use the same bandwidth fetch fraction and
+integer rounding rule. Cache hits stay on the GPU; the fraction selects how many
+missing experts to fetch, and the CPU computes the rest. Pre-Verify applies its
+route filter first. The three-level path retains grouped CPU execution, cache
+protection, prefetch and its dedicated CUDA Graphs, without startup window-cost
+calibration.
+
+Run `ft bench bw --model /path/to/model --cpu-threads 23 --gpu 0` with the same CPU
+worker count as inference. Profiles are stored under
+`$XDG_CACHE_HOME/freetoken/benchbw/<gpu-uuid>.json` (default `~/.cache`). Set
+`FREETOKEN_BENCHBW_PATH` to select a shared persistent profile when an experiment
+uses a separate cache directory. `speculative_hybrid_profile` no longer selects a
+window-cost table and is rejected when set.
+
+CPU expert workers prefer physical cores on the GPU's PCIe NUMA node. With 23
+workers on a 24-core node, the flag coordinator uses the remaining physical
+core. This pins the worker pool and coordinator; process memory placement is
+controlled separately, for example with `numactl --cpunodebind=N --membind=N`.
 The upstream `speculative_num_steps` option is rejected in this mode; use
 `speculative_depth` for the inner Draft depth.
 
@@ -182,11 +203,14 @@ PYTHONPATH=python python scripts/make_token_map.py /path/to/model \
 ```
 
 Pass the resulting path as `EngineConfig(speculative_token_map=...)` alongside
-the three-level settings. The map changes the draft head only; draft row IDs
-are mapped back to full vocabulary IDs before acceptance, and Full Verify keeps
-the full target vocabulary. Startup copies the selected head rows before weight
+the three-level settings. By default the map changes the draft head only.
+Set `speculative_preverify_token_map=True` to let Pre-Verify share the same
+selected head rows and token map, in both eager and Full Graph execution.
+Draft and Pre-Verify row IDs are mapped back to full vocabulary IDs before
+acceptance. Prefill and Full Verify keep the full target vocabulary.
+Startup copies the selected head rows once before weight
 finalization, so this option consumes additional GPU memory and can reduce the
-expert cache capacity. Keep it disabled for comparisons that aim to preserve
+expert cache capacity; enabling Pre-Verify reuses that copy. Keep it disabled for comparisons that aim to preserve
 the existing full-vocabulary draft protocol. Its benefit requires a separate
 measurement at the same absolute memory budget.
 

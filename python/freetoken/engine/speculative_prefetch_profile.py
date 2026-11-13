@@ -100,7 +100,7 @@ def build_prefetch_identity(config, device=None, *, hardware=None):
               "max_seq_len_override", "num_page_override", "num_token_override",
               "speculative_depth", "speculative_graph", "speculative_token_map", "speculative_max_loops",
               "speculative_submit_tokens", "speculative_max_input_tokens", "speculative_max_output_tokens",
-              "speculative_skip_last_preverify",
+              "speculative_skip_last_preverify", "speculative_preverify_token_map",
               "speculative_preverify_policy", "speculative_preverify_top_h", "speculative_preverify_replacement",
               "speculative_execution_implementation", "speculative_graph_implementation",
               "speculative_prefetch_demand_fence", "speculative_reference_math", "speculative_hybrid_phases",

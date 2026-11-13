@@ -11,16 +11,17 @@ import triton
 import triton.language as tl
 
 from .speculative_gpu import _prediction_victim
+from .offload_kernels import _hybrid_fetch_count
 
 
 @triton.jit(do_not_specialize=["LAYER", "ROWS"])
 def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
                cpu_ids, cpu_weights, gpu_slots, demand, plan_owners, plan_slots, plan_src, plan_count,
-               cpu_cost, gpu_cost, fixed_cost, dispatch_cost, gpu_fixed, io_cost, dram_cost, stats,
+               fetch_fraction_q16, stats,
                LAYER, EXPERTS: tl.constexpr, SLOTS: tl.constexpr,
                ROWS, TOPK: tl.constexpr, MAX_ROUTES: tl.constexpr,
                FETCH_CAP: tl.constexpr, E: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
-               Q: tl.constexpr, PREVERIFY: tl.constexpr, valid_rows=None, cache_conflict=None):
+               PREVERIFY: tl.constexpr, ROUND: tl.constexpr, valid_rows=None, cache_conflict=None):
     e = tl.arange(0, E)
     r = tl.arange(0, R)
     width = ROWS if valid_rows is None else tl.load(valid_rows)
@@ -29,25 +30,12 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     route_weights = tl.load(weights + r, r < ROWS * TOPK, 0)
     counts = tl.histogram(route_ids, E, mask=route_valid & (route_weights != 0))
     slots = tl.load(mapping + LAYER * EXPERTS + e, e < EXPERTS, -1)
-    hit = (e < EXPERTS) & (counts > 0) & (slots >= 0)
     missing = (e < EXPERTS) & (counts > 0) & (slots < 0)
     # Integer keys give deterministic count-descending, expert-id-ascending order.
     keys = tl.where(missing, (MAX_ROUTES - counts) * E + e, 2147483647)
     ordered = tl.sort(keys, descending=False)
     ordered_ids = ordered % E
-    ordered_counts = tl.gather(counts, ordered_ids, 0)
-    ordered_counts = tl.where(ordered < 2147483647, ordered_counts, 0)
     index = tl.arange(0, E)
-    cpu = tl.load(cpu_cost + ROWS * (MAX_ROUTES + 1) + ordered_counts)
-    gpu = tl.load(gpu_cost + ROWS * (MAX_ROUTES + 1) + ordered_counts)
-    cpu = tl.where(ordered_counts > 0, cpu, 0)
-    gpu = tl.where(ordered_counts > 0, gpu, 0)
-    # Each descriptor uses 8/4/2/1 routes; every descriptor streams one expert bank.
-    tiles = ordered_counts // 8 + (ordered_counts % 8) // 4 + (ordered_counts % 4) // 2 + ordered_counts % 2
-    prefix_cpu = tl.cumsum(cpu, 0)
-    prefix_gpu = tl.cumsum(gpu, 0)
-    prefix_tiles = tl.cumsum(tiles, 0)
-    resident_gpu = tl.sum(tl.where(hit, tl.load(gpu_cost + ROWS * (MAX_ROUTES + 1) + counts), 0), 0)
     c = tl.arange(0, C)
     cached = tl.load(owners + c, c < SLOTS, -1)
     age = tl.load(usage + c, c < SLOTS, 9223372036854775807)
@@ -59,21 +47,11 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     active &= tl.load(demand + tl.minimum(tl.maximum(local, 0), EXPERTS - 1), c < SLOTS, 0) > 0
     available = (c < SLOTS) & ~busy & ~active
     limit = tl.minimum(tl.sum(available.to(tl.int32), 0), tl.sum(missing.to(tl.int32), 0))
-    if FETCH_CAP >= 0:
-        limit = tl.minimum(limit, width * FETCH_CAP)
-    q = tl.arange(0, Q)
-    pos = tl.minimum(tl.maximum(q - 1, 0), E - 1)
-    cpu_left = tl.sum(cpu, 0) - tl.where(q > 0, tl.gather(prefix_cpu, pos, 0), 0)
-    gpu_added = tl.where(q > 0, tl.gather(prefix_gpu, pos, 0), 0)
-    tiles_left = tl.sum(tiles, 0) - tl.where(q > 0, tl.gather(prefix_tiles, pos, 0), 0)
-    gpu_time = tl.load(io_cost + q, q <= MAX_ROUTES, float("inf")) + tl.load(gpu_fixed + ROWS) + resident_gpu + gpu_added
-    cpu_active = q < tl.sum(missing.to(tl.int32), 0)
-    cpu_time = tl.load(fixed_cost + ROWS) + tl.where(cpu_active, tl.load(dispatch_cost + ROWS), 0) + cpu_left
-    shared_time = tl.load(dram_cost + ROWS) * (q + tiles_left)
-    estimate = tl.maximum(tl.maximum(gpu_time, cpu_time), shared_time)
-    best = tl.min(tl.where(q <= limit, estimate, float("inf")), 0)
-    chosen = tl.min(tl.where((q <= limit) & (estimate == best), q, 2147483647), 0)
     clock = tl.load(clock_ptr)
+    fraction = tl.load(fetch_fraction_q16 + LAYER)
+    chosen = _hybrid_fetch_count(tl.sum(missing.to(tl.int32), 0), fraction,
+                                 FETCH_CAP, clock + 1, 0, ROUND)
+    chosen = tl.minimum(limit, tl.maximum(0, chosen))
     for i in range(chosen):
         expert = tl.sum(tl.where(index == i, ordered_ids, 0), 0)
         slot = _prediction_victim(available, tl.where(cached < 0, -1, prediction_counts), age, c)

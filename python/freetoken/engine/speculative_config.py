@@ -7,6 +7,12 @@ def resolve_speculative_config(config):
     put = lambda name, value: object.__setattr__(config, name, value)
     if config.gpu_memory_budget_bytes is not None and config.gpu_memory_budget_bytes <= 0:
         raise ValueError("gpu_memory_budget_bytes must be positive")
+    if type(config.speculative_preverify_token_map) is not bool:
+        raise ValueError("speculative_preverify_token_map must be boolean")
+    if config.speculative_preverify_token_map and (
+        config.speculative_mode != "three_level_gpu" or not config.speculative_token_map
+    ):
+        raise ValueError("Pre-Verify token mapping requires three_level_gpu and speculative_token_map")
     if config.speculative_mode is None:
         if config.speculative_mtp_depth or config.speculative_depth or config.speculative_three_level:
             raise ValueError("select speculative_mode=three_level_gpu for the GPU three-level runtime")
@@ -14,6 +20,8 @@ def resolve_speculative_config(config):
         return
     if config.speculative_mode != "three_level_gpu":
         raise ValueError("this branch supports speculative_mode=three_level_gpu; CPU Async is not integrated")
+    if config.speculative_hybrid_profile is not None:
+        raise ValueError("Hybrid uses ft bench bw; select its profile with FREETOKEN_BENCHBW_PATH")
     if config.speculative_algorithm is not None:
         raise ValueError("three_level_gpu and the upstream speculative_algorithm runner are mutually exclusive")
     if config.speculative_num_steps != 0:

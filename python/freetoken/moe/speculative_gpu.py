@@ -650,8 +650,10 @@ class GPUExpertCache:
         self.implementation = implementation
         self.hybrid_phases = tuple(hybrid_phases)
         self.hybrid_max_fetch = hybrid_max_fetch
-        self.hybrid_profile = self.hybrid_tables = None
-        self.hybrid_profiles_by_layout, self.hybrid_tables_by_layout = {}, {}
+        self.hybrid_profile = None
+        self.hybrid_profiles_by_layout = {}
+        self.hybrid_fetch_fractions = ()
+        self.hybrid_fetch_q16 = None
         if self.hybrid_phases and (cache.decode_target != "hybrid" or implementation != "optimized" or not compact_control):
             raise ValueError("speculative Hybrid requires optimized compact hybrid cache")
         self.cpu_stream = torch.cuda.Stream(device=cache.device) if self.hybrid_phases else None
@@ -758,27 +760,28 @@ class GPUExpertCache:
             for views in cache._pool_bank_views for bank in views) and all(
             source.data_ptr() % 16 == 0 for sources, _ in cache.banks for source in sources)
 
-    def prepare_hybrid(self, layer, profile_path=None):
-        from .speculative_hybrid import load_or_calibrate
-
+    def prepare_hybrid(self, layer):
         executor = self.cache.cpu_executor
         layout = self.cache.layer_layout[layer.layer_id]
         required_widths = set(range(1, max(self.max_rows, self.inner_rows) + 1))
-        if (layout in self.hybrid_tables_by_layout and required_widths.issubset(
-                self.hybrid_profiles_by_layout[layout]["identity"]["widths"])):
+        if layout in self.hybrid_profiles_by_layout:
             return
-        if profile_path is not None and len(self.cache.layouts) > 1:
-            from pathlib import Path
-            path = Path(profile_path)
-            profile_path = str(path.with_name(f"{path.stem}_layout_{layout}{path.suffix}"))
         if not executor._flag_sync or not required_widths.issubset(executor.grouped_widths):
             raise RuntimeError("speculative Hybrid requires pre-registered grouped memop tasks for every width")
         with torch.cuda.stream(self.stream):
-            executor.validate_grouped_graph(self.stream)
-            self.hybrid_profile, self.hybrid_tables = load_or_calibrate(self, layer, executor, profile_path)
+            if self.hybrid_fetch_q16 is None:
+                executor.validate_grouped_graph(self.stream)
+                fractions = self.cache.hybrid_fetch_fraction or [0.] * self.cache.num_layers
+                self.hybrid_fetch_fractions = tuple(fractions)
+                self.hybrid_max_fetch = self.cache.hybrid_max_fetch
+                self.hybrid_fetch_q16 = torch.tensor(
+                    [min(1 << 16, max(0, round(f * (1 << 16)))) for f in fractions],
+                    dtype=torch.int32, device=self.cache.device)
+            self.hybrid_profile = dict(policy="benchbw", widths=sorted(required_widths),
+                fetch_fractions=list(self.hybrid_fetch_fractions), fallback_cap=self.hybrid_max_fetch,
+                cpu_threads=executor.num_threads, cpu_backend="grouped")
             self.hybrid_profiles_by_layout[layout] = self.hybrid_profile
-            self.hybrid_tables_by_layout[layout] = self.hybrid_tables
-            for rows in self.hybrid_profile["identity"]["widths"]:
+            for rows in required_widths:
                 self.hybrid_outputs[rows] = (
                     torch.empty((rows, self.top_k), dtype=torch.int32, device=self.cache.device),
                     torch.empty((rows, self.top_k), dtype=torch.float32, device=self.cache.device))
@@ -1025,10 +1028,11 @@ class GPUExpertCache:
         cpu_pending = None
         if hybrid:
             from .speculative_hybrid import _partition
+            from .offload_kernels import _HYBRID_FETCH_ROUND
 
             fixed = self.fixed_gpu_routes if self.phase == "verify" else None
-            if fixed is None and self.hybrid_tables is None:
-                raise RuntimeError("speculative Hybrid must be calibrated before capture")
+            if fixed is None and self.hybrid_fetch_q16 is None:
+                raise RuntimeError("speculative Hybrid must prepare its benchbw split before capture")
             cpu_ids, cpu_weights = self.hybrid_outputs[rows]
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_push(f"HYBRID/PLAN/{self.phase}/layer={li}/rows={rows}")
@@ -1037,16 +1041,14 @@ class GPUExpertCache:
                     rows, self.top_k, fixed, c.num_experts, triton.next_power_of_2(rows),
                     triton.next_power_of_2(self.top_k), triton.next_power_of_2(c.num_experts))
             else:
-                tables = (self.hybrid_tables_by_layout[c.layer_layout[li]]
-                          if self.hybrid_tables_by_layout else self.hybrid_tables)
                 _partition[(1,)](c.slot_for_id, c._pool_id_of_slot[pool], c._pool_usage[pool], c.step, self.refs, pending,
                     ids, selected, cpu_ids, cpu_weights, slots, self.demand, *self.plans[0],
-                    tables["cpu"], tables["gpu"], tables["fixed"], tables["dispatch"], tables["gpu_fixed"], tables["io"], tables["dram"], self.counters,
+                    self.hybrid_fetch_q16, self.counters,
                     li, c.num_experts, pool_size, rows, self.top_k,
                     max(self.max_rows, self.inner_rows) * self.top_k, self.hybrid_max_fetch,
                     triton.next_power_of_2(c.num_experts), triton.next_power_of_2(pool_size),
-                    triton.next_power_of_2(max(self.max_rows, self.inner_rows) * self.top_k), triton.next_power_of_2(c.num_experts + 1),
-                    self.phase == "preverify", valid_rows, cache_conflict=self.cache_conflict,
+                    triton.next_power_of_2(max(self.max_rows, self.inner_rows) * self.top_k),
+                    self.phase == "preverify", _HYBRID_FETCH_ROUND, valid_rows, cache_conflict=self.cache_conflict,
                     num_warps=8 if pool_size >= 2048 else 4)
             if self.profile_hybrid:
                 torch.cuda.nvtx.range_pop()

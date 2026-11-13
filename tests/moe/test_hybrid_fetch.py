@@ -8,8 +8,72 @@ import json
 import os
 
 import pytest
+import torch
 
 from freetoken.moe.bench_profile import PROFILE_VERSION, default_profile_path, fetch_fraction, layer_kind_key, load_layer_kinds, locked_fetch_fraction
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("rows,valid,fraction,cap,preverify,open_slots", [
+    (1, 1, .25, 1, False, 16),
+    (4, 4, .413, 1, True, 16),
+    (17, 11, .413, 1, False, 16),
+    (4, 2, 0., 1, True, 16),
+    (4, 4, 0., 0, False, 16),
+    (17, 17, 1., 1, False, 16),
+    (4, 4, .5, 1, False, 2),
+    (4, 0, .5, 1, True, 16),
+])
+def test_three_level_bandwidth_partition_matches_cpu_oracle(rows, valid, fraction, cap, preverify, open_slots):
+    import triton
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.moe.speculative_hybrid import _partition
+
+    experts, slots, top_k = 64, 64, 4
+    cache = OffloadMoeCache(num_layers=1, num_experts=experts, cache_size=slots,
+                           device=torch.device("cuda"), decode_target="hybrid")
+    owners, usage = cache.pool_state(0)
+    owners[:2] = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    cache.slot_for_id[0, :2] = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    host_ids = torch.arange(rows * top_k, dtype=torch.int32).reshape(rows, top_k) % experts
+    host_weights = torch.full((rows, top_k), .25)
+    if preverify:
+        host_weights[:, 1:] = 0
+    active = (torch.arange(rows)[:, None] < valid) & (host_weights != 0)
+    counts = torch.bincount(host_ids[active].long(), minlength=experts)
+    missing = sorted((e for e in range(2, experts) if counts[e]), key=lambda e: (-int(counts[e]), e))
+    fixed = round(fraction * 65536)
+    if fixed:
+        target = len(missing) * fixed / 65536
+        candidates = {int(target), min(len(missing), int(target) + 1)}
+        chosen = min(candidates, key=lambda q: (max(q * (1-fixed/65536), (len(missing)-q) * fixed/65536), q))
+    else:
+        chosen = cap
+    available = open_slots - sum(bool(counts[e]) for e in (0, 1))
+    chosen = min(chosen, len(missing), available)
+    fetched = set(missing[:chosen])
+    expected_gpu = active & torch.tensor([[int(e) < 2 or int(e) in fetched for e in row] for row in host_ids])
+    ids, weights = host_ids.cuda(), host_weights.cuda()
+    cpu_ids, cpu_weights, gpu_slots = torch.empty_like(ids), torch.empty_like(weights), torch.empty_like(ids)
+    refs = torch.zeros(experts, dtype=torch.int32, device="cuda")
+    pending = torch.zeros(slots, dtype=torch.int32, device="cuda")
+    pending[open_slots:] = 1
+    demand = counts.to(device="cuda", dtype=torch.int32)
+    plan = [torch.empty(experts, dtype=torch.int32, device="cuda") for _ in range(3)]
+    plan_count = torch.zeros(1, dtype=torch.int64, device="cuda")
+    stats = torch.zeros(32, dtype=torch.int64, device="cuda")
+    frac = torch.tensor([fixed], dtype=torch.int32, device="cuda")
+    valid_rows = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    _partition[(1,)](cache.slot_for_id, owners, usage, cache.step, refs, pending,
+        ids, weights, cpu_ids, cpu_weights, gpu_slots, demand, *plan, plan_count, frac, stats,
+        0, experts, slots, rows, top_k, rows*top_k, cap, experts, slots,
+        triton.next_power_of_2(rows*top_k), preverify, 0, valid_rows)
+    assert int(plan_count) == chosen and set(plan[2][:chosen].cpu().tolist()) == fetched
+    assert torch.equal(weights.cpu(), torch.where(expected_gpu, host_weights, 0))
+    assert torch.equal(cpu_weights.cpu(), torch.where(active & ~expected_gpu, host_weights, 0))
+    assert torch.equal(cpu_ids.cpu(), torch.where(active & ~expected_gpu, host_ids, -1))
+    assert not bool((weights.cpu() * cpu_weights.cpu()).any())
+    assert torch.equal((weights + cpu_weights).cpu(), torch.where(active, host_weights, 0))
 
 
 def test_layer_kind_rows_give_fetch_fractions(tmp_path):

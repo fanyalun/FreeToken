@@ -336,7 +336,7 @@ class QwenMTPRunner:
             self.engine.page_table[0].zero_()
         self._reserved_len = 0
 
-    def _target(self, batch, *, need_logits=True):
+    def _target(self, batch, *, need_logits=True, preverify=False):
         if self.reference_ar:
             self.engine.graph_runner.pad_batch(batch)
             args = self.engine.sampler.prepare(batch)
@@ -345,9 +345,16 @@ class QwenMTPRunner:
         with self.engine.ctx.forward_batch(batch):
             hidden = self.engine.model.model.forward(batch.input_ids)
             head = self.engine.model.lm_head
+            token_ids = None
+            if preverify and self.engine.config.speculative_preverify_token_map:
+                if head.kept_rows is None:
+                    raise RuntimeError("Pre-Verify requires the prepared MTP token-map head")
+                head, token_ids = head.kept_rows
             greedy = getattr(head, "greedy", None)
             tokens = ((greedy(hidden) if greedy is not None else head.forward(hidden).argmax(-1))
                       .to(torch.int32) if need_logits else None)
+            if tokens is not None and token_ids is not None:
+                tokens = token_ids[tokens.long()].to(tokens.dtype)
         return tokens, hidden
 
     def _draft(self, batch, hidden, count=None, *, need_logits=True, last_only=False):
@@ -372,7 +379,8 @@ class QwenMTPRunner:
             recorder.draft_end()
         return tokens, recursive_hidden
 
-    def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False):
+    def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False,
+                 preverify=False):
         if last_only and (hidden is None or count is not None):
             raise ValueError("last_only requires MTP hidden and no dynamic count")
         if self.reference_ar:
@@ -380,11 +388,13 @@ class QwenMTPRunner:
                 raise ValueError("reference AR does not support hidden-only replay")
             return self._target(batch)
         key = (phase, batch.input_ids.numel())
+        if preverify:
+            key += ("preverify",)
         if not need_logits or last_only:
             key += (need_logits, last_only)
         def forward(current, source, selected):
             if source is None:
-                return self._target(current) if need_logits else self._target(current, need_logits=False)
+                return self._target(current, need_logits=need_logits, preverify=preverify)
             if need_logits and not last_only:
                 return self._draft(current, source, selected)
             return self._draft(current, source, selected, need_logits=need_logits, last_only=last_only)
