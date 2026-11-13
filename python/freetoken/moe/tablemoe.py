@@ -48,8 +48,24 @@ def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False, dtype
                     raise ValueError(f"tablemoe requires {label} checkpoint weights; {key} is {actual}")
 
 
+def decode_top_h(config, req) -> int:
+    switch = getattr(config, "tablemoe_decode_switch_after", None)
+    if switch is not None and req.uid != -1 and req.output_len - req.remain_len >= switch:
+        return config.tablemoe_decode_late_top_h
+    return config.tablemoe_decode_keep_k
+
+
 def validate_tablemoe_config(config) -> None:
     mc = config.model_config
+    switch = getattr(config, "tablemoe_decode_switch_after", None)
+    late = getattr(config, "tablemoe_decode_late_top_h", None)
+    if (switch is None) != (late is None):
+        raise ValueError("TableMoE decode switch-after and late-top-h must be set together")
+    if switch is not None:
+        if switch < 1 or not 0 <= late <= mc.num_experts_per_tok:
+            raise ValueError("TableMoE decode switch-after must be positive and late-top-h must be in range")
+        if getattr(config, "moe_policy", "native") != "native":
+            raise ValueError("staged TableMoE decode top-h requires native moe-policy")
     activation = tablemoe_activation(mc.architectures)
     if config.dtype not in (torch.float16, torch.bfloat16) or config.tp_info.size != 1:
         raise ValueError("tablemoe requires FP16 or BF16 and TP=1")
@@ -76,7 +92,7 @@ def validate_tablemoe_config(config) -> None:
         raise ValueError("tablemoe uses --tablemoe-expert-mode; --moe-cpu-layers is unsupported")
     validate_fp16_checkpoint(config.model_path, allow_bf16=config.tablemoe_convert_bf16_weights, dtype=config.dtype)
     full = (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
-            config.tablemoe_decode_keep_k == mc.num_experts_per_tok and
+            config.tablemoe_decode_keep_k == mc.num_experts_per_tok and switch is None and
             getattr(config, "tablemoe_implementation", "optimized") == "optimized")
     skip = getattr(config, "tablemoe_skip_lookup", False)
     if skip and config.tablemoe_implementation != "optimized":
@@ -169,6 +185,7 @@ class TableMoeRuntime:
         self.num_layers = mc.num_moe_layers
         self.bypass_tables = getattr(config, "tablemoe_skip_lookup", False) or (getattr(config, "moe_policy", "native") == "native" and config.tablemoe_prefill_keep_rate == 1 and
                               config.tablemoe_decode_keep_k == mc.num_experts_per_tok and
+                              getattr(config, "tablemoe_decode_switch_after", None) is None and
                               config.tablemoe_implementation == "optimized")
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.pca = {}
@@ -504,7 +521,7 @@ class TableMoeRuntime:
                     batch.tablemoe_attn_scores[layer_id][offset:offset + n],
                     self.num_experts, self.config.tablemoe_prefill_keep_rate)
             else:
-                exact[offset:offset + n, :self.config.tablemoe_decode_keep_k] = True
+                exact[offset:offset + n, :decode_top_h(self.config, req)] = True
             offset += n
         if offset != hidden_states.shape[0]:
             raise ValueError("TableMoE batch rows do not match requests")

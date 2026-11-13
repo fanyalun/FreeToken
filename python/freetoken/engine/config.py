@@ -79,6 +79,8 @@ class EngineConfig:
     tablemoe_prefill_keep_rate: float = 0.6
     tablemoe_prefill_chunk_size: int = 0
     tablemoe_decode_keep_k: int = 4
+    tablemoe_decode_switch_after: int | None = None
+    tablemoe_decode_late_top_h: int | None = None
     tablemoe_online_cache_size: int = 64
     tablemoe_offline_cosine_threshold_vision: float = 0.6
     tablemoe_offline_cosine_threshold_text: float = 0.7

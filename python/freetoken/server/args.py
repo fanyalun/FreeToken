@@ -759,6 +759,10 @@ def parse_args(
                         type=int, default=ServerArgs.tablemoe_decode_keep_k,
                         help="Decode computes the leading h routes plus GPU expert-cache hits exactly; other routes use tables.")
     parser.add_argument("--tablemoe-online-cache-size", type=int, default=ServerArgs.tablemoe_online_cache_size)
+    parser.add_argument("--tablemoe-decode-switch-after", type=int, default=None,
+                        help="Switch decode top-h after this many generated tokens per request; prompt tokens are excluded.")
+    parser.add_argument("--tablemoe-decode-late-top-h", type=int, default=None,
+                        help="Decode top-h used after --tablemoe-decode-switch-after generated tokens.")
     parser.add_argument("--tablemoe-offline-cosine-threshold-vision", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_vision)
     parser.add_argument("--tablemoe-offline-cosine-threshold-text", type=float, default=ServerArgs.tablemoe_offline_cosine_threshold_text)
     parser.add_argument("--tablemoe-decode-offline-cosine-threshold", type=float,

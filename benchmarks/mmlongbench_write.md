@@ -1,5 +1,14 @@
 # MMLongBench-Write
 
+For staged decode top-h, pass `--tablemoe-decode-top-h 4
+--tablemoe-decode-switch-after 512 --tablemoe-decode-late-top-h 6`.
+The first 512 output tokens use h=4; output token 513 onward uses h=6.
+The first output token comes from prefill and retains the prefill policy.
+Prompt length is excluded, each request switches independently, and GPU cache
+hits remain exact in both stages. CUDA Graph replay reads the current per-request
+h. Suite configs accept `decode_switch_after` and `decode_late_top_h` alongside
+`decode_keep_k`. Leaving both optional values unset retains fixed top-h.
+
 The MoDES heldout runner is `bench_modes_mmlongbench_evaluate.py --config <config.json>`. It accepts one policy per run: `methods=["modes"]` or `methods=["modes_tablemoe"]`. It reuses the completed calibration via `calibration_from` and keeps the original TableMoE split via `dataset_root` and `design2code_root`. It validates the checkpoint, calibrated runtime source, all 48 evaluation requests, existing baseline receipts, official rubric and VLMEvalKit sources before generation. Existing baseline, skip and TableMoE inference is not rerun. The baseline is read only for comparison.
 
 MoDES generation uses FP16, hybrid eager execution, concurrency 4 and natural EOS with the same 8192-token ceiling and processor settings. After generation, the local BF16 Qwen judge runs sequentially on the configured GPU using the original native scoring protocol. `progress.json` distinguishes prediction from judging; `complete.json` becomes true only when all 48 scores verify. `comparison.json` reports native quality, length and overall scores plus the 1..5 Accuracy dimension. The reused baseline used offload graphs, so this run does not claim a paired performance result. The `artifacts/modes_mmlongbench_write_20261004_test48` run freezes its sources under `source_snapshot` and uses the completed 30-sample calibration targeting an overall 50% skip rate.
