@@ -13,6 +13,9 @@ Two layers of measurement:
     contending for host DRAM) -- those two achieved bandwidths set the hybrid backend's
     per-step fetch split (``bench_profile.fetch_fraction``).
 
+BF16 rows also record two fixed GPU MoE probes and small-copy latency for
+three-level prefetch. These probes do not depend on the serving batch limit.
+
 The rule, per (workload, format): recommend ``hybrid`` when the CPU MoE kernel
 bandwidth exceeds ``threshold`` x the PCIe gather bandwidth (default 2x), otherwise
 ``offload``. Formats with no CPU MoE weight path (e.g. block-fp8) can't be computed on
@@ -494,12 +497,67 @@ def measure_pcie_gather_bw(fmt: str, wl: Workload, device: torch.device, iters: 
     end.record()
     end.synchronize()
     ms = start.elapsed_time(end) / iters
+    small = []
+    for count in (0, 1):
+        cache.num_indices.fill_(count)
+        cache.copy_missing()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            cache.copy_missing()
+        samples = []
+        for _ in range(3):
+            start.record()
+            for _ in range(8):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            samples.append(start.elapsed_time(end) * 1000 / 8)
+        small.append(statistics.median(samples))
     return {
         "bw_gbs": total_bytes / (ms / 1e3) / 1e9,
         "expert_bytes": eb,
         "synth_experts": E,
         "fused": bool(cache._copy_fused_ok),
+        "launch_us": small[0],
+        "expert_us": max(0.0, small[1] - small[0]),
     }
+
+
+@torch.inference_mode()
+def measure_gpu_moe(wl: Workload, device: torch.device) -> dict:
+    """Two fixed BF16 decode probes; runtime interpolates route work without a width scan."""
+    from freetoken.moe.fused import _THREE_LEVEL_DECODE, fused_experts_decode_impl
+
+    h, inter, topk = wl.hidden, wl.inter, wl.top_k
+    experts = min(wl.experts, max(topk, 32))
+    gate = torch.randn(experts, 2 * inter, h, device=device, dtype=torch.bfloat16) * 0.01
+    down = torch.randn(experts, h, inter, device=device, dtype=torch.bfloat16) * 0.01
+    times = []
+    token = _THREE_LEVEL_DECODE.set(True)
+    try:
+        for rows in (1, 16):
+            x = torch.randn(rows, h, device=device, dtype=torch.bfloat16)
+            ids = (torch.arange(rows * topk, device=device, dtype=torch.int32) % experts).view(rows, topk)
+            weights = torch.full((rows, topk), 1 / topk, device=device, dtype=torch.float32)
+            fused_experts_decode_impl(x, gate, down, weights, ids, activation=wl.activation,
+                                     act_alpha=wl.swiglu_alpha, act_limit=wl.swiglu_limit or float("inf"))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = fused_experts_decode_impl(x, gate, down, weights, ids, activation=wl.activation,
+                    act_alpha=wl.swiglu_alpha, act_limit=wl.swiglu_limit or float("inf"))
+            samples = []
+            for _ in range(3):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(8):
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                samples.append(start.elapsed_time(end) * 1000 / 8)
+            times.append(statistics.median(samples))
+    finally:
+        _THREE_LEVEL_DECODE.reset(token)
+    return dict(version=1, rows=[1, 16], us=times, method="bf16_grouped_decode")
 
 
 def _build_cpu_moe_executor(fmt: str, wl: Workload, banks: dict, num_threads: int, E: int):
@@ -674,17 +732,28 @@ def _bench_format(fmt: str, wl: Workload, device: torch.device, threshold: float
         "cpu_moe_gbs": None, "cpu_moe_isa": None,
         "cpu_cores": None, "isa_sweep": None, "pcie_gather_gbs": None,
         "cpu_moe_overlap_gbs": None, "pcie_gather_overlap_gbs": None,
+        "gpu_moe": None, "pcie_copy_launch_us": None, "pcie_copy_expert_us": None,
         "recommended": None,
         "note": None,
     }
     try:
         g = measure_pcie_gather_bw(fmt, wl, device, pcie_iters)
         entry["pcie_gather_gbs"] = round(g["bw_gbs"], 2)
+        entry["pcie_copy_launch_us"] = g["launch_us"]
+        entry["pcie_copy_expert_us"] = g["expert_us"]
     except (ImportError, RuntimeError) as e:
         logger.warning(f"benchbw: PCIe gather bench failed for {wl.name}/{fmt}: {e}")
         _note(entry, f"pcie gather unavailable ({e})")
     finally:
         torch.cuda.empty_cache()
+
+    if fmt == "bf16":
+        try:
+            entry["gpu_moe"] = measure_gpu_moe(wl, device)
+        except (ImportError, RuntimeError) as e:
+            _note(entry, f"GPU MoE prefetch probe unavailable ({e})")
+        finally:
+            torch.cuda.empty_cache()
 
     if fmt not in _CPU_MOE_FORMATS:
         _note(entry, f"CPU MoE has no {fmt} weight path; hybrid unavailable")
@@ -974,6 +1043,10 @@ def _print_kernels(kernels: dict, iw: int) -> None:
         if c_ov and p_ov:
             print(f"       overlapped: CPU-MoE {c_ov:.1f} + PCIe {p_ov:.1f} GB/s "
                   f"-> hybrid fetches {p_ov / (p_ov + c_ov):.1%} of misses")
+        if e.get("gpu_moe"):
+            probe = e["gpu_moe"]
+            print(f"       GPU-MoE {probe['rows']} rows: {[round(t, 2) for t in probe['us']]} us; "
+                  f"copy launch {e['pcie_copy_launch_us']:.2f} us, expert {e['pcie_copy_expert_us']:.2f} us")
         if e.get("isa_sweep"):
             tiers = sorted(e["isa_sweep"].items(), key=lambda kv: -kv[1])
             for i, (k, v) in enumerate(tiers):

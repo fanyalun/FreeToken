@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import os
-from pathlib import Path
-import platform
-import statistics
-
-import torch
 import triton
 import triton.language as tl
 
@@ -17,15 +10,18 @@ from .offload_kernels import _hybrid_fetch_count
 @triton.jit(do_not_specialize=["LAYER", "ROWS"])
 def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
                cpu_ids, cpu_weights, gpu_slots, demand, plan_owners, plan_slots, plan_src, plan_count,
-               fetch_fraction_q16, stats,
+               stats,
                LAYER, EXPERTS: tl.constexpr, SLOTS: tl.constexpr,
                ROWS, TOPK: tl.constexpr, MAX_ROUTES: tl.constexpr,
-               FETCH_CAP: tl.constexpr, E: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
-               PREVERIFY: tl.constexpr, ROUND: tl.constexpr, valid_rows=None, cache_conflict=None):
+               FETCH_CAP: tl.constexpr, FETCH_FRAC: tl.constexpr, ROUND: tl.constexpr,
+               E: tl.constexpr, C: tl.constexpr, R: tl.constexpr,
+               PREVERIFY: tl.constexpr, valid_rows=None, cache_conflict=None, row_mask=None):
     e = tl.arange(0, E)
     r = tl.arange(0, R)
     width = ROWS if valid_rows is None else tl.load(valid_rows)
     route_valid = r < width * TOPK
+    if row_mask is not None:
+        route_valid &= tl.load(row_mask + r // TOPK, r < ROWS * TOPK, False)
     route_ids = tl.load(ids + r, route_valid, 0)
     route_weights = tl.load(weights + r, r < ROWS * TOPK, 0)
     counts = tl.histogram(route_ids, E, mask=route_valid & (route_weights != 0))
@@ -46,12 +42,10 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     active = (local >= 0) & (local < EXPERTS)
     active &= tl.load(demand + tl.minimum(tl.maximum(local, 0), EXPERTS - 1), c < SLOTS, 0) > 0
     available = (c < SLOTS) & ~busy & ~active
-    limit = tl.minimum(tl.sum(available.to(tl.int32), 0), tl.sum(missing.to(tl.int32), 0))
     clock = tl.load(clock_ptr)
-    fraction = tl.load(fetch_fraction_q16 + LAYER)
-    chosen = _hybrid_fetch_count(tl.sum(missing.to(tl.int32), 0), fraction,
-                                 FETCH_CAP, clock + 1, 0, ROUND)
-    chosen = tl.minimum(limit, tl.maximum(0, chosen))
+    misses = tl.sum(missing.to(tl.int32), 0)
+    fetch = _hybrid_fetch_count(misses, FETCH_FRAC, FETCH_CAP, clock + 1, 0, ROUND)
+    chosen = tl.minimum(tl.minimum(fetch, misses), tl.sum(available.to(tl.int32), 0))
     for i in range(chosen):
         expert = tl.sum(tl.where(index == i, ordered_ids, 0), 0)
         slot = _prediction_victim(available, tl.where(cached < 0, -1, prediction_counts), age, c)
@@ -92,322 +86,3 @@ def _partition(mapping, owners, usage, clock_ptr, refs, pending, ids, weights,
     tl.atomic_add(stats + 19, tl.sum((route_valid & (route_weights != 0) & (resolved >= 0)).to(tl.int32), 0))
     tl.atomic_add(stats + (20 if PREVERIFY else 21), tl.sum(cpu_route.to(tl.int32), 0))
     tl.atomic_add(stats + (22 if PREVERIFY else 23), tl.sum(((counts > 0) & (current < 0) & (e < EXPERTS)).to(tl.int32), 0))
-
-
-def profile_identity(cache, executor, widths, *, execution="graph", layer=None):
-    from .hybrid_profile import pcie_identity
-    from freetoken.kernel import _cpu_moe
-    from freetoken.kernel.backend import is_flashinfer_installed
-    from freetoken.kernel.triton import decode_moe
-
-    props = torch.cuda.get_device_properties(cache.device)
-    kernel_root = Path(_cpu_moe.__file__).parent
-    files = (Path(__file__), Path(_cpu_moe.__file__), Path(decode_moe.__file__),
-             Path(__file__).with_name("cpu_executor.py"), Path(__file__).with_name("speculative_gpu.py"),
-             kernel_root / "fast_index_copy.py", kernel_root / "csrc/jit/fast_index_copy.cuh",
-             Path(__file__).parents[1] / "layers/moe.py", Path(__file__).with_name("fused.py"),
-             kernel_root / "moe_impl.py", kernel_root / "csrc/cpu_moe/cpu_moe_ext.cpp",
-             kernel_root / "csrc/cpu_moe/kernels/bf16.cpp",
-             kernel_root / "csrc/cpu_moe/kernels/bf16_grouped.h")
-    numa = {}
-    for core in (*executor.core_ids, executor._coord_core):
-        numa[str(core)] = [p.name for p in Path(f"/sys/devices/system/cpu/cpu{core}").glob("node*")]
-    from freetoken.moe.fused import _GROUPED_DECODE
-    return dict(version=5, execution=execution, triton=triton.__version__,
-                gpu_grouped=_GROUPED_DECODE, cpu_backend="grouped", flag_sync=executor._flag_sync,
-                cache_layout=[[name, list(bank.shape), list(bank.stride()), str(bank.dtype)]
-                              for name, bank in cache.bank_caches.items()],
-                geometry=[cache.num_layers, cache.num_experts, executor.H, executor.I,
-                executor.top_k], dtype="bf16", widths=list(widths), gpu=props.name,
-                gpu_uuid=str(getattr(props, "uuid", "")), pcie=pcie_identity(str(getattr(props, "uuid", ""))),
-                activation_backend="flashinfer" if is_flashinfer_installed() else "triton", cpu=platform.processor(),
-                cpuinfo=[line for line in Path("/proc/cpuinfo").read_text().split("\n\n")[0].splitlines()
-                         if line.startswith(("model name", "flags", "vendor_id", "cpu family", "model\t"))],
-                threads=executor.num_threads, cores=executor.core_ids, coordinator=executor._coord_core,
-                numa=numa, isa=executor.isa, torch=torch.__version__, cuda=torch.version.cuda,
-                kernels={str(p.name): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
-                cache_slots=cache.cache_size, activation=executor.activation_signature,
-                expert_layout=None if layer is None else dict(
-                    format=cache.quant_format, layout=cache.layer_layout[layer.layer_id],
-                    pools=cache.pool_sizes, layer_pools=cache.pool_of_layer,
-                    bank_rows=[[str(bank.dtype), list(bank.shape[1:])]
-                               for bank in cache.pool_bank_views(layer.layer_id)],
-                    method=repr(layer.quant_method.cfg.scheme)))
-
-
-def validate_profile(profile, identity):
-    if profile.get("identity") != identity:
-        raise ValueError("speculative Hybrid profile identity mismatch; recalibrate for this runtime")
-    width = max(identity["widths"])
-    routes = width * identity["geometry"][-1]
-    shapes = {"cpu": (width + 1, routes + 1), "gpu": (width + 1, routes + 1),
-              "fixed": (width + 1,), "dispatch": (width + 1,), "gpu_fixed": (width + 1,), "dram": (width + 1,), "io": (routes + 1,)}
-    for name, shape in shapes.items():
-        value = torch.tensor(profile.get(name, []), dtype=torch.float32)
-        if tuple(value.shape) != shape or not bool(torch.isfinite(value).all()) or bool((value < 0).any()):
-            raise ValueError(f"invalid speculative Hybrid profile table: {name}")
-    if profile["io"][0] != 0:
-        raise ValueError("zero-fetch incremental IO cost must be zero")
-    return profile
-
-
-def predict_prefix(profile, width, counts, hits=(), available=None, cap=-1):
-    hit_set = set(hits)
-    misses = sorted((e for e, count in enumerate(counts) if count and e not in hit_set),
-                    key=lambda e: (-counts[e], e))
-    limit = min(len(misses), len(misses) if available is None else available)
-    if cap >= 0:
-        limit = min(limit, width * cap)
-    estimates = []
-    for q in range(limit + 1):
-        gpu = profile["gpu_fixed"][width] + profile["io"][q]
-        gpu += sum(profile["gpu"][width][counts[e]] for e in (*hit_set, *misses[:q]))
-        cpu = profile["fixed"][width] + (profile["dispatch"][width] if q < len(misses) else 0)
-        cpu += sum(profile["cpu"][width][counts[e]] for e in misses[q:])
-        tiles = sum(counts[e] // 8 + (counts[e] % 8) // 4 + (counts[e] % 4) // 2 + counts[e] % 2
-                    for e in misses[q:])
-        estimates.append(max(gpu, cpu, profile["dram"][width] * (q + tiles)))
-    return min(range(len(estimates)), key=lambda q: (estimates[q], q)), estimates
-
-
-def calibration_routes(width, top_k, experts, distribution):
-    if not 1 <= top_k <= experts or width < 1:
-        raise ValueError("invalid calibration geometry")
-    ids = torch.arange(width * top_k).reshape(width, top_k) % experts
-    if distribution == "shared":
-        ids = torch.arange(top_k).expand(width, top_k).clone()
-    elif distribution not in ("dispersed", "partial"):
-        raise ValueError("unknown calibration distribution")
-    valid = torch.ones_like(ids, dtype=torch.bool)
-    if distribution == "partial":
-        valid = (torch.arange(width)[:, None] + torch.arange(top_k)[None, :]) % 3 != 0
-    return ids, valid
-
-
-def load_or_calibrate(controller, layer, executor, profile_path=None):
-    from .hybrid_profile import load_profile
-
-    widths = tuple(range(1, max(controller.max_rows, controller.inner_rows) + 1))
-    identity = profile_identity(controller.cache, executor, widths,
-                                execution=getattr(controller, "execution_mode", "graph" if controller.use_graph else "eager"),
-                                layer=layer)
-    def measure(current, previous):
-        if previous is None:
-            return calibrate(controller, layer, executor, current)
-        return calibrate(controller, layer, executor, current, previous=previous)
-    profile = load_profile(identity, os.getenv("FREETOKEN_HYBRID_PROFILE_CACHE",
-                           str(Path.home() / ".cache/freetoken/speculative_hybrid")),
-                           profile_path, validate_profile, measure,
-                           ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io"))
-    device = controller.cache.device
-    return profile, {name: torch.tensor(profile[name], device=device, dtype=torch.float32)
-                     for name in ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io")}
-
-
-def calibrate(controller, layer, executor, identity, previous=None):
-    from .hybrid_profile import coverage, finish_coverage, initialize_profile, missing_widths
-    from .fused import _THREE_LEVEL_DECODE
-
-    cache, stream = controller.cache, controller.stream
-    widths = identity["widths"]
-    maximum, top_k = max(widths), executor.top_k
-    routes = maximum * top_k
-    profile = dict(identity=identity, cpu=[[0.] * (routes + 1) for _ in range(maximum + 1)],
-        gpu=[[0.] * (routes + 1) for _ in range(maximum + 1)], fixed=[0.] * (maximum + 1),
-        dispatch=[0.] * (maximum + 1), gpu_fixed=[0.] * (maximum + 1), dram=[0.] * (maximum + 1),
-        io=[0.] * (routes + 1), measurements=[], choice_audit=[], raw_samples=[])
-    initialize_profile(profile, previous, ("cpu", "gpu", "fixed", "dispatch", "gpu_fixed", "dram", "io"))
-    missing = missing_widths(previous, identity)
-    previous_io = coverage(previous)[1] if previous else -1
-    cpu_stream = controller.cpu_stream
-    plan = controller.plans[0]
-
-    def measure(call, repeats=3, setup=None):
-        if setup is not None:
-            setup(0)
-        output = call()
-        stream.synchronize()
-        run = call
-        if controller.use_graph:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                output = call()
-            run = graph.replay
-        run()
-        stream.synchronize()
-        values = []
-        for repeat in range(repeats):
-            if setup is not None:
-                setup(repeat + 1)
-            start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            start.record(stream)
-            run()
-            stop.record(stream)
-            stop.synchronize()
-            executor.raise_if_unhealthy()
-            values.append(start.elapsed_time(stop) * 1000)
-        del output
-        profile["raw_samples"].append(values)
-        return statistics.median(values)
-
-    def cpu_submit(x, weights, ids, *, grouped=True):
-        controller.cpu_fork.record(stream)
-        with torch.cuda.stream(cpu_stream):
-            cpu_stream.wait_event(controller.cpu_fork)
-            return executor.decode_submit(layer.layer_id, x, weights, ids, grouped=grouped)
-
-    def cpu_join(pending):
-        with torch.cuda.stream(cpu_stream):
-            result = executor.decode_sync(pending)
-            controller.cpu_done.record(cpu_stream)
-        stream.wait_event(controller.cpu_done)
-        return result
-
-    # Calibration bypasses Batch creation but must measure the runner's MoE kernels.
-    token = _THREE_LEVEL_DECODE.set(True)
-    try:
-        controller.phase = "verify"
-        copy_zero = profile.get("copy_zero_us")
-        if copy_zero is None and previous:
-            copy_zero = next((m["us"] for m in previous.get("measurements", [])
-                              if m.get("kind") == "weight_copy" and m.get("experts") == 0), None)
-        limit = min(cache.pool_slots(layer.layer_id), cache.num_experts, routes)
-        copy_counts = list(range(previous_io + 1, limit + 1))
-        if copy_zero is None and 0 not in copy_counts:
-            copy_counts.insert(0, 0)
-        for q in copy_counts:
-            plan[1][:q].copy_(torch.arange(q, device=cache.device, dtype=torch.int32))
-            plan[3].fill_(q)
-            def setup_copy(rotation):
-                owners = (torch.arange(q, device=cache.device, dtype=torch.int32) + rotation * max(1, q)) % cache.num_experts
-                plan[0][:q].copy_(owners + layer.layer_id * cache.num_experts)
-                plan[2][:q].copy_(owners)
-            elapsed = measure(lambda: controller._copy(layer.layer_id, plan), setup=setup_copy)
-            if q == 0:
-                copy_zero = elapsed
-            else:
-                profile["io"][q] = max(0., elapsed - copy_zero)
-            profile["measurements"].append(dict(kind="weight_copy", experts=q, us=elapsed,
-                                                samples_us=profile["raw_samples"][-1]))
-        profile["copy_zero_us"] = copy_zero
-        for width in missing:
-            x = torch.randn(width, executor.H, device=cache.device, dtype=torch.bfloat16)
-            ids = torch.full((width, top_k), -1, device=cache.device, dtype=torch.int32)
-            weights = torch.ones(width, top_k, device=cache.device) / top_k
-            slots = torch.zeros_like(ids)
-            gpu_weights = torch.zeros_like(weights)
-            def gpu_compute():
-                return layer._expert_gemm(cache, x, gpu_weights, slots, views=cache.pool_bank_views(layer.layer_id), n=None,
-                                          alphas=cache.alphas_for_slots(layer.layer_id), is_prefill=False)
-            empty = measure(lambda: cpu_join(cpu_submit(x, weights, ids)))
-            gpu_empty = measure(gpu_compute)
-            profile["fixed"][width] = empty
-            profile["gpu_fixed"][width] = gpu_empty + copy_zero
-            samples = range(1, width + 1)
-            observed_cpu, observed_gpu = {0: 0.}, {0: 0.}
-            for n in samples:
-                gpu_weights.zero_()
-                gpu_weights[:n, 0].fill_(1 / top_k)
-                def setup_single(rotation):
-                    expert = rotation % cache.num_experts
-                    ids.fill_(-1)
-                    ids[:n, 0].fill_(expert)
-                    plan[0][:1].fill_(layer.layer_id * cache.num_experts + expert)
-                    plan[1][:1].zero_()
-                    plan[2][:1].fill_(expert)
-                    plan[3].fill_(1)
-                    controller._copy(layer.layer_id, plan)
-                cpu_us = measure(lambda: cpu_join(cpu_submit(x, weights, ids)), setup=setup_single)
-                cpu_samples = profile["raw_samples"][-1]
-                gpu_us = measure(gpu_compute, setup=setup_single)
-                observed_cpu[n] = max(0., cpu_us - empty)
-                observed_gpu[n] = max(0., gpu_us - gpu_empty)
-                profile["measurements"].append(dict(kind="single_expert", width=width, routes=n,
-                                                    cpu_us=cpu_us, gpu_us=gpu_us, cpu_samples_us=cpu_samples,
-                                                    gpu_samples_us=profile["raw_samples"][-1]))
-            for name, observed in (("cpu", observed_cpu), ("gpu", observed_gpu)):
-                ordered = sorted(observed)
-                for left, right in zip(ordered, ordered[1:]):
-                    for n in range(left, right + 1):
-                        profile[name][width][n] = observed[left] + (observed[right] - observed[left]) * (n - left) / (right - left)
-            trials = []
-            for distribution in ("dispersed", "shared", "partial"):
-                host_ids, host_valid = calibration_routes(width, top_k, cache.num_experts, distribution)
-                counts = torch.bincount(host_ids[host_valid], minlength=cache.num_experts).tolist()
-                ordered = sorted((e for e, n in enumerate(counts) if n), key=lambda e: (-counts[e], e))
-                rank = torch.empty(cache.num_experts, dtype=torch.int32)
-                rank.fill_(cache.num_experts)
-                for position, e in enumerate(ordered):
-                    rank[e] = position
-                actual_ids = host_ids.to(device=cache.device, dtype=torch.int32)
-                actual_rank = rank[host_ids].to(device=cache.device)
-                valid = host_valid.to(device=cache.device)
-                weights.copy_(valid / top_k)
-                limit = min(len(ordered), cache.pool_slots(layer.layer_id))
-                times, samples = [], []
-                for q in range(limit + 1):
-                    owners = torch.tensor(ordered[:q], device=cache.device, dtype=torch.int32)
-                    plan[0][:q].copy_(owners + layer.layer_id * cache.num_experts)
-                    plan[1][:q].copy_(torch.arange(q, device=cache.device, dtype=torch.int32))
-                    plan[2][:q].copy_(owners)
-                    plan[3].fill_(q)
-                    ids.copy_(torch.where((actual_rank < q) | ~valid, -1, actual_ids))
-                    slots.copy_(torch.where(actual_rank < q, actual_rank, 0))
-                    gpu_weights.copy_(torch.where(actual_rank < q, weights, 0))
-                    def concurrent():
-                        pending = cpu_submit(x, weights, ids)
-                        controller._copy(layer.layer_id, plan)
-                        result = gpu_compute()
-                        result.add_(cpu_join(pending))
-                        return result
-                    def rotate(rotation):
-                        shifted = (actual_ids + rotation) % cache.num_experts
-                        ids.copy_(torch.where((actual_rank < q) | ~valid, -1, shifted))
-                        owners = (torch.tensor(ordered[:q], device=cache.device, dtype=torch.int32) + rotation) % cache.num_experts
-                        plan[0][:q].copy_(owners + layer.layer_id * cache.num_experts)
-                        plan[2][:q].copy_(owners)
-                    elapsed = measure(concurrent, setup=rotate)
-                    samples.append(profile["raw_samples"][-1])
-                    if q == 0:
-                        grouped = measure(lambda: cpu_join(cpu_submit(x, weights, ids)))
-                        legacy = measure(lambda: cpu_join(cpu_submit(x, weights, ids, grouped=False)))
-                        profile["measurements"].append(dict(kind="grouped_vs_gemv", width=width,
-                            distribution=distribution, grouped_cpu_us=grouped,
-                            grouped_with_empty_gpu_us=elapsed, legacy_cpu_us=legacy))
-                    times.append(elapsed)
-                trials.append(dict(width=width, distribution=distribution, counts=counts, measured_us=times,
-                                   samples_us=samples, route_ids=host_ids.tolist(), valid_routes=host_valid.tolist()))
-            uniform = trials[0]
-            unique = sum(n > 0 for n in uniform["counts"])
-            unit = max(0., (uniform["measured_us"][0] - empty - observed_cpu[1]) / max(1, unique - 1))
-            # A pool wake/barrier belongs to the task, not to every expert in its union.
-            dispatch = max(0., observed_cpu[1] - unit)
-            profile["dispatch"][width] = dispatch
-            for n, value in enumerate(profile["cpu"][width]):
-                tiles = n // 8 + (n % 8) // 4 + (n % 4) // 2 + n % 2
-                profile["cpu"][width][n] = max(0., value - dispatch, unit * tiles) if n else 0.
-            memory_samples = []
-            for trial in trials:
-                order = sorted((e for e, n in enumerate(trial["counts"]) if n), key=lambda e: (-trial["counts"][e], e))
-                for q in range(1, len(trial["measured_us"]) - 1):
-                    tiles = sum(trial["counts"][e] // 8 + (trial["counts"][e] % 8) // 4
-                        + (trial["counts"][e] % 4) // 2 + trial["counts"][e] % 2 for e in order[q:])
-                    memory_samples.append(trial["measured_us"][q] / (q + tiles))
-            profile["dram"][width] = min(memory_samples, default=0.)
-            for trial in trials:
-                chosen, estimates = predict_prefix(profile, width, trial["counts"], available=cache.pool_slots(layer.layer_id))
-                times = trial["measured_us"]
-                optimum = min(range(len(times)), key=lambda q: (times[q], q))
-                profile["choice_audit"].append(dict(**trial, predicted_q=chosen, predicted_us=estimates,
-                    measured_best_q=optimum, regret_ratio=times[chosen] / times[optimum] - 1))
-            print(f"speculative Hybrid calibration: width={width}/{maximum}", flush=True)
-        return finish_coverage(profile)
-    finally:
-        _THREE_LEVEL_DECODE.reset(token)
-        stream.wait_stream(cpu_stream)
-        stream.synchronize()
-        cache.reset()
-        cache.reset_stats()
-        controller.pending.zero_()
-        controller.counters.zero_()
-        plan[3].zero_()

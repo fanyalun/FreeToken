@@ -25,6 +25,18 @@ class QwenMTPKVCache(MHAKVCache):
         group = mc.linear_attention_group()
         if group is None:
             return per_page + draft_page, fixed, page_tokens, reserve
+        from freetoken.engine.baseline_sd import is_online_sd
+        if is_online_sd(config):
+            from freetoken.engine.speculative_window import three_level_max_rows
+            from freetoken.kvcache.linear_state_pool import (
+                linear_state_bytes_per_req, verify_scratch_bytes, _linear_pool_num_slots)
+            maximum = three_level_max_rows(config.speculative_mtp_depth, config.speculative_max_loops,
+                                           config.speculative_skip_last_preverify)
+            maximum = min(config.speculative_submit_tokens or maximum, maximum, config.speculative_max_output_tokens)
+            maximum = max(maximum, config.speculative_mtp_depth + 1, config.speculative_num_draft_tokens or 0)
+            private = _linear_pool_num_slots(config) * linear_state_bytes_per_req(group, config.tp_info.size, config.dtype)
+            scratch = verify_scratch_bytes(config, maximum)
+            return per_page + draft_page, fixed + private + scratch, page_tokens, reserve
         channels = 2 * group.num_key_heads * group.key_head_dim + group.num_value_heads * group.value_head_dim
         layers = len(group.layer_ids)
         vectors = group.num_key_heads * group.key_head_dim + group.num_value_heads * group.value_head_dim
@@ -67,12 +79,30 @@ class QwenMTPKVCache(MHAKVCache):
             views = inner + upper if graph_mode == "reference" else max(1, inner) + upper if graph_mode == "full" else 2
             private_bytes = (views - 1) * 12
             private_bytes += linear_state_bytes_per_req(group, config.tp_info.size, config.dtype)
+        from freetoken.engine.baseline_sd import is_online_sd
+        if is_online_sd(config):
+            from freetoken.kvcache.linear_state_pool import linear_state_bytes_per_req
+            private_bytes += 2 * config.max_running_req * linear_state_bytes_per_req(
+                group, config.tp_info.size, config.dtype)
         rows = sum(widths)
         scratch = (
             rows * layers * (vectors * config.dtype.itemsize + 2 * group.num_value_heads * 4)
             + (rows + len(widths) * (group.conv_kernel_dim - 2)) * layers * channels * config.dtype.itemsize
             + len(widths) * 12 + private_bytes + hybrid_scratch
         )
+        if getattr(config, "speculative_eagle_topk", 1) > 1:
+            nodes = config.speculative_num_draft_tokens
+            span = config.speculative_depth + 1
+            # Raw GDN projections survive until path selection; ancestry packing
+            # and per-row attention indices are temporary and must fit the budget.
+            scratch += nodes * layers * (channels + group.num_value_heads * (group.value_head_dim + 2)) * config.dtype.itemsize
+            scratch += nodes * span * (channels * 3 + 2 * group.num_value_heads) * config.dtype.itemsize
+            from freetoken.kvcache.linear_state_pool import ssm_state_dtype
+            scratch += nodes * group.num_value_heads * group.key_head_dim * group.value_head_dim * ssm_state_dtype().itemsize
+            scratch += nodes * (config.speculative_max_input_tokens + config.speculative_max_output_tokens
+                                + max(nodes, span * config.speculative_eagle_topk)) * 4
+            scratch += config.speculative_eagle_topk * mc.vocab_size * 8
+            scratch += config.speculative_max_loops * mc.num_moe_layers * nodes * mc.num_experts_per_tok * 16
         return per_page + draft_page, fixed + scratch, page_tokens, reserve
 
     @classmethod

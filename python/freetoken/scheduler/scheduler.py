@@ -65,6 +65,8 @@ ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
 class Scheduler(SchedulerIOMixin):
+    online_spec = None
+
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
 
@@ -81,6 +83,10 @@ class Scheduler(SchedulerIOMixin):
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.spec: SpecRuntime | None = self.engine.spec
+        self.online_spec = None
+        if self.engine.speculative_runner is not None:
+            from freetoken.engine.qwen_online import QwenOnlineRuntime
+            self.online_spec = QwenOnlineRuntime(self.engine.speculative_runner)
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
         # virtual full-token coordinate; model-specific tiers ride the plug-ins -- DSV4's
         # window/cmp/idx shadows via swa_pool, Gemma's swa via swa_pool, GDN state via
@@ -297,6 +303,11 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
         self._check_pending_flush()
 
+        if self.online_spec is not None:
+            self.online_spec.step(self)
+            self._flush_abort_acks()
+            return
+
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -313,7 +324,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec is not None or self.online_spec is not None:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -611,6 +622,16 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if self.online_spec is not None:
+                params = msg.sampling_params
+                if (input_len > self.config.speculative_max_input_tokens
+                        or params.max_tokens > self.config.speculative_max_output_tokens
+                        or not params.is_greedy or params.presence_penalty != 0
+                        or params.frequency_penalty != 0):
+                    self.send_result([ErrorReplyMsg(uid=msg.uid, error=
+                        "online three_level_gpu requires greedy sampling without penalties and requests "
+                        "within speculative_max_input_tokens/speculative_max_output_tokens")])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -705,6 +726,8 @@ class Scheduler(SchedulerIOMixin):
             return
         if self.spec is not None:
             self.spec.release(req)
+        if getattr(self, "online_spec", None) is not None:
+            self.online_spec.release(self, req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).

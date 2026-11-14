@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 
 def proposer_class(config) -> type[Proposer]:
+    if config.speculative_algorithm == "mtp" and config.speculative_eagle_topk > 1:
+        from .mtp.tree import MTPTreeProposer
+
+        return MTPTreeProposer
     from freetoken.models.register import _load_attr
     from freetoken.spec import PROPOSERS
 
@@ -33,7 +37,7 @@ class SpecRunner:
     def __init__(self, config, engine) -> None:
         self.config = config
         self.device = engine.device
-        self.k = config.speculative_num_steps
+        self.k = config.decode_rows_per_req - 1
         self.proposer = proposer_class(config)(config, engine.model)
         self.radix_lookahead = self.proposer.radix_lookahead
         self.engine = None
@@ -52,6 +56,13 @@ class SpecRunner:
                 f"--speculative-num-steps must be in [1, {max_k}] for "
                 f"{config.speculative_algorithm}, got {config.speculative_num_steps}"
             )
+        if config.speculative_algorithm == "mtp":
+            from freetoken.engine.speculative_config import resolve_tree_shape
+
+            _, nodes = resolve_tree_shape(config, config.speculative_num_steps)
+            if nodes > config.max_seq_len:
+                raise ValueError("the MTP verification node budget exceeds the context capacity")
+            override("speculative_num_draft_tokens", nodes)
 
     @classmethod
     def prepare_target(cls, config, model) -> None:
@@ -101,15 +112,20 @@ class SpecRunner:
         bs, width = batch.size, self.k + 1
         # each request's rows read its pending token then its drafts
         drafts = batch.input_ids[: bs * width].view(bs, width)[:, 1:].to(torch.int64)
-        batch.features = self.feature_sink(batch)
-        logits = engine.forward_logits(batch)[: bs * width]
         proposal, self._proposal = self._proposal, None
-        if proposal.draft_support_probs is not None:
-            out, emitted = reject_with_draft_probs(
-                logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
-            )
+        batch.features = self.feature_sink(batch)
+        if proposal.trees is not None:
+            from .mtp.tree import verify_tree
+
+            out, emitted = verify_tree(engine, batch, sample_args, self.proposer, proposal.trees)
         else:
-            out, emitted = reject(logits, drafts, sample_args, engine.sampler)
+            logits = engine.forward_logits(batch)[: bs * width]
+            if proposal.draft_support_probs is not None:
+                out, emitted = reject_with_draft_probs(
+                    logits, drafts, proposal.draft_support_ids, proposal.draft_support_probs, sample_args, engine.sampler,
+                )
+            else:
+                out, emitted = reject(logits, drafts, sample_args, engine.sampler)
         host = self._host[:bs]
         host.copy_(torch.cat([out, emitted.unsqueeze(1)], dim=1), non_blocking=True)
         copy_done = torch.cuda.Event()

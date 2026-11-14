@@ -195,13 +195,15 @@ def speculative_hybrid_workspace_bytes(config, *, include_cpu_partials=True) -> 
     limit = getattr(config, "speculative_max_output_tokens", None) or outer
     inner, outer = min(inner, limit), min(outer, limit)
     maximum = max(inner, outer)
+    maximum = max(maximum, getattr(config, "speculative_num_draft_tokens", None) or 0)
+    from .baseline_sd import is_online_sd
+    if is_online_sd(config):
+        maximum *= config.max_running_req
     widths = maximum * (maximum + 1) // 2
-    routes = maximum * mc.num_experts_per_tok
-    tables = 4 * (2 * (maximum + 1) * (routes + 1) + 4 * (maximum + 1) + routes + 1)
     routing = widths * mc.num_experts_per_tok * 8
     # The CPU branch joins before merge; the next layer forks after that merge.
     partials = 2 * widths * mc.hidden_size if include_cpu_partials else 0
-    return tables + routing + partials + 7 * 8
+    return routing + partials + 7 * 8
 
 
 def expert_pool_bytes(sources, pools, sizes, row_tail_bytes=None, layer_tags=None):

@@ -156,7 +156,11 @@ class QwenMTPRunner:
         self.mtp_enabled = engine.mtp is not None and not reference_ar
         self.baseline = self.mtp_enabled and not getattr(engine.config, "speculative_three_level", False)
         self.native_sd = self.mtp_enabled
-        self.fixed_mapping = bool(engine.config.speculative_mtp_depth)
+        from .baseline_sd import is_online_sd
+        self.online = is_online_sd(engine.config)
+        self.table_idx = 0
+        self.reserve_online = None
+        self.fixed_mapping = bool(engine.config.speculative_mtp_depth) and not self.online
         self.active = False
         self._request_lock = threading.Lock()
         self.graphs = {}
@@ -182,11 +186,14 @@ class QwenMTPRunner:
         self.use_graph = (engine.config.cuda_graph_max_bs != 0 and engine.config.cuda_graph_bs != []
                           and not reference_ar)
         self.full_graph = self.use_graph and getattr(engine.config, "speculative_graph_implementation", "reference") == "full"
+        from .speculative_prefetch import DraftTimings
+        self.prefetch_timings = DraftTimings()
         self.graph_captures = {}
         if self.native_sd:
             device = engine.device
             capacity = min(engine.num_pages * engine.config.page_size, engine.page_table.shape[1])
-            engine.page_table[0, :capacity].copy_(torch.arange(capacity, dtype=torch.int32, device=device))
+            if self.fixed_mapping:
+                engine.page_table[0, :capacity].copy_(torch.arange(capacity, dtype=torch.int32, device=device))
             self.proposal_buffer = torch.empty(self.draft_width - 1, dtype=torch.int32, device=device)
             self.verify_buffer = torch.empty(self.draft_width, dtype=torch.int32, device=device)
             self.anchor_buffer = torch.empty(1, dtype=torch.int32, device=device)
@@ -200,17 +207,23 @@ class QwenMTPRunner:
             self.reader_event = torch.cuda.Event() if device.type == "cuda" else None
         self.model_state = _QwenState(self)
         self.coordinator = SpeculativeCoordinator(_QwenProposer(self), self.model_state, _QwenReservation(self))
+        self.tree = None
+        if getattr(engine.config, "speculative_eagle_topk", 1) > 1 and not reference_ar:
+            from .speculative_tree import MTPTreeRuntime
+            self.tree = MTPTreeRuntime(self)
         self.three_level = None
         if getattr(engine.config, "speculative_three_level", False) and not reference_ar:
             from .qwen_three_level import ThreeLevelCoordinator
             self.three_level = ThreeLevelCoordinator(self)
-            if getattr(engine.config, "speculative_graph_implementation", "reference") in ("coarse", "full"):
+            if not self.online and getattr(engine.config, "speculative_graph_implementation", "reference") in ("coarse", "full"):
                 from .qwen_speculative_graph import QwenSpeculativeGraphSet
                 self.coarse_graphs = QwenSpeculativeGraphSet(self.three_level)
                 with torch.cuda.stream(engine.stream):
                     self.coarse_graphs.prepare(())
 
     def _batch(self, ids, start: int, *, prefill=False, state=None):
+        if getattr(self, "tree", None) is not None and self.tree.context is not None:
+            return self.tree.batch(ids, start, state)
         n = ids.numel()
         if not prefill and not self.reference_ar:
             return self._decode_batch(ids, start, state)
@@ -223,7 +236,7 @@ class QwenMTPRunner:
         batch.padded_reqs = reqs
         batch.input_ids = ids.to(device=self.engine.device, dtype=torch.int32)
         batch.positions = torch.arange(start, start + n, dtype=torch.int32, device=self.engine.device)
-        batch.out_loc = self.engine.page_table[0, start:start + n]
+        batch.out_loc = self.engine.page_table[self.table_idx, start:start + n]
         batch.linear_table_idx = torch.ones(n, dtype=torch.int32, device=self.engine.device)
         batch.fla_metadata = build_fla_metadata(batch, self.engine.device, self.engine.linear_state_pool)
         batch.gdn_verify_state = state
@@ -245,7 +258,7 @@ class QwenMTPRunner:
 
     def _decode_batch(self, ids, start, state):
         n = ids.numel()
-        fixed_mapping = getattr(self, "native_sd", getattr(self, "baseline", False))
+        fixed_mapping = self.fixed_mapping
         if n not in self._decode_batches:
             device = self.engine.device
             reqs = [self._req(0, self.engine.max_seq_len) for _ in range(n)]
@@ -283,13 +296,13 @@ class QwenMTPRunner:
             _baseline_decode_metadata[(1,)](ids, batch.input_ids, batch.positions, batch.out_loc,
                                              start, n, triton.next_power_of_2(n))
         elif optimized:
-            _decode_metadata[(triton.cdiv(start + n, 256), n)](ids, self.engine.page_table,
+            _decode_metadata[(triton.cdiv(start + n, 256), n)](ids, self.engine.page_table[self.table_idx],
                 batch.input_ids, batch.positions, batch.out_loc, batch.attn_metadata.indptr,
                 batch.attn_metadata.indices, start, n, 256)
         else:
             batch.input_ids.copy_(ids)
             torch.add(offsets, start, out=batch.positions)
-            batch.out_loc.copy_(self.engine.page_table[0, start:start + n])
+            batch.out_loc.copy_(self.engine.page_table[self.table_idx, start:start + n])
         batch.gdn_verify_state = state
         batch.rowwise_linear = self.mtp_enabled
         batch.speculative_reference_math = getattr(self.engine.config, "speculative_reference_math", False)
@@ -299,20 +312,24 @@ class QwenMTPRunner:
             metadata.indptr[1:].cumsum_(0)
         offset = 0
         for row, req in enumerate(batch.reqs):
+            req.table_idx = self.table_idx
             end = start + row + 1
             req.cached_len, req.device_len = end - 1, end
             req.input_ids = req._ids_buf[:end]
             if not optimized and not fixed_mapping:
-                metadata.indices[offset:offset + end].copy_(self.engine.page_table[0, :end])
+                metadata.indices[offset:offset + end].copy_(self.engine.page_table[self.table_idx, :end])
             offset += end
         return batch
 
     def _req(self, cached, end):
-        req = Req(torch.zeros(end, dtype=torch.int32), 0, cached, 1, 0, SamplingParams(), None)
+        req = Req(torch.zeros(end, dtype=torch.int32), self.table_idx, cached, 1, 0, SamplingParams(), None)
         req.linear_slot_idx = 1
         return req
 
     def _reserve(self, end):
+        if self.reserve_online is not None:
+            self._reserved_len = self.reserve_online(end)
+            return self._reserved_len
         page_size = self.engine.config.page_size
         # Whole-page reservation may include padding beyond the logical context.
         aligned_context = (self.engine.max_seq_len + page_size - 1) // page_size * page_size
@@ -326,7 +343,7 @@ class QwenMTPRunner:
         if end > self._reserved_len:
             start = self._reserved_len
             if not getattr(self, "fixed_mapping", False):
-                self.engine.page_table[0, start:end] = torch.arange(start, end, dtype=torch.int32, device=self.engine.device)
+                self.engine.page_table[self.table_idx, start:end] = torch.arange(start, end, dtype=torch.int32, device=self.engine.device)
             self._reserved_len = end
         return self._reserved_len
 
@@ -358,9 +375,6 @@ class QwenMTPRunner:
         return tokens, hidden
 
     def _draft(self, batch, hidden, count=None, *, need_logits=True, last_only=False):
-        recorder = getattr(getattr(self.engine, "config", None), "_prefetch_calibration_recorder", None)
-        if recorder is not None:
-            recorder.draft_begin()
         with self.engine.ctx.forward_batch(batch):
             output = self.engine.mtp.forward(batch.input_ids, hidden)
             logits_hidden, recursive_hidden = output if isinstance(output, tuple) else (output, output)
@@ -375,8 +389,6 @@ class QwenMTPRunner:
                       .to(torch.int32) if need_logits else None)
             if tokens is not None and hasattr(self.engine.mtp, "map_tokens"):
                 tokens = self.engine.mtp.map_tokens(tokens)
-        if recorder is not None:
-            recorder.draft_end()
         return tokens, recursive_hidden
 
     def _execute(self, phase, batch, hidden=None, *, count=None, need_logits=True, last_only=False,
@@ -405,7 +417,13 @@ class QwenMTPRunner:
             self.graph_fallbacks[phase] = self.graph_fallbacks.get(phase, 0) + 1
             with self.engine.model.forward_host_ctx(batch, False):
                 try:
-                    return forward(batch, hidden, count)
+                    sample = (self.prefetch_timings.begin("draft" if phase == "chain" else phase,
+                        batch.input_ids.numel(), self.engine.stream)
+                        if hidden is not None and phase in ("chain", "reconcile") and self.three_level is not None
+                        and getattr(self.three_level.experts, "auto_gap", False) else None)
+                    result = forward(batch, hidden, count)
+                    self.prefetch_timings.end(sample)
+                    return result
                 except BaseException:
                     if hidden is None:
                         cache = getattr(self.engine, "moe_offload_cache", None)
@@ -456,8 +474,13 @@ class QwenMTPRunner:
             fixed_hidden.copy_(hidden)
         if fixed_count is not None:
             fixed_count.copy_(count)
+        sample = (self.prefetch_timings.begin("draft" if phase == "chain" else phase,
+            batch.input_ids.numel(), self.engine.stream)
+            if hidden is not None and phase in ("chain", "reconcile") and self.three_level is not None
+            and getattr(self.three_level.experts, "auto_gap", False) else None)
         with self.engine.model.forward_host_ctx(batch, True):
             graph.replay()
+        self.prefetch_timings.end(sample)
         self.graph_replays[phase] = self.graph_replays.get(phase, 0) + 1
         return output
 
@@ -611,6 +634,8 @@ class QwenMTPRunner:
 
     @torch.inference_mode()
     def generate(self, input_ids, *, max_tokens, eos_ids=(), cancel=None, prompt_chunk_size=None):
+        if self.online:
+            raise ValueError("the scheduler owns this runner; use LLM.generate or the HTTP API")
         ids = torch.as_tensor(input_ids, dtype=torch.int32, device="cpu")
         if (ids.ndim != 1 or ids.numel() == 0 or type(max_tokens) is not int or max_tokens < 1
                 or (prompt_chunk_size is not None and (type(prompt_chunk_size) is not int or prompt_chunk_size < 1))):
@@ -635,9 +660,6 @@ class QwenMTPRunner:
             raise
         cancelled = lambda: cancel is not None and cancel.is_set()
         self.active = True
-        recorder = getattr(getattr(self.engine, "config", None), "_prefetch_calibration_recorder", None)
-        if recorder is not None:
-            recorder.reset_request()
         output, rounds = [], []
         self.graph_replays, self.graph_fallbacks = {}, {}
         started = time.perf_counter()
@@ -758,14 +780,14 @@ class QwenMTPRunner:
                 if result is not None:
                     result.wall_seconds = time.perf_counter() - started
             finally:
-                if recorder is not None:
-                    recorder.reset_request()
                 self.active = False
                 self._request_lock.release()
 
     def invalidate(self):
         if self.active:
             raise RuntimeError("cache rebuild requires an idle speculative runner")
+        if getattr(self, "online_runtime", None) is not None:
+            self.online_runtime.close()
         self.engine.stream.synchronize()
         if getattr(self, "coarse_graphs", None) is not None:
             self.coarse_graphs.close()

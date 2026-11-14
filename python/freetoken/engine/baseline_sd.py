@@ -12,15 +12,24 @@ def is_native_sd(config) -> bool:
     return bool(getattr(config, "speculative_mtp_depth", 0))
 
 
+def is_online_sd(config) -> bool:
+    return is_native_sd(config) and hasattr(config, "max_extend_tokens")
+
+
 def resolve_capacity(config) -> tuple[int, int]:
     limits = [getattr(config, name, None) for name in
               ("speculative_max_input_tokens", "speculative_max_output_tokens")]
     if any(type(value) is not int or value < 1 for value in limits):
         raise ValueError("baseline SD requires explicit positive maximum input and output tokens")
     capacity = sum(limits)
+    if getattr(config, "speculative_eagle_topk", 1) > 1:
+        capacity += max(config.speculative_num_draft_tokens,
+                        config.speculative_depth * config.speculative_eagle_topk)
     if capacity > config.max_seq_len:
         raise ValueError(f"baseline SD input/output capacity {capacity} exceeds context {config.max_seq_len}")
     pages = (capacity + config.page_size - 1) // config.page_size
+    if is_online_sd(config):
+        pages *= config.max_running_req
     override = getattr(config, "num_page_override", None)
     if override is not None and override < pages:
         raise ValueError(f"baseline SD needs at least {pages} KV pages, got {override}")

@@ -93,7 +93,7 @@ def _allowed_cpus(device=None) -> list[int]:
         allowed = list(range(os.cpu_count() or 1))
     if device is not None and device.type == "cuda":
         from pathlib import Path
-        from .hybrid_profile import pcie_identity
+        from freetoken.gpu_select import pcie_identity
 
         info = pcie_identity(str(getattr(torch.cuda.get_device_properties(device), "uuid", "")))
         node = (info or {}).get("numa_node", "-1")

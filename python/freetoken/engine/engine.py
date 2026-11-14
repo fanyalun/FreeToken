@@ -475,11 +475,12 @@ class Engine:
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
         if is_native_sd(config):
             from .speculative_config import resolve_draft_method
-            from .speculative_prefetch_profile import prepare_prefetch_profile
+            from .speculative_prefetch import prepare_prefetch, validate_prefetch
             self.draft_method = resolve_draft_method(config)
             if config.active_encoders:
                 raise ValueError("three_level_gpu currently requires text-only input")
-            prepare_prefetch_profile(config, self.device)
+            prepare_prefetch(config)
+            validate_prefetch(config)
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -553,9 +554,6 @@ class Engine:
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
-        if is_native_sd(config):
-            from .speculative_prefetch_profile import validate_prefetch_profile
-            validate_prefetch_profile(self)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
         self.encoder_cache = None
@@ -1186,6 +1184,10 @@ class Engine:
                                          config.speculative_skip_last_preverify)
             width = min(config.speculative_submit_tokens or width, width, config.speculative_max_output_tokens)
             width = max(config.speculative_mtp_depth + 1, width)
+            width = max(width, getattr(config, "speculative_num_draft_tokens", None) or 0)
+            from .baseline_sd import is_online_sd
+            if is_online_sd(config):
+                width *= config.max_running_req
             max_tokens = max(max_tokens, width)
             grouped_widths = tuple(range(1, width + 1))
         # Match GraphRunner's explicit-size precedence, including an empty list.

@@ -4,8 +4,115 @@ import pytest
 import torch
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-
 VOCAB = 8
+
+
+def test_tree_sampling_penalties_exclude_siblings_and_count_repeated_ancestors():
+    from freetoken.engine.sample import BatchSamplingArgs, Sampler
+    from freetoken.engine.speculative_tree import TreeProposal, tree_paths
+    from freetoken.spec.mtp.tree import sample_tree
+
+    torch.manual_seed(71)
+    parents = torch.tensor([-1, 0, 0, 1, 2, 3, 4])
+    paths, depths = tree_paths(parents, 3)
+    trees = [TreeProposal(torch.tensor(0), torch.tensor(tokens), parents, paths, depths)
+             for tokens in ([2, 3, 2, 4, 5, 3], [5, 2, 4, 2, 4, 5])]
+    counts = torch.tensor([0, 0, 2, 0, 0, 1, 0, 0])
+    logits = torch.randn(14, 8)
+    args = BatchSamplingArgs(None, penalties=[(i, counts, 0.7, 0.4) for i in range(2)])
+    actual = sample_tree(logits, args, trees, Sampler(torch.device("cpu"), 8))
+    for i, tree in enumerate(trees):
+        ids = tree.verify_inputs()
+        for node in range(7):
+            seen = counts.clone()
+            parent = node
+            while parent > 0:
+                seen[ids[parent]] += 1
+                parent = int(parents[parent])
+            expected = logits[i * 7 + node] - 0.4 * seen - 0.7 * (seen > 0)
+            assert actual[i, node] == expected.argmax()
+    assert counts.tolist() == [0, 0, 2, 0, 0, 1, 0, 0]
+
+
+@pytest.mark.parametrize("budget", [2, 7])
+@pytest.mark.parametrize("bs", [1, 3])
+def test_mtp_tree_keeps_unexpanded_children_and_uses_cumulative_probability(budget, bs):
+    from freetoken.engine.speculative_tree import build_mtp_tree, build_mtp_trees
+
+    probability = torch.tensor([[0.6, 0.3, 0.1], [0.5, 0.4, 0.1], [0.7, 0.2, 0.1]])
+    visited = []
+
+    def forward(ids, hidden, paths, depths, slots):
+        visited.append(ids.tolist())
+        return ids[:, None].long()
+
+    hidden = torch.arange(bs)[:, None]
+    if bs == 1:
+        actual = [build_mtp_tree(torch.tensor(2), hidden, 3, 2, budget,
+                   lambda h: probability[h[:, 0]].log(), lambda t: t, forward)]
+    else:
+        actual = build_mtp_trees(torch.full((bs,), 2), hidden, 3, 2, budget,
+                   lambda h: probability[h[:, 0]].log(), lambda t: t, forward)
+    for request, tree in enumerate(actual):
+        # Independent scalar beam search with all children retained for pruning.
+        nodes = [(2, -1, 1.0)]
+        beam = [0]
+        for step in range(3):
+            candidates = []
+            for parent in beam:
+                distribution = probability[request if parent == 0 else nodes[parent][0]].tolist()
+                for token in sorted(range(3), key=lambda t: -distribution[t])[:2]:
+                    candidates.append(len(nodes))
+                    nodes.append((token, parent, nodes[parent][2] * distribution[token]))
+            beam = sorted(candidates, key=lambda i: -nodes[i][2])[:2]
+        selected = [0] + sorted(sorted(range(1, len(nodes)), key=lambda i: -nodes[i][2])[:budget - 1])
+        assert tree.verify_inputs().tolist() == [nodes[i][0] for i in selected]
+        assert tree.parents.tolist() == [-1] + [selected.index(nodes[i][1]) for i in selected[1:]]
+    assert len(visited) == 2 and all(len(v) == bs * 2 for v in visited)
+
+
+@pytest.mark.parametrize("remaining,eos", [(8, ()), (2, ()), (8, (6,))])
+def test_tree_commit_follows_target_children_not_flattened_neighbors(remaining, eos):
+    from freetoken.engine.speculative import VerifyResult
+    from freetoken.engine.speculative_tree import TreeProposal, tree_paths, greedy_tree_commit
+
+    # Two siblings predict the same token; only the selected parent's child is eligible.
+    parents = torch.tensor([-1, 0, 0, 1, 2, 4, 4])
+    ids = torch.tensor([0, 3, 5, 6, 6, 2, 7], dtype=torch.int32)
+    predictions = torch.tensor([5, 6, 6, 2, 7, 1, 4], dtype=torch.int32)
+    paths, depths = tree_paths(parents, 3)
+    proposal = TreeProposal(ids[:1], ids[1:], parents, paths, depths)
+    commit, path = greedy_tree_commit(proposal, VerifyResult(predictions, torch.empty(7, 0)),
+                                      remaining=remaining, eos_ids=eos)
+    want, visited, node = [], [], 0
+    while len(want) < remaining:
+        visited.append(node)
+        token = int(predictions[node])
+        want.append(token)
+        children = [i for i, p in enumerate(parents.tolist()) if p == node and ids[i] == token]
+        if token in eos or not children:
+            break
+        node = children[0]
+    assert commit.tokens[:commit.input_count].tolist() == want
+    assert path[:commit.input_count].tolist() == visited
+    assert bool(commit.terminal) == (len(want) == remaining or want[-1] in eos)
+    for i, depth in enumerate(depths.tolist()):
+        chain, node = [], i
+        while node >= 0:
+            chain.insert(0, node)
+            node = int(parents[node])
+        assert paths[i, :depth + 1].tolist() == chain
+
+
+def test_tree_budget_keeps_ancestors_when_path_scores_tie():
+    from freetoken.engine.speculative_tree import select_tree
+
+    parents = torch.tensor([0, 0, 1, 2, 3, 4])
+    scores = torch.tensor([0.5, 0.5, 0.5, 0.25, 0.5, 0.125])
+    result = select_tree(torch.tensor([99]), torch.arange(6), parents, scores, 5, 3)
+    assert result.tokens.tolist() == [0, 1, 2, 4]
+    assert result.parents.tolist() == [-1, 0, 0, 1, 3]
+    assert result.paths[-1].tolist() == [0, 1, 3, 4]
 
 
 def _sampler(device, vocab=VOCAB):
@@ -71,7 +178,8 @@ def test_each_verify_row_counts_the_drafts_before_it_as_committed():
 
 
 @cuda
-def test_each_verify_row_samples_with_its_requests_params():
+@pytest.mark.parametrize("tree", [False, True], ids=["chain", "tree"])
+def test_each_verify_row_samples_with_its_requests_params(tree):
     """Request i's sampling params cover its k+1 verify rows: a top_k=1 request and a greedy one give the argmax on every row, a sampled one does not; the draft-probs verify reads each row's softmax at its request's temperature, renormalized over its top-k and then its top-p."""
     from freetoken.engine.sample import BatchSamplingArgs
 
@@ -88,7 +196,16 @@ def test_each_verify_row_samples_with_its_requests_params():
     off_argmax = []
     for _ in range(trials):
         logits = 0.1 * torch.randn(bs * (k + 1), vocab, device=device)
-        tokens = _sampler(device, vocab).sample_verify(logits, args, drafts)
+        if tree:
+            from freetoken.engine.speculative_tree import TreeProposal, tree_paths
+            from freetoken.spec.mtp.tree import sample_tree
+
+            parents = torch.tensor([-1, 0, 0], device=device)
+            paths, depths = tree_paths(parents, 1)
+            trees = [TreeProposal(torch.tensor(0, device=device), row, parents, paths, depths) for row in drafts]
+            tokens = sample_tree(logits, args, trees, _sampler(device, vocab)).flatten()
+        else:
+            tokens = _sampler(device, vocab).sample_verify(logits, args, drafts)
         off_argmax.append((tokens != logits.argmax(dim=-1)).view(bs, k + 1))
     off_argmax = torch.stack(off_argmax)
     assert not off_argmax[:, 0].any() and not off_argmax[:, 2].any()

@@ -12,7 +12,7 @@ class QwenGDNVerifyState:
     chunk_min_width = 8
     chunk_max_width = 64
 
-    def __init__(self, pool, layers, width: int, slot: int, *, workspace=None):
+    def __init__(self, pool, layers, width: int, slot: int, *, workspace=None, input_stash=None):
         if width < 1 or not 0 <= slot < pool.num_slots:
             raise ValueError("GDN verification requires positive width and a valid state slot")
         self.pool = pool
@@ -41,7 +41,7 @@ class QwenGDNVerifyState:
         self.conv_windows = allocate((layers_count, channels, history + width - 1), pool.conv_states.dtype,
                                      None if workspace is None else workspace.conv_windows)
         sources = (None,) * 4 if workspace is None else workspace.replay_inputs
-        self.replay_inputs = (
+        self.replay_inputs = () if input_stash is not None else (
             allocate((layers_count, width, key_heads, key_dim), pool.conv_states.dtype, sources[0]),
             allocate((layers_count, width, heads, value_dim), pool.conv_states.dtype, sources[1]),
             allocate((layers_count, width, heads), torch.float32, sources[2]),
@@ -49,6 +49,7 @@ class QwenGDNVerifyState:
         )
         self.snapshots = None
         self.snapshot_index = None
+        self.input_stash = input_stash
 
     def uses_chunk(self, dtype):
         from freetoken.core import get_active_batch
@@ -93,7 +94,7 @@ class QwenGDNVerifyState:
             raw, layer._conv_weight(), self.pool.conv_states[li], self.conv_windows[li], self.slot,
             fp32_products=self.conv_fp32_products,
         )
-        if self.uses_chunk(raw.dtype) and a.stride(-1) == b.stride(-1) == 1:
+        if self.input_stash is None and self.uses_chunk(raw.dtype) and a.stride(-1) == b.stride(-1) == 1:
             from freetoken.kernel.fla.gdn_speculative import chunk_verify
 
             return chunk_verify(mixed, a, b, layer, self.pool.recurrent_states[li], self.indices,
@@ -116,7 +117,8 @@ class QwenGDNVerifyState:
             initial_state_source=self.pool.recurrent_states[li], initial_state_indices=self.indices,
             cu_seqlens=self.cu_seqlens, scale=layer.head_k_dim ** -0.5,
             use_qk_l2norm_in_kernel=True, disable_state_update=True,
-            replay_inputs=tuple(x[li] for x in self.replay_inputs),
+            replay_inputs=tuple(x[li] for x in self.replay_inputs) if self.input_stash is None else None,
+            input_stash=tuple(x[li] for x in self.input_stash) if self.input_stash is not None else None,
             intermediate_states_buffer=reference, intermediate_state_indices=self.snapshot_index,
             round_state_each_step=self.pool.recurrent_states.dtype != torch.float32,
             small_value_tile=small_value_tile,
@@ -160,3 +162,55 @@ class QwenGDNVerifyState:
         if self.snapshot_index is not None:
             tensors.append(self.snapshot_index)
         return tensors
+
+
+class QwenGDNTreeVerifyState:
+    """Read each node's ancestry; stage only the accepted path for normal replay."""
+
+    def __init__(self, chain_state, paths, depths, *, workspace=None):
+        self.chain = chain_state
+        self.paths, self.depths = paths, depths
+        self.inputs = {}
+        self.parents = paths.gather(1, (depths - 1).clamp_min(0)[:, None]).T.contiguous()
+        pool = chain_state.pool
+        self.workspace = (torch.empty((1, paths.shape[0], *pool.recurrent_states.shape[2:]),
+                                      dtype=pool.recurrent_states.dtype, device=paths.device)
+                          if workspace is None else workspace)
+        self.cache_index = torch.zeros(1, dtype=torch.int32, device=paths.device)
+        self.cu_seqlens = torch.tensor([0, paths.shape[0]], dtype=torch.int32, device=paths.device)
+
+    def verify_layer(self, layer, raw, a, b):
+        from freetoken.kernel.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+        from freetoken.kernel.fla.gdn_speculative import tree_conv_verify
+
+        chain = self.chain
+        li = chain.pool.local_index(layer.layer_id)
+        mixed = tree_conv_verify(raw, layer._conv_weight(), chain.pool.conv_states[li],
+                                 self.paths, self.depths, chain.slot,
+                                 fp32_products=chain.conv_fp32_products)
+        self.inputs[layer.layer_id] = (raw, a, b)
+        nodes = raw.shape[0]
+        q, k, v = torch.split(mixed, [layer.key_dim, layer.key_dim, layer.value_dim], dim=-1)
+        # The SGLang EAGLE recurrence loads each parent's state before its child.
+        # One layer's snapshots are reused across all layers and never committed.
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=layer.A_log, a=a, b=b, dt_bias=layer.dt_bias,
+            softplus_beta=1.0, softplus_threshold=20.0,
+            q=q.reshape(1, nodes, layer.num_k_heads, layer.head_k_dim),
+            k=k.reshape(1, nodes, layer.num_k_heads, layer.head_k_dim),
+            v=v.reshape(1, nodes, layer.num_v_heads, layer.head_v_dim),
+            initial_state_source=chain.pool.recurrent_states[li], initial_state_indices=chain.indices,
+            cu_seqlens=self.cu_seqlens,
+            scale=layer.head_k_dim ** -0.5, use_qk_l2norm_in_kernel=True, disable_state_update=True,
+            retrieve_parent_token=self.parents, intermediate_states_buffer=self.workspace,
+            intermediate_state_indices=self.cache_index,
+            round_state_each_step=chain.pool.recurrent_states.dtype != torch.float32,
+        )[0]
+
+    def stage_commit(self, path):
+        # The existing replay commits from the original state, so speculative
+        # sibling states never become visible to another loop or request.
+        for layer in self.chain.layers:
+            raw, a, b = self.inputs[layer.layer_id]
+            self.chain.verify_layer(layer, raw[path], a[path], b[path])
+        self.inputs.clear()

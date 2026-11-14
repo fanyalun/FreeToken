@@ -26,6 +26,7 @@ class SpecProposal(NamedTuple):
     draft_token_ids: torch.Tensor                       # [bs, k] int64 target-vocab ids
     draft_support_ids: torch.Tensor | None = None       # [bs, k, K] the token ids where q can be nonzero
     draft_support_probs: torch.Tensor | None = None     # [bs, k, K] fp32 q over them, summing to 1
+    trees: tuple | None = None
 
 
 class DraftContext(NamedTuple):

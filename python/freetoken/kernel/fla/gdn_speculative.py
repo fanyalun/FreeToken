@@ -113,6 +113,40 @@ def conv_verify(raw, weight, state, windows, slot, *, fp32_products=True):
 
 
 @triton.jit
+def _tree_conv_kernel(raw, weight, state, paths, depths, out,
+                      R: tl.constexpr, C: tl.constexpr, W0: tl.constexpr, W1: tl.constexpr,
+                      S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
+                      CHANNELS: tl.constexpr, HISTORY: tl.constexpr, PATH: tl.constexpr,
+                      SLOT: tl.constexpr, FP32_PRODUCTS: tl.constexpr, BLOCK: tl.constexpr):
+    node = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    depth = tl.load(depths + node)
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for j in tl.static_range(HISTORY + 1):
+        pos = depth + j - HISTORY
+        ancestor = tl.load(paths + node * PATH + tl.maximum(pos, 0))
+        old = tl.load(state + SLOT * S0 + c * S1 + (pos + HISTORY) * S2,
+                      (c < CHANNELS) & (pos < 0), 0)
+        value = tl.load(raw + ancestor * R + c * C, (c < CHANNELS) & (pos >= 0), 0)
+        value = tl.where(pos < 0, old, value)
+        w = tl.load(weight + c * W0 + j * W1, c < CHANNELS, 0)
+        if FP32_PRODUCTS:
+            acc += value.to(tl.float32) * w.to(tl.float32)
+        else:
+            acc += value * w
+    tl.store(out + node * CHANNELS + c, acc / (1 + tl.exp(-acc)), c < CHANNELS)
+
+
+def tree_conv_verify(raw, weight, state, paths, depths, slot, *, fp32_products=True):
+    out = torch.empty_like(raw, memory_format=torch.contiguous_format)
+    _tree_conv_kernel[(raw.shape[0], triton.cdiv(raw.shape[1], 128))](
+        raw, weight, state, paths, depths, out, *raw.stride(), *weight.stride(), *state.stride(),
+        CHANNELS=raw.shape[1], HISTORY=state.shape[-1], PATH=paths.shape[1], SLOT=slot,
+        FP32_PRODUCTS=fp32_products, BLOCK=128, num_warps=4)
+    return out
+
+
+@triton.jit
 def _prepare_chunk_verify_kernel(
     mixed, a, b, a_log, dt_bias, q_normalized, k_normalized,
     raw_k, raw_v, decay, beta,

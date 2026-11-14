@@ -354,3 +354,230 @@ def test_verify_steps_reproduce_greedy_decode(tmp_path, plain_runs, family, back
         # every prefill and verify forward handed the sink each tapped layer's output, as the next layer read it
         taps = spec["taps"]
         assert taps["prefill"] > 0 and taps["verify"] > 0 and taps["mismatch"] == 0
+
+
+@pytest.mark.needs_weights
+@pytest.mark.parametrize("topk, graph, strategy, skip_last, graph_widths, preverify_map", [
+    (1, "eager", "offload", False, None, False),
+    (4, "eager", "offload", False, None, False),
+    (1, "full", "offload", False, None, False),
+    (1, "full", "hybrid", False, None, False),
+    (1, "eager", "hybrid", False, None, False),
+    (4, "eager", "hybrid", False, None, False),
+    (1, "full", "offload", True, None, False),
+    (1, "full", "offload", False, [24], False),
+    (1, "full", "hybrid", False, None, True),
+    (4, "eager", "hybrid", False, None, True),
+])
+def test_online_three_level_arrival_flush_and_request_isolation(tmp_path, topk, graph, strategy, skip_last, graph_widths, preverify_map):
+    model = os.environ.get("FREETOKEN_TEST_MODEL")
+    if not model:
+        pytest.skip("FREETOKEN_TEST_MODEL must point to a Qwen3.5/3.6 MoE checkpoint with native MTP")
+    script = r'''
+import json, sys, torch, numpy as np
+from freetoken.core import SamplingParams
+from freetoken.llm import LLM
+from freetoken.message import UserMsg, AbortBackendMsg, DetokenizeMsg
+from freetoken.mm.config import MultimodalConfig
+
+token_map = None
+if sys.argv[8] == "True":
+    from freetoken.utils.hf import load_tokenizer
+    tokenizer = load_tokenizer(sys.argv[1])
+    special = set(tokenizer.get_added_vocab().values()) | set(tokenizer.all_special_ids)
+    ids = sorted(special | set(range(4096)), reverse=True)
+    token_map = sys.argv[2] + ".map.bin"
+    np.array(ids, dtype="<i4").tofile(token_map)
+llm = LLM(sys.argv[1], speculative_mode="three_level_gpu", speculative_graph=sys.argv[4],
+    speculative_token_map=token_map, speculative_preverify_token_map=token_map is not None,
+    speculative_skip_last_preverify=sys.argv[6] == "True",
+    speculative_graph_widths=json.loads(sys.argv[7]),
+    speculative_depth=2, speculative_max_loops=3, max_running_req=4, max_extend_tokens=32,
+    speculative_eagle_topk=int(sys.argv[3]),
+    speculative_max_input_tokens=128, speculative_max_output_tokens=24, moe_strategy=sys.argv[5],
+    moe_cpu_threads=18,
+    gpu_memory_budget_bytes=20 * 2**30,
+    mm=MultimodalConfig(disabled_encoders=frozenset(("vision", "audio"))))
+texts = ["Repeat exactly, without explanation: alpha bravo charlie delta echo foxtrot golf hotel india juliet.",
+         "Write the numbers 1 through 10, separated by commas, without explanation.",
+         "Explain why the sky appears blue during the day and red near sunset in simple words.",
+         "Name the colors of the rainbow, separated by commas, without explanation."]
+# Distinct answers exercise state isolation beyond a shared thinking preamble.
+prompts = [llm.tokenizer.apply_chat_template([{"role": "user", "content": text}],
+    tokenize=False, add_generation_prompt=True, enable_thinking=False) for text in texts]
+ids = [llm._tokenize_one(p) for p in prompts]
+params = SamplingParams(max_tokens=16, ignore_eos=True)
+runner = llm.engine.speculative_runner
+graphs, use_graph, full_graph = runner.coarse_graphs, runner.use_graph, runner.full_graph
+# Compare graph execution against independent eager request runs with identical weights.
+runner.coarse_graphs, runner.use_graph, runner.full_graph = None, False, False
+# The offline API removes a final EOS even under ignore_eos; compare raw messages.
+reference, reference_messages = [], []
+send_result = llm.send_result
+def capture_reference(reply):
+    reference_messages.extend(reply)
+    send_result(reply)
+llm.send_result = capture_reference
+for prompt in prompts:
+    reference_messages.clear()
+    llm.generate([prompt], params)
+    reference.append([t for m in reference_messages if isinstance(m, DetokenizeMsg) for t in m.next_tokens])
+llm.send_result = send_result
+runner.coarse_graphs, runner.use_graph, runner.full_graph = graphs, use_graph, full_graph
+runner.graph_fallbacks.clear()
+messages = []
+send_result = llm.send_result
+llm.send_result = messages.extend
+runtime = llm.online_spec
+gap_overlap = set()
+runtime_call = runtime._call
+def record_runtime_call(phase, *args, **kwargs):
+    if runtime.gap_pending:
+        assert phase in ("draft", "reconcile"), phase
+        assert runner.three_level.experts.active
+        gap_overlap.add(phase)
+    return runtime_call(phase, *args, **kwargs)
+runtime._call = record_runtime_call
+observed_batches = {}
+checked_heads = set()
+original_target, original_draft = runner._target, llm.engine.mtp.forward
+def record_target(batch, **kwargs):
+    stage = getattr(batch, "online_spec_stage", None)
+    if stage is not None:
+        observed_batches[stage] = max(observed_batches.get(stage, 0), batch.size)
+    assert kwargs.get("preverify", False) == (stage == "preverify"), (stage, kwargs)
+    result = original_target(batch, **kwargs)
+    if token_map and not torch.cuda.is_current_stream_capturing():
+        head = llm.engine.model.lm_head
+        selected = stage == "preverify"
+        if selected:
+            head, mapped_ids = head.kept_rows
+        with llm.engine.ctx.forward_batch(batch):
+            expected = head.greedy(result[1])
+            if selected:
+                expected = mapped_ids[expected.long()]
+        assert torch.equal(result[0], expected.to(result[0].dtype))
+        checked_heads.add(stage or "prefill")
+    return result
+def record_draft(ids, hidden):
+    from freetoken.core import get_global_ctx
+    batch = get_global_ctx().batch
+    stage = getattr(batch, "online_spec_stage", None)
+    if stage is not None:
+        observed_batches[stage] = max(observed_batches.get(stage, 0), batch.size)
+    return original_draft(ids, hidden)
+runner._target, llm.engine.mtp.forward = record_target, record_draft
+with torch.inference_mode(), llm.engine_stream_ctx:
+    for uid in (0, 1):
+        llm._process_one_msg(UserMsg(uid=uid, input_ids=ids[uid], sampling_params=params))
+    for _ in range(100):
+        runtime.step(llm)
+        if len(runtime.requests) == 2 and all(s.loop_count > 0 for s in runtime.requests.values()):
+            break
+    else:
+        raise AssertionError("both requests must enter a provisional loop before the arrival")
+    llm._process_one_msg(UserMsg(uid=2, input_ids=ids[2], sampling_params=params))
+    llm._process_one_msg(UserMsg(uid=3, input_ids=ids[3], sampling_params=params))
+    runtime.step(llm)
+    assert set(runtime.requests) == {0, 1, 2, 3}, list(runtime.requests)
+    assert all(s.loop_count == 0 and s.window is None for s in runtime.requests.values())
+    resumed = set()
+    for _ in range(150):
+        runtime.step(llm)
+        resumed.update(uid for uid, s in runtime.requests.items() if s.loop_count > 0)
+        if not runtime.requests:
+            break
+    assert not runtime.requests and not llm.prefill_manager.runnable
+    assert resumed == {0, 1, 2, 3}
+    outputs = [[t for m in messages if isinstance(m, DetokenizeMsg) and m.uid == uid
+                for t in m.next_tokens] for uid in (0, 1, 2, 3)]
+    assert outputs == reference, (outputs, reference)
+    assert sum(isinstance(m, DetokenizeMsg) and m.finished for m in messages) == 4
+    for phase in ("draft", "preverify", "verify", "reconcile"):
+        assert observed_batches.get(phase, 0) >= 2, (phase, observed_batches)
+    assert observed_batches["preverify"] == 4, observed_batches
+    assert observed_batches["verify"] == 4, observed_batches
+
+    # Abort with unverified pages live, then reuse the slot with another prompt.
+    llm._process_one_msg(UserMsg(uid=4, input_ids=ids[2], sampling_params=params))
+    for _ in range(100):
+        runtime.step(llm)
+        if runtime.requests[4].loop_count:
+            break
+    assert runtime.requests[4].loop_count > 0
+    llm._process_one_msg(AbortBackendMsg(uid=4))
+    llm._flush_abort_acks()
+    assert not runtime.requests
+    llm._process_one_msg(UserMsg(uid=5, input_ids=ids[1], sampling_params=params))
+    for _ in range(100):
+        runtime.step(llm)
+        if not runtime.requests:
+            break
+    assert not runtime.requests
+    reused = [t for m in messages if isinstance(m, DetokenizeMsg) and m.uid == 5 for t in m.next_tokens]
+    assert reused == reference[1], (reused, reference[1])
+    llm.engine.stream.synchronize()
+    llm.cache_manager.check_integrity()
+    assert llm.table_manager.available_size == 4
+    assert len(llm.cache_manager.free_slots) == llm.engine.num_pages
+    # Different EOS policies must survive request switching and graph-buffer reuse.
+    eos_ids = llm.eos_token_ids
+    llm.eos_token_ids = {reference[0][1]}
+    llm._process_one_msg(UserMsg(uid=6, input_ids=ids[0],
+        sampling_params=SamplingParams(max_tokens=16, ignore_eos=False)))
+    llm._process_one_msg(UserMsg(uid=7, input_ids=ids[1], sampling_params=params))
+    for _ in range(150):
+        runtime.step(llm)
+        if not runtime.requests and not llm.prefill_manager.runnable:
+            break
+    stopped = [t for m in messages if isinstance(m, DetokenizeMsg) and m.uid == 6 for t in m.next_tokens]
+    ignored = [t for m in messages if isinstance(m, DetokenizeMsg) and m.uid == 7 for t in m.next_tokens]
+    assert stopped == reference[0][:reference[0].index(reference[0][1]) + 1]
+    assert ignored == reference[1]
+    llm.eos_token_ids = eos_ids
+llm.send_result = send_result
+# Exact-token comparisons use copy/list prompts: BF16 rounding with padded
+# shapes can flip a near-tied argmax on the open-ended explanatory prompt.
+short_prompts = [prompts[i] for i in (0, 1, 0, 3)]
+short = llm.generate(short_prompts, [SamplingParams(max_tokens=n, ignore_eos=True) for n in (1, 2, 5, 8)])
+assert [len(r["token_ids"]) for r in short] == [1, 2, 5, 8]
+# Compare against ordinary AR with the same ragged prefill schedule.
+prepare = llm._prepare_batch
+def ordinary_prepare(batch):
+    batch.three_level_runtime = True
+    return prepare(batch)
+llm.online_spec, llm._prepare_batch = None, ordinary_prepare
+try:
+    short_reference = llm.generate(short_prompts,
+        [SamplingParams(max_tokens=n, ignore_eos=True) for n in (1, 2, 5, 8)])
+finally:
+    llm.online_spec, llm._prepare_batch = runtime, prepare
+assert [r["token_ids"] for r in short] == [r["token_ids"] for r in short_reference], (short, short_reference)
+if graphs is not None:
+    assert graphs.ready and graphs.replays
+    assert not runner.graph_fallbacks, runner.graph_fallbacks
+    assert not graphs.active_lanes
+if sys.argv[4] == "full":
+    for phase in ("draft", "preverify", "verify", "reconcile", "commit_preverify", "commit_verify"):
+        assert runner.graph_replays.get(phase, 0) > 0, runner.graph_replays
+    assert not runner.graph_fallbacks, runner.graph_fallbacks
+if token_map:
+    assert {"preverify", "verify", "prefill"} <= checked_heads, checked_heads
+experts = runner.three_level.experts
+if experts.auto_gap and experts.gap_capacity > 1:
+    assert int(experts.request_transfer_bytes[3].item()) > 0
+    assert "reconcile" in gap_overlap, gap_overlap
+    if int(sys.argv[3]) == 1:
+        assert "draft" in gap_overlap, gap_overlap
+json.dump({"outputs": outputs, "resumed": sorted(resumed), "batches": observed_batches, "gap_prefetch_bytes": int(runner.three_level.experts.request_transfer_bytes[3].item()),
+           "gap_overlap_stages": sorted(gap_overlap), "checked_heads": sorted(checked_heads),
+           "replays": runner.graph_replays, "graph_shapes": [list(k) for k,v in runtime.forwards.items() if v.graph is not None]},
+          open(sys.argv[2], "w"))
+llm.engine.shutdown()
+'''
+    log = tmp_path / "model.log"
+    with log.open("w") as output:
+        run = subprocess.run([sys.executable, "-u", "-c", script, model, str(tmp_path / "online.json"), str(topk),
+                              graph, strategy, str(skip_last), json.dumps(graph_widths), str(preverify_map)],
+                             stdout=output, stderr=subprocess.STDOUT, text=True, timeout=3600, env=dict(os.environ))
+    assert run.returncode == 0, log.read_text()[-7000:]

@@ -87,6 +87,7 @@ class ThreeLevelCoordinator:
                                                and getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu"
                                                and getattr(engine.config, "speculative_execution_implementation", "reference") == "optimized"))
         self.inner_width, self.outer_width = self.budget.reachable_widths(engine.config.speculative_mtp_depth)
+        batch_factor = engine.config.max_running_req if runner.online else 1
         if coarse and max(self.draft_width, self.budget.submit_rows) > engine.max_seq_len:
             raise ValueError("speculative graph width exceeds context capacity")
         if resident:
@@ -95,8 +96,8 @@ class ThreeLevelCoordinator:
         elif getattr(engine.config, "speculative_expert_scheduler", "host") == "gpu":
             from freetoken.moe.speculative_gpu import GPUExpertCache
             self.experts = GPUExpertCache.from_engine(engine,
-                max_loops=self.budget.max_loops, max_rows=self.outer_width,
-                inner_rows=max(1, self.inner_width), use_graph=runner.use_graph,
+                max_loops=self.budget.max_loops, max_rows=batch_factor * self.outer_width,
+                inner_rows=batch_factor * max(1, self.inner_width, runner.tree.budget if runner.tree else 0), use_graph=runner.use_graph,
                 preverify_policy=policy)
         else:
             self.experts = SpeculativeExpertCache(cache, engine.stream,
@@ -105,28 +106,16 @@ class ThreeLevelCoordinator:
                 layer_quota=engine.config.speculative_prefetch_layer_experts,
                 gap_capacity=engine.config.speculative_prefetch_gap_capacity,
                 preverify_policy=policy)
-        recorder = getattr(engine.config, "_prefetch_calibration_recorder", None)
-        if recorder is not None:
-            self.experts.calibration_recorder = recorder
-            recorder.attach(engine, self.experts)
         if getattr(self.experts, "optimize_admission", False):
             self.experts.eos_mask = runner.eos_mask
         if hybrid_phases:
-            self.experts.execution_mode = (engine.config.speculative_graph_implementation
-                                           if runner.use_graph else "eager")
-            from freetoken.layers.moe import iter_moe_layers
-            layouts = set()
-            for layer in iter_moe_layers(engine.model):
-                layout = cache.layer_layout[layer.layer_id]
-                if layout not in layouts:
-                    self.experts.prepare_hybrid(layer)
-                    layouts.add(layout)
+            self.experts.prepare_hybrid()
         self.verify_prefetch_signature = self._verify_prefetch_signature()
         self.compact_control = getattr(self.experts, "compact_control", False)
-        self.private_pool = runner.state_adapter.private_pool()
+        self.private_pool = None if runner.online else runner.state_adapter.private_pool()
         runner.max_verify_width = self.outer_width
         self.private_states = {}
-        if not coarse:
+        if not coarse and not runner.online:
             workspace = runner._gdn_workspace(runner.max_verify_width, runner.state_adapter.layers)
             self.private_states = runner.state_adapter.states(max(1, self.inner_width),
                 pool=self.private_pool, private=True, workspace=workspace)
@@ -154,10 +143,14 @@ class ThreeLevelCoordinator:
                 getattr(self.experts, "verify_layer_quotas", None),
                 getattr(self.experts, "verify_prefetch_enabled", False),
                 tuple(getattr(c, "speculative_hybrid_phases", ())),
-                getattr(c, "speculative_hybrid_profile", None), getattr(c, "moe_hybrid_max_fetch", -1),
-                getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1))
+                getattr(c, "moe_hybrid_max_fetch", -1),
+                getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1),
+                getattr(self.experts, "hybrid_fetch_fraction", ()))
 
     def _forward(self, inputs, start, state):
+        if getattr(self.experts, "auto_gap", False) and not torch.cuda.is_current_stream_capturing():
+            self.experts.update_gap_budget(self.runner.prefetch_timings.window(
+                self.inner_width, max(0, self.engine.config.speculative_depth - 1)))
         if self._verify_prefetch_signature() != self.verify_prefetch_signature:
             raise RuntimeError("verify prefetch configuration changed; rebuild the idle runner")
         runner = self.runner
@@ -226,7 +219,7 @@ class ThreeLevelCoordinator:
                                     else "output_or_submit_limit")
                     if coarse is None:
                         runner.frontier = private
-                        proposal = self.candidate_runner.prepare(current, tail_count + 1)
+                        proposal = self.candidate_runner.prepare(current, tail_count + 1, tree=False)
                         offset = window.tail_draft["offset"]
                         self.candidates[offset:offset + tail_count].copy_(proposal.tokens)
                         private.in_flight = False
@@ -238,9 +231,12 @@ class ThreeLevelCoordinator:
                 runner.frontier = private
                 if coarse is None:
                     proposal = self.candidate_runner.prepare(current, width)
-                    inputs = self.inputs[:width]
-                    inputs[:1].copy_(proposal.anchor)
-                    inputs[1:].copy_(proposal.tokens)
+                    if runner.tree is None:
+                        inputs = self.inputs[:width]
+                        inputs[:1].copy_(proposal.anchor)
+                        inputs[1:].copy_(proposal.tokens)
+                    else:
+                        inputs = proposal.verify_inputs()
                 else:
                     end = runner._reserve(private.reserve_end(width))
                     private.begin(end, width)
@@ -269,11 +265,12 @@ class ThreeLevelCoordinator:
                                          commit.terminal.reshape(1))).tolist()
                     count, accepted = drained[-3:-1]
                     self.experts.decide(len(window.loops), count)
-                loop = {"drafted": width - 1, "accepted": accepted,
+                tree_rows = proposal.tokens.numel() + 1 if coarse is None else width
+                loop = {"drafted": tree_rows - 1, "accepted": accepted,
                         "accepted_before_stop": min(accepted, count - 1),
-                        "previous_unique_experts": previous_experts, "verify_rows": width,
+                        "previous_unique_experts": previous_experts, "verify_rows": tree_rows,
                         "blocked_slots": capacity["blocked_slots"],
-                        "worst_case_experts": previous_experts + width * self.budget.routes_per_row}
+                        "worst_case_experts": previous_experts + tree_rows * self.budget.routes_per_row}
                 window.append(drained[:count], loop)
                 if self.compact_control:
                     width = control[5]

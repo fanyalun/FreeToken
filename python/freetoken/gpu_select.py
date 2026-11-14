@@ -17,9 +17,28 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 from typing import Sequence
 
 UUID_PREFIX = "GPU-"
+
+
+def pcie_identity(gpu_uuid: str) -> dict | None:
+    """Linux PCIe topology for an NVIDIA GPU UUID, when exposed by the driver."""
+    for info in Path("/proc/driver/nvidia/gpus").glob("*/information"):
+        try:
+            values = dict(line.split(":", 1) for line in info.read_text().splitlines() if ":" in line)
+            if values.get("GPU UUID", "").strip().removeprefix("GPU-") != gpu_uuid.removeprefix("GPU-"):
+                continue
+            device = Path("/sys/bus/pci/devices") / values["Bus Location"].strip()
+            result = {"path": str(device.resolve())}
+            for name in ("max_link_speed", "max_link_width", "current_link_width", "numa_node"):
+                if (device / name).exists():
+                    result[name] = (device / name).read_text().strip()
+            return result
+        except (OSError, KeyError):
+            continue
+    return None
 
 
 def is_gpu_uuid(spec: str) -> bool:

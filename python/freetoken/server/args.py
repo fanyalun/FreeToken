@@ -941,6 +941,27 @@ def parse_args(
         ),
     )
 
+    parser.add_argument("--speculative-mode", choices=["three_level_gpu"], default=ServerArgs.speculative_mode,
+                        help="Native three-level MTP decoding with online request scheduling.")
+    parser.add_argument("--speculative-depth", type=int, default=ServerArgs.speculative_depth,
+                        help="Draft tokens per inner loop in three-level mode (default: 3).")
+    parser.add_argument("--speculative-eagle-topk", type=int, default=ServerArgs.speculative_eagle_topk,
+                        help="MTP candidate expansion width (default: 2); set 1 for chain speculation.")
+    parser.add_argument("--speculative-num-draft-tokens", type=int, default=ServerArgs.speculative_num_draft_tokens,
+                        help="MTP tree verification node budget, including the anchor.")
+    parser.add_argument("--speculative-graph", choices=["eager", "full"], default=ServerArgs.speculative_graph,
+                        help="Three-level execution: full CUDA Graphs (default for chain MTP), or eager; tree MTP requires eager.")
+    parser.add_argument("--speculative-graph-widths", type=int, nargs="+", default=ServerArgs.speculative_graph_widths,
+                        help="Override online three-level graph widths; default only the maximum width of each stage. Custom lists always include the stage maximum and ignore larger widths.")
+    parser.add_argument("--speculative-max-loops", type=int, default=ServerArgs.speculative_max_loops,
+                        help="Maximum inner loops before Full Verify; mixed prefill/decode verifies immediately.")
+    parser.add_argument("--speculative-preverify-token-map", action="store_true",
+                        default=ServerArgs.speculative_preverify_token_map,
+                        help="Let Pre-Verify share the Draft token map in three-level mode; Full Verify uses the full vocabulary.")
+    parser.add_argument("--speculative-max-input-tokens", type=int, default=ServerArgs.speculative_max_input_tokens,
+                        help="Per-request input capacity for native three-level decoding (default: 4096).")
+    parser.add_argument("--speculative-max-output-tokens", type=int, default=ServerArgs.speculative_max_output_tokens,
+                        help="Per-request output capacity for native three-level decoding (default: 1024).")
     parser.add_argument(
         "--speculative-algorithm",
         "--spec-algo",

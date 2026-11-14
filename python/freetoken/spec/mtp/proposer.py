@@ -210,7 +210,7 @@ class MTPProposer(Proposer):
         # a rebuild that keeps the target KV pool keeps this one, which the prefix cache still indexes
         if self.kv is None:
             self.kv = create_kvcache_pool(
-                model_config=cfg, num_pages=ctx.num_pages + 1, page_size=self.config.page_size, dtype=self.dtype,
+                model_config=cfg, num_pages=ctx.num_pages + 1 + getattr(self, "scratch_pages", 0), page_size=self.config.page_size, dtype=self.dtype,
                 device=ctx.device, num_req_slots=rows, num_speculative_tokens=self.k,
             )
         width = self.draft.relay_width(self.config.model_config)

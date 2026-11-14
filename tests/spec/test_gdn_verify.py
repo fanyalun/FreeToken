@@ -71,7 +71,8 @@ def test_kernel_verify_stash_replay_matches_decode_bitwise(layers, bs, h, hv, di
 @pytest.mark.parametrize("count", [0, 1, 3, 5])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
-def test_private_verify_commit_matches_sequential_decode(count, graph_mode, ssm_dtype):
+@pytest.mark.parametrize("tree", [False, True])
+def test_private_verify_commit_matches_sequential_decode(count, graph_mode, ssm_dtype, tree):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.kernel.causal_conv1d import causal_conv1d_decode
     from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update as fused
@@ -99,11 +100,38 @@ def test_private_verify_commit_matches_sequential_decode(count, graph_mode, ssm_
     layer.conv1d.weight.normal_(std=0.1)
     layer.A_log.zero_()
     layer.dt_bias.zero_()
-    raw = torch.randn(width, channels, device=device, dtype=torch.bfloat16)
-    a, b = [torch.randn(width, value_heads, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    rows = 7 if tree else width
+    raw = torch.randn(rows, channels, device=device, dtype=torch.bfloat16)
+    a, b = [torch.randn(rows, value_heads, device=device, dtype=torch.bfloat16) for _ in range(2)]
     before_ssm, before_conv = pool.recurrent_states.clone(), pool.conv_states.clone()
     verify = QwenGDNVerifyState(pool, [layer], width, 1)
-    verify.verify_layer(layer, raw, a, b)
+    if tree:
+        from freetoken.engine.speculative_tree import tree_paths
+        from freetoken.models.qwen3_5_moe.speculative_state import QwenGDNTreeVerifyState
+
+        parents = torch.tensor([-1, 0, 0, 1, 2, 4, 5], device=device)
+        paths, depths = tree_paths(parents, 4)
+        branch = QwenGDNTreeVerifyState(verify, paths, depths)
+        actual = branch.verify_layer(layer, raw, a, b)
+        for node in range(rows):
+            branch_ssm, branch_conv = before_ssm[0].clone(), before_conv[0].clone()
+            for row in paths[node, :int(depths[node]) + 1].tolist():
+                # sgl_kernel updates x in place; each branch needs the original ancestor input.
+                mixed = causal_conv1d_decode(raw[row:row + 1].clone(), branch_conv, layer._conv_weight(),
+                                            torch.tensor([1], dtype=torch.int32, device=device))
+                q, k, v = torch.split(mixed, [heads * dim, heads * dim, value_heads * dim], dim=-1)
+                expected = fused(A_log=layer.A_log, dt_bias=layer.dt_bias, a=a[row:row + 1], b=b[row:row + 1],
+                    q=q.reshape(1, 1, heads, dim), k=k.reshape(1, 1, heads, dim),
+                    v=v.reshape(1, 1, value_heads, dim), initial_state_source=branch_ssm,
+                    initial_state_indices=torch.tensor([1], dtype=torch.int32, device=device),
+                    cu_seqlens=torch.tensor([0, 1], dtype=torch.int32, device=device), scale=dim ** -0.5,
+                    softplus_beta=1.0, softplus_threshold=20.0, use_qk_l2norm_in_kernel=True)
+            torch.testing.assert_close(actual[node], expected[0, 0], atol=0, rtol=0, msg=f"node {node}")
+        path = torch.tensor([0, 2, 4, 5, 6], device=device)
+        branch.stage_commit(path)
+        raw, a, b = raw[path], a[path], b[path]
+    else:
+        verify.verify_layer(layer, raw, a, b)
     assert torch.equal(pool.recurrent_states, before_ssm)
     assert torch.equal(pool.conv_states, before_conv)
 
@@ -134,3 +162,60 @@ def test_private_verify_commit_matches_sequential_decode(count, graph_mode, ssm_
         verify.commit(accepted)
     assert torch.equal(pool.recurrent_states[0], expected_ssm)
     assert torch.equal(pool.conv_states[0], expected_conv)
+
+
+@cuda
+def test_batched_tree_state_commits_truncated_paths_into_distinct_slots():
+    from types import SimpleNamespace
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.speculative_tree import TreeProposal, tree_paths
+    from freetoken.kernel.causal_conv1d import causal_conv1d_decode
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update as fused
+    from freetoken.kvcache.linear_state_pool import LinearStatePool
+    from freetoken.layers.linear_attn import GatedDeltaNet
+    from freetoken.models.config import LinearGatedDeltaGroupConfig
+    from freetoken.spec.mtp.tree import _BatchedTreeState
+    from freetoken.utils import torch_dtype
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    torch.manual_seed(127)
+    device = torch.device("cuda")
+    group = LinearGatedDeltaGroupConfig(name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
+        key_head_dim=32, value_head_dim=32, conv_kernel_dim=4, output_gate="silu")
+    pool = LinearStatePool(group, 3, torch.bfloat16, device, tp_size=1)
+    pool.recurrent_states.normal_(std=0.1)
+    pool.conv_states.normal_(std=0.1)
+    pool.attach_verify_scratch(2, 7)
+    with torch.device(device), torch_dtype(torch.bfloat16):
+        layer = GatedDeltaNet(64, 2, 4, 32, 32, 4, 1e-6, 0)
+    layer.conv1d.weight.normal_(std=0.1)
+    layer.A_log.zero_()
+    layer.dt_bias.zero_()
+    parents = torch.tensor([-1, 0, 0, 1, 2, 4, 5], device=device)
+    paths, depths = tree_paths(parents, 4)
+    tree = TreeProposal(torch.tensor(0, device=device), torch.arange(6, device=device), parents, paths, depths)
+    state = _BatchedTreeState(pool, [SimpleNamespace(table_idx=2, linear_slot_idx=2),
+                                    SimpleNamespace(table_idx=0, linear_slot_idx=0)], [tree, tree])
+    raw = torch.randn(14, 256, device=device, dtype=torch.bfloat16)
+    a, b = [torch.randn(14, 4, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    before_ssm, before_conv = pool.recurrent_states.clone(), pool.conv_states.clone()
+    state.verify_layer(layer, raw, a, b)
+    accepted = torch.tensor([[0, 2, 4, 5, 6, 6, 6], [0, 1, 3, 3, 3, 3, 3]], device=device)
+    state.stage_commit(accepted)
+    assert torch.equal(pool.recurrent_states, before_ssm) and torch.equal(pool.conv_states, before_conv)
+    # Stop processing can truncate different requests at different positions.
+    pool.commit_verify([2, 0], [4, 1])
+    for i, (slot, count) in enumerate([(2, 4), (0, 1)]):
+        idx = torch.tensor([slot], device=device, dtype=torch.int32)
+        for row in accepted[i, :count].tolist():
+            row += i * 7
+            mixed = causal_conv1d_decode(raw[row:row + 1], before_conv[0], layer._conv_weight(), idx)
+            q, k, v = torch.split(mixed, [64, 64, 128], -1)
+            fused(A_log=layer.A_log, dt_bias=layer.dt_bias, a=a[row:row + 1], b=b[row:row + 1],
+                  q=q.reshape(1, 1, 2, 32), k=k.reshape(1, 1, 2, 32), v=v.reshape(1, 1, 4, 32),
+                  initial_state_source=before_ssm[0], initial_state_indices=idx,
+                  cu_seqlens=torch.tensor([0, 1], device=device, dtype=torch.int32), scale=32 ** -0.5,
+                  softplus_beta=1.0, softplus_threshold=20.0, use_qk_l2norm_in_kernel=True)
+    assert torch.equal(pool.recurrent_states, before_ssm)
+    assert torch.equal(pool.conv_states, before_conv)

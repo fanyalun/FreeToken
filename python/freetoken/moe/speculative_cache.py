@@ -324,7 +324,7 @@ class SpeculativeExpertCache:
                              key=lambda owner: (-self.recency[owner], owner) if _HYBRID_FETCH_BY_RECENCY else (0, owner))
             fraction = cache.hybrid_fetch_fraction[li] if cache.hybrid_fetch_fraction is not None else 0.0
             fraction = min(65536, max(0, round(fraction * 65536)))
-            fetch = cache.hybrid_max_fetch * hidden.shape[0]
+            fetch = cache.hybrid_max_fetch
             if fraction:
                 lo = len(missing) * fraction // 65536
                 cost_lo = max(lo * (65536 - fraction), (len(missing) - lo) * fraction)

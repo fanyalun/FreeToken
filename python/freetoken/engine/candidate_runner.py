@@ -33,7 +33,14 @@ class CandidateRunner:
         finally:
             self.runner.frontier = previous
 
-    def prepare(self, anchor, width):
+    def prepare(self, anchor, width, *, tree=True):
+        if tree and getattr(self.runner, "tree", None) is not None:
+            runner = self.runner
+            depth = width - 1
+            rows = max(runner.tree.budget, depth * runner.tree.topk, width)
+            end = runner._reserve(runner.frontier.reserve_end(rows))
+            runner.frontier.begin(end, rows)
+            return runner.tree.propose(anchor, depth)
         return self.runner.coordinator.prepare(self.runner.frontier, anchor, width - 1)
 
     def forward(self, inputs, start, state, *, experts, phase, need_logits=True, check_error=True):
@@ -50,6 +57,10 @@ class CandidateRunner:
         return result
 
     def verify(self, proposal, inputs, *, forward, state, remaining, eos_ids=()):
+        from .speculative_tree import TreeProposal
+        if isinstance(proposal, TreeProposal):
+            return self.runner.tree.verify(proposal, forward=forward, state=state,
+                                           remaining=remaining, eos_ids=eos_ids)
         tokens, hidden = forward(inputs, self.runner.frontier.target_valid_len, state)
         verified = VerifyResult(tokens, hidden)
         commit = self.runner._accept(proposal, verified, remaining, eos_ids)

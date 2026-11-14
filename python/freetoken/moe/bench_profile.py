@@ -8,6 +8,7 @@ layer's fetch split, without importing the (torch-heavy) benchmark. ``benchbw.py
 from __future__ import annotations
 
 import json
+import math
 import os
 
 from freetoken.utils import init_logger
@@ -148,3 +149,36 @@ def load_layer_kinds(gpu_name: str | None = None, path: str | None = None, gpu_u
         return None
     rows = prof.get("layer_kinds")
     return rows if isinstance(rows, dict) else {}
+
+
+def prefetch_rates(row: dict | None, expert_bytes: int, *, hybrid: bool = False) -> tuple[float, ...] | None:
+    """Microseconds for one copy, copy launch, GPU fixed/route work and one CPU expert."""
+    if not isinstance(row, dict) or expert_bytes <= 0:
+        return None
+    probe = row.get("gpu_moe") or {}
+    try:
+        widths, times, topk = probe["rows"], probe["us"], int(row["top_k"])
+        if (probe.get("version") != 1 or len(widths) != 2 or len(times) != 2
+                or not 0 < widths[0] < widths[1] or topk <= 0
+                or any(not math.isfinite(t) or t <= 0 for t in times)):
+            return None
+        pcie = row.get("pcie_gather_overlap_gbs") if hybrid else None
+        pcie = pcie or row["pcie_gather_gbs"]
+        launch = float(row["pcie_copy_launch_us"])
+        if not math.isfinite(pcie) or pcie <= 0 or not math.isfinite(launch) or launch < 0:
+            return None
+        copy = max(expert_bytes / (pcie * 1000), float(row.get("pcie_copy_expert_us", 0)))
+        slope = max(0.0, (times[1] - times[0]) / ((widths[1] - widths[0]) * topk))
+        fixed = max(0.0, min(times) - slope * widths[0] * topk)
+        cpu = row.get("cpu_moe_overlap_gbs") or row.get("cpu_moe_gbs") or 0
+        cpu_us = expert_bytes / (cpu * 1000) if hybrid and math.isfinite(cpu) and cpu > 0 else 0.0
+        values = copy, launch, fixed, slope, cpu_us
+        return values if all(math.isfinite(v) and v >= 0 for v in values) else None
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def prefetch_count(window_us: float, copy_us: float, launch_us: float, limit: int) -> int:
+    if not all(math.isfinite(x) for x in (window_us, copy_us, launch_us)) or copy_us <= 0:
+        return 0
+    return max(0, min(limit, math.floor((window_us - launch_us) / copy_us)))

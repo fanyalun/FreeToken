@@ -985,3 +985,35 @@ def test_triton_metadata_keeps_full_indices_and_optional_swa_indices(monkeypatch
     assert metadata.indices.tolist() == [10, 11, 20, 21, 22]
     assert metadata.swa_indices is not None
     assert metadata.swa_indices.tolist() == [110, 111, 120, 121, 122]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs a GPU")
+def test_tree_attention_reads_only_prefix_and_ancestors_with_shuffled_physical_slots():
+    from freetoken.engine.speculative_tree import tree_attention_metadata, tree_paths
+    from freetoken.kernel.triton.attention import decode_paged_attention
+
+    torch.manual_seed(43)
+    device = torch.device("cuda")
+    parents = torch.tensor([-1, 0, 0, 1, 2, 4, 5], device=device)
+    paths, depths = tree_paths(parents, 4)
+    slots = torch.randperm(53, device=device).to(torch.int32)
+    prefixes, locations = [slots[:3], slots[3:8]], [slots[8:15], slots[15:22]]
+    metadata = tree_attention_metadata(prefixes, locations, [paths, paths], [depths, depths])
+    q = torch.randn(14, 4, 64, device=device, dtype=torch.bfloat16)
+    k, v = [torch.randn(53, 2, 64, device=device, dtype=torch.bfloat16) for _ in range(2)]
+    actual = decode_paged_attention(q=q, k_cache=k, v_cache=v, indptr=metadata.indptr,
+        indices=metadata.indices, q_positions=metadata.q_positions, sm_scale=64 ** -0.5,
+        attn_logits=torch.empty(14, 4, 8, 64, device=device, dtype=torch.float32),
+        attn_lse=torch.empty(14, 4, 8, device=device, dtype=torch.float32), max_kv_splits=8)
+    for request in range(2):
+        for node in range(7):
+            ancestors, parent = [], node
+            while parent >= 0:
+                ancestors.insert(0, parent)
+                parent = int(parents[parent])
+            physical = torch.cat((prefixes[request], locations[request][ancestors])).long()
+            keys, values = [t[physical].float().repeat_interleave(2, dim=1).transpose(0, 1) for t in (k, v)]
+            query = q[request * 7 + node].float()
+            score = torch.einsum("hd,hnd->hn", query, keys) / 8
+            expected = torch.einsum("hn,hnd->hd", score.softmax(-1), values).to(q.dtype)
+            torch.testing.assert_close(actual[request * 7 + node], expected, atol=0.016, rtol=0.016)

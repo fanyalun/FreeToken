@@ -269,14 +269,17 @@ class Context:
         *,
         kv_cache: BaseKVCachePool | None = None,
         attn_backend: BaseAttnBackend | None = None,
+        linear_state_pool: LinearStatePool | None = None,
         hide_target_state: bool = False,
     ):
-        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool."""
+        """Temporarily select KV, attention and recurrent state resources for a forward."""
         swaps = {}
         if kv_cache is not None:
             swaps["kv_cache"] = kv_cache
         if attn_backend is not None:
             swaps["attn_backend"] = attn_backend
+        if linear_state_pool is not None:
+            swaps["linear_state_pool"] = linear_state_pool
         if hide_target_state:
             swaps["linear_state_pool"] = None
         saved = {name: getattr(self, name) for name in swaps}

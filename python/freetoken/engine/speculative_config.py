@@ -3,8 +3,25 @@ from __future__ import annotations
 import torch
 
 
+def resolve_tree_shape(config, depth):
+    topk = config.speculative_eagle_topk
+    if type(topk) is not int or not 1 <= topk <= 32:
+        raise ValueError("speculative_eagle_topk must be between 1 and 32")
+    maximum = topk + (depth - 1) * topk * topk + 1
+    nodes = config.speculative_num_draft_tokens
+    if nodes is None:
+        nodes = depth + 1 if topk == 1 else min(8, maximum)
+    minimum = depth + 1 if topk == 1 else 2
+    if type(nodes) is not int or not minimum <= nodes <= maximum:
+        raise ValueError(f"speculative_num_draft_tokens must be in [{minimum}, {maximum}], including the anchor")
+    return topk, nodes
+
+
 def resolve_speculative_config(config):
     put = lambda name, value: object.__setattr__(config, name, value)
+    if config.speculative_eagle_topk is None:
+        mtp = config.speculative_algorithm == "mtp" or config.speculative_mode == "three_level_gpu"
+        put("speculative_eagle_topk", 2 if mtp else 1)
     if config.gpu_memory_budget_bytes is not None and config.gpu_memory_budget_bytes <= 0:
         raise ValueError("gpu_memory_budget_bytes must be positive")
     if type(config.speculative_preverify_token_map) is not bool:
@@ -14,14 +31,14 @@ def resolve_speculative_config(config):
     ):
         raise ValueError("Pre-Verify token mapping requires three_level_gpu and speculative_token_map")
     if config.speculative_mode is None:
+        if (config.speculative_eagle_topk != 1 or config.speculative_num_draft_tokens is not None) and config.speculative_algorithm != "mtp":
+            raise ValueError("tree parameters require speculative_algorithm=mtp or speculative_mode=three_level_gpu")
         if config.speculative_mtp_depth or config.speculative_depth or config.speculative_three_level:
             raise ValueError("select speculative_mode=three_level_gpu for the GPU three-level runtime")
         put("speculative_mtp_depth", 0)
         return
     if config.speculative_mode != "three_level_gpu":
         raise ValueError("this branch supports speculative_mode=three_level_gpu; CPU Async is not integrated")
-    if config.speculative_hybrid_profile is not None:
-        raise ValueError("Hybrid uses ft bench bw; select its profile with FREETOKEN_BENCHBW_PATH")
     if config.speculative_algorithm is not None:
         raise ValueError("three_level_gpu and the upstream speculative_algorithm runner are mutually exclusive")
     if config.speculative_num_steps != 0:
@@ -40,6 +57,8 @@ def resolve_speculative_config(config):
         raise ValueError("speculative_depth must be between 1 and 8")
     put("speculative_depth", depth)
     put("speculative_mtp_depth", depth)
+    topk, nodes = resolve_tree_shape(config, depth)
+    put("speculative_num_draft_tokens", nodes)
     h, legacy_h = config.speculative_preverify_top_h, config.speculative_preverify_top_k
     if h is not None and legacy_h is not None and h != legacy_h:
         raise ValueError("speculative_preverify_top_h conflicts with speculative_preverify_top_k")
@@ -48,9 +67,12 @@ def resolve_speculative_config(config):
     put("speculative_preverify_top_k", h)
     if config.tp_info.size != 1 or config.dtype != torch.bfloat16 or config.page_size != 1:
         raise ValueError("three_level_gpu requires TP1, BF16 and page_size=1")
-    if config.max_running_req not in (1, 4):
-        raise ValueError("three_level_gpu requires one active request")
-    put("max_running_req", 1)
+    from .baseline_sd import is_online_sd
+    online = is_online_sd(config)
+    if type(config.max_running_req) is not int or config.max_running_req < 1:
+        raise ValueError("max_running_req must be positive")
+    if not online:
+        put("max_running_req", 1)
     if config.moe_strategy == "auto":
         put("moe_strategy", config.moe_backend or "offload")
         put("moe_backend", None)
@@ -63,8 +85,13 @@ def resolve_speculative_config(config):
     if config.attention_backend != "triton":
         raise ValueError("three_level_gpu requires Triton attention")
     graph = config.speculative_graph
+    widths = config.speculative_graph_widths
+    if widths is not None and (not widths or any(type(n) is not int or n < 1 for n in widths)):
+        raise ValueError("speculative_graph_widths must contain positive integer widths")
     if graph is None:
-        graph = "eager" if config.cuda_graph_max_bs == 0 or config.cuda_graph_bs == [] else "full"
+        graph = "eager" if topk > 1 or config.cuda_graph_max_bs == 0 or config.cuda_graph_bs == [] else "full"
+    if topk > 1 and graph != "eager":
+        raise ValueError("tree MTP currently requires speculative_graph=eager")
     if graph not in ("eager", "full"):
         raise ValueError("speculative_graph must be eager or full")
     if graph == "full" and (config.cuda_graph_max_bs == 0 or config.cuda_graph_bs == []):

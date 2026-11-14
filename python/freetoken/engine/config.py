@@ -91,9 +91,12 @@ class EngineConfig:
     gpu_memory_budget_bytes: int | None = None
     speculative_mode: str | None = None
     speculative_depth: int | None = None
+    speculative_eagle_topk: int | None = None
+    speculative_num_draft_tokens: int | None = None
     speculative_draft_method: str = "auto"
     speculative_draft_model: str | None = None
     speculative_graph: str | None = None
+    speculative_graph_widths: list[int] | None = None
     speculative_preverify_top_h: int | None = None
     _speculative_legacy: bool | None = field(default=None, repr=False)
     speculative_mtp_depth: int | None = None
@@ -110,8 +113,6 @@ class EngineConfig:
     speculative_modes_calibration: str | None = None
     speculative_reference_math: bool = False
     speculative_prefetch: bool | None = None
-    speculative_prefetch_profile: str | None = "auto"
-    _speculative_prefetch_receipt: dict | None = field(default=None, init=False, repr=False, compare=False)
     speculative_prefetch_layer_experts: int | None = None
     speculative_prefetch_layer_quotas: List[int] | None = None
     speculative_prefetch_demand_fence: bool = False
@@ -124,7 +125,6 @@ class EngineConfig:
     speculative_execution_implementation: str = "reference"
     speculative_graph_implementation: str = "reference"
     speculative_hybrid_phases: tuple[str, ...] | None = None
-    speculative_hybrid_profile: str | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
@@ -225,6 +225,8 @@ class EngineConfig:
     @property
     def decode_rows_per_req(self) -> int:
         """Query rows each running request takes per decode step; every per-request decode allowance derives from it."""
+        if self.speculative_algorithm == "mtp" and self.speculative_eagle_topk > 1:
+            return self.speculative_num_draft_tokens or self.speculative_num_steps + 1
         return self.speculative_num_steps + 1 if self.speculative_algorithm is not None else 1
 
     @property

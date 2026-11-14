@@ -10,8 +10,12 @@ import triton.language as tl
 from freetoken.attention.linear import FLAMetadata
 from freetoken.attention.triton import TritonMetadata
 from freetoken.core import Batch
+from freetoken.utils import init_logger
 from .speculative import Commit
 from .qwen_mtp import _can_join_capture_branch, _drain_failed_cpu_branch
+
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -100,7 +104,6 @@ class QwenSpeculativeGraphSet:
         self.coordinator = coordinator
         self.runner, self.engine = coordinator.runner, coordinator.engine
         self.experts = coordinator.experts
-        self.calibration = getattr(self.experts, "calibration_recorder", None)
         self.gap_ready = torch.cuda.Event(external=True)
         self.gap_ready.record(self.experts.copy_stream)
         self.width = max(1, coordinator.inner_width)
@@ -123,6 +126,11 @@ class QwenSpeculativeGraphSet:
                                device=self.engine.device)
         self.indices = torch.arange(self.engine.max_seq_len, dtype=torch.int32,
                                     device=self.engine.device).repeat(max(self.width, self.outer_width))
+        # Online requests use allocator-owned pages; capture must only touch scratch KV.
+        if self.runner.online:
+            self.indices.fill_(self.engine.num_pages * self.engine.config.page_size)
+        self.page_table = (self.indices[:self.engine.max_seq_len] if self.runner.online
+                           else self.engine.page_table[0])
         adapter = self.runner.state_adapter
         workspace = self.runner._gdn_workspace(max(self.width, self.outer_width), adapter.layers)
         inner_widths = range(1, self.width + 1) if self.exact else (self.width,)
@@ -177,9 +185,9 @@ class QwenSpeculativeGraphSet:
                 tuple(getattr(c, "speculative_verify_prefetch_layer_quotas", None) or ()),
                 self.experts.verify_layer_quotas,
                 tuple(getattr(c, "speculative_hybrid_phases", ())),
-                getattr(c, "speculative_hybrid_profile", None), getattr(c, "moe_hybrid_max_fetch", -1),
+                getattr(c, "moe_hybrid_max_fetch", -1),
                 getattr(self.experts, "hybrid_phases", ()), getattr(self.experts, "hybrid_max_fetch", -1),
-                getattr(self.experts, "hybrid_fetch_fractions", ()),
+                getattr(self.experts, "hybrid_fetch_fraction", ()),
                 id(getattr(self.runner, "three_level", self.coordinator)))
 
     def _batch(self, width, state):
@@ -214,7 +222,7 @@ class QwenSpeculativeGraphSet:
 
     def metadata(self, batch, inputs, step=-1, *, context=None):
         _metadata[(1, batch.size)](
-            inputs, self.engine.page_table, batch.input_ids, batch.positions, batch.out_loc,
+            inputs, self.page_table, batch.input_ids, batch.positions, batch.out_loc,
             batch.attn_metadata.indptr, batch.attn_metadata.indices, batch.speculative_valid_rows,
             self.context if context is None else context,
             batch.size, step, 256, True, batch.attn_metadata.q_positions)
@@ -230,8 +238,6 @@ class QwenSpeculativeGraphSet:
 
     def _body(self, inner):
         lane = self.inner if inner else self.outer
-        if self.calibration is not None:
-            self.calibration.begin("preverify" if inner else "verify", lane.width, "body")
         if inner:
             self._propose(lane.inputs, self.anchor, lane.width, self.context)
         else:
@@ -241,14 +247,9 @@ class QwenSpeculativeGraphSet:
 
     def _draft_verify_body(self, draft_count):
         lane = self.outer
-        if self.calibration is not None:
-            self.calibration.begin("verify", lane.width, f"draft_verify_{draft_count}")
-            self.calibration.mark("proposal_start")
         self._propose(self.draft_inputs, self.draft_anchor, draft_count + 1, self.draft_context)
         _append_draft[(1,)](self.draft_inputs, self.experts.candidate_buffer, self.draft_context,
                            self.tail_width, triton.next_power_of_2(self.tail_width))
-        if self.calibration is not None:
-            self.calibration.mark("proposal_end")
         _assemble[(1,)](self.anchor, self.experts.candidate_buffer, lane.inputs, self.context,
                         lane.width, triton.next_power_of_2(lane.width))
         self._target_body(lane, False)
@@ -259,32 +260,22 @@ class QwenSpeculativeGraphSet:
         self.experts.retire_gap()
         self.metadata(lane.batch, lane.inputs)
         self.experts.valid_rows = lane.batch.speculative_valid_rows
-        if self.calibration is not None:
-            self.calibration.mark("target_start")
         with self.engine.model.forward_host_ctx(lane.batch, True):
             tokens, hidden = self.runner._target(lane.batch, preverify=inner)
-        if self.calibration is not None:
-            self.calibration.mark("target_end")
         lane.hidden.copy_(hidden)
         _accept[(1,)](lane.inputs, tokens, lane.tokens, lane.commit.accepted_drafts,
             lane.commit.input_count, lane.commit.terminal, self.eos, self.context,
             lane.width, triton.next_power_of_2(lane.width))
         self.experts.write_control(lane.tokens, lane.commit, inner=inner, context=self.context,
                                    depth=self.engine.config.speculative_mtp_depth, eos_mask=self.eos)
-        if self.calibration is not None:
-            self.calibration.end()
 
     def _tail(self, inner):
         lane = self.inner if inner else self.outer
-        if self.calibration is not None:
-            self.calibration.begin("preverify" if inner else "verify", lane.width, "tail")
         self._commit(inner)
         self.metadata(lane.batch, lane.tokens)
         seed, hidden = self.runner._draft(lane.batch, lane.hidden, count=lane.commit.input_count)
         self.seed.copy_(seed)
         self.seed_hidden.copy_(hidden)
-        if self.calibration is not None:
-            self.calibration.end()
 
     def _commit(self, inner):
         lane = self.inner if inner else self.outer
@@ -303,12 +294,13 @@ class QwenSpeculativeGraphSet:
         if self.ready:
             return
         engine, experts = self.engine, self.experts
-        saved_table = engine.page_table[0].clone()
+        saved_table = engine.page_table[0].clone() if not self.runner.online else None
         saved_state = self.runner.state_adapter.snapshot()
         before = torch.cuda.memory_reserved(engine.device)
         capture_started = time.perf_counter()
         try:
-            self.runner._reserve(max(self.width, self.outer_width))
+            if not self.runner.online:
+                self.runner._reserve(max(self.width, self.outer_width))
             # Outer warmup runs before inner proposals exist; its token IDs must be valid.
             experts.candidate_buffer.zero_()
             for tensor in self.runner.state_adapter.tensors(self.coordinator.private_pool):
@@ -435,16 +427,27 @@ class QwenSpeculativeGraphSet:
         finally:
             experts.close(abort=True)
             engine.stream.synchronize()
-            engine.page_table[0].copy_(saved_table)
+            if saved_table is not None:
+                engine.page_table[0].copy_(saved_table)
             self.runner.state_adapter.restore(saved_state)
             experts.cache.reset()
             experts.valid_rows = None
             self.runner._reserved_len = 0
         self.reserved_capture_bytes = torch.cuda.memory_reserved(engine.device) - before
         self.capture_seconds = time.perf_counter() - capture_started
+        logger.info_rank0(f"Three-level CUDA Graphs ready: {self.captures} graphs, "
+                          f"inner widths {sorted(self.inner_lanes)}, outer widths {sorted(self.outer_lanes)}, "
+                          f"{self.capture_seconds:.1f}s capture; "
+                          f"{'shared online requests' if self.runner.online else 'offline request'}")
 
     def stage(self, start, rows, loop, candidates, limit, remaining, accept_remaining):
         _stage[(1,)](self.context, start, rows, loop, candidates, limit, remaining, accept_remaining)
+
+    def _bind_pages(self):
+        if self.runner.online:
+            # Stage after reservation: a short inner round may have just allocated new pages.
+            table = self.engine.page_table[self.runner.table_idx, :self.engine.max_seq_len]
+            self.indices.view(-1, self.engine.max_seq_len).copy_(table.unsqueeze(0))
 
     def body(self, anchor, *, inner, start, rows, loop=0, candidates=0, limit=0, remaining=0):
         if not self.ready or self.closed:
@@ -457,15 +460,14 @@ class QwenSpeculativeGraphSet:
         lane = (self.inner_lanes if inner else self.outer_lanes)[rows if self.exact else maximum]
         self.active_lanes[inner] = lane
         self.anchor.copy_(anchor)
+        self._bind_pages()
         self.stage(start, rows, loop, candidates, limit, remaining, rows if inner else remaining)
         self.experts.valid_rows = lane.batch.speculative_valid_rows
+        self.experts.update_gap_budget(self.runner.prefetch_timings.window(self.width, 0))
         self._replay(inner, "body", lane.width)
         self.experts.gap_active = False
         self.experts.gap_planned = inner and self.experts.prefetch and self.experts.gap_capacity > 1
         control = self.experts.drain_control(lane.width)
-        if self.calibration is not None:
-            self.calibration.body_finished("preverify" if inner else "verify", rows, start + rows,
-                                           capture_rows=lane.width)
         return lane.tokens, lane.hidden, lane.commit, control
 
     def draft_then_verify(self, first_anchor, tail_anchor, *, start, prefix_rows, draft_count, remaining):
@@ -483,6 +485,7 @@ class QwenSpeculativeGraphSet:
         self.active_lanes[False] = lane
         self.anchor.copy_(first_anchor)
         self.draft_anchor.copy_(tail_anchor)
+        self._bind_pages()
         self.stage(start, rows, 0, prefix_rows, self.outer_width - 1, remaining, remaining)
         _stage[(1,)](self.draft_context, start + prefix_rows, draft_count + 1, 0,
                      prefix_rows, self.outer_width - 1, remaining, draft_count + 1)
@@ -496,9 +499,6 @@ class QwenSpeculativeGraphSet:
         self.runner.graph_replays[key] = self.runner.graph_replays.get(key, 0) + 1
         self.experts.gap_active = self.experts.gap_planned = False
         control = self.experts.drain_control(lane.width)
-        if self.calibration is not None:
-            self.calibration.body_finished("verify", rows, start + rows, capture_rows=lane.width,
-                suffix=f"draft_verify_{physical_count}", draft_tail_count=draft_count)
         return lane.tokens, lane.hidden, lane.commit, control
 
     def tail(self, inner, continuing):
@@ -508,8 +508,6 @@ class QwenSpeculativeGraphSet:
             self.gap_ready.record(self.experts.copy_stream)
         if continuing:
             self._replay(inner, "tail", lane.width)
-            if self.calibration is not None:
-                self.calibration.tail_submitted("preverify" if inner else "verify", lane.width)
             self.runner.next_draft, self.runner.last_draft_hidden = self.seed, self.seed_hidden
         else:
             self._replay(inner, "commit", lane.width)
@@ -521,8 +519,11 @@ class QwenSpeculativeGraphSet:
         return (False, "draft_verify", width, count) if self.exact else (False, "draft_verify")
 
     def _replay(self, inner, suffix, width):
+        sample = (self.runner.prefetch_timings.begin("reconcile", width, self.engine.stream)
+                  if suffix == "tail" and self.experts.auto_gap else None)
         with torch.cuda.nvtx.range(f"SPEC_GRAPH/{'inner' if inner else 'outer'}/{suffix}"):
             self.graphs[self._key(inner, suffix, width)].replay()
+        self.runner.prefetch_timings.end(sample)
         key = f"{self.implementation}_{'inner' if inner else 'outer'}_{suffix}"
         if self.exact:
             key += f"_{width}"
