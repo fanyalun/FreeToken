@@ -1481,6 +1481,17 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    router_top_k = getattr(config, "deepseek_vl2_router_top_k", None)
+    if router_top_k is not None:
+        from freetoken.models.deepseek_vl2.config import with_router_top_k
+
+        model_config = with_router_top_k(model_config, router_top_k)
+        override("model_config", model_config)
+    if getattr(model_config, "deepseek_vl2_args", None) is not None:
+        from freetoken.models.deepseek_vl2.config import with_context_length
+
+        model_config = with_context_length(model_config, config.max_seq_len_override)
+        override("model_config", model_config)
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)

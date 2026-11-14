@@ -759,6 +759,8 @@ def parse_args(
                         type=int, default=ServerArgs.tablemoe_decode_keep_k,
                         help="Decode computes the leading h routes plus GPU expert-cache hits exactly; other routes use tables.")
     parser.add_argument("--tablemoe-online-cache-size", type=int, default=ServerArgs.tablemoe_online_cache_size)
+    parser.add_argument("--deepseek-vl2-router-top-k", type=int, default=None,
+                        help="Override native DeepSeek-VL2 routing in prefill and decode; preserve native normalization and scaling.")
     parser.add_argument("--tablemoe-decode-switch-after", type=int, default=None,
                         help="Switch decode top-h after this many generated tokens per request; prompt tokens are excluded.")
     parser.add_argument("--tablemoe-decode-late-top-h", type=int, default=None,

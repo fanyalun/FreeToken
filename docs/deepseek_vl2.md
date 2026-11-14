@@ -34,6 +34,11 @@ preprocessing defaults; image-budget and processor overrides are not supported.
 The checkpoint's nominal context is 4096 tokens. No long-context extension or
 full benchmark quality result is established by the integration checks.
 
+An explicit larger sequence ceiling grows the native unscaled RoPE frequency
+table, as the native model does, without changing theta or checkpoint files.
+For the frozen five-method writing-quality protocol, see
+[the experiment runner](../benchmarks/deepseek_vl2_freetoken_write.md).
+
 ## Existing offline tables
 
 The already-built MMLongBench-Write tables can be reused directly:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from freetoken.models.config import ModelConfig, RotaryConfig
@@ -29,6 +29,21 @@ class VisionConfig:
     text_hidden_size: int
     downsample_ratio: int
     global_view_pos: str
+
+
+def with_router_top_k(config: ModelConfig, top_k: int) -> ModelConfig:
+    if config.deepseek_vl2_args is None:
+        raise ValueError("router top-k override requires DeepSeek-VL2")
+    if not 1 <= top_k <= config.num_experts:
+        raise ValueError("DeepSeek-VL2 router top-k must be between 1 and num_experts")
+    return replace(config, num_experts_per_tok=top_k)
+
+
+def with_context_length(config: ModelConfig, length: int | None) -> ModelConfig:
+    if length is None or length <= config.rotary_config.max_position:
+        return config
+    # Native unscaled DeepSeek RoPE grows its frequency cache when a sequence exceeds the initial table.
+    return replace(config, rotary_config=replace(config.rotary_config, max_position=length))
 
 
 def normalize_hf_config(config):

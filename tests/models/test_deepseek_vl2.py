@@ -78,6 +78,54 @@ def test_router_bias_selects_without_reweighting_sigmoid_scores(topk):
     torch.testing.assert_close(weights, expected * 2)
 
 
+def test_router_top5_override_preserves_native_model_config():
+    from freetoken.models.deepseek_vl2.config import with_router_top_k
+
+    original = replace(parse_config(config()), num_experts=72, num_experts_per_tok=6)
+    adjusted = with_router_top_k(original, 5)
+    assert original.num_experts_per_tok == 6 and adjusted.num_experts_per_tok == 5
+    assert adjusted.routed_scaling_factor == original.routed_scaling_factor == 2
+    for invalid in (0, 73):
+        with pytest.raises(ValueError, match="between"):
+            with_router_top_k(original, invalid)
+    with pytest.raises(ValueError, match="requires DeepSeek"):
+        with_router_top_k(replace(original, deepseek_vl2_args=None), 5)
+
+
+def test_context_override_grows_only_the_unscaled_rope_table():
+    from freetoken.models.deepseek_vl2.config import with_context_length
+
+    original = parse_config(config())
+    adjusted = with_context_length(original, 32768)
+    assert adjusted.rotary_config.max_position == 32768
+    assert original.rotary_config.max_position == 2048
+    assert adjusted.rotary_config.base == original.rotary_config.base
+    assert adjusted.rotary_config.scaling == original.rotary_config.scaling is None
+    assert with_context_length(original, 1024) is original
+
+
+@pytest.mark.parametrize("bypass", [False, True])
+def test_tablemoe_ranks_unbiased_route_weights_and_preserves_full_baseline(monkeypatch, bypass):
+    import freetoken.models.deepseek_vl2.moe as module
+
+    weights = torch.tensor([[.2, .8, .4, .6]])
+    ids = torch.tensor([[3, 1, 0, 2]], dtype=torch.int32)
+    observed = {}
+    layer = DeepseekVL2MoE.__new__(DeepseekVL2MoE)
+    layer._config = SimpleNamespace(moe_strategy="tablemoe", n_shared_experts=0)
+    layer.route = lambda x: (weights, ids)
+
+    def capture(x, w, selected):
+        observed.update(weights=w, ids=selected)
+        return x
+
+    layer.experts = SimpleNamespace(routed_forward=capture)
+    monkeypatch.setattr(module, "get_global_ctx", lambda: SimpleNamespace(tablemoe_runtime=SimpleNamespace(bypass_tables=bypass)))
+    layer.forward(torch.ones(1, 2))
+    assert observed['ids'].tolist() == (ids.tolist() if bypass else [[1, 2, 0, 3]])
+    assert observed['weights'].sum().item() == pytest.approx(weights.sum().item())
+
+
 def test_image_processor_native_crop_switch_and_feature_layout(tmp_path):
     hf = config()
     hf._data["candidate_resolutions"] = [[384, 384], [384, 768], [768, 384]]

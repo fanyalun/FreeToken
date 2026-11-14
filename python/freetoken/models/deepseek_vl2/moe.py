@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
+from freetoken.core import get_global_ctx
 from freetoken.models.glm4_moe.mlp import GlmGatedMLP
 
 
@@ -38,6 +39,12 @@ class DeepseekVL2MoE(BaseOP):
 
     def forward(self, x):
         weights, ids = self.route(x)
+        if self._config.moe_strategy == "tablemoe":
+            runtime = get_global_ctx().tablemoe_runtime
+            if runtime is not None and not runtime.bypass_tables:
+                # Native top-k chooses with correction bias; TableMoE top-h ranks the returned unbiased weights.
+                order = weights.argsort(dim=-1, descending=True, stable=True)
+                weights, ids = weights.gather(-1, order).contiguous(), ids.gather(-1, order).contiguous()
         shared = self.shared_experts.forward(x) if self._config.n_shared_experts else None
         out = self.experts.routed_forward(x, weights, ids)
         return out if shared is None else out + shared

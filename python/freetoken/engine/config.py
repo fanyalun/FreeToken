@@ -27,6 +27,7 @@ class EngineConfig:
     attention_backend: str = "auto"
     moe_strategy: str = "auto"
     moe_policy: str = "native"
+    deepseek_vl2_router_top_k: int | None = None
     modes_config: str | None = None
     modes_prefill_policy: str = "modes"
     # old name of moe_strategy; __post_init__ folds it in
