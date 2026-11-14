@@ -1,8 +1,10 @@
 """Render compact, measured single-layer pipelines with one row per backend."""
 
 import argparse
+from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 
 import matplotlib
 matplotlib.use("Agg")
@@ -184,14 +186,188 @@ are cache-reset diagnostics, separate from steady decode.
     return audits
 
 
+def split_stage_blocks(rows):
+    gpu, transfers = [], []
+    for row in rows:
+        row = dict(row)
+        if row["category"] == "IO":
+            if row["name"] == "fast_index_copy_multi":
+                row["mechanism"] = "mapped"
+                transfers.append(row)
+                continue
+            if row["source_table"] == "CUPTI_ACTIVITY_KIND_MEMCPY":
+                size = int(row["bytes"])
+                if size >= 1 << 20:
+                    if row.get("copy_kind") != 1:
+                        raise ValueError("large prefetch copy is not HtoD; classify its transfer path")
+                    row["mechanism"] = "dma"
+                    transfers.append(row)
+                    continue
+                if size > 16:
+                    raise ValueError("unrecognized prefetch copy; classify its payload before plotting")
+            row["category"] = "Dispatch"
+        gpu.append(row)
+    blocks = []
+    for stream in sorted({r["stream"] for r in gpu}):
+        current = None
+        for row in sorted((r for r in gpu if r["stream"] == stream), key=lambda r:r["start"]):
+            if current is not None and current["category"] == row["category"]:
+                current["end"] = max(current["end"], row["end"])
+                current["events"].append(row)
+            else:
+                current = dict(start=row["start"], end=row["end"], category=row["category"],
+                               stream=stream, events=[row])
+                blocks.append(current)
+    for mechanism in sorted({r["mechanism"] for r in transfers}):
+        events = [r for r in transfers if r["mechanism"] == mechanism]
+        blocks.append(dict(start=min(r["start"] for r in events), end=max(r["end"] for r in events),
+                           category="IO", mechanism=mechanism, events=events))
+    return blocks
+
+
+def render_gpu_pcie(root, output, phase, config):
+    panels = [load_panel(root, b, phase, "gpu") for b in BACKENDS]
+    for panel in panels:
+        with closing(sqlite3.connect(panel["summary"]["source_sqlite"])) as connection:
+            for row in panel["rows"]:
+                if row["source_table"] == "CUPTI_ACTIVITY_KIND_MEMCPY":
+                    row["copy_kind"] = connection.execute(
+                        "SELECT copyKind FROM CUPTI_ACTIVITY_KIND_MEMCPY WHERE rowid=?",
+                        (row["source_rowid"],)).fetchone()[0]
+        panel["blocks"] = split_stage_blocks(panel["rows"])
+    active = {r["category"] for p in panels for r in p["blocks"] if r["category"] != "IO"}
+    mechanisms = {r["mechanism"] for p in panels for r in p["blocks"] if r["category"] == "IO"}
+    plt.rcParams.update({"font.family":"STIXGeneral", "font.size":12,
+                         "axes.labelsize":13, "xtick.labelsize":12, "ytick.labelsize":11.5,
+                         "legend.fontsize":10.5, "pdf.fonttype":42, "ps.fonttype":42})
+    legend_rows = 3 if len(active)+2>8 else 2
+    fig, ax = plt.subplots(figsize=(7.4, 4.0 if legend_rows == 3 else 3.65))
+    fig.subplots_adjust(left=.225, right=.985, bottom=.17, top=.74 if legend_rows == 3 else .79)
+    ax.set_xlim(0, max(p["elapsed_ms"] for p in panels)*1.09)
+    ax.set_ylim(-.28, 3.48)
+    ax.set_yticks([3,2.25,.95,.2], ["GPU", "PCIe", "GPU", "PCIe"])
+    ax.set_xlabel("Time from layer start (ms)")
+    ax.xaxis.set_major_locator(plt.MaxNLocator(6))
+    ax.set_facecolor("#FAFAFA")
+    ax.grid(axis="x", color="#DFDFDF", linewidth=.5, linestyle="--")
+    ax.set_axisbelow(True)
+    ax.spines[["top","right","left"]].set_visible(False)
+    ax.tick_params(axis="y", length=0, pad=7)
+    labels, audits = [], []
+    for panel, gpu_y, io_y in zip(panels, [3,.95], [2.25,.2]):
+        origin = panel["origin_ns"]
+        ax.add_patch(Rectangle((0,io_y-.30), panel["elapsed_ms"], gpu_y-io_y+.60,
+                              facecolor="white", edgecolor="#ADB3BD", linewidth=.7, zorder=0))
+        ax.text(-.13, (gpu_y+io_y)/2, LABELS[panel["backend"]],
+                transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=13.5)
+        primary = [b for b in panel["blocks"] if b["category"] not in ("Lookup", "Lookup+IO", "IO")]
+        records = []
+        for block in sorted(panel["blocks"], key=lambda b:b["category"] in ("Lookup", "Lookup+IO")):
+            category = block["category"]
+            x, width = (block["start"]-origin)/1e6, (block["end"]-block["start"])/1e6
+            io = category == "IO"
+            overlaps = not io and category in ("Lookup", "Lookup+IO") and any(
+                b["stream"] != block["stream"] and b["start"] < block["end"] and b["end"] > block["start"]
+                for b in primary)
+            height = .21 if overlaps else .44
+            bottom = (io_y if io else gpu_y)-.22 + (.23 if overlaps else 0)
+            ax.add_patch(Rectangle((x,bottom), width, height, facecolor=STAGES[category][1],
+                                  edgecolor="none", alpha=.22, zorder=1))
+            intervals = union((r["start"],r["end"]) for r in block["events"])
+            ax.broken_barh([((a-origin)/1e6,(b-a)/1e6) for a,b in intervals],
+                           (bottom,height),facecolors=STAGES[category][1],edgecolors="none",zorder=2)
+            ax.add_patch(Rectangle((x,bottom),width,height,facecolor="none",
+                                  edgecolor="#505050",linewidth=.45,zorder=3))
+            label = ("Expert IO (mapped)" if block["mechanism"] == "mapped" else "Expert IO (DMA)") if io else STAGES[category][0]
+            labels.append((ax.text(x+width/2,bottom+height/2,label,ha="center",va="center",fontsize=10.5,zorder=3),width,height))
+            records.append(dict(category=category, start_ns=block["start"], end_ns=block["end"],
+                track="pcie_expert_io" if io else "gpu_stages", mechanism=block.get("mechanism"),
+                active_us=duration((r["start"],r["end"]) for r in block["events"])/1000,
+                phase_span_us=(block["end"]-block["start"])/1000,
+                source_events=[{k:r[k] for k in ("source_table","source_rowid","start","end")} for r in block["events"]]))
+        ax.annotate(f"{panel['elapsed_ms']:.2f}", (panel["elapsed_ms"],(gpu_y+io_y)/2),
+                    xytext=(4,0),textcoords="offset points",va="center",fontsize=11,color="#555555")
+        audits.append(dict(backend=panel["backend"], layer=panel["summary"]["layer"], phase=phase,
+                           origin_ns=origin, elapsed_ms=panel["elapsed_ms"], source_csv=panel["source_csv"],
+                           source_sqlite=panel["summary"]["source_sqlite"], blocks=records))
+    handles = [Patch(facecolor=color,edgecolor="#505050",linewidth=.5,
+                     label=label)
+               for stage,(label,color) in STAGES.items() if stage in active]
+    if mechanisms:
+        handles.append(Patch(facecolor=STAGES["IO"][1],edgecolor="#505050",linewidth=.5,label="Expert IO"))
+    handles.append(Patch(facecolor="#F1F1F1",edgecolor="#505050",linewidth=.5,label="Phase envelope"))
+    fig.legend(handles=handles,loc="upper center",bbox_to_anchor=(.51,1.01),
+               ncol=3 if legend_rows == 3 else 4,frameon=False,columnspacing=.9,handlelength=1.2)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for text,width,height in labels:
+        box = text.get_window_extent(renderer)
+        size = ax.transData.transform((width,height))-ax.transData.transform((0,0))
+        if box.width+5>size[0] or box.height+2>size[1]:text.remove()
+    name = f"{phase}_gpu_pcie_layer_pipeline"
+    folder = output/name
+    folder.mkdir(parents=True,exist_ok=True)
+    for suffix in ("png","pdf"):
+        fig.savefig(folder/f"{name}.{suffix}",dpi=300,bbox_inches="tight",pad_inches=.025)
+    plt.close(fig)
+    note = f"""# {name}
+
+Only zero-based L24 (the 25th layer), physical GPU1. Each backend is one integrated
+GPU/PCIe pair. Both tracks share a single origin and scale within the method:
+the earliest attributed layer event. The two methods are independent requests.
+No events, start offsets or elapsed layer envelopes were shifted or rescaled.
+
+This is a phase overview: consecutive same-category GPU calls on a stream are
+grouped within one continuous phase outline. Pale fill is the phase envelope,
+including internal gaps and dependency waits; saturated fill is the actual event
+union. Per-kernel edges are hidden, but no idle gap is turned into active work.
+The Comp outline spans the expert pipeline, while its dark fill shows arithmetic
+and merge execution. Active unions and original timestamps are retained below.
+Lookup work concurrent on another stream occupies the upper half
+of the GPU band, leaving the concurrent main phase visible beneath it.
+
+The PCIe row shows expert-weight transfer operation envelopes. Native large bank
+memcpys are DMA. fast_index_copy_multi is mapped-host read executed by GPU SMs;
+its kernel interval is used as the mapped-IO operation envelope, not a measurement
+of PCIe bus utilization or a DMA engine. Cache-hit/no-copy invocations can also
+have a short envelope. Native 4-byte metadata copies and IO-preparation kernels
+belong to GPU Dispatch, not expert-weight transport. An unexpected copy payload
+between 16 bytes and 1 MiB is rejected for explicit classification.
+
+Lookup+IO remains the fused offline search and table-value read on the GPU row;
+the lower row is limited to expert weights and does not claim all PCIe traffic.
+Blank regions do not establish device idle. Stage spans and overlapping track
+durations must not be summed to infer layer latency. The right number is the
+original measured layer event envelope in ms. These are measured-event phase
+figures, not Nsight GUI screenshots or raw link-counter traces.
+
+Configuration: {json.dumps(config, ensure_ascii=False)}
+
+```json
+{json.dumps(audits,indent=2)}
+```
+
+Reproduce: `plot_qwen3vl_layer_pipeline.py --analysis-root {root} --output {output}
+--layout gpu_pcie --config CONFIG.json`.
+"""
+    (folder/f"{name}.md").write_text(note)
+    return audits
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--layout", choices=("compact", "gpu_pcie"), default="compact")
     args = parser.parse_args()
     config = json.loads(args.config.read_text()) if args.config else None
     audit = []
+    if args.layout == "gpu_pcie":
+        for phase in ("prefill_chunk0", "decode128", "decode128_cold"):
+            audit.extend(render_gpu_pcie(args.analysis_root,args.output,phase,config))
+        print(json.dumps(audit,indent=2))
+        return
     for phase, resource in (("prefill_chunk0", "gpu"), ("decode128", "gpu"),
                             ("prefill_chunk0", "cpu"), ("decode128_cold", "gpu")):
         audit.extend(render(args.analysis_root, args.output, phase, resource, config))

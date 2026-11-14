@@ -94,6 +94,14 @@ These retain measured intervals and overlap instead of concatenating stage sums.
 CPU prefill is a separate figure with its own local origin; decode has no
 per-layer host submission and therefore no per-layer CPU figure.
 
+Add `--layout gpu_pcie` for integrated GPU/expert-IO pairs sharing a clock per
+backend. Consecutive stage calls form one phase outline: pale fill includes
+internal gaps and waits, and dark fill retains actual event unions. Expert IO
+uses large HtoD bank copies or mapped-read kernel intervals; mapped reads also
+use GPU SMs and are not physical DMA/link-utilization counters. Fused table-value
+Lookup+IO remains on the GPU row. All source events and original timestamps are
+retained in the plot audit.
+
 The cache manager parallelizes active-expert marking and slot rewriting for more
 than 256 routes. The single-block LRU consumes the active-expert bitmap instead
 of scanning the entire token-route matrix. Smaller route batches keep the
