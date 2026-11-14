@@ -110,6 +110,17 @@ with visible/occluded intervals recorded alongside intact source events in the
 audit. Prefill Comp phases split between expert groups across waits longer than
 50 us.
 
+For a combined two-panel publication figure, run
+`plot_qwen3vl_combined_pipeline.py --analysis-root ANALYSIS_ROOT --output FIGURES
+--config RESULT/config.json`. This uses solid phase envelopes and a shared legend.
+The TableMoE prefill prefix is consolidated as Attn, Schedule, Route by summing
+each stage's source phase spans and collecting small inter-phase gaps at the end;
+the displayed prefix is a phase overview, not the original interleaved kernel
+order. Downstream anchors and layer envelopes stay fixed. Original source events
+and separate display intervals are retained in the audit. Lookup is one envelope;
+prefill Comp retains its five groups. The previous measured-order figures remain
+available through the original plotting script.
+
 The cache manager parallelizes active-expert marking and slot rewriting for more
 than 256 routes. The single-block LRU consumes the active-expert bitmap instead
 of scanning the entire token-route matrix. Smaller route batches keep the
