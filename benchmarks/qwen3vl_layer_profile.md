@@ -104,8 +104,11 @@ retained in the plot audit.
 This layout exports prefill and cold-cache decode only, with a single-row legend.
 For display, Dispatch joins Route and fused Lookup+IO joins Lookup; the original
 categories remain in event provenance. GPU/PCIe row and method gaps are compact.
-All stage bars have equal height. Concurrent Lookup has a small vertical offset;
-prefill Comp phases split between expert groups across waits longer than 50 us.
+All stage bars have equal height and share their track's baseline. Concurrent
+Lookup is drawn in the foreground; covered parts of other GPU phases are hidden,
+with visible/occluded intervals recorded alongside intact source events in the
+audit. Prefill Comp phases split between expert groups across waits longer than
+50 us.
 
 The cache manager parallelizes active-expert marking and slot rewriting for more
 than 256 routes. The single-block LRU consumes the active-expert bitmap instead

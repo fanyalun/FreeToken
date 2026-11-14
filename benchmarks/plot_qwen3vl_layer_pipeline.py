@@ -235,6 +235,26 @@ def split_stage_blocks(rows):
     return blocks
 
 
+def subtract_intervals(intervals, masks):
+    visible = []
+    masks = union(masks)
+    for start, end in union(intervals):
+        cursor = start
+        for a, b in masks:
+            if b <= cursor:
+                continue
+            if a >= end:
+                break
+            if cursor < a:
+                visible.append((cursor, a))
+            cursor = max(cursor, b)
+            if cursor >= end:
+                break
+        if cursor < end:
+            visible.append((cursor, end))
+    return visible
+
+
 def render_gpu_pcie(root, output, phase, config):
     panels = [load_panel(root, b, phase, "gpu") for b in BACKENDS]
     for panel in panels:
@@ -269,29 +289,35 @@ def render_gpu_pcie(root, output, phase, config):
                               facecolor="white", edgecolor="#ADB3BD", linewidth=.7, zorder=0))
         ax.text(-.13, (gpu_y+io_y)/2, LABELS[panel["backend"]],
                 transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=13.5)
-        primary = [b for b in panel["blocks"] if b["category"] not in ("Lookup", "Lookup+IO", "IO")]
+        foreground = [b for b in panel["blocks"] if b["category"] == "Lookup"]
         records = []
         for block in sorted(panel["blocks"], key=lambda b:b["category"] in ("Lookup", "Lookup+IO")):
             category = block["category"]
-            x, width = (block["start"]-origin)/1e6, (block["end"]-block["start"])/1e6
             io = category == "IO"
-            overlaps = not io and category in ("Lookup", "Lookup+IO") and any(
-                b["stream"] != block["stream"] and b["start"] < block["end"] and b["end"] > block["start"]
-                for b in primary)
+            masks = [(b["start"], b["end"]) for b in foreground
+                     if not io and category != "Lookup" and b["stream"] != block["stream"]]
+            visible = subtract_intervals([(block["start"], block["end"])], masks)
+            occluded = subtract_intervals([(block["start"], block["end"])], visible)
             height = .36
-            bottom = (io_y if io else gpu_y)-.18 - (.055 if overlaps else 0)
-            ax.add_patch(Rectangle((x,bottom), width, height, facecolor=STAGES[category][1],
-                                  edgecolor="none", alpha=.22, zorder=1))
-            intervals = union((r["start"],r["end"]) for r in block["events"])
+            bottom = (io_y if io else gpu_y)-.18
+            for a, b in visible:
+                ax.add_patch(Rectangle(((a-origin)/1e6,bottom), (b-a)/1e6, height,
+                                      facecolor=STAGES[category][1], edgecolor="none", alpha=.22, zorder=1))
+            intervals = subtract_intervals(((r["start"],r["end"]) for r in block["events"]), masks)
             ax.broken_barh([((a-origin)/1e6,(b-a)/1e6) for a,b in intervals],
                            (bottom,height),facecolors=STAGES[category][1],edgecolors="none",zorder=2)
-            ax.add_patch(Rectangle((x,bottom),width,height,facecolor="none",
-                                  edgecolor="#505050",linewidth=.45,zorder=3))
+            for a, b in visible:
+                ax.add_patch(Rectangle(((a-origin)/1e6,bottom),(b-a)/1e6,height,facecolor="none",
+                                      edgecolor="#505050",linewidth=.45,zorder=3))
             label = ("Expert IO (mapped)" if block["mechanism"] == "mapped" else "Expert IO (DMA)") if io else "Comp" if category == "Comp" else STAGES[category][0]
-            labels.append((ax.text(x+width/2,bottom+height/2,label,ha="center",va="center",fontsize=10.5,zorder=3),width,height))
+            if visible:
+                a, b = max(visible, key=lambda interval:interval[1]-interval[0])
+                x, width = (a-origin)/1e6, (b-a)/1e6
+                labels.append((ax.text(x+width/2,bottom+height/2,label,ha="center",va="center",fontsize=10.5,zorder=3),width,height))
             records.append(dict(category=category, start_ns=block["start"], end_ns=block["end"],
                 track="pcie_expert_io" if io else "gpu_stages", mechanism=block.get("mechanism"),
-                display_height=height, display_bottom=bottom,
+                stream=block.get("stream"), display_height=height, display_bottom=bottom,
+                visible_intervals_ns=visible, occluded_intervals_ns=occluded,
                 active_us=duration((r["start"],r["end"]) for r in block["events"])/1000,
                 phase_span_us=(block["end"]-block["start"])/1000,
                 source_events=[{k:r[k] for k in ("source_table","source_rowid","start","end","original_category")} for r in block["events"]]))
@@ -333,9 +359,11 @@ union. Per-kernel edges are hidden, but no idle gap is turned into active work.
 Comp phases split at separate expert-group calls when their gap exceeds 50 us;
 long expert-IO waits are no longer bridged by one compute outline. Adjacent
 kernels within a group remain together. Active unions and timestamps are retained.
-Every stage has the same height. Concurrent Lookup on another stream has only a
-small vertical offset to expose both overlapping phases; height does not encode
-time, work, bandwidth or utilization.
+Every stage has the same height and shares its track's baseline. Concurrent Lookup
+is in the foreground: intersecting parts of other GPU phases, including their
+outlines and labels, are hidden rather than shifted. Visible and occluded intervals
+are recorded separately; original events and activity totals remain intact.
+Height does not encode time, work, bandwidth or utilization.
 
 Display categories merge Dispatch into Route and Lookup+IO into Lookup. This is
 only a plotting aggregation; original_category and every source event remain in
