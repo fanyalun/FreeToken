@@ -203,13 +203,19 @@ def worker(config, method, gpu):
                     elapsed_s=elapsed, engine_backend="freetoken", physical_gpu=gpu,
                     source_manifest=str(root / "source_manifest.json"), per_request_cache_reset=True)
 
-    reference = read(root / "native_reference.json")
+    reference = read(root / "validation/freetoken_reference.json")
     reference_row = next(row for row in evaluation if row["id"] == reference["id"])
-    if not (folder / "policy_smoke.json").exists():
+    if (folder / "policy_smoke.json").exists():
+        probe = read(folder / "policy_smoke.json")
+    else:
         probe = generate(reference_row, 32, False)
         save(folder / "policy_smoke.json", probe)
-        if method == "baseline" and probe["output_token_ids"] != reference["tokens"]:
-            raise ValueError("FreeToken baseline differs from saved 32-token native reference")
+    if method == "baseline":
+        if probe["output_token_ids"] != reference["tokens"]:
+            raise ValueError("FreeToken baseline differs from its validated full-expert reference")
+        save(folder / "baseline_validation.json",dict(passed=True,sample=reference["id"],tokens=32,
+             reference=str(root / "validation/freetoken_reference.json"),
+             native_comparison=str(root / "validation/native_freetoken_logit_comparison.json"),strict_native_token_parity=False))
     previous = rows(folder / "requests.jsonl") if (folder / "requests.jsonl").exists() else []
     if [item["id"] for item in previous] != [row["id"] for row in evaluation[:len(previous)]]:
         raise ValueError("resume predictions do not match the frozen cohort order")
@@ -301,6 +307,8 @@ def score_all(config):
 
 def run(config):
     root = Path(config["output"])
+    if not read(root / "validation/numerical_validation.json")["passed"]:
+        raise ValueError("full-expert backend numerical validation is incomplete")
     manifest = read(root / "source_manifest.json")
     for name, expected in manifest["sources"].items():
         if hashlib.sha256((root / "runtime_snapshot" / name).read_bytes()).hexdigest() != expected:

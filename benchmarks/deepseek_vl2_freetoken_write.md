@@ -41,3 +41,12 @@ official six-dimension rubric and original length score, and requires all 48
 grades for every method before publishing `comparison.json` and `complete.json`.
 The source snapshot, actual rendered prompts, resolved runtime, route audit,
 worker PIDs and per-request progress are retained in the campaign directory.
+
+The formal 1044-slot baseline diverged from the saved native reference at token
+27 of a 32-token probe. At the shared-prefix divergence, the full-vocabulary
+logits had cosine similarity 0.99983, mean absolute difference 0.0289 and maximum
+absolute difference 0.1875; the native leading candidates were separated by
+0.0625. The campaign records this BF16 backend numerical difference rather than
+claiming strict native token parity. Its deterministic baseline check uses a
+separately validated FreeToken full-expert reference with the formal cache and
+context configuration. The check runs on retries as well as fresh starts.
