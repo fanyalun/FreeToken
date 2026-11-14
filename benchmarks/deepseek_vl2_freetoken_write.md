@@ -5,12 +5,13 @@ FreeToken DeepSeek-VL2 model. Its `prepare`, `worker` and `run` actions share a
 persistent JSON configuration. There is no external DeepSeek model or legacy
 TableMoE inference backend on this path.
 
-The five methods are the native full-expert baseline; TableMoE 0.6/top-4;
-TableMoE 0.7/top-6; TableMoE 0.6/top-4 with top-6 from output token 513; and native
-AdapMoE gating with top-5 in both prefill and decode. Shared experts always run.
+DeepSeek-VL2 natively selects six routed experts. The five methods are the native
+full-expert baseline; TableMoE 0.6/top-3; TableMoE 0.7/top-4; TableMoE 0.6/top-3
+with top-4 from output token 513; and native AdapMoE gating with top-4 in both
+prefill and decode. Shared experts always run.
 TableMoE ranks the native six selected experts by their returned unbiased route
 weights before choosing top-h. Cache hits also run exactly. The full-expert
-baseline retains native route order. Gating top-5 preserves native normalization
+baseline retains native route order. Gating top-4 preserves native normalization
 and the routing scale of 2.
 
 Preparation reuses the frozen 48 holdout records, official questions and original
@@ -41,6 +42,12 @@ official six-dimension rubric and original length score, and requires all 48
 grades for every method before publishing `comparison.json` and `complete.json`.
 The source snapshot, actual rendered prompts, resolved runtime, route audit,
 worker PIDs and per-request progress are retained in the campaign directory.
+
+The earlier 0.6/top-4, 0.7/top-6, staged top-4/top-6 and gating top-5 campaign
+remains a separate historical experiment. Its completed baseline can be reused
+when all engine source hashes, input records, residency and non-policy settings
+match. Preserve its original prediction provenance and record that reuse in the
+new campaign; regenerate all four corrected methods.
 
 The formal 1044-slot baseline diverged from the saved native reference at token
 27 of a 32-token probe. At the shared-prefix divergence, the full-vocabulary

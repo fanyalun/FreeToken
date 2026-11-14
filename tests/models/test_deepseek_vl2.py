@@ -78,18 +78,19 @@ def test_router_bias_selects_without_reweighting_sigmoid_scores(topk):
     torch.testing.assert_close(weights, expected * 2)
 
 
-def test_router_top5_override_preserves_native_model_config():
+@pytest.mark.parametrize("top_k", [4, 5])
+def test_router_top_k_override_preserves_native_model_config(top_k):
     from freetoken.models.deepseek_vl2.config import with_router_top_k
 
     original = replace(parse_config(config()), num_experts=72, num_experts_per_tok=6)
-    adjusted = with_router_top_k(original, 5)
-    assert original.num_experts_per_tok == 6 and adjusted.num_experts_per_tok == 5
+    adjusted = with_router_top_k(original, top_k)
+    assert original.num_experts_per_tok == 6 and adjusted.num_experts_per_tok == top_k
     assert adjusted.routed_scaling_factor == original.routed_scaling_factor == 2
     for invalid in (0, 73):
         with pytest.raises(ValueError, match="between"):
             with_router_top_k(original, invalid)
     with pytest.raises(ValueError, match="requires DeepSeek"):
-        with_router_top_k(replace(original, deepseek_vl2_args=None), 5)
+        with_router_top_k(replace(original, deepseek_vl2_args=None), top_k)
 
 
 def test_context_override_grows_only_the_unscaled_rope_table():

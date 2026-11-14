@@ -17,7 +17,7 @@ import threading
 import time
 
 
-METHODS = ("baseline", "tablemoe_06_top4", "tablemoe_07_top6", "tablemoe_06_top4_512_top6", "adapmoe_gating_top5")
+METHODS = ("baseline", "tablemoe_06_top3", "tablemoe_07_top4", "tablemoe_06_top3_512_top4", "adapmoe_gating_top4")
 
 
 def read(path):
@@ -45,15 +45,15 @@ def write_rows(path, values):
 
 def policy_options(method):
     options = dict(tablemoe_prefill_keep_rate=1., tablemoe_decode_keep_k=6)
-    if method == "tablemoe_06_top4":
-        options.update(tablemoe_prefill_keep_rate=.6, tablemoe_decode_keep_k=4)
-    elif method == "tablemoe_07_top6":
-        options.update(tablemoe_prefill_keep_rate=.7)
-    elif method == "tablemoe_06_top4_512_top6":
-        options.update(tablemoe_prefill_keep_rate=.6, tablemoe_decode_keep_k=4,
-                       tablemoe_decode_switch_after=512, tablemoe_decode_late_top_h=6)
-    elif method == "adapmoe_gating_top5":
-        options.update(deepseek_vl2_router_top_k=5, tablemoe_decode_keep_k=5)
+    if method == "tablemoe_06_top3":
+        options.update(tablemoe_prefill_keep_rate=.6, tablemoe_decode_keep_k=3)
+    elif method == "tablemoe_07_top4":
+        options.update(tablemoe_prefill_keep_rate=.7, tablemoe_decode_keep_k=4)
+    elif method == "tablemoe_06_top3_512_top4":
+        options.update(tablemoe_prefill_keep_rate=.6, tablemoe_decode_keep_k=3,
+                       tablemoe_decode_switch_after=512, tablemoe_decode_late_top_h=4)
+    elif method == "adapmoe_gating_top4":
+        options.update(deepseek_vl2_router_top_k=4, tablemoe_decode_keep_k=4)
     elif method != "baseline":
         raise ValueError(f"unknown method: {method}")
     return options
@@ -170,7 +170,7 @@ def worker(config, method, gpu):
         num_page_override=config["max_seq_len"], cache_type="naive", memory_ratio=.9,
         mm=MultimodalConfig(encoder_weights="gpu"), **policy_options(method))
     runtime = llm.engine.tablemoe_runtime
-    expected_top_k = 5 if method == "adapmoe_gating_top5" else 6
+    expected_top_k = policy_options(method).get("deepseek_vl2_router_top_k", 6)
     if any(layer.mlp._config.num_experts_per_tok != expected_top_k for layer in llm.engine.model.model.layers.op_list[1:]):
         raise ValueError("native gate top-k differs from the requested method")
     if set(llm.engine.graph_runner.graph_map) != {1}:
