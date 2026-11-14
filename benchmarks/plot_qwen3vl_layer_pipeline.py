@@ -190,6 +190,7 @@ def split_stage_blocks(rows):
     gpu, transfers = [], []
     for row in rows:
         row = dict(row)
+        row["original_category"] = row["category"]
         if row["category"] == "IO":
             if row["name"] == "fast_index_copy_multi":
                 row["mechanism"] = "mapped"
@@ -206,17 +207,22 @@ def split_stage_blocks(rows):
                 if size > 16:
                     raise ValueError("unrecognized prefetch copy; classify its payload before plotting")
             row["category"] = "Dispatch"
+        row["category"] = {"Dispatch":"Route", "Lookup+IO":"Lookup"}.get(row["category"],row["category"])
         gpu.append(row)
     blocks = []
     for stream in sorted({r["stream"] for r in gpu}):
         current = None
         for row in sorted((r for r in gpu if r["stream"] == stream), key=lambda r:r["start"]):
-            if current is not None and current["category"] == row["category"]:
+            # Merged labels must not bridge distinct phases across a long dependency wait.
+            close = current is not None and (row["start"]-current["end"] <= 50000 or
+                    current["last_original_category"] == row["original_category"])
+            if current is not None and current["category"] == row["category"] and close:
                 current["end"] = max(current["end"], row["end"])
                 current["events"].append(row)
+                current["last_original_category"] = row["original_category"]
             else:
                 current = dict(start=row["start"], end=row["end"], category=row["category"],
-                               stream=stream, events=[row])
+                               stream=stream, events=[row], last_original_category=row["original_category"])
                 blocks.append(current)
     for mechanism in sorted({r["mechanism"] for r in transfers}):
         events = [r for r in transfers if r["mechanism"] == mechanism]
@@ -239,13 +245,12 @@ def render_gpu_pcie(root, output, phase, config):
     mechanisms = {r["mechanism"] for p in panels for r in p["blocks"] if r["category"] == "IO"}
     plt.rcParams.update({"font.family":"STIXGeneral", "font.size":12,
                          "axes.labelsize":13, "xtick.labelsize":12, "ytick.labelsize":11.5,
-                         "legend.fontsize":10.5, "pdf.fonttype":42, "ps.fonttype":42})
-    legend_rows = 3 if len(active)+2>8 else 2
-    fig, ax = plt.subplots(figsize=(7.4, 4.0 if legend_rows == 3 else 3.65))
-    fig.subplots_adjust(left=.225, right=.985, bottom=.17, top=.74 if legend_rows == 3 else .79)
+                         "legend.fontsize":11.5, "pdf.fonttype":42, "ps.fonttype":42})
+    fig, ax = plt.subplots(figsize=(7.2, 2.6))
+    fig.subplots_adjust(left=.22, right=.985, bottom=.23, top=.86)
     ax.set_xlim(0, max(p["elapsed_ms"] for p in panels)*1.09)
-    ax.set_ylim(-.28, 3.48)
-    ax.set_yticks([3,2.25,.95,.2], ["GPU", "PCIe", "GPU", "PCIe"])
+    ax.set_ylim(-.18, 2.03)
+    ax.set_yticks([1.75,1.23,.62,.10], ["GPU", "PCIe", "GPU", "PCIe"])
     ax.set_xlabel("Time from layer start (ms)")
     ax.xaxis.set_major_locator(plt.MaxNLocator(6))
     ax.set_facecolor("#FAFAFA")
@@ -254,9 +259,9 @@ def render_gpu_pcie(root, output, phase, config):
     ax.spines[["top","right","left"]].set_visible(False)
     ax.tick_params(axis="y", length=0, pad=7)
     labels, audits = [], []
-    for panel, gpu_y, io_y in zip(panels, [3,.95], [2.25,.2]):
+    for panel, gpu_y, io_y in zip(panels, [1.75,.62], [1.23,.10]):
         origin = panel["origin_ns"]
-        ax.add_patch(Rectangle((0,io_y-.30), panel["elapsed_ms"], gpu_y-io_y+.60,
+        ax.add_patch(Rectangle((0,io_y-.24), panel["elapsed_ms"], gpu_y-io_y+.48,
                               facecolor="white", edgecolor="#ADB3BD", linewidth=.7, zorder=0))
         ax.text(-.13, (gpu_y+io_y)/2, LABELS[panel["backend"]],
                 transform=ax.get_yaxis_transform(), ha="right", va="center", fontsize=13.5)
@@ -269,8 +274,8 @@ def render_gpu_pcie(root, output, phase, config):
             overlaps = not io and category in ("Lookup", "Lookup+IO") and any(
                 b["stream"] != block["stream"] and b["start"] < block["end"] and b["end"] > block["start"]
                 for b in primary)
-            height = .21 if overlaps else .44
-            bottom = (io_y if io else gpu_y)-.22 + (.23 if overlaps else 0)
+            height = .17 if overlaps else .36
+            bottom = (io_y if io else gpu_y)-.18 + (.19 if overlaps else 0)
             ax.add_patch(Rectangle((x,bottom), width, height, facecolor=STAGES[category][1],
                                   edgecolor="none", alpha=.22, zorder=1))
             intervals = union((r["start"],r["end"]) for r in block["events"])
@@ -278,26 +283,25 @@ def render_gpu_pcie(root, output, phase, config):
                            (bottom,height),facecolors=STAGES[category][1],edgecolors="none",zorder=2)
             ax.add_patch(Rectangle((x,bottom),width,height,facecolor="none",
                                   edgecolor="#505050",linewidth=.45,zorder=3))
-            label = ("Expert IO (mapped)" if block["mechanism"] == "mapped" else "Expert IO (DMA)") if io else STAGES[category][0]
+            label = ("Expert IO (mapped)" if block["mechanism"] == "mapped" else "Expert IO (DMA)") if io else "Comp" if category == "Comp" else STAGES[category][0]
             labels.append((ax.text(x+width/2,bottom+height/2,label,ha="center",va="center",fontsize=10.5,zorder=3),width,height))
             records.append(dict(category=category, start_ns=block["start"], end_ns=block["end"],
                 track="pcie_expert_io" if io else "gpu_stages", mechanism=block.get("mechanism"),
                 active_us=duration((r["start"],r["end"]) for r in block["events"])/1000,
                 phase_span_us=(block["end"]-block["start"])/1000,
-                source_events=[{k:r[k] for k in ("source_table","source_rowid","start","end")} for r in block["events"]]))
+                source_events=[{k:r[k] for k in ("source_table","source_rowid","start","end","original_category")} for r in block["events"]]))
         ax.annotate(f"{panel['elapsed_ms']:.2f}", (panel["elapsed_ms"],(gpu_y+io_y)/2),
                     xytext=(4,0),textcoords="offset points",va="center",fontsize=11,color="#555555")
         audits.append(dict(backend=panel["backend"], layer=panel["summary"]["layer"], phase=phase,
                            origin_ns=origin, elapsed_ms=panel["elapsed_ms"], source_csv=panel["source_csv"],
                            source_sqlite=panel["summary"]["source_sqlite"], blocks=records))
     handles = [Patch(facecolor=color,edgecolor="#505050",linewidth=.5,
-                     label=label)
+                     label="Comp" if stage == "Comp" else label)
                for stage,(label,color) in STAGES.items() if stage in active]
     if mechanisms:
         handles.append(Patch(facecolor=STAGES["IO"][1],edgecolor="#505050",linewidth=.5,label="Expert IO"))
-    handles.append(Patch(facecolor="#F1F1F1",edgecolor="#505050",linewidth=.5,label="Phase envelope"))
     fig.legend(handles=handles,loc="upper center",bbox_to_anchor=(.51,1.01),
-               ncol=3 if legend_rows == 3 else 4,frameon=False,columnspacing=.9,handlelength=1.2)
+               ncol=len(handles),frameon=False,columnspacing=.75,handlelength=1.05,handletextpad=.4)
     fig.canvas.draw()
     renderer = fig.canvas.get_renderer()
     for text,width,height in labels:
@@ -326,6 +330,11 @@ and merge execution. Active unions and original timestamps are retained below.
 Lookup work concurrent on another stream occupies the upper half
 of the GPU band, leaving the concurrent main phase visible beneath it.
 
+Display categories merge Dispatch into Route and Lookup+IO into Lookup. This is
+only a plotting aggregation; original_category and every source event remain in
+the audit. The white/pale envelope has no separate legend item. The single-row
+legend and close GPU/PCIe pairs use the same font scale as the earlier version.
+
 The PCIe row shows expert-weight transfer operation envelopes. Native large bank
 memcpys are DMA. fast_index_copy_multi is mapped-host read executed by GPU SMs;
 its kernel interval is used as the mapped-IO operation envelope, not a measurement
@@ -334,7 +343,7 @@ have a short envelope. Native 4-byte metadata copies and IO-preparation kernels
 belong to GPU Dispatch, not expert-weight transport. An unexpected copy payload
 between 16 bytes and 1 MiB is rejected for explicit classification.
 
-Lookup+IO remains the fused offline search and table-value read on the GPU row;
+The fused offline search and table-value read stays on the GPU row under Lookup;
 the lower row is limited to expert weights and does not claim all PCIe traffic.
 Blank regions do not establish device idle. Stage spans and overlapping track
 durations must not be summed to infer layer latency. The right number is the
@@ -364,7 +373,7 @@ def main():
     config = json.loads(args.config.read_text()) if args.config else None
     audit = []
     if args.layout == "gpu_pcie":
-        for phase in ("prefill_chunk0", "decode128", "decode128_cold"):
+        for phase in ("prefill_chunk0", "decode128_cold"):
             audit.extend(render_gpu_pcie(args.analysis_root,args.output,phase,config))
         print(json.dumps(audit,indent=2))
         return
