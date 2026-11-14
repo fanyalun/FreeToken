@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import json
 import re
 from collections import defaultdict
@@ -20,9 +19,9 @@ _CACHE_NAME = re.compile(r"L(\d+)_E(\d+)_(vision|text)_cache\.pt$")
 def tablemoe_activation(architectures) -> str:
     if "Gemma4ForConditionalGeneration" in architectures:
         return "gelu_tanh"
-    if "Qwen3VLMoeForConditionalGeneration" in architectures:
+    if any(name in architectures for name in ("Qwen3VLMoeForConditionalGeneration", "DeepseekVLV2ForCausalLM")):
         return "silu"
-    raise ValueError("tablemoe requires Qwen3VLMoeForConditionalGeneration or Gemma4ForConditionalGeneration")
+    raise ValueError("tablemoe requires Qwen3-VL-MoE, Gemma4 or DeepSeek-VL2")
 
 
 def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False, dtype=torch.float16) -> None:
@@ -41,6 +40,8 @@ def validate_fp16_checkpoint(model_path: str, *, allow_bf16: bool = False, dtype
         with safe_open(path, framework="pt", device="cpu") as source:
             for key in source.keys():
                 actual = source.get_slice(key).get_dtype()
+                if key.endswith(".mlp.gate.e_score_correction_bias") and actual == "F32":
+                    continue
                 allowed = {expected, "BF16"} if allow_bf16 and expected == "F16" else {expected}
                 if actual in ("F16", "BF16", "F32", "F64") and actual not in allowed:
                     label = "BF16" if expected == "BF16" else "FP16"
@@ -108,7 +109,8 @@ def validate_tablemoe_config(config) -> None:
             raise ValueError("tablemoe cosine thresholds must be in [-1, 1]")
 
 
-def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list) -> torch.Tensor:
+def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list, *,
+                                sm_scale: float | None = None, sliding_window: int | None = None) -> torch.Tensor:
     """Average head attention from each current chunk's last token to that chunk."""
     scores = torch.empty(q.shape[0], dtype=torch.float32, device=q.device)
     offset = 0
@@ -120,7 +122,10 @@ def last_token_attention_scores(q: torch.Tensor, k: torch.Tensor, reqs: list) ->
         if q.shape[1] != k.shape[1]:
             keys = keys.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
         logits = torch.einsum("hd,thd->ht", q[offset + n - 1].float(), keys.float())
-        scores[offset:offset + n] = (logits / math.sqrt(q.shape[-1])).softmax(-1).mean(0)
+        logits *= q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
+        if sliding_window is not None:
+            logits[:, :max(0, n - sliding_window)] = -float("inf")
+        scores[offset:offset + n] = logits.softmax(-1).mean(0)
         offset += n
     if offset != q.shape[0]:
         raise ValueError("TableMoE attention rows do not match current request chunks")
@@ -157,6 +162,8 @@ class TableMoeRuntime:
         self.expert_mode = getattr(config, "tablemoe_expert_mode", "cpu")
         self.stats_enabled = getattr(config, "tablemoe_stats", False)
         mc = config.model_config
+        self.activation = tablemoe_activation(mc.architectures)
+        self.asset_layer_offset = mc.first_k_dense_replace
         self.hidden = mc.hidden_size
         self.num_experts = mc.num_experts
         self.num_layers = mc.num_moe_layers
@@ -178,7 +185,7 @@ class TableMoeRuntime:
         self.executor = None
         if self.expert_mode != "offload":
             self.executor = CpuMoeExecutor(
-                banks, top_k=mc.num_experts_per_tok, activation="silu",
+                banks, top_k=mc.num_experts_per_tok, activation=self.activation,
                 apply_router_weight_on_input=False, num_threads=config.moe_cpu_threads,
                 max_tokens=max(128, config.max_running_req), device=self.device, fmt="bf16_routes" if self.dtype == torch.bfloat16 else "fp16_routes",
             )
@@ -229,7 +236,12 @@ class TableMoeRuntime:
             if (Path(expected["path"]).resolve() != Path(cfg.model_path).resolve() or
                     manifest["provenance"]["convert_bf16"] != cfg.tablemoe_convert_bf16_weights):
                 raise ValueError("TableMoE asset checkpoint/conversion mismatch")
-            if manifest["provenance"]["processor"] != cfg.mm.processor_kwargs:
+            processor = cfg.mm.processor_kwargs
+            if getattr(getattr(cfg, "model_config", None), "deepseek_vl2_args", None) is not None:
+                if processor or cfg.mm.image_min_tokens is not None or cfg.mm.image_max_tokens is not None:
+                    raise ValueError("DeepSeek-VL2 tables require native image preprocessing defaults")
+                processor = {"native_defaults": True}
+            if manifest["provenance"]["processor"] != processor:
                 raise ValueError("TableMoE asset processor configuration mismatch")
             for name in manifest["pca_outputs"]:
                 if not (Path(cfg.tablemoe_pca_dir) / name).is_file():
@@ -246,8 +258,9 @@ class TableMoeRuntime:
         pca_root = Path(cfg.tablemoe_pca_dir)
         cache_root = Path(cfg.tablemoe_cache_dir)
         for layer in range(self.num_layers):
+            asset_layer = layer + getattr(self, "asset_layer_offset", 0)
             for modality in ("vision", "text"):
-                path = pca_root / f"layer_{layer}" / f"L{layer}_{modality}_pca.pt"
+                path = pca_root / f"layer_{asset_layer}" / f"L{asset_layer}_{modality}_pca.pt"
                 if not path.is_file():
                     raise ValueError(f"missing TableMoE PCA file: {path}")
                 data = torch.load(path, map_location="cpu", weights_only=True)
@@ -261,9 +274,9 @@ class TableMoeRuntime:
             width = self.pca[layer, "text"][0].shape[1]
             if self.pca[layer, "vision"][0].shape[1] != width:
                 raise ValueError(f"TableMoE PCA modalities disagree at layer {layer}")
-            for path in (cache_root / f"layer_{layer}").glob("*_cache.pt"):
+            for path in (cache_root / f"layer_{asset_layer}").glob("*_cache.pt"):
                 match = _CACHE_NAME.fullmatch(path.name)
-                if match is None or int(match[1]) != layer or int(match[2]) >= self.num_experts:
+                if match is None or int(match[1]) != asset_layer or int(match[2]) >= self.num_experts:
                     raise ValueError(f"invalid TableMoE cache filename: {path}")
                 data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
                 key, value = data["key"], data["value"]
@@ -296,7 +309,8 @@ class TableMoeRuntime:
             self.host_values[layer] = values.reshape(-1, self.hidden)
             for modality in ("vision", "text"):
                 # Match the reference's mean/projection and bias rounding in the runtime dtype.
-                path = Path(self.config.tablemoe_pca_dir) / f"layer_{layer}" / f"L{layer}_{modality}_pca.pt"
+                asset_layer = layer + getattr(self, "asset_layer_offset", 0)
+                path = Path(self.config.tablemoe_pca_dir) / f"layer_{asset_layer}" / f"L{asset_layer}_{modality}_pca.pt"
                 d = torch.load(path, map_location="cpu", weights_only=True)
                 proj = d["proj"].to(device=self.device, dtype=self.dtype)
                 mean = d["mean"].to(device=self.device, dtype=self.dtype)
@@ -472,7 +486,7 @@ class TableMoeRuntime:
         return function(
             x.contiguous(), cache.bank_caches["gate_up"], cache.bank_caches["down"],
             torch.ones_like(slots, dtype=torch.float32), slots,
-            return_routes=True,
+            activation=self.activation, return_routes=True,
         )
 
     def forward(self, layer_id: int, hidden_states: torch.Tensor, weights: torch.Tensor,

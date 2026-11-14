@@ -614,7 +614,9 @@ def cluster(root, config):
                         num_layers=source["num_layers"], num_experts=source["num_experts"], dtype=config["dtype"])
 
 
-def expert_values(x, gate_up, down, chunk=64):
+def expert_values(x, gate_up, down, chunk=64, *, activation="silu"):
+    if activation not in ("silu", "gelu_tanh"):
+        raise ValueError(f"unsupported TableMoE expert activation: {activation}")
     result = []
     for part in x.split(chunk):
         gate, up = F.linear(part, gate_up).chunk(2, -1)
@@ -701,8 +703,10 @@ def iter_checkpoint_experts(model):
     from freetoken.moe.expert_pieces import packed_expert_source_info
 
     geometry = read_json(Path(model) / "config.json")
-    if geometry["architectures"] != ["Qwen3VLMoeForConditionalGeneration"]:
-        raise ValueError("builder requires Qwen3-VL-MoE")
+    architectures = geometry["architectures"]
+    if architectures not in (["Qwen3VLMoeForConditionalGeneration"], ["Gemma4ForConditionalGeneration"]):
+        raise ValueError("builder requires Qwen3-VL-MoE or Gemma4")
+    transform = _linear_layout if architectures == ["Qwen3VLMoeForConditionalGeneration"] else lambda x: x
     sources = {}
     for path in sorted(Path(model).glob("*.safetensors")):
         with safe_open(path, framework="pt", device="cpu") as handle:
@@ -725,7 +729,7 @@ def iter_checkpoint_experts(model):
                 tensors[role] = handles[path].get_slice(key)
             for expert in range(text["num_experts"]):
                 yield layer, expert, expert + 1, {
-                    role: _linear_layout(view[expert:expert + 1]).contiguous() for role, view in tensors.items()}
+                    role: transform(view[expert:expert + 1]).contiguous() for role, view in tensors.items()}
 
 
 def main():

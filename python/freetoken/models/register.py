@@ -86,6 +86,13 @@ _MINIMAX_M3_PROCESSOR = "freetoken.mm.processors.minimax_m3:MiniMaxM3MMProcessor
 _MINIMAX_M3_ENCODERS = (EncoderSpec("vision", "vision_config", ("image",)),)
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "DeepseekVLV2ForCausalLM": ModelSpec(
+        "freetoken.models.deepseek_vl2", "DeepseekVLV2ForCausalLM",
+        checkpoint_roots=(("model", "language.model"), ("lm_head", "language.lm_head"), ("visual", "vision")),
+        packed_modules_mapping=_EXPERTS_PACKED,
+        mm_processor="freetoken.mm.processors.deepseek_vl2:DeepseekVL2MMProcessor",
+        encoders=(EncoderSpec("vision", "vision_config", ("image",)),),
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",

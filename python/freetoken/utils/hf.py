@@ -37,6 +37,15 @@ def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
 
         return load_gguf_tokenizer(gguf_src)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+    if not getattr(tokenizer, "chat_template", None):
+        config_path = optional_hf_file(model_path, "config.json")
+        if config_path is not None:
+            with open(config_path, encoding="utf-8") as handle:
+                model_type = json.load(handle).get("model_type")
+            if model_type == "deepseek_vl_v2":
+                from freetoken.models.deepseek_vl2.chat import CHAT_TEMPLATE
+
+                tokenizer.chat_template = CHAT_TEMPLATE
     # Some Mistral models store chat_template in a separate JSON file
     if not getattr(tokenizer, "chat_template", None):
         try:
@@ -232,6 +241,10 @@ def _load_hf_config(model_path: str) -> Any:
             raise
         config = RawConfigShim(_raw_config_json(model_path), _name_or_path=model_path)
     _merge_sidecar_quantization_config(config, model_path)
+    if getattr(config, "model_type", None) == "deepseek_vl_v2":
+        from freetoken.models.deepseek_vl2.config import normalize_hf_config
+
+        config = normalize_hf_config(config)
     return config
 
 

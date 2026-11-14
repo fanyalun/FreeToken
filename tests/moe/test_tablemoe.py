@@ -106,7 +106,7 @@ def test_tablemoe_cli_weight_modes_are_mutually_exclusive(flags):
                     "--tool-call-parser", "llama3", "--reasoning-parser", "off", *flags])
 
 
-def _executor(g, d, top_k):
+def _executor(g, d, top_k, *, activation="silu"):
     banks = SimpleNamespace(num_layers=1, num_experts=g.shape[0],
                             bank_sources={"gate_up": [g], "down": [d]})
     return CpuMoeExecutor(
@@ -132,7 +132,8 @@ def test_native_routes_mask_and_repeated_async_buffers(hidden, inter, activation
         for row, slot in torch.nonzero(ids.cpu() >= 0).tolist():
             expert = ids[row, slot].item()
             gate, up = F.linear(x[row], g[expert]).chunk(2)
-            reference[row, slot] = F.linear(F.silu(gate) * up, d[expert])
+            act = F.gelu(gate, approximate="tanh") if activation == "gelu_tanh" else F.silu(gate)
+            reference[row, slot] = F.linear(act * up, d[expert])
         pending = executor.decode_submit(0, x.cuda(), torch.ones_like(ids).float(), ids)
         # Enqueue independent GPU work between submit and sync.
         torch.mm(torch.ones(32, 32, device="cuda"), torch.ones(32, 32, device="cuda"))
@@ -389,7 +390,7 @@ def test_bf16_source_requires_explicit_conversion_flag(tmp_path):
     cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             architectures=["Qwen3VLMoeForConditionalGeneration"], expert_quant="none",
-            num_experts_per_tok=8,
+            num_experts_per_tok=8, num_experts=128,
         ),
         dtype=torch.float16, tp_info=SimpleNamespace(size=1), use_dummy_weight=False,
         moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=False, moe_cpu_layers=None,
