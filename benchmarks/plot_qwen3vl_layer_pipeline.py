@@ -214,15 +214,19 @@ def split_stage_blocks(rows):
         current = None
         for row in sorted((r for r in gpu if r["stream"] == stream), key=lambda r:r["start"]):
             # Merged labels must not bridge distinct phases across a long dependency wait.
+            same_compute_group = current is not None and (row["category"] != "Comp" or
+                current["last_source_nvtx_row"] == row["source_nvtx_row"])
             close = current is not None and (row["start"]-current["end"] <= 50000 or
-                    current["last_original_category"] == row["original_category"])
+                    current["last_original_category"] == row["original_category"] and same_compute_group)
             if current is not None and current["category"] == row["category"] and close:
                 current["end"] = max(current["end"], row["end"])
                 current["events"].append(row)
                 current["last_original_category"] = row["original_category"]
+                current["last_source_nvtx_row"] = row["source_nvtx_row"]
             else:
                 current = dict(start=row["start"], end=row["end"], category=row["category"],
-                               stream=stream, events=[row], last_original_category=row["original_category"])
+                               stream=stream, events=[row], last_original_category=row["original_category"],
+                               last_source_nvtx_row=row["source_nvtx_row"])
                 blocks.append(current)
     for mechanism in sorted({r["mechanism"] for r in transfers}):
         events = [r for r in transfers if r["mechanism"] == mechanism]
@@ -274,8 +278,8 @@ def render_gpu_pcie(root, output, phase, config):
             overlaps = not io and category in ("Lookup", "Lookup+IO") and any(
                 b["stream"] != block["stream"] and b["start"] < block["end"] and b["end"] > block["start"]
                 for b in primary)
-            height = .17 if overlaps else .36
-            bottom = (io_y if io else gpu_y)-.18 + (.19 if overlaps else 0)
+            height = .36
+            bottom = (io_y if io else gpu_y)-.18 - (.055 if overlaps else 0)
             ax.add_patch(Rectangle((x,bottom), width, height, facecolor=STAGES[category][1],
                                   edgecolor="none", alpha=.22, zorder=1))
             intervals = union((r["start"],r["end"]) for r in block["events"])
@@ -287,6 +291,7 @@ def render_gpu_pcie(root, output, phase, config):
             labels.append((ax.text(x+width/2,bottom+height/2,label,ha="center",va="center",fontsize=10.5,zorder=3),width,height))
             records.append(dict(category=category, start_ns=block["start"], end_ns=block["end"],
                 track="pcie_expert_io" if io else "gpu_stages", mechanism=block.get("mechanism"),
+                display_height=height, display_bottom=bottom,
                 active_us=duration((r["start"],r["end"]) for r in block["events"])/1000,
                 phase_span_us=(block["end"]-block["start"])/1000,
                 source_events=[{k:r[k] for k in ("source_table","source_rowid","start","end","original_category")} for r in block["events"]]))
@@ -325,10 +330,12 @@ This is a phase overview: consecutive same-category GPU calls on a stream are
 grouped within one continuous phase outline. Pale fill is the phase envelope,
 including internal gaps and dependency waits; saturated fill is the actual event
 union. Per-kernel edges are hidden, but no idle gap is turned into active work.
-The Comp outline spans the expert pipeline, while its dark fill shows arithmetic
-and merge execution. Active unions and original timestamps are retained below.
-Lookup work concurrent on another stream occupies the upper half
-of the GPU band, leaving the concurrent main phase visible beneath it.
+Comp phases split at separate expert-group calls when their gap exceeds 50 us;
+long expert-IO waits are no longer bridged by one compute outline. Adjacent
+kernels within a group remain together. Active unions and timestamps are retained.
+Every stage has the same height. Concurrent Lookup on another stream has only a
+small vertical offset to expose both overlapping phases; height does not encode
+time, work, bandwidth or utilization.
 
 Display categories merge Dispatch into Route and Lookup+IO into Lookup. This is
 only a plotting aggregation; original_category and every source event remain in
