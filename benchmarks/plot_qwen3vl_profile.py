@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 
-COLORS={"Attn":"#4C78A8","Route":"#F2B447","Schedule":"#B279A2","Lookup":"#59A14F",
+COLORS={"Attn":"#4C78A8","Route":"#F2B447","Schedule":"#B279A2","Dispatch":"#9D755D","Lookup":"#59A14F",
         "IO":"#E45756","Comp":"#76B7B2","Lookup+IO":"#8C6D31","Other":"#CFD3D8"}
 
 
@@ -59,13 +59,13 @@ def plot(analysis,output,name,backend,config_path=None):
     plt.rcParams.update({"font.family":"STIXGeneral","font.size":12,"axes.labelsize":12,
         "xtick.labelsize":11,"ytick.labelsize":11,"legend.fontsize":10.5,
         "pdf.fonttype":42,"ps.fonttype":42,"axes.linewidth":.7})
-    fig,axes=plt.subplots(3,1,figsize=(7.2,7.3),gridspec_kw={"height_ratios":[2.1,1.0,1.8]})
+    fig,axes=plt.subplots(3,1,figsize=(7.2,7.7),gridspec_kw={"height_ratios":[2.1,1.0,1.8]})
     a,b,c=axes
     root=[dict(start=summary["host_root_start_ns"],end=summary["host_root_end_ns"])]
     bars(a,root,0,origin,category="Other")
     bars(a,host,0,origin)
     launches=[r for r in api if "GraphLaunch" in r["label"]]
-    if graph:bars(a,launches,0,origin,category="Schedule")
+    if graph:bars(a,launches,0,origin,category="Dispatch")
     sync=[r for r in api if "Synchronize" in r["label"]]
     bars(a,sync,1,origin,category="Other")
     streams=sorted({r["stream"] for r in all_gpu})
@@ -91,7 +91,7 @@ def plot(analysis,output,name,backend,config_path=None):
         b.set_ylim(.6,-.6)
         caption="(b) Layer host submission (independent zoom)"
     else:
-        bars(b,launches,0,origin,category="Schedule")
+        bars(b,launches,0,origin,category="Dispatch")
         bars(b,sync,1,origin,category="Other")
         b.set_yticks([0,1],["Graph launch","CUDA sync"])
         b.set_ylim(1.6,-.6)
@@ -112,8 +112,8 @@ def plot(analysis,output,name,backend,config_path=None):
         ax.set_axisbelow(True)
         ax.xaxis.set_major_locator(plt.MaxNLocator(5))
     fig.legend(handles=[Patch(facecolor=value,label=key) for key,value in COLORS.items()],
-               loc="upper center",ncol=4,frameon=False,columnspacing=1.1,handlelength=1.2)
-    fig.subplots_adjust(top=.885,bottom=.1,left=.18,right=.985,hspace=.78)
+               loc="upper center",ncol=3,frameon=False,columnspacing=1.1,handlelength=1.2)
+    fig.subplots_adjust(top=.84,bottom=.1,left=.18,right=.985,hspace=.78)
     output.mkdir(parents=True,exist_ok=True)
     fig.savefig(output/f"{name}.png",dpi=300,bbox_inches="tight",pad_inches=.025)
     fig.savefig(output/f"{name}.pdf",bbox_inches="tight",pad_inches=.025)
@@ -145,8 +145,9 @@ of next-layer prefetch. GPU costs follow work ownership: selected-layer incoming
 prefetch is included even when launched by the preceding layer; outgoing
 next-layer prefetch is excluded. These scopes intentionally differ.
 
-Attn includes input/post-attention normalization. Route includes router projection,
-TopK/normalization and prefill keep selection. Schedule includes route/cache planning,
+Attn includes input/post-attention normalization. Route includes router projection
+and TopK/normalization. Schedule is TableMoE token importance plus expert importance
+aggregation, sorting and keep-mask selection. Dispatch includes route/cache planning,
 alignment and workspace bookkeeping. IO is expert-weight copy work, including
 mapped-host copy kernels where applicable. Lookup+IO is the fused offline nearest-
 neighbor and mapped table-value read kernel; these two operations are not split.

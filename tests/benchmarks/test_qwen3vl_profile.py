@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"benchmarks"))
 
-from analyze_qwen3vl_profile import cpu_exclusive, duration, load, overlap, resolve_node, union
+from analyze_qwen3vl_profile import cpu_exclusive, duration, load, overlap, resolve_node, semantic_category, union
 from profile_qwen3vl_layer import canonical_mm_input
 
 
@@ -36,6 +36,14 @@ def test_nested_host_ranges_use_exclusive_wall_time():
     intervals=cpu_exclusive(rows)
     assert duration((r["start"],r["end"]) for r in intervals if r["category"]=="Comp")==4
     assert duration((r["start"],r["end"]) for r in intervals if r["category"]=="Schedule")==6
+
+
+def test_schedule_separates_importance_from_legacy_cache_dispatch():
+    assert semantic_category("Schedule", "ensure_experts_hybrid")=="Dispatch"
+    assert semantic_category("Route", "prefill_keep_mask")=="Schedule"
+    assert semantic_category("Schedule", "last_token_attention_scores")=="Schedule"
+    assert semantic_category("Dispatch", "expert_token_alignment")=="Dispatch"
+    assert semantic_category("Route", "topk_softmax_normalize")=="Route"
 
 
 def test_device_events_after_host_range_still_map_by_graph_launch(tmp_path):

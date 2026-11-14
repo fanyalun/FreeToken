@@ -67,9 +67,12 @@ while layer 23 runs; prefetch for layer 25 is excluded from layer 24.
 CPU costs instead cover the actual Layer24.forward host scope, including its
 submission of layer 25 prefetch. CPU scope and GPU work ownership differ.
 
-Attn includes the two adjacent normalizations. Route includes router projection,
-TopK/normalization and prefill keep selection. Schedule includes expert/cache
-planning, alignment and workspace bookkeeping. IO includes expert weights moved
+Attn includes the two adjacent normalizations. Route includes router projection
+and TopK/normalization. Schedule means TableMoE importance scheduling: attention-
+derived token importance, expert importance aggregation, ranking and keep selection.
+Dispatch covers expert/cache planning, alignment and workspace bookkeeping.
+Decode top-h uses the already ordered native router output; it does not run the
+prefill importance aggregation, so its Schedule is zero. IO includes expert weights moved
 by DMA or mapped-host read kernels. Lookup covers online search and PCA/query
 work. Offline search and mapped table-value loading are fused and reported as
 `Lookup+IO`. Comp includes expert GEMMs, activation, merge and online update.
@@ -82,6 +85,11 @@ Plots retain a common timestamp origin with explicitly independent zoom limits.
 They are measured-event figures, not Nsight GUI screenshots. Each figure folder
 contains PNG, vector PDF and its data/configuration notes; raw `.nsys-rep` files
 remain the primary evidence.
+
+The original campaign mislabeled Dispatch as Schedule, placed expert importance
+aggregation under Route, and included token importance inside Attn. Legacy labels
+are reclassified by the analyzer. A legacy capture cannot separate token importance
+from Attn, so use a recapture with both importance labels for a complete prefill split.
 
 For a separate cold-cache decode diagnostic, add `--decode-only --cold-decode`
 and use `--capture-range-end=stop`. Immediately before measured step 128 the

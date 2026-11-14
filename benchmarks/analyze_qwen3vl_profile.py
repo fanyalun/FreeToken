@@ -9,8 +9,15 @@ import re
 import sqlite3
 
 
-PHASES = ("Attn", "Route", "Schedule", "Lookup", "IO", "Comp", "Lookup+IO", "Other")
+PHASES = ("Attn", "Route", "Schedule", "Dispatch", "Lookup", "IO", "Comp", "Lookup+IO", "Other")
 LABEL = re.compile(r"^FT/L(\d+)(?:/([^/]+)(?:/(.*))?)?$")
+
+
+def semantic_category(category, detail):
+    if detail in ("last_token_attention_scores", "prefill_keep_mask"):
+        return "Schedule"
+    # Legacy captures used Schedule for cache and execution preparation.
+    return "Dispatch" if category == "Schedule" else category
 
 
 def union(intervals):
@@ -77,9 +84,11 @@ def load(path):
         if row["end"] is None or row["end"]<=row["start"]:continue
         text=row["text"] if row["text"] is not None else strings.get(row["textId"],"")
         match=LABEL.match(text)
+        raw_category=(match[2] or "Other") if match else None
+        detail=(match[3] or "") if match else ""
         row.update(label=text,layer=int(match[1]) if match else None,
-                   category=(match[2] or "Other") if match else None,
-                   detail=(match[3] or "") if match else "")
+                   captured_category=raw_category,
+                   category=semantic_category(raw_category, detail),detail=detail)
         ranges.append(row)
     per_thread=defaultdict(list)
     roots=defaultdict(list)
@@ -112,6 +121,7 @@ def load(path):
             gpu.append(dict(start=row["start"],end=row["end"],stream=row["streamId"],device=row["deviceId"],
                 layer=label["layer"] if label else None,category=label["category"] if label else "Other",
                 detail=label["detail"] if label else "",forward=root["label"] if root else None,
+                captured_category=label["captured_category"] if label else None,
                 source_table=table,source_rowid=row["source_rowid"],
                 name=strings.get(row.get("shortName"),table.removeprefix("CUPTI_ACTIVITY_KIND_")),
                 graph_node=row.get("graphNodeId"),mapping=mapping,source_nvtx_row=label["source_rowid"] if label else None,
@@ -172,12 +182,26 @@ def analyze(database, output, layer, forward):
         physical_gpu=1,nsight_device_ordinal=sorted({r["device"] for r in selected}),analysis_details=details,
         cpu_context_switches_collected=False,stage_durations_additive=False,
         mapped_offline_lookup_and_value_load_are_fused=True,stage_costs=costs)
+    summary["schedule_definition"]="TableMoE token importance, expert importance aggregation, sorting and keep-mask selection"
+    summary["dispatch_definition"]="Expert cache management, route packing, alignment, workspace and execution preparation"
+    summary["token_importance_has_dedicated_label"] = any(r["detail"] == "last_token_attention_scores"
+        and r["start"]>=root["start"] and r["end"]<=root["end"] for r in ranges)
     summary["cpu_scope"]="Layer.forward host scope, including its submission of next-layer prefetch"
     summary["gpu_scope"]="GPU work owned by the selected layer, including incoming expert prefetch"
     write_csv(output/"gpu_events.csv",selected)
     write_csv(output/"forward_gpu_events.csv",[r for r in gpu if r["forward"]==forward])
     write_csv(output/"cpu_stage_intervals.csv",exclusive)
     write_csv(output/"stage_costs.csv",costs)
+    detail_costs=[]
+    for category,detail in sorted({(r["category"],r["detail"]) for r in selected}):
+        items=[r for r in selected if r["category"]==category and r["detail"]==detail]
+        cpu=[r for r in exclusive if r["category"]==category and
+             (LABEL.match(r["label"])[3] or "")==detail]
+        detail_costs.append(dict(category=category,detail=detail,
+            gpu_active_us=duration((r["start"],r["end"]) for r in items)/1000,
+            gpu_events=len(items),host_exclusive_wall_us=duration((r["start"],r["end"]) for r in cpu)/1000
+            if host else None))
+    write_csv(output/"stage_details.csv",detail_costs)
     exported=[]
     for r in ranges:
         if r["start"]>=0 and (r["label"]==forward or r in host or

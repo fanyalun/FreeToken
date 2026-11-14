@@ -59,6 +59,7 @@ def install(selected_layer):
     from freetoken.models.qwen3_moe.model import Qwen3DecoderLayer
     from freetoken.moe.offload_cache import OffloadMoeCache
     from freetoken.moe.tablemoe_optimized import TableMoeOptimizedRuntime
+    import freetoken.moe.tablemoe as importance
     import freetoken.moe.tablemoe_optimized as optimized
     import freetoken.moe.fused as fused
     import freetoken.kernel.triton.moe_align as align_kernels
@@ -92,9 +93,10 @@ def install(selected_layer):
 
     Qwen3DecoderLayer.__init__, Qwen3DecoderLayer.forward = init, forward
     _wrap(moe, "fused_topk", "Route", "topk_softmax_normalize")
-    _wrap(optimized, "prefill_keep_mask", "Route", "prefill_keep_mask")
+    _wrap(importance, "last_token_attention_scores", "Schedule", "last_token_attention_scores")
+    _wrap(optimized, "prefill_keep_mask", "Schedule", "prefill_keep_mask")
     for name in ("ensure_experts", "ensure_experts_hybrid", "materialize_layer"):
-        _wrap(OffloadMoeCache, name, "Schedule", owner=lambda self, layer_id, *a, **k: layer_id)
+        _wrap(OffloadMoeCache, name, "Dispatch", owner=lambda self, layer_id, *a, **k: layer_id)
     _wrap(OffloadMoeCache, "copy_missing", "IO", "expert_weight_mapped_read",
           owner=lambda self: self._pending_src_layer)
     original_prefetch = OffloadMoeCache.prefetch_prefill_layer
@@ -108,29 +110,29 @@ def install(selected_layer):
 
     OffloadMoeCache.prefetch_prefill_layer = prefetch
     for name in ("wait_prefill_layer", "release_prefill_layer"):
-        _wrap(OffloadMoeCache, name, "Schedule", owner=lambda self, layer_id, *a, **k: layer_id)
+        _wrap(OffloadMoeCache, name, "Dispatch", owner=lambda self, layer_id, *a, **k: layer_id)
     _wrap(OffloadMoELayer, "_expert_gemm", "Comp", "expert_gemm_activation_merge")
-    _wrap(TableMoeOptimizedRuntime, "forward", "Schedule", "table_dispatch",
+    _wrap(TableMoeOptimizedRuntime, "forward", "Dispatch", "table_dispatch",
           owner=lambda self, layer_id, *a, **k: layer_id)
-    _wrap(TableMoeOptimizedRuntime, "_prefill", "Schedule", "prefill_workspace")
-    _wrap(GroupPrefillCopyPlan, "prepare", "Schedule", "prefill_copy_plan")
+    _wrap(TableMoeOptimizedRuntime, "_prefill", "Dispatch", "prefill_workspace")
+    _wrap(GroupPrefillCopyPlan, "prepare", "Dispatch", "prefill_copy_plan")
     _wrap(GroupPrefillCopyPlan, "copy_group", "IO", "expert_weight_group_mapped_read",
           owner=lambda self, group_id: self.layer)
-    _wrap(GroupedPrefillExperts, "__init__", "Schedule", "grouped_expert_workspace")
+    _wrap(GroupedPrefillExperts, "__init__", "Dispatch", "grouped_expert_workspace")
     _wrap(GroupedPrefillExperts, "run", "Comp", "grouped_expert_gateup_silu_down")
     for name in ("fused_experts_impl", "fused_experts_decode_impl"):
         _wrap(fused, name, "Comp", name)
-    _wrap(fused, "moe_align_block_size", "Schedule", "expert_token_alignment")
-    _wrap(align_kernels, "moe_align_block_size", "Schedule", "expert_token_alignment")
-    _wrap(grouped_prefill, "moe_align_block_size", "Schedule", "expert_token_alignment")
+    _wrap(fused, "moe_align_block_size", "Dispatch", "expert_token_alignment")
+    _wrap(align_kernels, "moe_align_block_size", "Dispatch", "expert_token_alignment")
+    _wrap(grouped_prefill, "moe_align_block_size", "Dispatch", "expert_token_alignment")
     for name, category, detail in (
-        ("_prepare_routes", "Schedule", "top_h_cache_mask"),
-        ("_split_routes", "Schedule", "partition_routes"),
+        ("_prepare_routes", "Dispatch", "top_h_cache_mask"),
+        ("_split_routes", "Dispatch", "partition_routes"),
         ("_online_scores", "Lookup", "online_cosine_scores"),
         ("_online_select", "Lookup", "online_select_and_value"),
         ("_mapped_offline", "Lookup+IO", "offline_nn_and_mapped_value"),
         ("_merge_update", "Comp", "weighted_merge_and_online_update"),
-        ("_advance_online", "Schedule", "advance_online_state"),
+        ("_advance_online", "Dispatch", "advance_online_state"),
     ):
         setattr(optimized.kernels, name, _Kernel(getattr(optimized.kernels, name), category, detail))
     original_run = TableMoeOptimizedRuntime._run_impl
@@ -162,7 +164,7 @@ def install(selected_layer):
 
     @functools.wraps(original_replay)
     def replay(self, *args, **kwargs):
-        with torch.cuda.nvtx.range("FT/Global/Schedule/graph_replay"):
+        with torch.cuda.nvtx.range("FT/Global/Dispatch/graph_replay"):
             return original_replay(self, *args, **kwargs)
 
     GraphRunner.replay = replay
