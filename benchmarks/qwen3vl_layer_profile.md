@@ -86,6 +86,14 @@ They are measured-event figures, not Nsight GUI screenshots. Each figure folder
 contains PNG, vector PDF and its data/configuration notes; raw `.nsys-rep` files
 remain the primary evidence.
 
+For compact plots containing only the selected layer, use
+`plot_qwen3vl_layer_pipeline.py --analysis-root ANALYSIS_ROOT --output FIGURES
+--config RESULT/config.json`, where ANALYSIS_ROOT contains offload/tablemoe phase
+folders. Each backend has one row, with actual GPU streams as thin subdivisions.
+These retain measured intervals and overlap instead of concatenating stage sums.
+CPU prefill is a separate figure with its own local origin; decode has no
+per-layer host submission and therefore no per-layer CPU figure.
+
 The original campaign mislabeled Dispatch as Schedule, placed expert importance
 aggregation under Route, and included token importance inside Attn. Legacy labels
 are reclassified by the analyzer. A legacy capture cannot separate token importance

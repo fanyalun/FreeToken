@@ -1,0 +1,200 @@
+"""Render compact, measured single-layer pipelines with one row per backend."""
+
+import argparse
+import json
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch, Rectangle
+
+from analyze_qwen3vl_profile import duration, union
+from plot_qwen3vl_profile import read_csv
+
+
+STAGES = {
+    "Attn": ("Attn.", "#A7A7A7"),
+    "Route": ("Route", "#8FB8D8"),
+    "Schedule": ("Schedule", "#B8D8BA"),
+    "Dispatch": ("Dispatch", "#B7A5C8"),
+    "Lookup": ("Lookup", "#72A9A1"),
+    "Lookup+IO": ("Lookup+IO", "#607F9F"),
+    "IO": ("Expert Load", "#F0BA72"),
+    "Comp": ("Expert Comp.", "#D98EA4"),
+    "Other": ("Other", "#DFDFDF"),
+}
+BACKENDS = ("offload", "tablemoe")
+LABELS = {"offload": "Offload", "tablemoe": "TableMoE"}
+
+
+def load_panel(root, backend, phase, resource):
+    folder = root / backend / phase
+    summary = json.loads((folder / "summary.json").read_text())
+    filename = "gpu_events.csv" if resource == "gpu" else "cpu_stage_intervals.csv"
+    rows = read_csv(folder / filename)
+    if not rows:
+        raise ValueError(f"no per-layer {resource} events in {folder}")
+    if resource == "gpu" and any(r["layer"] != summary["layer"] for r in rows):
+        raise ValueError("GPU plot contains a different layer")
+    if any(r["category"] not in STAGES for r in rows):
+        raise ValueError("unexpected stage category")
+    start = min(r["start"] for r in rows)
+    end = max(r["end"] for r in rows)
+    streams = sorted({r["stream"] for r in rows}) if resource == "gpu" else [None]
+    return dict(backend=backend, summary=summary, rows=rows, streams=streams,
+                origin_ns=start, end_ns=end, elapsed_ms=(end-start)/1e6,
+                source_csv=str(folder / filename))
+
+
+def render(root, output, phase, resource, config):
+    panels = [load_panel(root, b, phase, resource) for b in BACKENDS]
+    if len({p["summary"]["layer"] for p in panels}) != 1:
+        raise ValueError("backend layers differ")
+    layer = panels[0]["summary"]["layer"]
+    plt.rcParams.update({"font.family": "STIXGeneral", "font.size": 13,
+                         "axes.labelsize": 14, "xtick.labelsize": 13,
+                         "ytick.labelsize": 14, "legend.fontsize": 11.5,
+                         "pdf.fonttype": 42, "ps.fonttype": 42})
+    three_bands = max(len(p["streams"]) for p in panels) > 2
+    fig, ax = plt.subplots(figsize=(7.2, 3.15 if three_bands else 2.85))
+    fig.subplots_adjust(left=.16, right=.985, bottom=.22 if three_bands else .25,
+                        top=.75 if three_bands else .71)
+    ax.set_facecolor("#FAFAFA")
+    maximum = max(p["elapsed_ms"] for p in panels)
+    ax.set_xlim(0, maximum*1.12)
+    ax.set_ylim(-.56, 1.56)
+    ax.set_yticks([1, 0], [LABELS[b] for b in BACKENDS])
+    ax.set_xlabel("Layer time (ms)")
+    ax.xaxis.set_major_locator(plt.MaxNLocator(6))
+    ax.grid(axis="x", color="#DDDDDD", linestyle="--", linewidth=.6)
+    ax.set_axisbelow(True)
+    for spine in ax.spines.values():
+        spine.set_color("#4B5568")
+        spine.set_linewidth(.9)
+    candidates = []
+    active = set()
+    audits = []
+    for y, panel in zip([1, 0], panels):
+        row_height = .64
+        streams = panel["streams"]
+        band_height = row_height/len(streams)
+        costs = {stage: duration((r["start"], r["end"]) for r in panel["rows"]
+                                if r["category"] == stage)/1e6 for stage in STAGES}
+        label_positions = {}
+        for index, stream in enumerate(streams):
+            bottom = y+row_height/2-(index+1)*band_height
+            band = [r for r in panel["rows"] if resource == "cpu" or r["stream"] == stream]
+            for stage, (_, color) in STAGES.items():
+                intervals = union((r["start"], r["end"]) for r in band if r["category"] == stage)
+                if not intervals:
+                    continue
+                active.add(stage)
+                rectangles = [((a-panel["origin_ns"])/1e6, (b-a)/1e6) for a,b in intervals]
+                ax.broken_barh(rectangles, (bottom, band_height), facecolors=color,
+                               edgecolors="none", zorder=2)
+                a,b = max(intervals, key=lambda x: x[1]-x[0])
+                width = (b-a)/1e6
+                if stage not in label_positions or width > label_positions[stage][0]:
+                    label_positions[stage] = (width, ((a+b)/2-panel["origin_ns"])/1e6,
+                                               bottom+band_height/2)
+            if index:
+                ax.plot([0, panel["elapsed_ms"]], [bottom+band_height]*2,
+                        color="white", linewidth=.45, zorder=3)
+        ax.add_patch(Rectangle((0, y-row_height/2), panel["elapsed_ms"], row_height,
+                              facecolor="none", edgecolor="#3E3E3E", linewidth=.8, zorder=3))
+        ax.annotate(f"{panel['elapsed_ms']:.2f}", (panel["elapsed_ms"], y),
+                    xytext=(5, 0), textcoords="offset points", va="center",
+                    color="#555555", fontsize=12)
+        for stage, (width, x, label_y) in label_positions.items():
+            candidates.append((ax.text(x, label_y, f"{costs[stage]:.2f}", ha="center", va="center",
+                                      fontsize=10.5, zorder=4), width, band_height))
+        audits.append(dict(backend=panel["backend"], layer=layer, phase=phase, resource=resource,
+                           source_csv=panel["source_csv"], source_sqlite=panel["summary"]["source_sqlite"],
+                           origin_ns=panel["origin_ns"], end_ns=panel["end_ns"],
+                           elapsed_ms=panel["elapsed_ms"], stage_active_ms=costs,
+                           streams=streams, source_events=len(panel["rows"])))
+    # Short kernels retain their real widths; labels must not make them wider.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for text, width, height in candidates:
+        bounds = text.get_window_extent(renderer)
+        pixels = ax.transData.transform((width, height))-ax.transData.transform((0, 0))
+        if bounds.width+5 > pixels[0] or bounds.height+2 > pixels[1]:
+            text.remove()
+    handles = [Patch(facecolor=color, edgecolor="#3E3E3E", linewidth=.7, label=label)
+               for stage, (label, color) in STAGES.items() if stage in active]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(.52, 1.01),
+               ncol=4 if len(handles)>6 else 3, frameon=False, handlelength=1.2,
+               columnspacing=1.05, handletextpad=.45, labelspacing=.3)
+    name = f"{phase}_{resource}_layer_pipeline"
+    folder = output / name
+    folder.mkdir(parents=True, exist_ok=True)
+    for suffix in ("png", "pdf"):
+        fig.savefig(folder/f"{name}.{suffix}", dpi=300, bbox_inches="tight", pad_inches=.025)
+    plt.close(fig)
+    note = f"""# {name}
+
+Only zero-based layer {layer} (the {layer+1}th layer), physical GPU1. Offload and
+TableMoE are separate measured requests. The compact two-row layout follows
+`/home/fanya/tablemoe/eval_perf/figures/decode_pipeline.pdf`; no numerical values,
+attention alignment, or interval compaction are copied from that reference.
+
+Each method starts at its own earliest selected {resource.upper()} event. Horizontal
+positions, widths, gaps and cross-stream overlap are the actual Nsight intervals
+after subtracting this single origin. Events are not rearranged or concatenated
+by category. The number to the right is the actual selected-layer event envelope,
+not a sum of overlapping stage durations. Numbers inside colored bands are total
+active time for that stage in ms, placed once in its widest interval when there
+is sufficient room. Small stages keep their true widths and are not forced wider
+for a label; all exact stage totals are preserved in the audit below.
+
+GPU bands within a method row correspond to actual CUDA streams (ordered by
+stream ID, top to bottom). They are subsets of this layer only; no other-layer,
+whole-model, Graph-launch, or profiler-boundary work is drawn. Blank regions are
+not a GPU-idle claim. Different stream counts only affect vertical subdivision.
+
+CPU uses the exclusive NVTX intervals inside the actual L{layer}.forward host
+scope, including the next-layer prefetch it submits. These are host wall spans,
+not sampled CPU compute time. CPU and GPU figures have separate local origins;
+do not align their zero points to infer CPU/GPU overlap. Whole-Graph decode has
+no measured per-layer CPU submission, so no decode CPU figure is manufactured.
+
+Schedule is the TableMoE token/expert importance pipeline. Dispatch covers cache,
+route packing and execution preparation. Lookup+IO is the fused offline search
+and mapped-host table-value read and is not split. Expert Comp. includes weighted
+merge and online update. Stage active durations below use interval unions and
+must not be added to infer wall latency. Raw reports are referenced in the audit.
+
+This is an offline figure of measured Nsight events, not a GUI screenshot. The
+original frozen-input FP16 bank hook, 50% expert-cache setting, and diagnostic
+limits remain as documented in the parent profiling report. Cold-decode figures
+are cache-reset diagnostics, separate from steady decode.
+
+```json
+{json.dumps(audits, indent=2)}
+```
+"""
+    if config:
+        note += "\nFrozen configuration:\n\n```json\n"+json.dumps(config, indent=2)+"\n```\n"
+    note += f"\nReproduce: `plot_qwen3vl_layer_pipeline.py --analysis-root {root} --output {output}`\n"
+    (folder/f"{name}.md").write_text(note)
+    return audits
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--analysis-root", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    args = parser.parse_args()
+    config = json.loads(args.config.read_text()) if args.config else None
+    audit = []
+    for phase, resource in (("prefill_chunk0", "gpu"), ("decode128", "gpu"),
+                            ("prefill_chunk0", "cpu"), ("decode128_cold", "gpu")):
+        audit.extend(render(args.analysis_root, args.output, phase, resource, config))
+    print(json.dumps(audit, indent=2))
+
+
+if __name__ == "__main__":
+    main()
