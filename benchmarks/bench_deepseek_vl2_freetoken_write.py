@@ -165,6 +165,7 @@ def worker(config, method, gpu):
         tablemoe_offline_cosine_threshold_text=.7, tablemoe_decode_online_cosine_threshold=.7,
         tablemoe_decode_offline_cosine_threshold=.7, tablemoe_report_path=str(audit_path),
         tablemoe_stats=False, attention_backend="triton", max_running_req=1, cuda_graph_max_bs=1,
+        distributed_port=23761 + gpu,
         max_extend_tokens=config["max_extend_tokens"], max_seq_len_override=config["max_seq_len"],
         num_page_override=config["max_seq_len"], cache_type="naive", memory_ratio=.9,
         mm=MultimodalConfig(encoder_weights="gpu"), **policy_options(method))

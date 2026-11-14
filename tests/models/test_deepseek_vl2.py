@@ -104,6 +104,16 @@ def test_context_override_grows_only_the_unscaled_rope_table():
     assert with_context_length(original, 1024) is original
 
 
+def test_independent_offline_gpu_workers_have_distinct_distributed_ports():
+    from freetoken.engine.config import EngineConfig
+    from freetoken.distributed import DistributedInfo
+
+    first = EngineConfig(model_path="unused", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16, distributed_port=23761)
+    second = replace(first, distributed_port=23762)
+    assert first.distributed_addr == "tcp://127.0.0.1:23761"
+    assert second.distributed_addr == "tcp://127.0.0.1:23762"
+
+
 @pytest.mark.parametrize("bypass", [False, True])
 def test_tablemoe_ranks_unbiased_route_weights_and_preserves_full_baseline(monkeypatch, bypass):
     import freetoken.models.deepseek_vl2.moe as module
