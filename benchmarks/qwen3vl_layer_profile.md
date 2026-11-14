@@ -94,6 +94,12 @@ These retain measured intervals and overlap instead of concatenating stage sums.
 CPU prefill is a separate figure with its own local origin; decode has no
 per-layer host submission and therefore no per-layer CPU figure.
 
+The cache manager parallelizes active-expert marking and slot rewriting for more
+than 256 routes. The single-block LRU consumes the active-expert bitmap instead
+of scanning the entire token-route matrix. Smaller route batches keep the
+original single-kernel path. Fetch caps, recency ordering and slot choices are
+checked against the serial GPU kernel, including repeated Graph replay.
+
 The original campaign mislabeled Dispatch as Schedule, placed expert importance
 aggregation under Route, and included token importance inside Attn. Legacy labels
 are reclassified by the analyzer. A legacy capture cannot separate token importance

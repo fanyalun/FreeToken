@@ -65,7 +65,7 @@ def render(root, output, phase, resource, config):
     ax.set_xlim(0, maximum*1.12)
     ax.set_ylim(-.56, 1.56)
     ax.set_yticks([1, 0], [LABELS[b] for b in BACKENDS])
-    ax.set_xlabel("Layer time (ms)")
+    ax.set_xlabel("Host wall time (ms)" if resource == "cpu" else "Layer time (ms)")
     ax.xaxis.set_major_locator(plt.MaxNLocator(6))
     ax.grid(axis="x", color="#DDDDDD", linestyle="--", linewidth=.6)
     ax.set_axisbelow(True)
@@ -122,7 +122,9 @@ def render(root, output, phase, resource, config):
         pixels = ax.transData.transform((width, height))-ax.transData.transform((0, 0))
         if bounds.width+5 > pixels[0] or bounds.height+2 > pixels[1]:
             text.remove()
-    handles = [Patch(facecolor=color, edgecolor="#3E3E3E", linewidth=.7, label=label)
+    cpu_labels = {"Comp": "Comp submit", "IO": "Load/wait"}
+    handles = [Patch(facecolor=color, edgecolor="#3E3E3E", linewidth=.7,
+                     label=cpu_labels.get(stage, label) if resource == "cpu" else label)
                for stage, (label, color) in STAGES.items() if stage in active]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(.52, 1.01),
                ncol=4 if len(handles)>6 else 3, frameon=False, handlelength=1.2,

@@ -100,6 +100,13 @@ def _ensure_experts_hybrid_gpu(
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
+    parallel_routes = expert_ids.numel() > 256
+    if parallel_routes:
+        # Long prefills must not scan every token route inside the single-block LRU.
+        cache.active_mask.zero_()
+        _mark_active_experts_kernel[(triton.cdiv(expert_ids.numel(), 256),)](
+            expert_ids, cache.active_mask, expert_ids.numel(), cache.num_experts, BLOCK=256,
+        )
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -121,8 +128,13 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        PRECOMPUTED_ACTIVE=parallel_routes,
         num_warps=num_warps,
     )
+    if parallel_routes:
+        _rewrite_expert_slots_kernel[(triton.cdiv(expert_ids.numel(), 256),)](
+            expert_ids, cache.slot_for_id, layer_id, expert_ids.numel(), cache.num_experts, BLOCK=256,
+        )
 
 
 def _ensure_experts_hybrid_cpu(
@@ -288,6 +300,25 @@ def _materialize_layer_kernel(
 
 
 
+@triton.jit
+def _mark_active_experts_kernel(expert_ids, active_mask, count, num_experts: tl.constexpr,
+                                BLOCK: tl.constexpr):
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    expert = tl.load(expert_ids + off, off < count, -1)
+    tl.atomic_or(active_mask + expert, 1, mask=(off < count) & (expert >= 0) & (expert < num_experts),
+                 sem="relaxed")
+
+
+@triton.jit(do_not_specialize=["layer_id"])
+def _rewrite_expert_slots_kernel(expert_ids, slot_for_id, layer_id, count,
+                                 num_experts: tl.constexpr, BLOCK: tl.constexpr):
+    off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    expert = tl.load(expert_ids + off, off < count, -1)
+    slot = tl.load(slot_for_id + layer_id * num_experts + expert,
+                   (off < count) & (expert >= 0), -1)
+    tl.store(expert_ids + off, slot, off < count)
+
+
 @triton.jit(do_not_specialize=["layer_id", "num_active", "max_fetch", "fetch_frac_q16"])
 def _ensure_experts_hybrid_kernel(
     expert_ids_ptr,
@@ -310,6 +341,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    PRECOMPUTED_ACTIVE: tl.constexpr = False,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -334,10 +366,13 @@ def _ensure_experts_hybrid_kernel(
     # ---- Phase 1: active + missing over experts ----
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
-    is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+    if PRECOMPUTED_ACTIVE:
+        is_active = tl.load(active_mask_ptr + off_e, e_mask, 0) != 0
+    else:
+        is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+        for i in tl.range(num_active):
+            e = tl.load(expert_ids_ptr + i)
+            is_active = is_active | (off_e == e)
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
@@ -376,10 +411,15 @@ def _ensure_experts_hybrid_kernel(
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
         u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
-        owner_active = c_mask & False
-        for i in tl.range(num_active):
-            ei = tl.load(expert_ids_ptr + i)
-            owner_active = owner_active | ((ei >= 0) & (oid == base + ei))
+        if PRECOMPUTED_ACTIVE:
+            local_id = oid - base
+            owner_active = tl.load(active_mask_ptr + local_id,
+                c_mask & (local_id >= 0) & (local_id < num_experts), 0) != 0
+        else:
+            owner_active = c_mask & False
+            for i in tl.range(num_active):
+                ei = tl.load(expert_ids_ptr + i)
+                owner_active = owner_active | ((ei >= 0) & (oid == base + ei))
         u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
         for i in tl.range(num_fetch):
             victim = tl.argmin(u, axis=0).to(tl.int32)
@@ -399,10 +439,11 @@ def _ensure_experts_hybrid_kernel(
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
-    for i in tl.range(num_active):
-        e = tl.load(expert_ids_ptr + i)
-        s = tl.load(slot_for_id_ptr + base + e, mask=e >= 0, other=-1)
-        tl.store(expert_ids_ptr + i, s)
+    if not PRECOMPUTED_ACTIVE:
+        for i in tl.range(num_active):
+            e = tl.load(expert_ids_ptr + i)
+            s = tl.load(slot_for_id_ptr + base + e, mask=e >= 0, other=-1)
+            tl.store(expert_ids_ptr + i, s)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
     # computed on the CPU now ranks high if it recurs, so it gets fetched next time.

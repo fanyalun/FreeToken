@@ -881,3 +881,109 @@ def test_lock_failure_downgrades_echoed_residency(monkeypatch):
         with hb.PinPipeline() as pins:
             pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
     assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def _long_route_cache(residency):
+    from types import SimpleNamespace
+
+    layers, experts, capacity = 48, 128, 3072
+    generator = torch.Generator().manual_seed(42)
+    owner = torch.full((capacity,), -1, dtype=torch.int32)
+    mapping = torch.full((layers * experts,), -1, dtype=torch.int32)
+    count = {"cold": 0, "mixed": capacity // 2, "hot": capacity}[residency]
+    resident = torch.randperm(layers * experts, generator=generator)[:count]
+    if residency == "hot":
+        active_ids = torch.arange(24 * experts, 25 * experts)
+        resident = torch.cat((active_ids, resident[~torch.isin(resident, active_ids)]))[:count]
+    owner[:count] = resident.int()
+    mapping[resident] = torch.arange(count, dtype=torch.int32)
+    values = dict(slot_for_id=mapping.view(layers, experts), id_of_slot=owner,
+        usage=torch.randint(0, 10, (capacity,), generator=generator, dtype=torch.int64),
+        step=torch.tensor(10, dtype=torch.int64), active_mask=torch.ones(experts, dtype=torch.int32),
+        evict_slots=torch.full((capacity,), -9, dtype=torch.int32),
+        src_indices=torch.full((capacity,), -9, dtype=torch.int32),
+        num_indices=torch.zeros(1, dtype=torch.int64), num_missing_full=torch.zeros(1, dtype=torch.int64),
+        expert_recency=torch.randint(-1, 10, (layers, experts), generator=generator, dtype=torch.int64))
+    return SimpleNamespace(num_experts=experts, cache_size=capacity,
+                           **{key:value.cuda() for key,value in values.items()})
+
+
+def _copy_route_cache(cache):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**{key:value.clone() if isinstance(value, torch.Tensor) else value
+                              for key,value in vars(cache).items()})
+
+
+def _serial_route_ensure(cache, ids, max_fetch, fraction, by_recency, layer=24):
+    import triton
+    from freetoken.moe.offload_kernels import _ensure_experts_hybrid_kernel
+
+    _ensure_experts_hybrid_kernel[(1,)](ids, cache.slot_for_id, cache.id_of_slot, cache.usage,
+        cache.step, cache.active_mask, cache.evict_slots, cache.src_indices, cache.num_indices,
+        cache.num_missing_full, cache.expert_recency, layer, ids.numel(), max_fetch,
+        min(1 << 16, max(0, round(fraction * (1 << 16)))), cache.num_experts, cache.cache_size,
+        BLOCK_E=triton.next_power_of_2(cache.num_experts),
+        BLOCK_C=triton.next_power_of_2(cache.cache_size), BY_RECENCY=by_recency,
+        PRECOMPUTED_ACTIVE=False, num_warps=8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("residency", ["cold", "mixed", "hot"])
+@pytest.mark.parametrize("by_recency", [False, True])
+@pytest.mark.parametrize("max_fetch,fraction", [(0, 0.), (16, 0.), (128, 0.), (128, .5)])
+def test_long_hybrid_routes_preserve_serial_cache_state(monkeypatch, residency, by_recency, max_fetch, fraction):
+    import freetoken.moe.offload_kernels as kernels
+
+    monkeypatch.setattr(kernels, "_HYBRID_FETCH_BY_RECENCY", by_recency)
+    original = _long_route_cache(residency)
+    serial, parallel = _copy_route_cache(original), _copy_route_cache(original)
+    generator = torch.Generator().manual_seed(123)
+    for layer, count in [(24, 32768), (25, 257), (24, 32768)]:
+        routes = torch.randint(-64, 128, (count,), generator=generator).clamp_min(-1).int().cuda()
+        expected, actual = routes.clone(), routes.clone()
+        _serial_route_ensure(serial, expected, max_fetch, fraction, by_recency, layer)
+        kernels.ensure_experts_hybrid(parallel, layer, actual, max_fetch, fraction)
+        assert torch.equal(actual, expected)
+        for name,value in vars(serial).items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(getattr(parallel, name), value), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("invalid", [False, True])
+def test_long_hybrid_routes_replay_in_graph(monkeypatch, invalid):
+    import freetoken.moe.offload_kernels as kernels
+
+    monkeypatch.setattr(kernels, "_HYBRID_FETCH_BY_RECENCY", True)
+    initial = _long_route_cache("mixed")
+    actual, expected = _copy_route_cache(initial), _copy_route_cache(initial)
+    routes = torch.arange(32768, device="cuda", dtype=torch.int32) % 128
+    if invalid:
+        routes.fill_(-1)
+    ids = routes.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        kernels.ensure_experts_hybrid(actual, 24, ids, 128)
+    torch.cuda.current_stream().wait_stream(stream)
+    for name,value in vars(initial).items():
+        if isinstance(value, torch.Tensor):
+            getattr(actual, name).copy_(value)
+    ids.copy_(routes)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        kernels.ensure_experts_hybrid(actual, 24, ids, 128)
+    for _ in range(2):
+        for name,value in vars(initial).items():
+            if isinstance(value, torch.Tensor):
+                getattr(actual, name).copy_(value)
+                getattr(expected, name).copy_(value)
+        ids.copy_(routes)
+        reference = routes.clone()
+        _serial_route_ensure(expected, reference, 128, 0., True)
+        graph.replay()
+        assert torch.equal(ids, reference)
+        for name,value in vars(expected).items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(getattr(actual, name), value), name
